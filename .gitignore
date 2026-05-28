@@ -45,3 +45,10 @@ perf.data.old
 
 # Local Claude / agent state
 .claude/settings.local.json
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+

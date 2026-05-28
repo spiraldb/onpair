@@ -9,18 +9,25 @@ markdown summary plus per-iteration raw timings under `results/`.
 ```
 onpair-bench/
 ├── run.py                  # orchestrator
+├── corpus.py               # managed dataset fetcher (TPC-H, ClickBench, OnPair-paper)
 ├── pyproject.toml
 ├── corpora/                # gitignored; drop .txt or .parquet here
-│   └── .cache/             # parquet → .txt extracts (one per Utf8/Utf8View col)
+│   ├── .cache/             # parquet → .txt extracts (one per Utf8/Utf8View col)
+│   └── datasets/           # managed by corpus.py; one dir per dataset, .done marks success
 ├── results/                # gitignored; <UTC>.json per run
-├── rust-bench/
+├── rust-bench/             # path dep on ../.. (workspace `onpair` crate)
 │   ├── Cargo.toml
-│   ├── src/main.rs
-│   └── mock/               # passthrough mock; swap to registry dep when real
+│   └── src/main.rs
 └── cpp-bench/
-    ├── CMakeLists.txt
+    ├── CMakeLists.txt      # add_subdirectory(onpair_cpp)
     ├── main.cpp
-    └── mock/               # passthrough mock; swap add_subdirectory to use real
+    └── onpair_cpp/         # git submodule → gargiulofrancesco/onpair_cpp
+```
+
+Initialise the C++ submodule before building:
+
+```bash
+git submodule update --init --recursive
 ```
 
 ## Input format
@@ -33,31 +40,80 @@ them.
 
 ## Usage
 
-```bash
-# drop a corpus in:
-cp /some/strings.txt corpora/
-# or a parquet (each Utf8/Utf8View column becomes one .txt under .cache/)
-cp /some/strings.parquet corpora/
+The bench is a uv workspace member of the repo-root `pyproject.toml`. Sync
+once from the repo root, then drive it with `uv run`:
 
-python run.py
-python run.py --bits 12 14 16 --iters 10
-python run.py --rust-only --no-decompress
-python run.py extra1.txt extra2.parquet
+```bash
+# from /Users/joeisaacs/git/spiraldb/onpair (one-time):
+uv sync
+
+# drop a corpus in:
+cp /some/strings.txt benchmarks/onpair-bench/corpora/
+# or a parquet (each Utf8/Utf8View column becomes one .txt under .cache/)
+cp /some/strings.parquet benchmarks/onpair-bench/corpora/
+
+uv run onpair-bench
+uv run onpair-bench --bits 12 14 16 --iters 10
+uv run onpair-bench --rust-only --no-decompress
+uv run onpair-bench extra1.txt extra2.parquet
 ```
 
-## Mock vs real impls
+## Managed datasets (TPC-H, ClickBench, OnPair paper)
 
-Both `rust-bench/mock/` and `cpp-bench/mock/` are no-op passthroughs that
-mirror the expected API surface, so the harness builds and `--verify` passes
-end-to-end without any upstream code.
+`corpus.py` fetches reproducible reference datasets into
+`corpora/datasets/<name>/`. Each dataset lands once — a `.done` marker in
+its directory short-circuits re-downloads. Run benchmarks against them via
+`run.py --dataset NAME` (repeatable) or `run.py --all-datasets`; the
+existing parquet → per-column extractor fans every string column out into
+its own row in the result table, so rs vs cpp can be compared column by
+column.
 
-To wire up the real impls:
+```bash
+# inspect registry + completion state
+uv run onpair-bench-corpus list
 
-- **Rust**: in `rust-bench/Cargo.toml`, change
-  `vortex-onpair-rs = { path = "mock" }` to a registry dep
-  (`vortex-onpair-rs = "X.Y"`). The expected API is the `Column` type in
-  `mock/src/lib.rs`.
-- **C++**: in `cpp-bench/CMakeLists.txt`, replace `add_subdirectory(mock)`
-  with `add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../onpair-sys/cmake onpair-sys)`.
-  Upstream is expected to expose a CMake target named `onpair` and the header
-  `<onpair/api.h>` matching `cpp-bench/mock/include/onpair/api.h`.
+# fetch one or many
+uv run onpair-bench-corpus fetch tpch-sf1 clickbench amazon-books-titles
+
+# fetch every registered dataset
+uv run onpair-bench-corpus fetch-all
+
+# remove a specific dataset / wipe everything
+uv run onpair-bench-corpus clean tpch-sf1
+uv run onpair-bench-corpus clean-all
+
+# print absolute path (handy for scripting)
+uv run onpair-bench-corpus path tpch-sf1
+
+# benchmark against a managed dataset (auto-fetches if missing)
+uv run onpair-bench --dataset tpch-sf1 --dataset clickbench --bits 12 14 16
+uv run onpair-bench --all-datasets --rust-only
+```
+
+| name                  | source                                                            | needs           |
+|-----------------------|-------------------------------------------------------------------|-----------------|
+| `tpch-sf0.1`          | generated via duckdb tpch extension                               | `duckdb`        |
+| `tpch-sf1`            | generated via duckdb tpch extension                               | `duckdb`        |
+| `clickbench`          | `datasets.clickhouse.com/hits_compatible/athena/hits.parquet`     | network         |
+| `amazon-books-titles` | `McAuley-Lab/Amazon-Reviews-2023 :: raw_meta_Books.title`         | `datasets` (HF) |
+| `amazon-books-reviews`| `McAuley-Lab/Amazon-Reviews-2023 :: raw_review_Books.text` (≤500MB) | `datasets` (HF) |
+| `news-headlines`      | `rajistics/million-headlines :: headline_text`                    | `datasets` (HF) |
+| `sentiment140-tweets` | `stanfordnlp/sentiment140 :: text`                                | `datasets` (HF) |
+
+Install the optional fetcher deps with one of:
+
+```bash
+pip install -e '.[tpch]'    # duckdb only
+pip install -e '.[paper]'   # HuggingFace datasets only
+pip install -e '.[full]'    # both
+```
+
+## Implementations
+
+- **Rust**: `rust-bench` is a separate workspace whose `Cargo.toml` carries a
+  path dep on the workspace-root `onpair` crate (`../..`). The bench shells
+  out to `onpair::compress` / decodes rows directly off `Column::as_parts()`.
+- **C++**: `cpp-bench` links the upstream
+  [`gargiulofrancesco/onpair_cpp`](https://github.com/gargiulofrancesco/onpair_cpp)
+  vendored under `cpp-bench/onpair_cpp/` as a git submodule. It exports the
+  CMake target `onpair` and the `<onpair/api.h>` umbrella header.

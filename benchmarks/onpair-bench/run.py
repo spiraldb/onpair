@@ -4,6 +4,12 @@ Discovers corpora (.txt directly; .parquet → one .txt per string column under
 corpora/.cache/), builds the rust + cpp benchmark binaries on staleness, then
 sweeps (corpus × bits 9..=16), printing a markdown summary to stdout and
 writing the raw timings to results/<UTC>.json.
+
+Managed reference datasets (TPC-H, ClickBench, OnPair-paper) live under
+corpora/datasets/<name>/ and are fetched once by ``corpus.py``. Pass
+``--dataset NAME`` (repeatable) or ``--all-datasets`` to ensure + include
+them; the discovery loop fans every string column out into its own row in
+the result table so rs vs cpp can be compared column-by-column.
 """
 
 from __future__ import annotations
@@ -19,8 +25,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import corpus as corpus_mod
+
 HERE = Path(__file__).resolve().parent
 CORPORA = HERE / "corpora"
+DATASETS_ROOT = CORPORA / "datasets"
 CACHE = CORPORA / ".cache"
 RESULTS = HERE / "results"
 RUST_DIR = HERE / "rust-bench"
@@ -47,6 +56,13 @@ def _extract_parquet(parquet: Path) -> list[Path]:
         return []
 
     CACHE.mkdir(parents=True, exist_ok=True)
+    # Derive a path-unique stem so e.g. tpch-sf1/lineitem.parquet and
+    # tpch-sf0.1/lineitem.parquet don't collide in the shared cache.
+    try:
+        rel = parquet.resolve().relative_to(CORPORA.resolve())
+        stem = "__".join(rel.with_suffix("").parts)
+    except ValueError:
+        stem = parquet.stem
     outputs: list[Path] = []
     table = pq.read_table(parquet)
     for col_name in table.column_names:
@@ -55,7 +71,7 @@ def _extract_parquet(parquet: Path) -> list[Path]:
             hasattr(pa.types, "is_string_view") and pa.types.is_string_view(col.type)
         ):
             continue
-        out = CACHE / f"{parquet.stem}__{col_name}.txt"
+        out = CACHE / f"{stem}__{col_name}.txt"
         if not _is_newer(parquet, out):
             outputs.append(out)
             continue
@@ -80,8 +96,20 @@ def _extract_parquet(parquet: Path) -> list[Path]:
     return outputs
 
 
-def discover_corpora(extra: list[Path]) -> list[Path]:
+def _walk_corpus_dir(root: Path, found: list[Path]) -> None:
+    """Add .txt verbatim, fan .parquet out into one .txt per string column."""
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.suffix == ".txt":
+            found.append(p)
+        elif p.suffix == ".parquet":
+            found.extend(_extract_parquet(p))
+
+
+def discover_corpora(extra: list[Path], dataset_dirs: list[Path]) -> list[Path]:
     found: list[Path] = []
+    # Top-level files dropped directly into corpora/.
     if CORPORA.exists():
         for p in sorted(CORPORA.iterdir()):
             if p.is_dir():
@@ -90,6 +118,11 @@ def discover_corpora(extra: list[Path]) -> list[Path]:
                 found.append(p)
             elif p.suffix == ".parquet":
                 found.extend(_extract_parquet(p))
+    # Managed datasets fetched by corpus.py — walk recursively so per-table
+    # parquet (tpch) and per-column txt (paper datasets) both get picked up.
+    for root in dataset_dirs:
+        if root.exists():
+            _walk_corpus_dir(root, found)
     for p in extra:
         p = p.resolve()
         if p.suffix == ".parquet":
@@ -123,9 +156,8 @@ def _max_mtime(paths: list[Path]) -> float:
 
 
 def build_rust(force: bool) -> None:
-    src = _files_under(RUST_DIR / "src", RUST_DIR / "mock")
+    src = _files_under(RUST_DIR / "src")
     src.append(RUST_DIR / "Cargo.toml")
-    src.append(RUST_DIR / "mock" / "Cargo.toml")
     if not force and RUST_BIN.exists() and RUST_BIN.stat().st_mtime > _max_mtime(src):
         return
     print("building rust-bench...", file=sys.stderr)
@@ -228,6 +260,21 @@ def render_table(runs: list[Run]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("corpus", nargs="*", type=Path, help="extra corpus paths (.txt or .parquet)")
+    ap.add_argument(
+        "--dataset",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "managed dataset to ensure + include (repeatable). "
+            "see `python corpus.py list` for available names."
+        ),
+    )
+    ap.add_argument(
+        "--all-datasets",
+        action="store_true",
+        help="ensure + include every registered dataset (corpus.py fetch-all).",
+    )
     ap.add_argument("--bits", type=int, nargs="+", default=list(range(9, 17)))
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=1)
@@ -238,10 +285,14 @@ def main() -> int:
     ap.add_argument("--force-build", action="store_true")
     args = ap.parse_args()
 
-    corpora = discover_corpora(args.corpus)
+    dataset_names = list(corpus_mod.REGISTRY) if args.all_datasets else list(args.dataset)
+    dataset_dirs = corpus_mod.ensure(dataset_names) if dataset_names else []
+
+    corpora = discover_corpora(args.corpus, dataset_dirs)
     if not corpora:
         print(
-            f"no corpora found. drop .txt or .parquet into {CORPORA}/ or pass paths on cli",
+            f"no corpora found. drop .txt or .parquet into {CORPORA}/, "
+            f"pass paths on cli, or use --dataset NAME.",
             file=sys.stderr,
         )
         return 1

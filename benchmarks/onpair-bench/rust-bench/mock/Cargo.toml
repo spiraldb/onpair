@@ -1,9 +1,0 @@
-[package]
-name = "vortex-onpair-rs"
-version = "0.0.0-mock"
-edition = "2021"
-publish = false
-description = "No-op mock that mirrors the expected vortex-onpair-rs API surface; swap path dep for a real crate dep to drop the mock."
-
-[lib]
-path = "src/lib.rs"

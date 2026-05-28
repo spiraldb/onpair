@@ -102,6 +102,33 @@ std::string join_u64(const std::vector<uint64_t>& v) {
   return oss.str();
 }
 
+onpair::encoding::TrainingConfig make_cfg(uint32_t bits) {
+  onpair::encoding::TrainingConfig cfg;
+  cfg.bits = static_cast<onpair::BitWidth>(bits);
+  cfg.threshold = onpair::encoding::DynamicThreshold{0.2};
+  return cfg;
+}
+
+onpair::OnPairColumn do_compress(uint32_t bits,
+                                 const std::vector<uint8_t>& payload,
+                                 const std::vector<uint32_t>& offsets) {
+  const size_t n = offsets.empty() ? 0 : offsets.size() - 1;
+  return onpair::OnPairColumn::compress(
+      reinterpret_cast<const char*>(payload.data()), offsets.data(), n, make_cfg(bits));
+}
+
+size_t codes_bytes_of(const onpair::OnPairColumnView& view) {
+  const auto store = view.store();
+  const size_t total_bits = store.num_tokens() * static_cast<size_t>(store.bits());
+  return (total_bits + 7) / 8;
+}
+
+size_t dict_bytes_of(const onpair::OnPairColumnView& view) {
+  const auto dict = view.dictionary();
+  const size_t n = dict.num_tokens();
+  return n == 0 ? 0 : static_cast<size_t>(dict.raw_offsets()[n]);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -116,42 +143,47 @@ int main(int argc, char** argv) {
   std::vector<uint64_t> compress_ns;
   compress_ns.reserve(args.iters);
   for (uint32_t i = 0; i < args.warmup; ++i) {
-    (void)onpair::OnPairColumn::compress(args.bits, payload.data(), payload.size(),
-                                         offsets.data(), offsets.size());
+    (void)do_compress(args.bits, payload, offsets);
   }
   std::optional<onpair::OnPairColumn> last;
   for (uint32_t i = 0; i < args.iters; ++i) {
     auto t0 = std::chrono::steady_clock::now();
-    auto col = onpair::OnPairColumn::compress(args.bits, payload.data(), payload.size(),
-                                              offsets.data(), offsets.size());
+    auto col = do_compress(args.bits, payload, offsets);
     compress_ns.push_back(elapsed_ns(t0));
     last.emplace(std::move(col));
   }
   if (!last) die("--iters must be >= 1");
 
+  auto view = last->view();
+
+  // Max row length, used to size the scratch buffer (+ decoder padding).
+  size_t max_row = 0;
+  for (size_t r = 0; r < num_rows; ++r) {
+    const size_t len = offsets[r + 1] - offsets[r];
+    if (len > max_row) max_row = len;
+  }
+  std::vector<char> scratch(max_row + onpair::DECOMPRESS_BUFFER_PADDING);
+
   std::vector<uint64_t> decompress_ns;
   if (args.decompress) {
-    std::vector<uint8_t> scratch;
-    scratch.reserve(1024);
     for (uint32_t i = 0; i < args.warmup; ++i) {
-      for (size_t r = 0; r < num_rows; ++r) last->decompress_row(r, scratch);
+      for (size_t r = 0; r < num_rows; ++r) (void)view.decompress(r, scratch.data());
     }
     decompress_ns.reserve(args.iters);
     for (uint32_t i = 0; i < args.iters; ++i) {
       auto t0 = std::chrono::steady_clock::now();
-      for (size_t r = 0; r < num_rows; ++r) last->decompress_row(r, scratch);
+      for (size_t r = 0; r < num_rows; ++r) (void)view.decompress(r, scratch.data());
       decompress_ns.push_back(elapsed_ns(t0));
     }
   }
 
   if (args.verify) {
-    std::vector<uint8_t> scratch;
     for (size_t r = 0; r < num_rows; ++r) {
-      last->decompress_row(r, scratch);
-      uint32_t start = offsets[r];
-      uint32_t end = offsets[r + 1];
-      if (scratch.size() != static_cast<size_t>(end - start) ||
-          std::memcmp(scratch.data(), payload.data() + start, scratch.size()) != 0) {
+      const size_t len = view.decompress(r, scratch.data());
+      const uint32_t start = offsets[r];
+      const uint32_t end = offsets[r + 1];
+      if (len != static_cast<size_t>(end - start) ||
+          std::memcmp(scratch.data(), payload.data() + start, len) != 0) {
         std::fprintf(stderr, "verify failed at row %zu\n", r);
         return 2;
       }
@@ -162,10 +194,12 @@ int main(int argc, char** argv) {
             << "\"bits\":" << args.bits << ','
             << "\"num_rows\":" << num_rows << ','
             << "\"input_bytes\":" << input_bytes << ','
-            << "\"dict_size\":" << last->dict_size() << ','
-            << "\"dict_bytes\":" << last->dict_bytes() << ','
-            << "\"codes_bytes\":" << last->codes_bytes() << ','
-            << "\"compressed_bytes\":" << last->compressed_bytes() << ','
+            << "\"dict_size\":" << view.dictionary().num_tokens() << ','
+            << "\"dict_bytes\":" << dict_bytes_of(view) << ','
+            << "\"codes_bytes\":" << codes_bytes_of(view) << ','
+            // dict + bit-packed codes only — excludes the StoreView boundary
+            // index (the "Store" side-table). Rust bench reports the same.
+            << "\"compressed_bytes\":" << (view.dictionary().bytes_used() + codes_bytes_of(view)) << ','
             << "\"compress_ns\":" << join_u64(compress_ns) << ','
             << "\"decompress_ns\":" << join_u64(decompress_ns)
             << '}' << std::endl;
