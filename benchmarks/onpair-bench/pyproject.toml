@@ -1,0 +1,18 @@
+[project]
+name = "onpair-bench"
+version = "0.0.0"
+description = "Cross-impl OnPair compression benchmark harness."
+requires-python = ">=3.10"
+dependencies = [
+    "pyarrow>=14",
+]
+
+[project.scripts]
+onpair-bench = "run:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["run"]
