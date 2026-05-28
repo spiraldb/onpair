@@ -10,14 +10,15 @@ keywords = ["compression", "strings", "onpair", "random-access", "lightweight"]
 categories = ["compression"]
 rust-version = "1.91.0"
 edition = "2024"
-exclude = ["benchmarks/*", ".github/*"]
+exclude = [".github/*"]
 
 [lib]
 name = "onpair"
 
 [lints.rust]
 warnings = "deny"
-missing_docs = "deny"
+# TODO: re-tighten to "deny" once the slim public API has docs.
+missing_docs = "allow"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -30,9 +31,31 @@ tests_outside_test_module = { level = "deny" }
 unwrap_in_result = { level = "deny" }
 use_debug = { level = "deny" }
 
+[dependencies]
+hashbrown = "0.16.1"
+rand = "0.9.0"
+# Optional alt-hasher for the LPM maps. Default is hashbrown's foldhash;
+# enabling `hash-gxhash` swaps in gxhash (requires hardware AES).
+gxhash = { version = "3", optional = true }
+
+[features]
+hash-gxhash = ["dep:gxhash"]
+
 [dev-dependencies]
-criterion = { package = "codspeed-criterion-compat", version = "4.0" }
+divan = { package = "codspeed-divan-compat", version = "4.0.4" }
+rstest = "0.26.1"
+arrow-array = "57.1"
+arrow-schema = "57.1"
+parquet = "57.1"
+tpchgen = "2.0.2"
+tpchgen-arrow = "2.0.2"
 
 [[bench]]
-name = "smoke"
+name = "tpch"
 harness = false
+
+# TODO: re-enable once the slim public API in PUBLIC_API.md lands in src/;
+# the file is already written against `compress`/`decompress` free fns.
+# [[bench]]
+# name = "clickbench"
+# harness = false
