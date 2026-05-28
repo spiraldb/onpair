@@ -60,7 +60,10 @@ def _download(url: str, dst: Path, *, chunk: int = 1 << 20) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(dst.name + ".part")
     print(f"  downloading {url}", file=sys.stderr)
-    with urllib.request.urlopen(url) as resp, tmp.open("wb") as fh:
+    # Some CDNs (Cloudflare R2 public buckets) 403 the default `Python-urllib`
+    # User-Agent. Use a generic browser-ish UA — same content either way.
+    req = urllib.request.Request(url, headers={"User-Agent": "onpair-bench/0.1 (+https://github.com/spiraldb/onpair)"})
+    with urllib.request.urlopen(req) as resp, tmp.open("wb") as fh:
         total = int(resp.headers.get("Content-Length") or 0)
         seen = 0
         last_pct = -1
@@ -147,9 +150,32 @@ def _fetch_tpch(target: Path, scale: float) -> None:
     con.close()
 
 
-def _fetch_clickbench(target: Path) -> None:
-    url = "https://datasets.clickhouse.com/hits_compatible/athena/hits.parquet"
-    _download(url, target / "hits.parquet")
+_CLICKBENCH_SHARDS_URL = (
+    "https://pub-3ba949c0f0354ac18db1f0f14f0a2c52.r2.dev"
+    "/clickbench/parquet_many/hits_{idx}.parquet"
+)
+_CLICKBENCH_FULL_URL = (
+    "https://pub-3ba949c0f0354ac18db1f0f14f0a2c52.r2.dev"
+    "/clickbench/parquet_single/hits.parquet"
+)
+
+
+def _fetch_clickbench_sample(target: Path, *, num_shards: int = 6) -> None:
+    # ClickHouse's own bucket (datasets.clickhouse.com) returns 403 as of 2026.
+    # vortex hosts a sharded mirror on Cloudflare R2; pull the first
+    # `num_shards` shards (~120 MB each) — plenty of rows for compression
+    # stats at ~20× less I/O than the full hits.parquet.
+    for idx in range(num_shards):
+        _download(
+            _CLICKBENCH_SHARDS_URL.format(idx=idx),
+            target / f"hits_{idx}.parquet",
+        )
+
+
+def _fetch_clickbench_full(target: Path) -> None:
+    # Full ~14.5 GB single hits.parquet — same string columns as the sample,
+    # ~99 M rows instead of ~10 M. Opt-in via `--dataset clickbench-full`.
+    _download(_CLICKBENCH_FULL_URL, target / "hits.parquet")
 
 
 def _hf_column_to_txt(
@@ -162,15 +188,20 @@ def _hf_column_to_txt(
     out_name: str,
     max_bytes: int | None = None,
 ) -> None:
+    """Stream a single column from an HF dataset to LF-delimited bytes.
+
+    Streaming avoids the ``download_and_prepare`` pipeline (which materialises
+    the full dataset as Arrow under ``~/.cache/huggingface/datasets`` — many
+    GB even for a single text column). We just read rows lazily and write
+    the column out, no on-disk cache beyond ``out_name``."""
     datasets = _require("datasets", "pip install datasets")
-    cache_dir = target / ".hf-cache"
     desc = repo + (f":{config}" if config else "") + f"[{split}].{column}"
-    print(f"  loading hf:{desc}", file=sys.stderr)
+    print(f"  streaming hf:{desc}", file=sys.stderr)
     ds = datasets.load_dataset(
         repo,
         name=config,
         split=split,
-        cache_dir=str(cache_dir),
+        streaming=True,
         trust_remote_code=True,
     )
     out = target / out_name
@@ -181,8 +212,6 @@ def _hf_column_to_txt(
         max_bytes=max_bytes,
     )
     print(f"  wrote {n:,} rows ({nb / 1e6:.1f} MB)", file=sys.stderr)
-    if cache_dir.exists():
-        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 # --- registry ---------------------------------------------------------------
@@ -193,6 +222,10 @@ class Dataset:
     name: str
     description: str
     fetch: Callable[[Path], None]
+    # When False, `--all-datasets` skips this entry; it still fetches via
+    # explicit `--dataset NAME`. Used for outsized variants (e.g. the
+    # 14.5 GB clickbench-full) that aren't a sensible default.
+    include_in_all: bool = True
 
 
 REGISTRY: dict[str, Dataset] = {
@@ -208,8 +241,14 @@ REGISTRY: dict[str, Dataset] = {
     ),
     "clickbench": Dataset(
         "clickbench",
-        "ClickBench hits.parquet (~14 GB; many wide string columns).",
-        _fetch_clickbench,
+        "ClickBench hits shards 0..5 (~720 MB; sample of the full hits.parquet).",
+        _fetch_clickbench_sample,
+    ),
+    "clickbench-full": Dataset(
+        "clickbench-full",
+        "ClickBench full hits.parquet (~14.5 GB; --dataset opt-in, skipped by --all-datasets).",
+        _fetch_clickbench_full,
+        include_in_all=False,
     ),
     "amazon-books-titles": Dataset(
         "amazon-books-titles",
@@ -271,7 +310,10 @@ def _is_done(target: Path) -> bool:
 
 
 def ensure(names: Iterable[str]) -> list[Path]:
-    """Fetch any of ``names`` not already complete. Returns dataset dirs."""
+    """Fetch any of ``names`` not already complete. Returns dataset dirs that
+    are usable (``.done``-marked). Per-dataset failures warn and continue —
+    one broken upstream shouldn't block the rest of an ``--all-datasets``
+    sweep. Unknown names still hard-fail (typo defence)."""
     dirs: list[Path] = []
     for name in names:
         ds = REGISTRY.get(name)
@@ -288,7 +330,22 @@ def ensure(names: Iterable[str]) -> list[Path]:
         if target.exists():
             shutil.rmtree(target)
         target.mkdir(parents=True, exist_ok=True)
-        ds.fetch(target)
+        try:
+            ds.fetch(target)
+        except Exception as exc:  # noqa: BLE001 — surface any fetch failure
+            # Walk the cause chain to print the original error (HTTPError,
+            # OSError, etc) — the outer wrapper is often DatasetGenerationError
+            # which by itself doesn't say what went wrong.
+            cause = exc
+            chain = [repr(cause)]
+            while cause.__cause__ is not None and cause.__cause__ is not cause:
+                cause = cause.__cause__
+                chain.append(repr(cause))
+            print(f"warn: {name} fetch failed; skipping", file=sys.stderr)
+            for line in chain:
+                print(f"  · {line}", file=sys.stderr)
+            shutil.rmtree(target, ignore_errors=True)
+            continue
         (target / DONE).touch()
         dirs.append(target)
     return dirs

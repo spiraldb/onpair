@@ -12,9 +12,11 @@ dependencies = [
 tpch = ["duckdb>=1.0"]
 # The OnPair-paper datasets (amazon, news, sentiment140) flow through the
 # HuggingFace `datasets` library, which transitively pulls huggingface_hub.
-paper = ["datasets>=2.14"]
+# Pinned <4 because v4 removed script-based dataset loading, which
+# McAuley-Lab/Amazon-Reviews-2023 (the two OnPair amazon datasets) still uses.
+paper = ["datasets>=2.14,<4"]
 # Convenience superset for `pip install -e .[full]`.
-full = ["duckdb>=1.0", "datasets>=2.14"]
+full = ["duckdb>=1.0", "datasets>=2.14,<4"]
 
 [project.scripts]
 onpair-bench = "run:main"

@@ -4,26 +4,6 @@ Cross-impl benchmark harness for OnPair. Builds the Rust and C++ benchmark
 binaries, runs them across a corpus sweep × `bits ∈ 9..=16`, and prints a
 markdown summary plus per-iteration raw timings under `results/`.
 
-## Layout
-
-```
-onpair-bench/
-├── run.py                  # orchestrator
-├── corpus.py               # managed dataset fetcher (TPC-H, ClickBench, OnPair-paper)
-├── pyproject.toml
-├── corpora/                # gitignored; drop .txt or .parquet here
-│   ├── .cache/             # parquet → .txt extracts (one per Utf8/Utf8View col)
-│   └── datasets/           # managed by corpus.py; one dir per dataset, .done marks success
-├── results/                # gitignored; <UTC>.json per run
-├── rust-bench/             # path dep on ../.. (workspace `onpair` crate)
-│   ├── Cargo.toml
-│   └── src/main.rs
-└── cpp-bench/
-    ├── CMakeLists.txt      # add_subdirectory(onpair_cpp)
-    ├── main.cpp
-    └── onpair_cpp/         # git submodule → gargiulofrancesco/onpair_cpp
-```
-
 Initialise the C++ submodule before building:
 
 ```bash
@@ -100,12 +80,13 @@ uv run onpair-bench --all-datasets --rust-only
 | `news-headlines`      | `rajistics/million-headlines :: headline_text`                    | `datasets` (HF) |
 | `sentiment140-tweets` | `stanfordnlp/sentiment140 :: text`                                | `datasets` (HF) |
 
-Install the optional fetcher deps with one of:
+Install the optional fetcher deps with one of (run from the repo root so
+the extras land in the shared workspace venv):
 
 ```bash
-pip install -e '.[tpch]'    # duckdb only
-pip install -e '.[paper]'   # HuggingFace datasets only
-pip install -e '.[full]'    # both
+uv sync --extra tpch    # duckdb only
+uv sync --extra paper   # HuggingFace datasets only
+uv sync --extra full    # both
 ```
 
 ## Implementations

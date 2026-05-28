@@ -1,9 +1,10 @@
 use std::fs;
+use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use onpair::{Column, Config, DEFAULT_CONFIG, compress};
+use onpair::{Column, Config, DEFAULT_CONFIG, compress, decompress_into};
 
 struct Args {
     input: PathBuf,
@@ -64,24 +65,12 @@ fn cfg_for(bits: u32) -> Config {
     Config { bits, ..DEFAULT_CONFIG }
 }
 
-fn decompress_row_into(col: &Column<u32>, row: usize, out: &mut Vec<u8>) {
-    let parts = col.as_parts();
-    let begin = parts.code_boundaries[row] as usize;
-    let end = parts.code_boundaries[row + 1] as usize;
-    out.clear();
-    for &c in &parts.codes[begin..end] {
-        let s = parts.dict_offsets[c as usize] as usize;
-        let e = parts.dict_offsets[c as usize + 1] as usize;
-        out.extend_from_slice(&parts.dict_bytes[s..e]);
-    }
-}
-
 fn dict_size(col: &Column<u32>) -> usize {
     col.dict_offsets.len().saturating_sub(1)
 }
 
 fn dict_bytes(col: &Column<u32>) -> usize {
-    col.dict_bytes.len()
+    col.dict_offsets.last().copied().unwrap_or(0) as usize
 }
 
 /// Bit-packed size of the code stream — what a `bits`-wide store would use.
@@ -121,34 +110,36 @@ fn main() -> Result<()> {
         last = Some(col);
     }
     let col = last.ok_or_else(|| anyhow!("--iters must be >= 1"))?;
-
+    let parts = col.as_parts();
     let mut decompress_ns: Vec<u128> = Vec::new();
     if args.decompress {
-        let mut scratch: Vec<u8> = Vec::with_capacity(1024);
+        let mut scratch: Vec<u8> = Vec::with_capacity(payload.len());
         for _ in 0..args.warmup {
-            for i in 0..num_rows {
-                decompress_row_into(&col, i, &mut scratch);
-            }
+            let len = decompress_into(parts, scratch.spare_capacity_mut());
+            // SAFETY: `len` logical bytes were initialized by the decoder.
+            unsafe { scratch.set_len(len) };
+            black_box(scratch.as_slice());
+            scratch.clear();
         }
         for _ in 0..args.iters {
             let t0 = Instant::now();
-            for i in 0..num_rows {
-                decompress_row_into(&col, i, &mut scratch);
-            }
+            let len = decompress_into(parts, scratch.spare_capacity_mut());
+            // SAFETY: `len` logical bytes were initialized by the decoder.
+            unsafe { scratch.set_len(len) };
+            black_box(scratch.as_slice());
+            scratch.clear();
             decompress_ns.push(t0.elapsed().as_nanos());
         }
     }
 
     if args.verify {
-        let mut scratch: Vec<u8> = Vec::with_capacity(1024);
-        for i in 0..num_rows {
-            decompress_row_into(&col, i, &mut scratch);
-            let start = offsets[i] as usize;
-            let end = offsets[i + 1] as usize;
-            if scratch.as_slice() != &payload[start..end] {
-                eprintln!("verify failed at row {i}");
-                std::process::exit(2);
-            }
+        let mut scratch: Vec<u8> = Vec::with_capacity(payload.len());
+        let len = decompress_into(parts, scratch.spare_capacity_mut());
+        // SAFETY: `len` logical bytes were initialized by the decoder.
+        unsafe { scratch.set_len(len) };
+        if len != payload.len() || scratch.as_slice() != payload.as_slice() {
+            eprintln!("verify failed");
+            std::process::exit(2);
         }
     }
 

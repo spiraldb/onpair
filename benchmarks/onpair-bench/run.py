@@ -285,7 +285,13 @@ def main() -> int:
     ap.add_argument("--force-build", action="store_true")
     args = ap.parse_args()
 
-    dataset_names = list(corpus_mod.REGISTRY) if args.all_datasets else list(args.dataset)
+    if args.all_datasets:
+        # --all-datasets excludes Dataset entries flagged include_in_all=False
+        # (e.g. clickbench-full's 14.5 GB single-file variant). Those still
+        # fetch via explicit `--dataset NAME`.
+        dataset_names = [n for n, d in corpus_mod.REGISTRY.items() if d.include_in_all]
+    else:
+        dataset_names = list(args.dataset)
     dataset_dirs = corpus_mod.ensure(dataset_names) if dataset_names else []
 
     corpora = discover_corpora(args.corpus, dataset_dirs)
