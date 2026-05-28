@@ -7,6 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/spiraldb/onpair"
 rust-version = "1.91.0"
 edition = "2024"
+exclude = ["benchmarks/*", ".github/*"]
 
 [lib]
 name = "onpair"
