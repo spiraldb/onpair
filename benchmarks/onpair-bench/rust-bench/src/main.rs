@@ -62,7 +62,11 @@ fn build_payload_and_offsets(src: &[u8]) -> (Vec<u8>, Vec<u32>) {
 }
 
 fn cfg_for(bits: u32) -> Config {
-    Config { bits, ..DEFAULT_CONFIG }
+    Config {
+        bits,
+        seed: Some(42),
+        ..DEFAULT_CONFIG
+    }
 }
 
 fn dict_size(col: &Column<u32>) -> usize {

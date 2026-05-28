@@ -64,7 +64,7 @@ fn main() {
         let cfg = Config {
             bits,
             threshold,
-            seed: 42,
+            seed: Some(42),
         };
 
         let mut compress_secs = f64::MAX;

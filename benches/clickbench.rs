@@ -214,7 +214,7 @@ fn compress_column(bits: u32) -> Column<u64> {
     let cfg = Config {
         bits,
         threshold: 0.5,
-        seed: 42,
+        seed: Some(42),
     };
     compress(&c.bytes, &c.offsets, cfg).unwrap()
 }
@@ -232,7 +232,7 @@ fn train_and_compress(bencher: Bencher, bits: u32) {
             let cfg = Config {
                 bits,
                 threshold: 0.5,
-                seed: 42,
+                seed: Some(42),
             };
             compress(
                 divan::black_box(&c.bytes),
