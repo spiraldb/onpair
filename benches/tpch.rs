@@ -199,7 +199,7 @@ fn build_column(col: &'static str, bits: u32) -> Column<u64> {
     let cfg = Config {
         bits,
         threshold: 0.2,
-        seed: 42,
+        seed: Some(42),
     };
     compress(&c.bytes, &c.offsets, cfg).unwrap()
 }
@@ -215,7 +215,7 @@ fn train_and_compress(bencher: Bencher, param: (&'static str, u32)) {
     let cfg = Config {
         bits,
         threshold: 0.2,
-        seed: 42,
+        seed: Some(42),
     };
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))

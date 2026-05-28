@@ -4,27 +4,26 @@
 use crate::types::BitWidth;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public config — slim, FFI-friendly.
+// Public config.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Training configuration.
 ///
 /// - `bits`: max dict size = `2^bits`. Range `9..=16`.
 /// - `threshold`: dynamic-threshold sample fraction. Range `(0.0, 1.0]`.
-/// - `seed`: `0` means non-deterministic.
-#[repr(C)]
+/// - `seed`: `None` means non-deterministic.
 #[derive(Copy, Clone, Debug)]
 pub struct Config {
     pub bits: u32,
     pub threshold: f64,
-    pub seed: u64,
+    pub seed: Option<u64>,
 }
 
 /// Reasonable starting point: 12-bit codes, dynamic threshold sampling 20 %.
 pub const DEFAULT_CONFIG: Config = Config {
     bits: 12,
     threshold: 0.2,
-    seed: 0,
+    seed: None,
 };
 
 impl Default for Config {
@@ -112,7 +111,7 @@ impl From<Config> for TrainingConfig {
             threshold: ThresholdSpec::Dynamic(DynamicThreshold {
                 sample_fraction: c.threshold,
             }),
-            seed: (c.seed != 0).then_some(c.seed),
+            seed: c.seed,
         }
     }
 }
