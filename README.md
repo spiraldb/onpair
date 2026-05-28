@@ -1,8 +1,7 @@
 # onpair
 
-[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/spiraldb/onpair?utm_source=badge)
-
-OnPair is a dictionary-based string compression algorithm designed for in-memory database workloads that need both strong compression ratios and fast random access to individual values. It builds its dictionary in a single sequential pass by incrementally merging frequent adjacent substrings, achieving compression comparable to BPE while being substantially faster and more memory-efficient. This crate is a Rust port targeted at the SpiralDB engine.
+OnPair is a dictionary-based string compression algorithm designed for on-disk and in-memory database workloads that need both strong compression ratios and fast random access to individual values. 
+It builds its dictionary in a single sequential pass by incrementally merging frequent adjacent substrings, achieving compression comparable to BPE while being substantially faster and more memory-efficient. 
 
 ## References
 
