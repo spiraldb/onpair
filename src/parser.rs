@@ -5,6 +5,7 @@
 // is fast and self-contained. Codes are emitted as plain `u16` (no bit
 // packing); decoders look up dict bytes directly.
 
+use crate::DECOMPRESS_BUFFER_PADDING;
 use crate::column::Column;
 use crate::config::Config;
 use crate::config::Error;
@@ -46,8 +47,10 @@ impl Parser {
     pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column<O>, Error> {
         validate_offsets(bytes, offsets)?;
         let (codes, code_boundaries) = encode_strings(bytes, offsets, &self.lpm);
+        let mut dict_bytes = self.dict.bytes.clone();
+        dict_bytes.resize(dict_bytes.len() + DECOMPRESS_BUFFER_PADDING, 0);
         Ok(Column {
-            dict_bytes: self.dict.bytes.clone(),
+            dict_bytes,
             dict_offsets: self.dict.offsets.clone(),
             bits: self.dict.bits,
             codes,

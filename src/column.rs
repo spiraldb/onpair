@@ -10,6 +10,8 @@ use crate::offset::Offset;
 /// [`crate::Parser::parse`].
 #[derive(Debug, Clone)]
 pub struct Column<O: Offset> {
+    /// Dictionary bytes. Columns produced by [`crate::Parser::parse`] include
+    /// trailing decoder padding after `dict_offsets.last()`.
     pub dict_bytes: Vec<u8>,
     pub dict_offsets: Vec<u32>,
     pub bits: u32,
@@ -17,7 +19,8 @@ pub struct Column<O: Offset> {
     pub code_boundaries: Vec<O>,
 }
 
-/// Borrowed view of the same data, consumed by [`crate::decompress`].
+/// Borrowed view of the same data, consumed by [`crate::decompress`] and
+/// [`crate::decompress_into`].
 /// Downstream consumers deserializing from storage build this via struct
 /// literal — there is no constructor.
 #[derive(Copy, Clone, Debug)]
@@ -31,7 +34,7 @@ pub struct Parts<'a, O: Offset> {
 
 impl<O: Offset> Column<O> {
     /// Zero-copy view over this column's arrays. Pass directly to
-    /// [`crate::decompress`].
+    /// [`crate::decompress`] or [`crate::decompress_into`].
     #[inline]
     pub fn as_parts(&self) -> Parts<'_, O> {
         Parts {
