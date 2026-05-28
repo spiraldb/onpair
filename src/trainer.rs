@@ -133,11 +133,7 @@ impl DynamicThresholdController {
 /// dictionary lexicographically. `offsets` has length `n + 1`; string `i`
 /// occupies `data[offsets[i]..offsets[i + 1]]`. Caller validates offsets fit
 /// in `usize` and that `cfg.bits ∈ 9..=16`.
-pub(crate) fn train<O: Offset>(
-    data: &[u8],
-    offsets: &[O],
-    cfg: &TrainingConfig,
-) -> TrainResult {
+pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig) -> TrainResult {
     debug_assert!(!offsets.is_empty());
     let n = offsets.len() - 1;
     let dict_capacity = max_dict_size(cfg.bits);

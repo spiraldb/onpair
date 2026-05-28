@@ -16,9 +16,9 @@ use crate::offset::Offset;
 use crate::trainer::TrainResult;
 use crate::trainer::train;
 
-/// Trained encoder: pairs the decode-side [`Dictionary`] with the encode-side
-/// [`LongestPrefixMatcher`]. Build with [`Parser::train`]; encode with
-/// [`Parser::parse`].
+/// Trained encoder: pairs the decode-side [`Dictionary`] with a crate-private
+/// longest-prefix matcher that drives encoding. Build with [`Parser::train`];
+/// encode with [`Parser::parse`].
 #[derive(Debug, Clone)]
 pub struct Parser {
     pub dict: Dictionary,
@@ -30,11 +30,7 @@ impl Parser {
     /// LPM. `offsets` has length `n + 1`. Returns [`Error::InvalidArg`] on
     /// bad `cfg`, on any `offsets[i] > bytes.len()`, on `offsets.is_empty()`,
     /// or if any offset cannot be represented in `usize`.
-    pub fn train<O: Offset>(
-        bytes: &[u8],
-        offsets: &[O],
-        cfg: Config,
-    ) -> Result<Self, Error> {
+    pub fn train<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Self, Error> {
         validate_config(cfg)?;
         validate_offsets(bytes, offsets)?;
 
@@ -47,11 +43,7 @@ impl Parser {
     /// into the returned [`Column`] so the column is fully decode-self-
     /// contained — the strings need not be the corpus the parser was trained
     /// on.
-    pub fn parse<O: Offset>(
-        &self,
-        bytes: &[u8],
-        offsets: &[O],
-    ) -> Result<Column<O>, Error> {
+    pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column<O>, Error> {
         validate_offsets(bytes, offsets)?;
         let (codes, code_boundaries) = encode_strings(bytes, offsets, &self.lpm);
         Ok(Column {
@@ -91,10 +83,7 @@ pub(crate) fn encode_strings<O: Offset>(
 
 /// Validate the `(bytes, offsets)` Arrow-style pair. Empty offsets is a hard
 /// error; otherwise every offset must fit in `usize` and be ≤ `bytes.len()`.
-pub(crate) fn validate_offsets<O: Offset>(
-    bytes: &[u8],
-    offsets: &[O],
-) -> Result<(), Error> {
+pub(crate) fn validate_offsets<O: Offset>(bytes: &[u8], offsets: &[O]) -> Result<(), Error> {
     if offsets.is_empty() {
         return Err(Error::InvalidArg);
     }
@@ -225,7 +214,10 @@ mod tests {
         let expected = "Hello, World!";
         let raw = make_raw(&[expected]);
         let (codes, boundaries) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        assert_eq!(decode_tokens(&codes, &boundaries, &d, 0), expected.as_bytes());
+        assert_eq!(
+            decode_tokens(&codes, &boundaries, &d, 0),
+            expected.as_bytes()
+        );
     }
 
     #[test]

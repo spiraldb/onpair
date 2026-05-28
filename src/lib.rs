@@ -60,11 +60,7 @@ pub use parser::Parser;
 
 /// Compress `bytes` / `offsets` end-to-end. Equivalent to
 /// `Parser::train(..)?.parse(..)`.
-pub fn compress<O: Offset>(
-    bytes: &[u8],
-    offsets: &[O],
-    cfg: Config,
-) -> Result<Column<O>, Error> {
+pub fn compress<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Column<O>, Error> {
     Parser::train(bytes, offsets, cfg)?.parse(bytes, offsets)
 }
 
@@ -92,4 +88,3 @@ pub fn decompress<O: Offset>(parts: Parts<'_, O>) -> Vec<u8> {
     }
     out
 }
-

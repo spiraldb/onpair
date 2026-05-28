@@ -91,15 +91,24 @@ fn main() {
         let compressed = dict_bytes + dict_offsets + codes + boundaries;
         let comp_mib = compressed as f64 / (1024.0 * 1024.0);
 
-        println!("  compress:   {compress_secs:.3}s  {:.1} MiB/s", mib / compress_secs);
-        println!("  decompress: {decompress_secs:.3}s  {:.1} MiB/s", mib / decompress_secs);
+        println!(
+            "  compress:   {compress_secs:.3}s  {:.1} MiB/s",
+            mib / compress_secs
+        );
+        println!(
+            "  decompress: {decompress_secs:.3}s  {:.1} MiB/s",
+            mib / decompress_secs
+        );
         println!(
             "  dict tokens = {}, dict bytes = {dict_bytes}, codes = {} ({} bytes)",
             parts.dict_offsets.len() - 1,
             parts.codes.len(),
             codes
         );
-        println!("  compressed = {comp_mib:.2} MiB, ratio = {:.3}x", mib / comp_mib);
+        println!(
+            "  compressed = {comp_mib:.2} MiB, ratio = {:.3}x",
+            mib / comp_mib
+        );
 
         let roundtrip_ok = decoded == bytes;
         println!(
@@ -174,11 +183,38 @@ fn read_parquet(path: &PathBuf, max_bytes: usize) -> Option<(Vec<u8>, Vec<u64>)>
 /// English words separated by spaces, ~27 bytes each, with heavy word reuse.
 fn synthetic(max_bytes: usize) -> (Vec<u8>, Vec<u64>) {
     const WORDS: &[&str] = &[
-        "the", "quickly", "final", "regular", "ironic", "express", "packages", "accounts",
-        "deposits", "foxes", "requests", "blithely", "carefully", "furiously", "slyly",
-        "pending", "unusual", "even", "bold", "silent", "theodolites", "instructions",
-        "asymptotes", "across", "above", "after", "among", "around", "thinly", "sometimes",
-        "boldly", "fluffily",
+        "the",
+        "quickly",
+        "final",
+        "regular",
+        "ironic",
+        "express",
+        "packages",
+        "accounts",
+        "deposits",
+        "foxes",
+        "requests",
+        "blithely",
+        "carefully",
+        "furiously",
+        "slyly",
+        "pending",
+        "unusual",
+        "even",
+        "bold",
+        "silent",
+        "theodolites",
+        "instructions",
+        "asymptotes",
+        "across",
+        "above",
+        "after",
+        "among",
+        "around",
+        "thinly",
+        "sometimes",
+        "boldly",
+        "fluffily",
     ];
     let mut bytes = Vec::with_capacity(max_bytes.min(1 << 28));
     let mut offsets = vec![0u64];

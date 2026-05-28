@@ -34,14 +34,7 @@ impl Hasher for FxHasher {
 
 pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
-// The hasher backing the LPM short/long maps. Default is hashbrown's foldhash;
-// the `hash-gxhash` feature swaps in gxhash (requires hardware AES).
-
-#[cfg(not(feature = "hash-gxhash"))]
 pub type MapHasher = hashbrown::DefaultHashBuilder;
-
-#[cfg(feature = "hash-gxhash")]
-pub type MapHasher = gxhash::GxBuildHasher;
 
 /// LPM map type, parameterised over the feature-selected [`MapHasher`].
 pub type Map<K, V> = hashbrown::HashMap<K, V, MapHasher>;

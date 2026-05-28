@@ -34,12 +34,6 @@ use_debug = { level = "deny" }
 [dependencies]
 hashbrown = "0.16.1"
 rand = "0.9.0"
-# Optional alt-hasher for the LPM maps. Default is hashbrown's foldhash;
-# enabling `hash-gxhash` swaps in gxhash (requires hardware AES).
-gxhash = { version = "3", optional = true }
-
-[features]
-hash-gxhash = ["dep:gxhash"]
 
 [dev-dependencies]
 divan = { package = "codspeed-divan-compat", version = "4.0.4" }
@@ -54,8 +48,6 @@ tpchgen-arrow = "2.0.2"
 name = "tpch"
 harness = false
 
-# TODO: re-enable once the slim public API in PUBLIC_API.md lands in src/;
-# the file is already written against `compress`/`decompress` free fns.
-# [[bench]]
-# name = "clickbench"
-# harness = false
+[[bench]]
+name = "clickbench"
+harness = false
