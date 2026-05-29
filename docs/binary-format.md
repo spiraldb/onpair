@@ -100,14 +100,6 @@ serializing. The two are equivalent under `bits`.
 
 Invariant: every code `< N` (indexes a real token).
 
-## Related: row boundaries
-
-A column also carries `code_boundaries`, `R + 1` offsets into the code stream
-that delimit the `R` input rows (row `r`'s codes are
-`codes[ b_r .. b_{r+1} )`). Their integer width matches the input offset type
-(`u32`/`u64`). They are an index over the codes, not part of the code/dict
-encoding, and are not required to decode the column as one flat stream.
-
 ## Decode
 
 ```

@@ -13,7 +13,6 @@ use rand::SeedableRng;
 pub(crate) struct Raw {
     pub data: Vec<u8>,
     pub offsets: Vec<u32>,
-    pub n: usize,
 }
 
 pub(crate) fn make_raw<S: AsRef<[u8]>>(strings: &[S]) -> Raw {
@@ -24,11 +23,7 @@ pub(crate) fn make_raw<S: AsRef<[u8]>>(strings: &[S]) -> Raw {
         data.extend_from_slice(s.as_ref());
         offsets.push(data.len() as u32);
     }
-    Raw {
-        data,
-        offsets,
-        n: strings.len(),
-    }
+    Raw { data, offsets }
 }
 
 /// URL-shaped repetitive corpus — easy BPE merge targets.

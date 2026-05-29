@@ -44,9 +44,9 @@ impl Parser {
     /// into the returned [`Column`] so the column is fully decode-self-
     /// contained — the strings need not be the corpus the parser was trained
     /// on.
-    pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column<O>, Error> {
+    pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column, Error> {
         validate_offsets(bytes, offsets)?;
-        let (codes, code_boundaries) = encode_strings(bytes, offsets, &self.lpm);
+        let codes = encode_strings(bytes, offsets, &self.lpm);
         let mut dict_bytes = self.dict.bytes.clone();
         // Decoder reads a fixed MAX_TOKEN_SIZE bytes from every token offset;
         // pad so that read is in bounds for the last token (worst case: a
@@ -58,22 +58,18 @@ impl Parser {
             dict_offsets: self.dict.offsets.clone(),
             bits: self.dict.bits,
             codes,
-            code_boundaries,
         })
     }
 }
 
-/// Encode every string into a flat `Vec<u16>` of codes plus per-row token
-/// boundaries. Output boundary `[i]..[i+1]` indexes into `codes`.
+/// Encode every string into one flat `Vec<u16>` of codes, in input order.
 pub(crate) fn encode_strings<O: Offset>(
     bytes: &[u8],
     offsets: &[O],
     lpm: &LongestPrefixMatcher,
-) -> (Vec<u16>, Vec<O>) {
+) -> Vec<u16> {
     let n = offsets.len() - 1;
     let mut codes: Vec<u16> = Vec::with_capacity(bytes.len());
-    let mut boundaries: Vec<O> = Vec::with_capacity(n + 1);
-    boundaries.push(O::from_usize(0));
     for i in 0..n {
         let s = offsets[i].to_usize().expect("validated");
         let e = offsets[i + 1].to_usize().expect("validated");
@@ -83,9 +79,8 @@ pub(crate) fn encode_strings<O: Offset>(
             codes.push(tok);
             pos += mlen;
         }
-        boundaries.push(O::from_usize(codes.len()));
     }
-    (codes, boundaries)
+    codes
 }
 
 /// Validate the `(bytes, offsets)` Arrow-style pair. Empty offsets is a hard
@@ -135,12 +130,10 @@ mod tests {
         d
     }
 
-    /// Decode all tokens for row `idx` against `dict`.
-    fn decode_tokens(codes: &[u16], boundaries: &[u32], dict: &Dictionary, idx: usize) -> Vec<u8> {
-        let begin = boundaries[idx] as usize;
-        let end = boundaries[idx + 1] as usize;
+    /// Decode the whole flat code stream against `dict`.
+    fn decode_all(codes: &[u16], dict: &Dictionary) -> Vec<u8> {
         let mut out = Vec::new();
-        for &c in &codes[begin..end] {
+        for &c in codes {
             out.extend_from_slice(dict.data(c as Token));
         }
         out
@@ -157,61 +150,26 @@ mod tests {
             seed: Some(seed),
         };
         let TrainResult { dict, lpm } = train(&raw.data, &raw.offsets, &cfg);
-        let (codes, boundaries) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        for i in 0..strings.len() {
-            let decoded = decode_tokens(&codes, &boundaries, &dict, i);
-            if decoded != strings[i].as_ref() {
-                return false;
-            }
-        }
-        true
+        let codes = encode_strings(&raw.data, &raw.offsets, &lpm);
+        // Rows decode as one flat concatenation, so the whole stream must equal
+        // the concatenated input bytes.
+        decode_all(&codes, &dict) == raw.data
     }
 
     const WIDTHS: &[BitWidth] = &[9, 10, 11, 12, 13, 14, 15, 16];
 
     #[test]
-    fn zero_strings_produces_one_boundary() {
+    fn zero_strings_produces_no_codes() {
         let lpm = LongestPrefixMatcher::new();
-        let (codes, boundaries) = encode_strings::<u32>(&[], &[0], &lpm);
-        assert_eq!(boundaries, vec![0u32]);
+        let codes = encode_strings::<u32>(&[], &[0], &lpm);
         assert!(codes.is_empty());
     }
 
     #[test]
-    fn single_empty_string_produces_two_zero_boundaries() {
+    fn single_empty_string_produces_no_codes() {
         let lpm = LongestPrefixMatcher::new();
-        let (codes, boundaries) = encode_strings::<u32>(&[], &[0, 0], &lpm);
-        assert_eq!(boundaries, vec![0u32, 0]);
+        let codes = encode_strings::<u32>(&[], &[0, 0], &lpm);
         assert!(codes.is_empty());
-    }
-
-    #[test]
-    fn boundary_count_is_n_plus_one() {
-        let lpm = LongestPrefixMatcher::new();
-        let raw = make_raw(&make_user_strings(20));
-        let (_, boundaries) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        assert_eq!(boundaries.len(), raw.n + 1);
-    }
-
-    #[test]
-    fn boundaries_are_monotonic() {
-        let lpm = LongestPrefixMatcher::new();
-        let raw = make_raw(&make_random_strings(25, 40, 7));
-        let (_, boundaries) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        for i in 1..boundaries.len() {
-            assert!(
-                boundaries[i] >= boundaries[i - 1],
-                "non-monotonic at index {i}"
-            );
-        }
-    }
-
-    #[test]
-    fn last_boundary_equals_total_token_count() {
-        let lpm = LongestPrefixMatcher::new();
-        let raw = make_raw(&make_random_strings(15, 30, 99));
-        let (codes, boundaries) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        assert_eq!(*boundaries.last().unwrap() as usize, codes.len());
     }
 
     #[test]
@@ -220,11 +178,8 @@ mod tests {
         let d = make_base_dict();
         let expected = "Hello, World!";
         let raw = make_raw(&[expected]);
-        let (codes, boundaries) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        assert_eq!(
-            decode_tokens(&codes, &boundaries, &d, 0),
-            expected.as_bytes()
-        );
+        let codes = encode_strings(&raw.data, &raw.offsets, &lpm);
+        assert_eq!(decode_all(&codes, &d), expected.as_bytes());
     }
 
     #[test]
@@ -233,14 +188,8 @@ mod tests {
         let d = make_base_dict();
         let strings: Vec<Vec<u8>> = (0u16..=255).map(|i| vec![i as u8]).collect();
         let raw = make_raw(&strings);
-        let (codes, boundaries) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        for (i, s) in strings.iter().enumerate() {
-            assert_eq!(
-                decode_tokens(&codes, &boundaries, &d, i),
-                *s,
-                "mismatch for byte value {i}"
-            );
-        }
+        let codes = encode_strings(&raw.data, &raw.offsets, &lpm);
+        assert_eq!(decode_all(&codes, &d), raw.data);
     }
 
     #[test]
@@ -253,9 +202,12 @@ mod tests {
             seed: Some(42),
         };
         let TrainResult { dict: _, lpm } = train(&raw.data, &raw.offsets, &cfg);
-        let (_, boundaries) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        let tokens_0 = boundaries[1] - boundaries[0];
-        assert!(tokens_0 < 40, "parser did not use any multi-byte tokens");
+        let codes = encode_strings(&raw.data, &raw.offsets, &lpm);
+        // Multi-byte tokens mean fewer codes than input bytes.
+        assert!(
+            codes.len() < raw.data.len(),
+            "parser did not use any multi-byte tokens"
+        );
     }
 
     #[test]
