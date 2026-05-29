@@ -9,7 +9,6 @@ use crate::column::Column;
 use crate::config::Config;
 use crate::config::Error;
 use crate::config::TrainingConfig;
-use crate::config::validate_config;
 use crate::dict::Dictionary;
 use crate::lpm::LongestPrefixMatcher;
 use crate::offset::Offset;
@@ -30,11 +29,11 @@ pub struct Parser {
 
 impl Parser {
     /// Train a dictionary against `bytes` / `offsets` and build the matching
-    /// LPM. `offsets` has length `n + 1`. Returns [`Error::InvalidArg`] on
-    /// bad `cfg`, on any `offsets[i] > bytes.len()`, on `offsets.is_empty()`,
-    /// or if any offset cannot be represented in `usize`.
+    /// LPM. `offsets` has length `n + 1`. Returns [`Error::InvalidArg`] on any
+    /// `offsets[i] > bytes.len()`, on `offsets.is_empty()`, or if any offset
+    /// cannot be represented in `usize`. The `cfg` is valid by construction
+    /// ([`Bits`](crate::Bits) / [`Threshold`](crate::Threshold)).
     pub fn train<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Self, Error> {
-        validate_config(cfg)?;
         validate_offsets(bytes, offsets)?;
 
         let internal_cfg: TrainingConfig = cfg.into();

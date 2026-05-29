@@ -54,9 +54,11 @@ mod test_corpus;
 
 pub use column::Column;
 pub use column::Parts;
+pub use config::Bits;
 pub use config::Config;
 pub use config::DEFAULT_CONFIG;
 pub use config::Error;
+pub use config::Threshold;
 pub use decompress::InvalidParts;
 pub use decompress::decompress;
 pub use decompress::decompress_into;
