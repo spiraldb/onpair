@@ -30,87 +30,31 @@
 use std::mem::MaybeUninit;
 
 use crate::column::Parts;
-use crate::offset::Offset;
 use crate::types::MAX_TOKEN_SIZE;
 
 mod scalar;
 
 pub(crate) mod fat;
 
-/// Return the exact decoded byte length of one row.
-///
-/// ## Panics
-///
-/// Panics if `row` is out of bounds or if `parts` violates the invariants
-/// documented by the public API.
-pub fn decompressed_row_len<O: Offset>(parts: Parts<'_, O>, row: usize) -> usize {
-    let (begin, end) = row_code_range(parts, row);
-    parts.codes[begin..end]
-        .iter()
-        .map(|&code| code_len(parts, code))
-        .sum()
-}
-
-/// Return the exact decoded byte length of all rows in input order.
+/// Return the exact decoded byte length of all codes in input order.
 ///
 /// ## Panics
 ///
 /// Panics if `parts` violates the invariants documented by the public API.
-pub fn decompressed_len<O: Offset>(parts: Parts<'_, O>) -> usize {
+pub fn decompressed_len(parts: Parts<'_>) -> usize {
     parts.codes.iter().map(|&code| code_len(parts, code)).sum()
 }
 
-/// Decode one row into a caller-provided output buffer.
+/// Decode every code in a [`Parts`] view into one caller-provided flat byte
+/// buffer in input order.
 ///
 /// Returns the number of initialized bytes in `out`.
 ///
 /// ## Panics
 ///
-/// Panics if `row` is out of bounds, if `out` is too small, or if `parts`
-/// violates the invariants documented by the public API.
-pub fn decompress_row_into<O: Offset>(
-    parts: Parts<'_, O>,
-    row: usize,
-    out: &mut [MaybeUninit<u8>],
-) -> usize {
-    let (begin, end) = row_code_range(parts, row);
-    let out_ptr = out.as_mut_ptr().cast::<u8>();
-    let out_len = out.len();
-    let mut written = 0;
-    for &code in &parts.codes[begin..end] {
-        let (s, e) = code_byte_range(parts, code);
-        let src = parts
-            .dict_bytes
-            .get(s..e)
-            .expect("dictionary offset range fits dictionary bytes");
-        let len = src.len();
-        assert!(
-            len <= out_len.saturating_sub(written),
-            "output buffer too small for decompressed bytes"
-        );
-        // SAFETY: the assertion above guarantees `out_ptr.add(written)..+len` is
-        // within the caller-provided output buffer, and the dictionary range is
-        // derived from the `Parts` dictionary offset table.
-        unsafe {
-            scalar::copy_token_bytes(src.as_ptr(), out_ptr.add(written), len);
-        }
-        written += len;
-    }
-    written
-}
-
-/// Decode every row in a [`Parts`] view into one caller-provided flat byte
-/// buffer in input order.
-///
-/// Returns the number of initialized bytes in `out`. The caller already owns
-/// the row offsets (they passed them to [`crate::compress`] or used them to
-/// build the `Parts`), so they are not returned.
-///
-/// ## Panics
-///
 /// Panics if `out` is too small or if `parts` violates the invariants
 /// documented by the public API.
-pub fn decompress_into<O: Offset>(parts: Parts<'_, O>, out: &mut [MaybeUninit<u8>]) -> usize {
+pub fn decompress_into(parts: Parts<'_>, out: &mut [MaybeUninit<u8>]) -> usize {
     // The checked decode is just the unchecked decode behind a one-time output
     // bounds check — no duplicate loop. The unchecked path is safe iff
     // `out.len() >= decompressed_len(parts)`. Validate that with a cheap
@@ -126,7 +70,7 @@ pub fn decompress_into<O: Offset>(parts: Parts<'_, O>, out: &mut [MaybeUninit<u8
     // loop) and `decode_fat` validates the dictionary (offsets, token sizes, and
     // the required decoder padding) up front, so a malformed `Parts` panics
     // rather than reading out of bounds — making this sound for any `Parts`.
-    unsafe { decode_fat::<true, O>(parts, out) }
+    unsafe { decode_fat::<true>(parts, out) }
 }
 
 /// Out-of-line panic for an out-of-range code. `#[cold]` + `#[inline(never)]` so
@@ -174,7 +118,7 @@ impl std::fmt::Display for InvalidParts {
 
 impl std::error::Error for InvalidParts {}
 
-impl<O: Offset> Parts<'_, O> {
+impl Parts<'_> {
     /// Validate the dictionary metadata every decoder relies on for memory
     /// safety, in `O(dict_tokens)` — independent of the code stream.
     ///
@@ -251,7 +195,7 @@ impl<O: Offset> Parts<'_, O> {
 /// Panic helper for the safe decoders: assert the dictionary is valid before
 /// running the (otherwise unchecked) decode loop.
 #[inline]
-fn assert_valid_dictionary<O: Offset>(parts: Parts<'_, O>) {
+fn assert_valid_dictionary(parts: Parts<'_>) {
     if let Err(e) = parts.validate_dictionary() {
         panic!("onpair: {e}");
     }
@@ -279,18 +223,7 @@ fn assert_valid_dictionary<O: Offset>(parts: Parts<'_, O>) {
 // here and dispatch in `decode_fat` below.
 
 #[inline]
-fn row_code_range<O: Offset>(parts: Parts<'_, O>, row: usize) -> (usize, usize) {
-    let begin = parts.code_boundaries[row]
-        .to_usize()
-        .expect("code boundary fits usize");
-    let end = parts.code_boundaries[row + 1]
-        .to_usize()
-        .expect("code boundary fits usize");
-    (begin, end)
-}
-
-#[inline]
-fn code_byte_range<O: Offset>(parts: Parts<'_, O>, code: u16) -> (usize, usize) {
+fn code_byte_range(parts: Parts<'_>, code: u16) -> (usize, usize) {
     let s = parts.dict_offsets[code as usize] as usize;
     let e = parts.dict_offsets[code as usize + 1] as usize;
     assert!(e >= s, "dictionary offsets must be nondecreasing");
@@ -298,7 +231,7 @@ fn code_byte_range<O: Offset>(parts: Parts<'_, O>, code: u16) -> (usize, usize) 
 }
 
 #[inline]
-fn code_len<O: Offset>(parts: Parts<'_, O>, code: u16) -> usize {
+fn code_len(parts: Parts<'_>, code: u16) -> usize {
     let (s, e) = code_byte_range(parts, code);
     e - s
 }
@@ -317,10 +250,7 @@ fn code_len<O: Offset>(parts: Parts<'_, O>, code: u16) -> usize {
 /// `CHECK == false`, every code must also be a valid token index; with
 /// `CHECK == true` that is enforced.
 #[inline]
-unsafe fn decode_fat<const CHECK: bool, O: Offset>(
-    parts: Parts<'_, O>,
-    out: &mut [MaybeUninit<u8>],
-) -> usize {
+unsafe fn decode_fat<const CHECK: bool>(parts: Parts<'_>, out: &mut [MaybeUninit<u8>]) -> usize {
     if CHECK {
         // O(dict_tokens), off the hot loop: makes the fat-table build and every
         // per-token access below in-bounds for an arbitrary `Parts`.
@@ -343,29 +273,24 @@ unsafe fn decode_fat<const CHECK: bool, O: Offset>(
 /// stream and that `parts` satisfies the public API invariants — including
 /// `dict_bytes` extending [`MAX_TOKEN_SIZE`] bytes past the highest token offset
 /// (the over-copy decode reads them). [`Parts::validate`] checks all of these.
-pub unsafe fn decompress_into_unchecked<O: Offset>(
-    parts: Parts<'_, O>,
-    out: &mut [MaybeUninit<u8>],
-) -> usize {
+pub unsafe fn decompress_into_unchecked(parts: Parts<'_>, out: &mut [MaybeUninit<u8>]) -> usize {
     // SAFETY: forwarded under this function's safety contract.
-    unsafe { decode_fat::<false, O>(parts, out) }
+    unsafe { decode_fat::<false>(parts, out) }
 }
 
-/// Decode every row in a [`Parts`] view into one flat byte buffer in input
-/// order. The caller already owns the row offsets (they passed them to
-/// [`crate::compress`] or used them to build the `Parts`), so they are not
-/// returned.
+/// Decode every code in a [`Parts`] view into one flat byte buffer in input
+/// order.
 ///
 /// A malformed `Parts` panics rather than reading or writing out of bounds (the
 /// dictionary is validated once up front and each code is bounds-checked in the
 /// decode loop). See [`Parts::validate`].
-pub fn decompress<O: Offset>(parts: Parts<'_, O>) -> Vec<u8> {
+pub fn decompress(parts: Parts<'_>) -> Vec<u8> {
     let decoded_len = decompressed_len(parts);
     let mut out: Vec<u8> = Vec::with_capacity(decoded_len);
     // SAFETY: the vector was allocated with the exact decoded length, and
     // `decode_fat` with `CHECK = true` validates the dictionary (incl. the
     // required decoder padding) and bounds-checks every code.
-    let len = unsafe { decode_fat::<true, O>(parts, out.spare_capacity_mut()) };
+    let len = unsafe { decode_fat::<true>(parts, out.spare_capacity_mut()) };
     // SAFETY: the decoder returns exactly the number of logical bytes it
     // initialized in `out.spare_capacity_mut()`.
     unsafe { out.set_len(len) };
@@ -406,7 +331,7 @@ mod tests {
     /// A valid, hand-built padded `Parts` with enough codes (> `MAX_TOKEN_SIZE`)
     /// to drive the 16-byte over-copy fast region as well as the exact tail.
     /// `dict_bytes` carries the worst-case `MAX_TOKEN_SIZE - 1` trailing padding.
-    fn valid_padded(tokens: &[&[u8]], code_seq: &[u16]) -> (Vec<u8>, Vec<u32>, Vec<u16>, Vec<u32>) {
+    fn valid_padded(tokens: &[&[u8]], code_seq: &[u16]) -> (Vec<u8>, Vec<u32>, Vec<u16>) {
         let mut dict = Vec::new();
         let mut offsets = vec![0u32];
         for t in tokens {
@@ -415,22 +340,15 @@ mod tests {
         }
         dict.resize(dict.len() + MAX_TOKEN_SIZE - 1, 0);
         let codes = code_seq.to_vec();
-        let boundaries = vec![0u32, codes.len() as u32];
-        (dict, offsets, codes, boundaries)
+        (dict, offsets, codes)
     }
 
-    fn parts<'a>(
-        dict: &'a [u8],
-        offsets: &'a [u32],
-        codes: &'a [u16],
-        boundaries: &'a [u32],
-    ) -> Parts<'a, u32> {
+    fn parts<'a>(dict: &'a [u8], offsets: &'a [u32], codes: &'a [u16]) -> Parts<'a> {
         Parts {
             dict_bytes: dict,
             dict_offsets: offsets,
             bits: 3,
             codes,
-            code_boundaries: boundaries,
         }
     }
 
@@ -442,8 +360,8 @@ mod tests {
         let tokens: &[&[u8]] = &[b"a", b"bc", b"def", b"ghij"];
         // 40 codes (> MAX_TOKEN_SIZE) so split = 24 fast-region + 16 exact tail.
         let seq: Vec<u16> = (0..40).map(|i| (i % 4) as u16).collect();
-        let (dict, offsets, codes, bounds) = valid_padded(tokens, &seq);
-        let p = parts(&dict, &offsets, &codes, &bounds);
+        let (dict, offsets, codes) = valid_padded(tokens, &seq);
+        let p = parts(&dict, &offsets, &codes);
 
         let expected: Vec<u8> = seq
             .iter()
@@ -484,8 +402,7 @@ mod tests {
     /// panic instead of UB. Run with a generous output buffer so the O(1) buffer
     /// check short-circuits and the dictionary validation is what fires.
     fn assert_decode_panics(dict: &[u8], offsets: &[u32], codes: &[u16]) {
-        let bounds = vec![0u32, codes.len() as u32];
-        let p = parts(dict, offsets, codes, &bounds);
+        let p = parts(dict, offsets, codes);
         let mut out: Vec<MaybeUninit<u8>> = (0..codes.len() * MAX_TOKEN_SIZE + 16)
             .map(|_| MaybeUninit::uninit())
             .collect();
@@ -531,8 +448,8 @@ mod tests {
     fn parts_validate_classifies_corruption() {
         // Valid padded parts → Ok for both the dictionary and full checks.
         let tokens: &[&[u8]] = &[b"a", b"bc", b"def"];
-        let (dict, offsets, codes, bounds) = valid_padded(tokens, &[0, 1, 2, 0]);
-        let p = parts(&dict, &offsets, &codes, &bounds);
+        let (dict, offsets, codes) = valid_padded(tokens, &[0, 1, 2, 0]);
+        let p = parts(&dict, &offsets, &codes);
         assert_eq!(p.validate_dictionary(), Ok(()));
         assert_eq!(p.validate(), Ok(()));
 
@@ -542,7 +459,7 @@ mod tests {
         let mut d = b"ab".to_vec();
         pad(&mut d);
         assert_eq!(
-            parts(&d, &[0, 2, 1], &[0], &[0, 1]).validate_dictionary(),
+            parts(&d, &[0, 2, 1], &[0]).validate_dictionary(),
             Err(InvalidParts::NonIncreasingOffsets)
         );
 
@@ -550,13 +467,13 @@ mod tests {
         let mut d = vec![b'x'; 21];
         pad(&mut d);
         assert_eq!(
-            parts(&d, &[0, 20, 21], &[0], &[0, 1]).validate_dictionary(),
+            parts(&d, &[0, 20, 21], &[0]).validate_dictionary(),
             Err(InvalidParts::TokenTooLarge)
         );
 
         // Dictionary lacks the required trailing decoder padding.
         assert_eq!(
-            parts(b"abcdef", &[0, 4, 6], &[0], &[0, 1]).validate_dictionary(),
+            parts(b"abcdef", &[0, 4, 6], &[0]).validate_dictionary(),
             Err(InvalidParts::MissingDecoderPadding)
         );
 
@@ -564,7 +481,7 @@ mod tests {
         // catches it (the dictionary check is independent of the code stream).
         let mut d = b"ab".to_vec();
         pad(&mut d);
-        let p = parts(&d, &[0, 1, 2], &[0, 5], &[0, 2]);
+        let p = parts(&d, &[0, 1, 2], &[0, 5]);
         assert_eq!(p.validate_dictionary(), Ok(()));
         assert_eq!(p.validate(), Err(InvalidParts::CodeOutOfRange));
     }
@@ -580,8 +497,7 @@ mod tests {
         dict.extend(std::iter::repeat_n(b'y', MAX_TOKEN_SIZE)); // token 1: full width
         let offsets = [0u32, 1, 1 + MAX_TOKEN_SIZE as u32];
         let seq: Vec<u16> = (0..40).map(|i| (i % 2) as u16).collect();
-        let bounds = vec![0u32, seq.len() as u32];
-        let p = parts(&dict, &offsets, &seq, &bounds);
+        let p = parts(&dict, &offsets, &seq);
         assert_eq!(p.validate_dictionary(), Ok(()));
 
         let expected: Vec<u8> = seq
@@ -600,14 +516,11 @@ mod tests {
         // logical end.
         let full = vec![b'z'; MAX_TOKEN_SIZE];
         let offs = [0u32, MAX_TOKEN_SIZE as u32];
-        assert_eq!(
-            parts(&full, &offs, &[0], &[0, 1]).validate_dictionary(),
-            Ok(())
-        );
+        assert_eq!(parts(&full, &offs, &[0]).validate_dictionary(), Ok(()));
         // One byte short → the fixed read would run off the end.
         let short = vec![b'z'; MAX_TOKEN_SIZE - 1];
         assert_eq!(
-            parts(&short, &offs, &[0], &[0, 1]).validate_dictionary(),
+            parts(&short, &offs, &[0]).validate_dictionary(),
             Err(InvalidParts::MissingDecoderPadding)
         );
 
@@ -617,12 +530,12 @@ mod tests {
         let mut buf = b"ab".to_vec();
         buf.resize(1 + MAX_TOKEN_SIZE, 0);
         assert_eq!(
-            parts(&buf, &[0, 1, 2], &[0, 1], &[0, 2]).validate_dictionary(),
+            parts(&buf, &[0, 1, 2], &[0, 1]).validate_dictionary(),
             Ok(())
         );
         buf.pop(); // one byte short
         assert_eq!(
-            parts(&buf, &[0, 1, 2], &[0, 1], &[0, 2]).validate_dictionary(),
+            parts(&buf, &[0, 1, 2], &[0, 1]).validate_dictionary(),
             Err(InvalidParts::MissingDecoderPadding)
         );
     }
@@ -638,14 +551,12 @@ mod tests {
         let mut dict = b"ab".to_vec();
         dict.resize(2 + MAX_TOKEN_SIZE - 1, 0);
         let offsets = [0u32, 1, 2];
-        let boundaries = [0u32, 2];
         let codes = [0u16, 5]; // 5 is out of range (dict has 2 tokens)
         let parts = Parts {
             dict_bytes: &dict,
             dict_offsets: &offsets,
             bits: 3,
             codes: &codes,
-            code_boundaries: &boundaries,
         };
         assert_eq!(parts.validate_dictionary(), Ok(()));
 
@@ -661,36 +572,14 @@ mod tests {
         // The trailing decoder padding is part of the format spec; an unpadded
         // dictionary is rejected rather than silently decoded.
         let offsets = [0u32, 1, 2];
-        let boundaries = [0u32, 2];
         let codes = [0u16, 1];
         let parts = Parts {
             dict_bytes: b"ab",
             dict_offsets: &offsets,
             bits: 1,
             codes: &codes,
-            code_boundaries: &boundaries,
         };
         decompress(parts);
-    }
-
-    #[test]
-    fn decompress_row_into_uses_caller_buffer() {
-        let rows: &[&[u8]] = &[b"short", b"longer-row", b"", b"tail"];
-        let mut bytes = Vec::new();
-        let mut offsets = vec![0u32];
-        for row in rows {
-            bytes.extend_from_slice(row);
-            offsets.push(bytes.len() as u32);
-        }
-
-        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
-        for (row, expected) in rows.iter().enumerate() {
-            let mut decoded = Vec::with_capacity(expected.len());
-            let len = decompress_row_into(col.as_parts(), row, decoded.spare_capacity_mut());
-            // SAFETY: `len` bytes have been initialized by `decompress_row_into`.
-            unsafe { decoded.set_len(len) };
-            assert_eq!(decoded, *expected);
-        }
     }
 
     /// Exercise the full decode width sweep against a corpus large enough to

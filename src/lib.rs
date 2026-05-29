@@ -61,9 +61,7 @@ pub use decompress::InvalidParts;
 pub use decompress::decompress;
 pub use decompress::decompress_into;
 pub use decompress::decompress_into_unchecked;
-pub use decompress::decompress_row_into;
 pub use decompress::decompressed_len;
-pub use decompress::decompressed_row_len;
 pub use dict::Dictionary;
 pub use offset::Offset;
 pub use parser::Parser;
@@ -71,6 +69,6 @@ pub use types::MAX_TOKEN_SIZE;
 
 /// Compress `bytes` / `offsets` end-to-end. Equivalent to
 /// `Parser::train(..)?.parse(..)`.
-pub fn compress<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Column<O>, Error> {
+pub fn compress<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Column, Error> {
     Parser::train(bytes, offsets, cfg)?.parse(bytes, offsets)
 }

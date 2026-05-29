@@ -17,7 +17,6 @@ use std::mem::MaybeUninit;
 
 use super::scalar;
 use crate::column::Parts;
-use crate::offset::Offset;
 use crate::types::MAX_TOKEN_SIZE;
 
 /// 16-byte-strided token table: row `code` holds the token bytes (zero-padded to
@@ -44,7 +43,7 @@ pub(crate) struct FatTable {
 /// most `MAX_TOKEN_SIZE - 1` bytes past the logical end), and
 /// `parts.dict_offsets` must be non-decreasing with tokens ≤ [`MAX_TOKEN_SIZE`]
 /// (i.e. [`Parts::validate_dictionary`] holds).
-pub(crate) unsafe fn build<O: Offset>(parts: Parts<'_, O>) -> FatTable {
+pub(crate) unsafe fn build(parts: Parts<'_>) -> FatTable {
     let dict_size = parts.dict_offsets.len().saturating_sub(1);
     // One extra row of slack so the last row's 16-byte over-store stays in
     // bounds even though the token's true length may be < 16.
