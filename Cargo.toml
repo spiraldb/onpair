@@ -1,6 +1,6 @@
 [package]
 name = "onpair"
-version = "0.0.3"
+version = "0.0.4"
 description = "Short-strings compression for fast random access"
 authors = ["SpiralDB Developers <hello@spiraldb.com>"]
 license = "Apache-2.0"
