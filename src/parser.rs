@@ -115,7 +115,9 @@ pub(crate) fn encode_strings<O: Offset>(
 /// be ≤ `bytes.len()`. Empty offsets is a hard error. O(1) in release.
 pub(crate) fn validate_offsets<O: Offset>(bytes: &[u8], offsets: &[O]) -> Result<(), Error> {
     debug_assert!(
-        offsets.windows(2).all(|w| w[0].to_usize() <= w[1].to_usize()),
+        offsets
+            .windows(2)
+            .all(|w| w[0].to_usize() <= w[1].to_usize()),
         "offsets must be monotonic non-decreasing",
     );
     let last = offsets.last().ok_or(Error::InvalidArg)?;
