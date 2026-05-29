@@ -10,8 +10,10 @@ use crate::offset::Offset;
 /// [`crate::Parser::parse`].
 #[derive(Debug, Clone)]
 pub struct Column<O: Offset> {
-    /// Dictionary bytes. Columns produced by [`crate::Parser::parse`] include
-    /// trailing decoder padding after `dict_offsets.last()`.
+    /// Dictionary bytes, with trailing decoder padding: the buffer extends
+    /// [`crate::MAX_TOKEN_SIZE`] bytes past the highest token offset so the
+    /// decoder's fixed-width read of any token is in bounds (see
+    /// [`Parts::validate_dictionary`]). [`crate::Parser::parse`] emits it.
     pub dict_bytes: Vec<u8>,
     pub dict_offsets: Vec<u32>,
     pub bits: u32,

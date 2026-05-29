@@ -5,7 +5,6 @@
 // is fast and self-contained. Codes are emitted as plain `u16` (no bit
 // packing); decoders look up dict bytes directly.
 
-use crate::DECOMPRESS_BUFFER_PADDING;
 use crate::column::Column;
 use crate::config::Config;
 use crate::config::Error;
@@ -16,6 +15,7 @@ use crate::lpm::LongestPrefixMatcher;
 use crate::offset::Offset;
 use crate::trainer::TrainResult;
 use crate::trainer::train;
+use crate::types::MAX_TOKEN_SIZE;
 
 /// Trained encoder: pairs the decode-side [`Dictionary`] with a crate-private
 /// longest-prefix matcher that drives encoding. Build with [`Parser::train`];
@@ -48,7 +48,11 @@ impl Parser {
         validate_offsets(bytes, offsets)?;
         let (codes, code_boundaries) = encode_strings(bytes, offsets, &self.lpm);
         let mut dict_bytes = self.dict.bytes.clone();
-        dict_bytes.resize(dict_bytes.len() + DECOMPRESS_BUFFER_PADDING, 0);
+        // Decoder reads a fixed MAX_TOKEN_SIZE bytes from every token offset;
+        // pad so that read is in bounds for the last token (worst case: a
+        // 1-byte final token needs MAX_TOKEN_SIZE - 1 trailing bytes). See
+        // `Parts::validate_dictionary`.
+        dict_bytes.resize(dict_bytes.len() + (MAX_TOKEN_SIZE - 1), 0);
         Ok(Column {
             dict_bytes,
             dict_offsets: self.dict.offsets.clone(),

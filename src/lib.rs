@@ -40,7 +40,6 @@
 
 mod column;
 mod config;
-mod cpu;
 mod decompress;
 mod dict;
 mod hash;
@@ -58,21 +57,17 @@ pub use column::Parts;
 pub use config::Config;
 pub use config::DEFAULT_CONFIG;
 pub use config::Error;
-pub use decompress::DECOMPRESS_BUFFER_PADDING;
-pub use decompress::DecodeEntry;
 pub use decompress::InvalidParts;
-pub use decompress::decode_entries;
 pub use decompress::decompress;
 pub use decompress::decompress_into;
 pub use decompress::decompress_into_unchecked;
-pub use decompress::decompress_into_unchecked_padded;
-pub use decompress::decompress_into_unchecked_padded_with_entries;
 pub use decompress::decompress_row_into;
 pub use decompress::decompressed_len;
 pub use decompress::decompressed_row_len;
 pub use dict::Dictionary;
 pub use offset::Offset;
 pub use parser::Parser;
+pub use types::MAX_TOKEN_SIZE;
 
 /// Compress `bytes` / `offsets` end-to-end. Equivalent to
 /// `Parser::train(..)?.parse(..)`.

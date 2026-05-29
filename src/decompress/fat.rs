@@ -27,20 +27,38 @@ pub(crate) struct FatTable {
     lens: Vec<u8>,
 }
 
-/// Materialize the [`FatTable`] for a column. Built once per decode call, the
-/// analogue of [`super::decode_entries`].
-pub(crate) fn build<O: Offset>(parts: Parts<'_, O>) -> FatTable {
+/// Materialize the [`FatTable`] for a column. Built once per decode call.
+///
+/// Each token is over-copied into its 16-byte row with a single branchless
+/// [`super::scalar::copy16`] — the same fixed [`MAX_TOKEN_SIZE`]-byte read the
+/// decode loop uses, which is why the dictionary must carry trailing padding.
+/// The row's bytes past the token's true length hold neighbouring dictionary
+/// bytes; that is harmless because decode advances the output cursor by the true
+/// length (`lens[code]`) and the over-written tail is reclaimed by the next
+/// token (or by the exact decode tail).
+///
+/// ## Safety
+///
+/// `parts.dict_bytes` must extend [`MAX_TOKEN_SIZE`] bytes past the highest
+/// token offset (so the fixed-width read from every offset is in bounds — at
+/// most `MAX_TOKEN_SIZE - 1` bytes past the logical end), and
+/// `parts.dict_offsets` must be non-decreasing with tokens ≤ [`MAX_TOKEN_SIZE`]
+/// (i.e. [`Parts::validate_dictionary`] holds).
+pub(crate) unsafe fn build<O: Offset>(parts: Parts<'_, O>) -> FatTable {
     let dict_size = parts.dict_offsets.len().saturating_sub(1);
-    // One extra row of slack so the last code's 16-byte over-read stays in
-    // bounds even though its true length may be < 16.
+    // One extra row of slack so the last row's 16-byte over-store stays in
+    // bounds even though the token's true length may be < 16.
     let mut data = vec![0u8; dict_size * 16 + 16];
     let mut lens = vec![0u8; dict_size];
+    let src = parts.dict_bytes.as_ptr();
+    let dst = data.as_mut_ptr();
     for i in 0..dict_size {
         let s = parts.dict_offsets[i] as usize;
         let e = parts.dict_offsets[i + 1] as usize;
-        let len = e - s;
-        data[i * 16..i * 16 + len].copy_from_slice(&parts.dict_bytes[s..e]);
-        lens[i] = len as u8;
+        lens[i] = (e - s) as u8;
+        // SAFETY: dict padding (contract) gives 16 readable bytes from `s`; row
+        // `i` is 16 writable bytes within `data` (`dict_size*16 + 16`).
+        unsafe { scalar::copy16(src.add(s), dst.add(i * 16)) };
     }
     FatTable { data, lens }
 }

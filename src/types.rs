@@ -11,7 +11,13 @@ pub(crate) type BitWidth = u8;
 pub(crate) type Token = u16;
 
 /// Maximum byte length of any dictionary token.
-pub(crate) const MAX_TOKEN_SIZE: usize = 16;
+///
+/// Also the decoder's fixed read width: it reads `MAX_TOKEN_SIZE` bytes from
+/// each token offset and slices to the token's true length (the branchless
+/// "fat read, then advance by `len`" pattern). A dictionary's byte buffer must
+/// therefore extend `MAX_TOKEN_SIZE` past its highest token offset so that read
+/// never touches unallocated memory — see [`crate::Parts::validate_dictionary`].
+pub const MAX_TOKEN_SIZE: usize = 16;
 
 /// Byte range `[begin, end)` inside the dictionary buffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
