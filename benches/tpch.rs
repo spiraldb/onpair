@@ -30,8 +30,10 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_schema::Schema;
 use divan::Bencher;
+use onpair::Bits;
 use onpair::Column;
 use onpair::Config;
+use onpair::Threshold;
 use onpair::compress;
 use onpair::decompress;
 use tpchgen::generators::CustomerGenerator;
@@ -57,7 +59,7 @@ use tpchgen_arrow::SupplierArrow;
 // (`l_shipmode`, `l_shipinstruct`) and all-unique address-shaped columns
 // (`c_address`) which expand under OnPair; patterned IDs (`o_clerk`,
 // `c_name`) and small corpora (`p_comment`) which compress mediocrely.
-const PARAMS: &[(&str, u32)] = &[
+const PARAMS: &[(&str, u8)] = &[
     ("o_comment", 12),
     ("o_comment", 16),
     ("p_name", 12),
@@ -194,11 +196,11 @@ where
     (bytes, offsets)
 }
 
-fn build_column(col: &'static str, bits: u32) -> Column<u64> {
+fn build_column(col: &'static str, bits: u8) -> Column<u64> {
     let c = corpus_for(col);
     let cfg = Config {
-        bits,
-        threshold: 0.2,
+        bits: Bits::new(bits).unwrap(),
+        threshold: Threshold::new(0.2).unwrap(),
         seed: Some(42),
     };
     compress(&c.bytes, &c.offsets, cfg).unwrap()
@@ -209,12 +211,12 @@ fn build_column(col: &'static str, bits: u32) -> Column<u64> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[divan::bench(args = PARAMS)]
-fn train_and_compress(bencher: Bencher, param: (&'static str, u32)) {
+fn train_and_compress(bencher: Bencher, param: (&'static str, u8)) {
     let (col, bits) = param;
     let c = corpus_for(col);
     let cfg = Config {
-        bits,
-        threshold: 0.2,
+        bits: Bits::new(bits).unwrap(),
+        threshold: Threshold::new(0.2).unwrap(),
         seed: Some(42),
     };
     bencher
@@ -230,7 +232,7 @@ fn train_and_compress(bencher: Bencher, param: (&'static str, u32)) {
 }
 
 #[divan::bench(args = PARAMS)]
-fn decompress_all(bencher: Bencher, param: (&'static str, u32)) {
+fn decompress_all(bencher: Bencher, param: (&'static str, u8)) {
     let (col, bits) = param;
     let c = corpus_for(col);
     let column = build_column(col, bits);

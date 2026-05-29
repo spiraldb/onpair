@@ -32,12 +32,14 @@ use std::time::Instant;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
+use onpair::Bits;
 use onpair::Config;
+use onpair::Threshold;
 use onpair::compress;
 use onpair::decompress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-const BITS: &[u32] = &[12, 16];
+const BITS: &[u8] = &[12, 16];
 
 fn main() {
     let max_bytes = env::var("ONPAIR_BENCH_MAX_BYTES")
