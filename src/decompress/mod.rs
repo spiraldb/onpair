@@ -37,59 +37,6 @@ mod scalar;
 
 pub(crate) mod fat;
 
-#[inline]
-fn row_code_range<O: Offset>(parts: Parts<'_, O>, row: usize) -> (usize, usize) {
-    let begin = parts.code_boundaries[row]
-        .to_usize()
-        .expect("code boundary fits usize");
-    let end = parts.code_boundaries[row + 1]
-        .to_usize()
-        .expect("code boundary fits usize");
-    (begin, end)
-}
-
-#[inline]
-fn code_byte_range<O: Offset>(parts: Parts<'_, O>, code: u16) -> (usize, usize) {
-    let s = parts.dict_offsets[code as usize] as usize;
-    let e = parts.dict_offsets[code as usize + 1] as usize;
-    assert!(e >= s, "dictionary offsets must be nondecreasing");
-    (s, e)
-}
-
-#[inline]
-fn code_len<O: Offset>(parts: Parts<'_, O>, code: u16) -> usize {
-    let (s, e) = code_byte_range(parts, code);
-    e - s
-}
-
-#[inline]
-fn write_code<O: Offset>(
-    parts: Parts<'_, O>,
-    code: u16,
-    out_ptr: *mut u8,
-    out_len: usize,
-    written: &mut usize,
-) {
-    let (s, e) = code_byte_range(parts, code);
-    let src = parts
-        .dict_bytes
-        .get(s..e)
-        .expect("dictionary offset range fits dictionary bytes");
-    let len = src.len();
-    assert!(
-        len <= out_len.saturating_sub(*written),
-        "output buffer too small for decompressed bytes"
-    );
-
-    // SAFETY: the assertion above guarantees `out_ptr.add(*written)..+len`
-    // is within the caller-provided output buffer, and the dictionary range is
-    // derived from the `Parts` dictionary offset table.
-    unsafe {
-        scalar::copy_token_bytes(src.as_ptr(), out_ptr.add(*written), len);
-    }
-    *written += len;
-}
-
 /// Return the exact decoded byte length of one row.
 ///
 /// ## Panics
@@ -128,9 +75,26 @@ pub fn decompress_row_into<O: Offset>(
 ) -> usize {
     let (begin, end) = row_code_range(parts, row);
     let out_ptr = out.as_mut_ptr().cast::<u8>();
+    let out_len = out.len();
     let mut written = 0;
     for &code in &parts.codes[begin..end] {
-        write_code(parts, code, out_ptr, out.len(), &mut written);
+        let (s, e) = code_byte_range(parts, code);
+        let src = parts
+            .dict_bytes
+            .get(s..e)
+            .expect("dictionary offset range fits dictionary bytes");
+        let len = src.len();
+        assert!(
+            len <= out_len.saturating_sub(written),
+            "output buffer too small for decompressed bytes"
+        );
+        // SAFETY: the assertion above guarantees `out_ptr.add(written)..+len` is
+        // within the caller-provided output buffer, and the dictionary range is
+        // derived from the `Parts` dictionary offset table.
+        unsafe {
+            scalar::copy_token_bytes(src.as_ptr(), out_ptr.add(written), len);
+        }
+        written += len;
     }
     written
 }
@@ -313,6 +277,31 @@ fn assert_valid_dictionary<O: Offset>(parts: Parts<'_, O>) {
 // `Layout`/`plan()`/`cpu::l2_cache_bytes()`, the `DecodeEntry` table and
 // `decode_entries()`, and the `padded_unchecked_loop` over it. Re-add `plan()`
 // here and dispatch in `decode_fat` below.
+
+#[inline]
+fn row_code_range<O: Offset>(parts: Parts<'_, O>, row: usize) -> (usize, usize) {
+    let begin = parts.code_boundaries[row]
+        .to_usize()
+        .expect("code boundary fits usize");
+    let end = parts.code_boundaries[row + 1]
+        .to_usize()
+        .expect("code boundary fits usize");
+    (begin, end)
+}
+
+#[inline]
+fn code_byte_range<O: Offset>(parts: Parts<'_, O>, code: u16) -> (usize, usize) {
+    let s = parts.dict_offsets[code as usize] as usize;
+    let e = parts.dict_offsets[code as usize + 1] as usize;
+    assert!(e >= s, "dictionary offsets must be nondecreasing");
+    (s, e)
+}
+
+#[inline]
+fn code_len<O: Offset>(parts: Parts<'_, O>, code: u16) -> usize {
+    let (s, e) = code_byte_range(parts, code);
+    e - s
+}
 
 /// Decode the padded fast path: build the fat table and over-copy each code.
 ///
