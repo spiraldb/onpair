@@ -299,7 +299,7 @@ pub fn decompress(parts: Parts<'_>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, DEFAULT_CONFIG, Parts, compress};
+    use crate::{Bits, Config, DEFAULT_CONFIG, Parts, compress};
 
     use super::*;
 
@@ -594,9 +594,9 @@ mod tests {
             bytes.extend_from_slice(row.as_bytes());
             offsets.push(bytes.len() as u32);
         }
-        for bits in 9..=16u32 {
+        for bits in 9..=16u8 {
             let cfg = Config {
-                bits,
+                bits: Bits::new(bits).unwrap(),
                 ..DEFAULT_CONFIG
             };
             let col = compress(&bytes, &offsets, cfg).unwrap();

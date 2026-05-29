@@ -17,8 +17,7 @@ name = "onpair"
 
 [lints.rust]
 warnings = "deny"
-# TODO: re-tighten to "deny" once the slim public API has docs.
-missing_docs = "allow"
+missing_docs = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

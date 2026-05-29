@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
+//! Standalone OnPair compression/decompression benchmark over TPC-H columns.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::expect_used,
@@ -32,12 +33,14 @@ use std::time::Instant;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
+use onpair::Bits;
 use onpair::Config;
+use onpair::Threshold;
 use onpair::compress;
 use onpair::decompress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-const BITS: &[u32] = &[12, 16];
+const BITS: &[u8] = &[12, 16];
 
 fn main() {
     let max_bytes = env::var("ONPAIR_BENCH_MAX_BYTES")
@@ -51,7 +54,8 @@ fn main() {
     let threshold = env::var("ONPAIR_BENCH_THRESHOLD")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.2);
+        .map(|t| Threshold::new(t).expect("ONPAIR_BENCH_THRESHOLD must be in (0.0, 1.0]"))
+        .unwrap_or_else(|| Threshold::new(0.2).expect("0.2 is in range"));
 
     let (source, bytes, offsets) = load_corpus(max_bytes);
     let n = offsets.len() - 1;
@@ -62,7 +66,7 @@ fn main() {
     for &bits in BITS {
         println!("\n=== bits = {bits} ===");
         let cfg = Config {
-            bits,
+            bits: Bits::new(bits).expect("BITS entries are in 9..=16"),
             threshold,
             seed: Some(42),
         };
@@ -87,7 +91,8 @@ fn main() {
         let dict_bytes = parts.dict_bytes.len();
         let dict_offsets = parts.dict_offsets.len() * 4;
         let codes = parts.codes.len() * 2;
-        let compressed = dict_bytes + dict_offsets + codes;
+        let code_offsets = std::mem::size_of_val(col.code_offsets.as_slice());
+        let compressed = dict_bytes + dict_offsets + codes + code_offsets;
         let comp_mib = compressed as f64 / (1024.0 * 1024.0);
 
         println!(

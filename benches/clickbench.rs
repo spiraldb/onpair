@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
+//! End-to-end OnPair benchmark over a ClickBench string column.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::expect_used,
@@ -31,13 +32,15 @@ use std::sync::OnceLock;
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use divan::Bencher;
+use onpair::Bits;
 use onpair::Column;
 use onpair::Config;
+use onpair::Threshold;
 use onpair::compress;
 use onpair::decompress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-const BITS_CONFIGS: &[u32] = &[12, 16];
+const BITS_CONFIGS: &[u8] = &[12, 16];
 
 /// Pack `Vec<Vec<u8>>` (the corpus) into `(bytes, offsets)`.
 fn pack(strings: &[Vec<u8>]) -> (Vec<u8>, Vec<u64>) {
@@ -209,11 +212,11 @@ fn synthetic_clickbench_urls(n: usize) -> Vec<Vec<u8>> {
 // Helpers shared by the bench groups.
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn compress_column(bits: u32) -> Column<u64> {
+fn compress_column(bits: u8) -> Column<u64> {
     let c = corpus();
     let cfg = Config {
-        bits,
-        threshold: 0.5,
+        bits: Bits::new(bits).unwrap(),
+        threshold: Threshold::new(0.5).unwrap(),
         seed: Some(42),
     };
     compress(&c.bytes, &c.offsets, cfg).unwrap()
@@ -224,14 +227,14 @@ fn compress_column(bits: u32) -> Column<u64> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[divan::bench(args = BITS_CONFIGS)]
-fn train_and_compress(bencher: Bencher, bits: u32) {
+fn train_and_compress(bencher: Bencher, bits: u8) {
     let c = corpus();
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
         .bench(|| {
             let cfg = Config {
-                bits,
-                threshold: 0.5,
+                bits: Bits::new(bits).unwrap(),
+                threshold: Threshold::new(0.5).unwrap(),
                 seed: Some(42),
             };
             compress(
@@ -244,7 +247,7 @@ fn train_and_compress(bencher: Bencher, bits: u32) {
 }
 
 #[divan::bench(args = BITS_CONFIGS)]
-fn decompress_all(bencher: Bencher, bits: u32) {
+fn decompress_all(bencher: Bencher, bits: u8) {
     let c = corpus();
     let col = compress_column(bits);
     bencher

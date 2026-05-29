@@ -100,6 +100,15 @@ serializing. The two are equivalent under `bits`.
 
 Invariant: every code `< N` (indexes a real token).
 
+## Related: row offsets
+
+A column also carries `code_offsets`, `R + 1` offsets into the code stream that
+delimit the `R` input rows (row `r`'s codes are `codes[ o_r .. o_{r+1} )`).
+Their integer width matches the input offset type (`u32`/`u64`). The compressor
+emits them because a token may span a row boundary, so the row structure cannot
+otherwise be recovered. They index the codes and are not part of the code/dict
+encoding.
+
 ## Decode
 
 ```

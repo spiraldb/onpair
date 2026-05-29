@@ -7,22 +7,86 @@ use crate::types::BitWidth;
 // Public config.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Training configuration.
-///
-/// - `bits`: max dict size = `2^bits`. Range `9..=16`.
-/// - `threshold`: dynamic-threshold sample fraction. Range `(0.0, 1.0]`.
-/// - `seed`: `None` means non-deterministic.
+/// Code width: the maximum dictionary size is `2^bits`. Validated to `9..=16`
+/// at construction, so a [`Bits`] always holds an in-range value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Bits(u8);
+
+impl Bits {
+    /// Construct a [`Bits`], returning [`Error::InvalidArg`] unless
+    /// `value` is in `9..=16`.
+    pub const fn new(value: u8) -> Result<Self, Error> {
+        if 9 <= value && value <= 16 {
+            Ok(Self(value))
+        } else {
+            Err(Error::InvalidArg)
+        }
+    }
+
+    /// The validated code width, in `9..=16`.
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for Bits {
+    type Error = Error;
+    fn try_from(value: u8) -> Result<Self, Error> {
+        Self::new(value)
+    }
+}
+
+/// Dynamic-threshold sample fraction. Validated to `(0.0, 1.0]` at
+/// construction, so a [`Threshold`] always holds an in-range value.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Threshold(f64);
+
+impl Threshold {
+    /// Construct a [`Threshold`], returning [`Error::InvalidArg`] unless
+    /// `value` is in `(0.0, 1.0]`.
+    pub const fn new(value: f64) -> Result<Self, Error> {
+        if value > 0.0 && value <= 1.0 {
+            Ok(Self(value))
+        } else {
+            Err(Error::InvalidArg)
+        }
+    }
+
+    /// The validated sample fraction, in `(0.0, 1.0]`.
+    pub const fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for Threshold {
+    type Error = Error;
+    fn try_from(value: f64) -> Result<Self, Error> {
+        Self::new(value)
+    }
+}
+
+/// Training configuration. See [`DEFAULT_CONFIG`] for a reasonable starting
+/// point.
 #[derive(Copy, Clone, Debug)]
 pub struct Config {
-    pub bits: u32,
-    pub threshold: f64,
+    /// Code width; see [`Bits`].
+    pub bits: Bits,
+    /// Dynamic-threshold sample fraction; see [`Threshold`].
+    pub threshold: Threshold,
+    /// RNG seed for sampling; `None` means non-deterministic.
     pub seed: Option<u64>,
 }
 
 /// Reasonable starting point: 12-bit codes, dynamic threshold sampling 20 %.
 pub const DEFAULT_CONFIG: Config = Config {
-    bits: 12,
-    threshold: 0.2,
+    bits: match Bits::new(12) {
+        Ok(b) => b,
+        Err(_) => unreachable!(),
+    },
+    threshold: match Threshold::new(0.2) {
+        Ok(t) => t,
+        Err(_) => unreachable!(),
+    },
     seed: None,
 };
 
@@ -36,8 +100,10 @@ impl Default for Config {
 // Error — single-variant.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Error returned by the public training and encoding API.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Error {
+    /// A configuration value or input buffer was out of range or malformed.
     InvalidArg,
 }
 
@@ -107,22 +173,11 @@ impl Default for TrainingConfig {
 impl From<Config> for TrainingConfig {
     fn from(c: Config) -> Self {
         Self {
-            bits: c.bits as BitWidth,
+            bits: c.bits.value(),
             threshold: ThresholdSpec::Dynamic(DynamicThreshold {
-                sample_fraction: c.threshold,
+                sample_fraction: c.threshold.value(),
             }),
             seed: c.seed,
         }
     }
-}
-
-/// Validate a public [`Config`].
-pub(crate) fn validate_config(cfg: Config) -> Result<(), Error> {
-    if !(9..=16).contains(&cfg.bits) {
-        return Err(Error::InvalidArg);
-    }
-    if !(cfg.threshold > 0.0 && cfg.threshold <= 1.0) {
-        return Err(Error::InvalidArg);
-    }
-    Ok(())
 }

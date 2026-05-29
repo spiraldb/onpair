@@ -10,7 +10,9 @@ mod sealed {
 /// Width of a row offset. Sealed to `u32` and `u64` to match Arrow binary /
 /// large-binary layouts.
 pub trait Offset: sealed::Sealed + Copy + Clone + Default + std::fmt::Debug + 'static {
+    /// Convert to `usize`, returning `None` if the value does not fit.
     fn to_usize(self) -> Option<usize>;
+    /// Construct from a `usize`, truncating if it does not fit.
     fn from_usize(n: usize) -> Self;
 }
 
