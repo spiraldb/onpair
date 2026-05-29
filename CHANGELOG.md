@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/spiraldb/onpair/compare/v0.0.1...v0.0.2) - 2026-05-29
+
+### Other
+
+- automate releases with release-plz ([#8](https://github.com/spiraldb/onpair/pull/8))
+- clean up benchmarks and decompression ([#6](https://github.com/spiraldb/onpair/pull/6))
+- add benchmarks with onpair cpp ([#5](https://github.com/spiraldb/onpair/pull/5))
+- c
+- onpair
+- gitignore
+
 ## [0.0.1] - 2026-05-29
 
 ### Added
