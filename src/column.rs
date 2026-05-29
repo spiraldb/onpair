@@ -16,8 +16,15 @@ pub struct Column<O: Offset> {
     /// decoder's fixed-width read of any token is in bounds (see
     /// [`Parts::validate_dictionary`]). [`crate::Parser::parse`] emits it.
     pub dict_bytes: Vec<u8>,
+    /// `dict_offsets[i]..dict_offsets[i + 1]` is token `i`'s byte range in
+    /// [`dict_bytes`](Self::dict_bytes); `dict_offsets.len() == num_tokens + 1`
+    /// and `dict_offsets[0] == 0`.
     pub dict_offsets: Vec<u32>,
+    /// Code width chosen at training time, in `9..=16`. Consumers may use it to
+    /// store [`codes`](Self::codes) more compactly than `u16`.
     pub bits: u32,
+    /// One `u16` per encoded token, in row-concatenated order; each indexes a
+    /// token via [`dict_offsets`](Self::dict_offsets).
     pub codes: Vec<u16>,
     /// `R + 1` offsets into `codes` delimiting the `R` input rows: row `r`'s
     /// codes are `codes[code_offsets[r]..code_offsets[r + 1]]`. The compressor
@@ -32,9 +39,18 @@ pub struct Column<O: Offset> {
 /// literal — there is no constructor.
 #[derive(Copy, Clone, Debug)]
 pub struct Parts<'a> {
+    /// Dictionary bytes, with the trailing decoder padding required by
+    /// [`validate_dictionary`](Self::validate_dictionary). Mirrors
+    /// [`Column::dict_bytes`].
     pub dict_bytes: &'a [u8],
+    /// Token byte ranges into [`dict_bytes`](Self::dict_bytes); mirrors
+    /// [`Column::dict_offsets`].
     pub dict_offsets: &'a [u32],
+    /// Code width chosen at training time, in `9..=16`; mirrors
+    /// [`Column::bits`].
     pub bits: u32,
+    /// Encoded tokens indexing [`dict_offsets`](Self::dict_offsets); mirrors
+    /// [`Column::codes`].
     pub codes: &'a [u16],
 }
 
