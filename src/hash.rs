@@ -36,7 +36,7 @@ pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 pub type MapHasher = hashbrown::DefaultHashBuilder;
 
-/// LPM map type, parameterised over the feature-selected [`MapHasher`].
+/// Hash map used by the LPM, keyed through [`MapHasher`].
 pub type Map<K, V> = hashbrown::HashMap<K, V, MapHasher>;
 
 /// An empty [`Map`] with the selected hasher.

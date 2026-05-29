@@ -73,7 +73,7 @@ pub(crate) fn encode_strings<O: Offset>(
     let n = offsets.len() - 1;
     let mut codes: Vec<u16> = Vec::with_capacity(bytes.len());
     let mut boundaries: Vec<O> = Vec::with_capacity(n + 1);
-    boundaries.push(O::zero());
+    boundaries.push(O::from_usize(0));
     for i in 0..n {
         let s = offsets[i].to_usize().expect("validated");
         let e = offsets[i + 1].to_usize().expect("validated");
