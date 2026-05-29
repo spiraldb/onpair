@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/spiraldb/onpair/compare/v0.0.2...v0.0.3) - 2026-05-29
+
+### Other
+
+- fat-table layout with scalar copy and L2-indexed fallback ([#12](https://github.com/spiraldb/onpair/pull/12))
+- Feat/decode fat table scalar ([#7](https://github.com/spiraldb/onpair/pull/7))
+- update changelog ([#10](https://github.com/spiraldb/onpair/pull/10))
+
 ## [0.0.2](https://github.com/spiraldb/onpair/compare/v0.0.1...v0.0.2) - 2026-05-29
 
 ### Other
