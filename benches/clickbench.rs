@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
+//! End-to-end OnPair benchmark over a ClickBench string column.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::expect_used,

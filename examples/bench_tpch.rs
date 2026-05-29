@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
+//! Standalone OnPair compression/decompression benchmark over TPC-H columns.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::expect_used,
@@ -53,7 +54,8 @@ fn main() {
     let threshold = env::var("ONPAIR_BENCH_THRESHOLD")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.2);
+        .map(|t| Threshold::new(t).expect("ONPAIR_BENCH_THRESHOLD must be in (0.0, 1.0]"))
+        .unwrap_or_else(|| Threshold::new(0.2).expect("0.2 is in range"));
 
     let (source, bytes, offsets) = load_corpus(max_bytes);
     let n = offsets.len() - 1;
@@ -64,7 +66,7 @@ fn main() {
     for &bits in BITS {
         println!("\n=== bits = {bits} ===");
         let cfg = Config {
-            bits,
+            bits: Bits::new(bits).expect("BITS entries are in 9..=16"),
             threshold,
             seed: Some(42),
         };
