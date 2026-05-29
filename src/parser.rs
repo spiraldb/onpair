@@ -22,6 +22,8 @@ use crate::types::MAX_TOKEN_SIZE;
 /// encode with [`Parser::parse`].
 #[derive(Debug, Clone)]
 pub struct Parser {
+    /// Decode-side dictionary, cloned into each [`Column`] produced by
+    /// [`Parser::parse`] so columns are self-contained.
     pub dict: Dictionary,
     pub(crate) lpm: LongestPrefixMatcher,
 }
