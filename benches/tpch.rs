@@ -250,7 +250,8 @@ fn main() {
         let dict_bytes = parts.dict_bytes.len();
         let dict_offsets = parts.dict_offsets.len() * 4;
         let codes = parts.codes.len() * 2;
-        let compressed = dict_bytes + dict_offsets + codes;
+        let code_offsets = std::mem::size_of_val(column.code_offsets.as_slice());
+        let compressed = dict_bytes + dict_offsets + codes + code_offsets;
         eprintln!(
             "  {col:<16} bits={bits}: ratio = {:.3}x  (raw {:.2} MiB → {:.2} MiB)",
             c.total_bytes as f64 / compressed as f64,

@@ -87,7 +87,8 @@ fn main() {
         let dict_bytes = parts.dict_bytes.len();
         let dict_offsets = parts.dict_offsets.len() * 4;
         let codes = parts.codes.len() * 2;
-        let compressed = dict_bytes + dict_offsets + codes;
+        let code_offsets = std::mem::size_of_val(col.code_offsets.as_slice());
+        let compressed = dict_bytes + dict_offsets + codes + code_offsets;
         let comp_mib = compressed as f64 / (1024.0 * 1024.0);
 
         println!(

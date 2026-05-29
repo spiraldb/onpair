@@ -44,9 +44,9 @@ impl Parser {
     /// into the returned [`Column`] so the column is fully decode-self-
     /// contained — the strings need not be the corpus the parser was trained
     /// on.
-    pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column, Error> {
+    pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column<O>, Error> {
         validate_offsets(bytes, offsets)?;
-        let codes = encode_strings(bytes, offsets, &self.lpm);
+        let (codes, code_offsets) = encode_strings(bytes, offsets, &self.lpm);
         let mut dict_bytes = self.dict.bytes.clone();
         // Decoder reads a fixed MAX_TOKEN_SIZE bytes from every token offset;
         // pad so that read is in bounds for the last token (worst case: a
@@ -58,18 +58,25 @@ impl Parser {
             dict_offsets: self.dict.offsets.clone(),
             bits: self.dict.bits,
             codes,
+            code_offsets,
         })
     }
 }
 
-/// Encode every string into one flat `Vec<u16>` of codes, in input order.
+/// Encode every string into a flat `Vec<u16>` of codes plus per-row
+/// `code_offsets`. Offset `[i]..[i + 1]` indexes the codes for row `i`. The
+/// offsets are compressor metadata — a token may span a row boundary, so the
+/// row structure cannot be recovered from the codes alone — and are not needed
+/// to decode the column as one flat stream.
 pub(crate) fn encode_strings<O: Offset>(
     bytes: &[u8],
     offsets: &[O],
     lpm: &LongestPrefixMatcher,
-) -> Vec<u16> {
+) -> (Vec<u16>, Vec<O>) {
     let n = offsets.len() - 1;
     let mut codes: Vec<u16> = Vec::with_capacity(bytes.len());
+    let mut code_offsets: Vec<O> = Vec::with_capacity(n + 1);
+    code_offsets.push(O::from_usize(0));
     for i in 0..n {
         let s = offsets[i].to_usize().expect("validated");
         let e = offsets[i + 1].to_usize().expect("validated");
@@ -79,8 +86,9 @@ pub(crate) fn encode_strings<O: Offset>(
             codes.push(tok);
             pos += mlen;
         }
+        code_offsets.push(O::from_usize(codes.len()));
     }
-    codes
+    (codes, code_offsets)
 }
 
 /// Validate the `(bytes, offsets)` Arrow-style pair. Empty offsets is a hard
@@ -139,6 +147,18 @@ mod tests {
         out
     }
 
+    /// Decode the codes for row `idx` (delimited by `code_offsets`) against
+    /// `dict`.
+    fn decode_row(codes: &[u16], code_offsets: &[u32], dict: &Dictionary, idx: usize) -> Vec<u8> {
+        let begin = code_offsets[idx] as usize;
+        let end = code_offsets[idx + 1] as usize;
+        let mut out = Vec::new();
+        for &c in &codes[begin..end] {
+            out.extend_from_slice(dict.data(c as Token));
+        }
+        out
+    }
+
     fn roundtrip_all<S: AsRef<[u8]>>(strings: &[S], bits: BitWidth, seed: u64) -> bool {
         if strings.is_empty() {
             return true;
@@ -150,7 +170,7 @@ mod tests {
             seed: Some(seed),
         };
         let TrainResult { dict, lpm } = train(&raw.data, &raw.offsets, &cfg);
-        let codes = encode_strings(&raw.data, &raw.offsets, &lpm);
+        let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
         // Rows decode as one flat concatenation, so the whole stream must equal
         // the concatenated input bytes.
         decode_all(&codes, &dict) == raw.data
@@ -161,15 +181,39 @@ mod tests {
     #[test]
     fn zero_strings_produces_no_codes() {
         let lpm = LongestPrefixMatcher::new();
-        let codes = encode_strings::<u32>(&[], &[0], &lpm);
+        let (codes, code_offsets) = encode_strings::<u32>(&[], &[0], &lpm);
         assert!(codes.is_empty());
+        assert_eq!(code_offsets, vec![0u32]);
     }
 
     #[test]
     fn single_empty_string_produces_no_codes() {
         let lpm = LongestPrefixMatcher::new();
-        let codes = encode_strings::<u32>(&[], &[0, 0], &lpm);
+        let (codes, code_offsets) = encode_strings::<u32>(&[], &[0, 0], &lpm);
         assert!(codes.is_empty());
+        assert_eq!(code_offsets, vec![0u32, 0]);
+    }
+
+    #[test]
+    fn code_offsets_delimit_each_row() {
+        // `code_offsets` has R + 1 entries, is monotonic, ends at codes.len(),
+        // and each row's slice decodes back to that input row — even when tokens
+        // span row boundaries.
+        let lpm = LongestPrefixMatcher::new();
+        let d = make_base_dict();
+        let strings: &[&[u8]] = &[b"alpha", b"", b"beta beta", b"gamma"];
+        let raw = make_raw(strings);
+        let (codes, code_offsets) = encode_strings(&raw.data, &raw.offsets, &lpm);
+
+        assert_eq!(code_offsets.len(), strings.len() + 1);
+        assert_eq!(code_offsets[0], 0);
+        assert_eq!(*code_offsets.last().unwrap() as usize, codes.len());
+        for w in code_offsets.windows(2) {
+            assert!(w[1] >= w[0], "code_offsets must be monotonic");
+        }
+        for (i, s) in strings.iter().enumerate() {
+            assert_eq!(decode_row(&codes, &code_offsets, &d, i), *s);
+        }
     }
 
     #[test]
@@ -178,7 +222,7 @@ mod tests {
         let d = make_base_dict();
         let expected = "Hello, World!";
         let raw = make_raw(&[expected]);
-        let codes = encode_strings(&raw.data, &raw.offsets, &lpm);
+        let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
         assert_eq!(decode_all(&codes, &d), expected.as_bytes());
     }
 
@@ -188,7 +232,7 @@ mod tests {
         let d = make_base_dict();
         let strings: Vec<Vec<u8>> = (0u16..=255).map(|i| vec![i as u8]).collect();
         let raw = make_raw(&strings);
-        let codes = encode_strings(&raw.data, &raw.offsets, &lpm);
+        let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
         assert_eq!(decode_all(&codes, &d), raw.data);
     }
 
@@ -202,7 +246,7 @@ mod tests {
             seed: Some(42),
         };
         let TrainResult { dict: _, lpm } = train(&raw.data, &raw.offsets, &cfg);
-        let codes = encode_strings(&raw.data, &raw.offsets, &lpm);
+        let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
         // Multi-byte tokens mean fewer codes than input bytes.
         assert!(
             codes.len() < raw.data.len(),
