@@ -71,20 +71,28 @@ both are valid.
 ## 3. Codes
 
 `M` values, each a dictionary index in `[0, N)`. Every code fits in `bits` bits
-because `N <= 2^bits`.
+because `N <= 2^bits`. 
 
-**Canonical packed form** (matches the reference onpair C++): codes are
-bit-packed **LSB-first at `bits` bits each** into a stream of little-endian
-`u64` words. A code whose bits straddle a 64-bit word boundary is split — low
-bits in the current word, remaining high bits open the next. The stream ends
-with **one zero `u64` sentinel word** so a reader can over-read a few bytes at
-the last code without running off the buffer.
+**Packed form**: codes are bit-packed **LSB-first at `bits` bits each** into a
+stream of little-endian `u64` words. A code whose bits straddle a 64-bit word
+boundary is split — low bits in the current word, remaining high bits open the
+next.
 
 ```
 word k holds codes packed LSB-first:  bit position of code j = j * bits
-packed words = ceil(M * bits / 64) + 1 (sentinel)
-logical packed size = ceil(M * bits / 8) bytes
+packed size = ceil(M * bits / 8) bytes
 ```
+
+A word-at-a-time unpacker over-reads up to 7 bytes when it extracts the last
+code (its `u64` load starts near the end of the buffer). This is a reader
+concern, not a format one: the unpacker reads the bulk fast with full-width word
+loads and switches to an exact, masked tail for the final few codes whose load
+would cross `ceil(M * bits / 8)` — the same fast-region-plus-exact-tail split
+the decode loop uses (§Decode, `fat::decode_loop`). No padding word is emitted.
+
+Reference onpair appends one zero `u64` after the packed codes (its unpacker
+over-reads unconditionally). OnPair neither writes nor requires it; a reader
+ingesting such a buffer ignores any bytes past `ceil(M * bits / 8)`.
 
 **In-memory form** (this crate): `codes` is materialized as a `[u16]`, one
 element per code, unpacked — the `bits`-wide packing is applied only when
