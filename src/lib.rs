@@ -40,6 +40,7 @@
 
 mod column;
 mod config;
+mod cpu;
 mod decompress;
 mod dict;
 mod hash;
@@ -59,6 +60,7 @@ pub use config::DEFAULT_CONFIG;
 pub use config::Error;
 pub use decompress::DECOMPRESS_BUFFER_PADDING;
 pub use decompress::DecodeEntry;
+pub use decompress::InvalidParts;
 pub use decompress::decode_entries;
 pub use decompress::decompress;
 pub use decompress::decompress_into;
