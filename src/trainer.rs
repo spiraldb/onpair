@@ -327,7 +327,7 @@ pub(crate) mod tests {
         let mut found = [false; 256];
         for i in 0..d.num_tokens() {
             let s = d.span(i as Token);
-            if s.size() == 1 {
+            if s.end - s.begin == 1 {
                 found[d.bytes[s.begin as usize] as usize] = true;
             }
         }
@@ -478,7 +478,7 @@ pub(crate) mod tests {
         let strings = make_random_strings(100, 50, 99);
         let result = train_strings(&strings, &TrainingConfig::default());
         for i in 0..result.dict.num_tokens() {
-            let len = result.dict.token_size(i as Token);
+            let len = result.dict.data(i as Token).len();
             assert!(len <= MAX_TOKEN_SIZE, "token {i} exceeds MAX_TOKEN_SIZE");
         }
     }
@@ -505,7 +505,7 @@ pub(crate) mod tests {
         for (name, c) in &corpora {
             let result = train_strings(c, &cfg);
             for i in 0..result.dict.num_tokens() {
-                let len = result.dict.token_size(i as Token);
+                let len = result.dict.data(i as Token).len();
                 assert!(len > 0, "corpus={name} token {i} has zero length");
             }
         }

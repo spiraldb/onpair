@@ -26,14 +26,6 @@ pub(crate) struct ByteSpan {
     pub(crate) end: u32,
 }
 
-impl ByteSpan {
-    #[inline]
-    #[allow(dead_code)] // exercised in tests only
-    pub(crate) const fn size(self) -> u32 {
-        self.end - self.begin
-    }
-}
-
 /// Maximum dictionary size given a bit width.
 #[inline]
 pub(crate) const fn max_dict_size(bits: BitWidth) -> usize {
@@ -43,12 +35,6 @@ pub(crate) const fn max_dict_size(bits: BitWidth) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn byte_span_size_is_end_minus_begin() {
-        assert_eq!(ByteSpan { begin: 0, end: 0 }.size(), 0);
-        assert_eq!(ByteSpan { begin: 5, end: 10 }.size(), 5);
-    }
 
     #[test]
     fn max_dict_size_12_is_4096() {
