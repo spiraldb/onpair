@@ -70,7 +70,9 @@ pub use parser::Parser;
 pub use types::MAX_TOKEN_SIZE;
 
 /// Compress `bytes` / `offsets` end-to-end. Equivalent to
-/// `Parser::train(..)?.parse(..)`.
+/// `Parser::train(..)?.parse(..)`, but validates the offsets once instead of
+/// in both the train and parse steps.
 pub fn compress<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Column<O>, Error> {
-    Parser::train(bytes, offsets, cfg)?.parse(bytes, offsets)
+    parser::validate_offsets(bytes, offsets)?;
+    Ok(Parser::train_unchecked(bytes, offsets, cfg).parse_unchecked(bytes, offsets))
 }

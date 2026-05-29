@@ -29,26 +29,39 @@ pub struct Parser {
 
 impl Parser {
     /// Train a dictionary against `bytes` / `offsets` and build the matching
-    /// LPM. `offsets` has length `n + 1`. Returns [`Error::InvalidArg`] on any
-    /// `offsets[i] > bytes.len()`, on `offsets.is_empty()`, or if any offset
-    /// cannot be represented in `usize`. The `cfg` is valid by construction
-    /// ([`Bits`](crate::Bits) / [`Threshold`](crate::Threshold)).
+    /// LPM. `offsets` has length `n + 1`. Returns [`Error::InvalidArg`] if
+    /// `offsets` is empty or its last (maximum) offset cannot be represented in
+    /// `usize` or exceeds `bytes.len()` — see [`validate_offsets`]. The `cfg`
+    /// is valid by construction ([`Bits`](crate::Bits) /
+    /// [`Threshold`](crate::Threshold)).
     pub fn train<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Self, Error> {
-        // TODO(joe): validate later and once
         validate_offsets(bytes, offsets)?;
+        Ok(Self::train_unchecked(bytes, offsets, cfg))
+    }
 
+    /// Like [`Parser::train`] but skips offset validation. The caller must
+    /// guarantee `(bytes, offsets)` is a valid Arrow-style pair (`offsets`
+    /// non-empty and monotonic non-decreasing, every offset ≤ `bytes.len()`
+    /// and representable in `usize`); slicing panics otherwise.
+    pub(crate) fn train_unchecked<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Self {
         let internal_cfg: TrainingConfig = cfg.into();
         let TrainResult { dict, lpm } = train(bytes, offsets, &internal_cfg);
-        Ok(Self { dict, lpm })
+        Self { dict, lpm }
     }
 
     /// Encode `bytes` / `offsets` using this parser. The dictionary is cloned
     /// into the returned [`Column`] so the column is fully decode-self-
     /// contained — the strings need not be the corpus the parser was trained
-    /// on.
+    /// on. Returns [`Error::InvalidArg`] on invalid offsets — see
+    /// [`validate_offsets`].
     pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column<O>, Error> {
-        // TODO(joe): validate later and once
         validate_offsets(bytes, offsets)?;
+        Ok(self.parse_unchecked(bytes, offsets))
+    }
+
+    /// Like [`Parser::parse`] but skips offset validation. Same caller
+    /// guarantees as [`Parser::train_unchecked`].
+    pub(crate) fn parse_unchecked<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Column<O> {
         let (codes, code_offsets) = encode_strings(bytes, offsets, &self.lpm);
         let mut dict_bytes = self.dict.bytes.clone();
         // Decoder reads a fixed MAX_TOKEN_SIZE bytes from every token offset;
@@ -56,13 +69,13 @@ impl Parser {
         // 1-byte final token needs MAX_TOKEN_SIZE - 1 trailing bytes). See
         // `Parts::validate_dictionary`.
         dict_bytes.resize(dict_bytes.len() + (MAX_TOKEN_SIZE - 1), 0);
-        Ok(Column {
+        Column {
             dict_bytes,
             dict_offsets: self.dict.offsets.clone(),
             bits: self.dict.bits,
             codes,
             code_offsets,
-        })
+        }
     }
 }
 
@@ -94,17 +107,20 @@ pub(crate) fn encode_strings<O: Offset>(
     (codes, code_offsets)
 }
 
-/// Validate the `(bytes, offsets)` Arrow-style pair. Empty offsets is a hard
-/// error; otherwise every offset must fit in `usize` and be ≤ `bytes.len()`.
+/// Validate the `(bytes, offsets)` Arrow-style pair. `offsets` must be
+/// non-empty and monotonic non-decreasing — the Arrow contract, relied on by
+/// every consumer (slices `bytes[offsets[i]..offsets[i + 1]]`) and asserted
+/// here only in debug builds. Given monotonicity the maximum offset is the
+/// last, so a single bounds check on it suffices: it must fit in `usize` and
+/// be ≤ `bytes.len()`. Empty offsets is a hard error. O(1) in release.
 pub(crate) fn validate_offsets<O: Offset>(bytes: &[u8], offsets: &[O]) -> Result<(), Error> {
-    if offsets.is_empty() {
+    debug_assert!(
+        offsets.windows(2).all(|w| w[0].to_usize() <= w[1].to_usize()),
+        "offsets must be monotonic non-decreasing",
+    );
+    let last = offsets.last().ok_or(Error::InvalidArg)?;
+    if last.to_usize().ok_or(Error::InvalidArg)? > bytes.len() {
         return Err(Error::InvalidArg);
-    }
-    for o in offsets {
-        let p = o.to_usize().ok_or(Error::InvalidArg)?;
-        if p > bytes.len() {
-            return Err(Error::InvalidArg);
-        }
     }
     Ok(())
 }
