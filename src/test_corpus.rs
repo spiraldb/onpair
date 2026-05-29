@@ -6,36 +6,27 @@
 // `decoder`, and `search` all draw from the same data and can be compared
 // head-to-head against the upstream test suite.
 
-#![allow(dead_code)]
-
 use rand::Rng;
 use rand::SeedableRng;
-
-use crate::types::MAX_TOKEN_SIZE;
 
 /// Arrow-style flat representation of a list of byte strings.
 pub(crate) struct Raw {
     pub data: Vec<u8>,
     pub offsets: Vec<u32>,
-    pub offsets_u64: Vec<u64>,
     pub n: usize,
 }
 
 pub(crate) fn make_raw<S: AsRef<[u8]>>(strings: &[S]) -> Raw {
     let mut data = Vec::new();
     let mut offsets = Vec::with_capacity(strings.len() + 1);
-    let mut offsets_u64 = Vec::with_capacity(strings.len() + 1);
     offsets.push(0u32);
-    offsets_u64.push(0u64);
     for s in strings {
         data.extend_from_slice(s.as_ref());
         offsets.push(data.len() as u32);
-        offsets_u64.push(data.len() as u64);
     }
     Raw {
         data,
         offsets,
-        offsets_u64,
         n: strings.len(),
     }
 }
@@ -108,21 +99,4 @@ pub(crate) fn mixed_length_strings(n: usize, max_len: usize, seed: u64) -> Vec<V
             (0..l).map(|_| rng.random_range(b'a'..=b'z')).collect()
         })
         .collect()
-}
-
-/// One row per byte value 0..=255 — exercises the base dictionary.
-pub(crate) fn single_byte_strings() -> Vec<Vec<u8>> {
-    (0u16..=255).map(|i| vec![i as u8]).collect()
-}
-
-/// `n` empty strings.
-pub(crate) fn empty_strings(n: usize) -> Vec<Vec<u8>> {
-    vec![vec![]; n]
-}
-
-/// A corpus designed to trigger longer-token discovery: `n` copies of a
-/// long fixed string that is exactly `MAX_TOKEN_SIZE` bytes.
-pub(crate) fn max_token_strings(n: usize) -> Vec<Vec<u8>> {
-    let pat: Vec<u8> = (0..MAX_TOKEN_SIZE as u8).collect();
-    vec![pat; n]
 }

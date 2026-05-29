@@ -42,15 +42,27 @@ CPP_BIN = CPP_BUILD / "cpp_bench"
 # --- corpus discovery + parquet extraction ----------------------------------
 
 
+# Columns whose distinct (non-null) values are below this fraction of their
+# non-null rows are dropped from the sweep: low-cardinality columns are what a
+# dictionary encoding already collapses, so OnPair has nothing to gain on them
+# and they only skew the corpus toward repeated tokens.
+MIN_UNIQUE_RATIO = 0.5
+
+
 def _is_newer(src: Path, dst: Path) -> bool:
     return not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime
 
 
 def _extract_parquet(parquet: Path) -> list[Path]:
-    """One .txt per string column, cached by mtime. Warns on embedded LF."""
+    """One .txt per string column, cached by mtime. Warns on embedded LF.
+
+    String columns whose distinct-value ratio is below [`MIN_UNIQUE_RATIO`] are
+    skipped (dictionary-encoded / low-cardinality data is not a useful OnPair
+    benchmark)."""
     try:
         import pyarrow.parquet as pq  # type: ignore[import-not-found]
         import pyarrow as pa  # type: ignore[import-not-found]
+        import pyarrow.compute as pc  # type: ignore[import-not-found]
     except ImportError:
         print(f"warn: pyarrow not installed, skipping {parquet.name}", file=sys.stderr)
         return []
@@ -70,6 +82,21 @@ def _extract_parquet(parquet: Path) -> list[Path]:
         if not pa.types.is_string(col.type) and not (
             hasattr(pa.types, "is_string_view") and pa.types.is_string_view(col.type)
         ):
+            continue
+        # Skip low-cardinality columns (distinct < MIN_UNIQUE_RATIO of non-null
+        # rows): a dictionary encoding already collapses them, so OnPair gains
+        # nothing and they only skew the corpus toward repeated tokens.
+        n_valid = len(col) - col.null_count
+        if n_valid == 0:
+            continue
+        n_distinct = pc.count_distinct(col).as_py()
+        if n_distinct < MIN_UNIQUE_RATIO * n_valid:
+            print(
+                f"info: {parquet.name}:{col_name}: skipped, "
+                f"{n_distinct}/{n_valid} = {n_distinct / n_valid:.0%} unique "
+                f"< {MIN_UNIQUE_RATIO:.0%}",
+                file=sys.stderr,
+            )
             continue
         out = CACHE / f"{stem}__{col_name}.txt"
         if not _is_newer(parquet, out):

@@ -45,12 +45,6 @@ impl Dictionary {
         let s = self.span(id);
         &self.bytes[s.begin as usize..s.end as usize]
     }
-
-    #[inline]
-    #[allow(dead_code)] // exercised in tests only
-    pub(crate) fn token_size(&self, id: Token) -> usize {
-        self.span(id).size() as usize
-    }
 }
 
 #[cfg(test)]
@@ -95,17 +89,5 @@ mod tests {
         assert_eq!(d.data(0), b"a");
         assert_eq!(d.data(1), b"bc");
         assert_eq!(d.data(2), b"def");
-    }
-
-    #[test]
-    fn token_size_consistent_with_span() {
-        let d = Dictionary {
-            bytes: b"abcdef".to_vec(),
-            offsets: vec![0, 1, 3, 6],
-            bits: 12,
-        };
-        for t in 0u16..3 {
-            assert_eq!(d.token_size(t), d.span(t).size() as usize);
-        }
     }
 }

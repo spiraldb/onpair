@@ -11,21 +11,19 @@ pub(crate) type BitWidth = u8;
 pub(crate) type Token = u16;
 
 /// Maximum byte length of any dictionary token.
-pub(crate) const MAX_TOKEN_SIZE: usize = 16;
+///
+/// Also the decoder's fixed read width: it reads `MAX_TOKEN_SIZE` bytes from
+/// each token offset and slices to the token's true length (the branchless
+/// "fat read, then advance by `len`" pattern). A dictionary's byte buffer must
+/// therefore extend `MAX_TOKEN_SIZE` past its highest token offset so that read
+/// never touches unallocated memory — see [`crate::Parts::validate_dictionary`].
+pub const MAX_TOKEN_SIZE: usize = 16;
 
 /// Byte range `[begin, end)` inside the dictionary buffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ByteSpan {
     pub(crate) begin: u32,
     pub(crate) end: u32,
-}
-
-impl ByteSpan {
-    #[inline]
-    #[allow(dead_code)] // exercised in tests only
-    pub(crate) const fn size(self) -> u32 {
-        self.end - self.begin
-    }
 }
 
 /// Maximum dictionary size given a bit width.
@@ -37,12 +35,6 @@ pub(crate) const fn max_dict_size(bits: BitWidth) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn byte_span_size_is_end_minus_begin() {
-        assert_eq!(ByteSpan { begin: 0, end: 0 }.size(), 0);
-        assert_eq!(ByteSpan { begin: 5, end: 10 }.size(), 5);
-    }
 
     #[test]
     fn max_dict_size_12_is_4096() {

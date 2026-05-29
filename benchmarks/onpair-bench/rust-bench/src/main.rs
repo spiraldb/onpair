@@ -117,7 +117,10 @@ fn main() -> Result<()> {
     let parts = col.as_parts();
     let mut decompress_ns: Vec<u128> = Vec::new();
     if args.decompress {
-        let mut scratch: Vec<u8> = Vec::with_capacity(payload.len());
+        // Size the scratch to the worst-case decoded length (every token is
+        // <= 16 bytes) so `decompress_into`'s O(1) buffer check passes and we
+        // time the decode loop itself, not the exact-length validation pass.
+        let mut scratch: Vec<u8> = Vec::with_capacity(parts.codes.len() * 16);
         for _ in 0..args.warmup {
             let len = decompress_into(parts, scratch.spare_capacity_mut());
             // SAFETY: `len` logical bytes were initialized by the decoder.
