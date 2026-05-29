@@ -34,6 +34,7 @@ impl Parser {
     /// cannot be represented in `usize`. The `cfg` is valid by construction
     /// ([`Bits`](crate::Bits) / [`Threshold`](crate::Threshold)).
     pub fn train<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Self, Error> {
+        // TODO(joe): validate later and once
         validate_offsets(bytes, offsets)?;
 
         let internal_cfg: TrainingConfig = cfg.into();
@@ -46,6 +47,7 @@ impl Parser {
     /// contained — the strings need not be the corpus the parser was trained
     /// on.
     pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column<O>, Error> {
+        // TODO(joe): validate later and once
         validate_offsets(bytes, offsets)?;
         let (codes, code_offsets) = encode_strings(bytes, offsets, &self.lpm);
         let mut dict_bytes = self.dict.bytes.clone();
