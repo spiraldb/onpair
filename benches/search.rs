@@ -500,36 +500,37 @@ fn prefix_no_index(bencher: Bencher, needle: &Needle) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Arrow-like baselines: scan decompressed bytes the way an Arrow `StringArray`
-// compute kernel would — a (values, offsets) buffer pair with `starts_with`
-// (prefix) or `memchr::memmem` (contains, the kernel Arrow's `contains` uses).
+// Arrow-like baselines: evaluate the predicate over decompressed bytes the way
+// an Arrow `StringArray` LIKE kernel does — a (values, offsets) buffer pair with
+// `starts_with` (prefix) or `memchr::memmem` (contains, the finder Arrow's
+// `contains`/`like` kernels use) — and pack the per-row verdict into a
+// `BooleanBuffer` via `collect_bool`, the same 64-bits-per-word packer arrow-rs
+// uses to build the `BooleanArray` result. This makes the baseline produce a
+// packed bitmask comparable to onpair's `RowMask`, not just a counter.
 // `*_arrow` assumes the data is already decompressed in memory; the
 // `*_decompress_arrow` pair pays the onpair decompress first, so it is the true
 // "decode then scan" alternative to compressed-domain search.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Count rows matching `needle` over a decompressed `(bytes, offsets)` buffer,
-/// Arrow-`StringArray`-style.
-fn arrow_count(bytes: &[u8], offsets: &[u64], needle: &Needle) -> usize {
-    let mut matches = 0usize;
-    match needle.mode {
-        Mode::Prefix => {
-            for w in offsets.windows(2) {
-                if bytes[w[0] as usize..w[1] as usize].starts_with(&needle.bytes) {
-                    matches += 1;
-                }
-            }
-        }
+/// Evaluate `needle` over a decompressed `(bytes, offsets)` buffer
+/// Arrow-`StringArray`-style, packing the verdicts into a `BooleanBuffer` with
+/// `collect_bool` (the arrow-rs bitmask builder), and return its set-bit count.
+fn arrow_mask(bytes: &[u8], offsets: &[u64], needle: &Needle) -> usize {
+    let n = offsets.len() - 1;
+    let mask = match needle.mode {
+        Mode::Prefix => arrow_buffer::BooleanBuffer::collect_bool(n, |r| {
+            bytes[offsets[r] as usize..offsets[r + 1] as usize].starts_with(&needle.bytes)
+        }),
         Mode::Contains => {
             let finder = memchr::memmem::Finder::new(&needle.bytes);
-            for w in offsets.windows(2) {
-                if finder.find(&bytes[w[0] as usize..w[1] as usize]).is_some() {
-                    matches += 1;
-                }
-            }
+            arrow_buffer::BooleanBuffer::collect_bool(n, |r| {
+                finder
+                    .find(&bytes[offsets[r] as usize..offsets[r + 1] as usize])
+                    .is_some()
+            })
         }
-    }
-    matches
+    };
+    mask.count_set_bits()
 }
 
 #[divan::bench(args = prefix_needles())]
@@ -538,7 +539,7 @@ fn prefix_arrow(bencher: Bencher, needle: &Needle) {
     bencher
         .counter(BytesCount::new(c.total_bytes))
         .counter(ItemsCount::new(c.rows.len()))
-        .bench_local(|| divan::black_box(arrow_count(&c.bytes, &c.offsets, needle)));
+        .bench_local(|| divan::black_box(arrow_mask(&c.bytes, &c.offsets, needle)));
 }
 
 #[divan::bench(args = contains_needles())]
@@ -547,7 +548,7 @@ fn contains_arrow(bencher: Bencher, needle: &Needle) {
     bencher
         .counter(BytesCount::new(c.total_bytes))
         .counter(ItemsCount::new(c.rows.len()))
-        .bench_local(|| divan::black_box(arrow_count(&c.bytes, &c.offsets, needle)));
+        .bench_local(|| divan::black_box(arrow_mask(&c.bytes, &c.offsets, needle)));
 }
 
 #[divan::bench(args = prefix_needles())]
@@ -559,7 +560,7 @@ fn prefix_decompress_arrow(bencher: Bencher, needle: &Needle) {
         .counter(ItemsCount::new(c.rows.len()))
         .bench_local(|| {
             let bytes = decompress(col.as_parts());
-            divan::black_box(arrow_count(&bytes, &c.offsets, needle))
+            divan::black_box(arrow_mask(&bytes, &c.offsets, needle))
         });
 }
 
@@ -572,7 +573,7 @@ fn contains_decompress_arrow(bencher: Bencher, needle: &Needle) {
         .counter(ItemsCount::new(c.rows.len()))
         .bench_local(|| {
             let bytes = decompress(col.as_parts());
-            divan::black_box(arrow_count(&bytes, &c.offsets, needle))
+            divan::black_box(arrow_mask(&bytes, &c.offsets, needle))
         });
 }
 

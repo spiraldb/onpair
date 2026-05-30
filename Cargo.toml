@@ -39,6 +39,7 @@ divan = { package = "codspeed-divan-compat", version = "4.0.4" }
 rstest = "0.26.1"
 memchr = "2"
 arrow-array = "57.1"
+arrow-buffer = "57.1"
 arrow-schema = "57.1"
 parquet = "57.1"
 tpchgen = "2.0.2"
