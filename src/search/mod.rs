@@ -216,21 +216,23 @@ fn avx2_enabled() -> bool {
     on
 }
 
-/// Reduce a row's codes to a single class via the per-token `class` table:
-/// [`CLASS_DEFINITE`] if any token contains the whole needle, else
-/// [`CLASS_OPENER`] if any token can open a match, else `0` (reject). Short-
-/// circuits on the first definite token. This is the scalar contains pass 1;
-/// the dependent `class[code]` load pipelines across the loop (no carried
-/// state), the same shape as the KMP fast path but with a one-byte verdict.
+/// OR-reduce a row's codes through the per-token `class` table into the union
+/// of token classes: bit [`CLASS_DEFINITE`] set iff any token contains the whole
+/// needle, bit [`CLASS_OPENER`] set iff any token can open a match, `0` if every
+/// token is inert (reject). This is the scalar contains pass 1.
+///
+/// Branchless: a plain `|=` per code with no in-loop early exit, so the loop
+/// body is `load code → load class[code] → or → loop` with no data-dependent
+/// branch capping the out-of-order window. The two dependent loads across
+/// iterations are independent, so they pipeline at load-port throughput. (An
+/// early return on the first DEFINITE token was measured slower: it adds a
+/// per-code branch to win only on the rare rows that have a DEFINITE token,
+/// which are short anyway.)
 #[inline]
 fn row_class(class: &[u8], codes: &[Token]) -> u8 {
     let mut acc = 0u8;
     for &c in codes {
-        let cls = class[c as usize];
-        if cls == CLASS_DEFINITE {
-            return CLASS_DEFINITE;
-        }
-        acc |= cls;
+        acc |= class[c as usize];
     }
     acc
 }
