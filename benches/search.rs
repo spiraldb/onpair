@@ -44,6 +44,7 @@ use onpair::Config;
 use onpair::Pattern;
 use onpair::Threshold;
 use onpair::compress;
+use onpair::decompress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -495,6 +496,83 @@ fn prefix_no_index(bencher: Bencher, needle: &Needle) {
             let mut matches = 0usize;
             parts.search_callback(Pattern::Prefix(&needle.bytes), |_| matches += 1);
             divan::black_box(matches)
+        });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Arrow-like baselines: scan decompressed bytes the way an Arrow `StringArray`
+// compute kernel would — a (values, offsets) buffer pair with `starts_with`
+// (prefix) or `memchr::memmem` (contains, the kernel Arrow's `contains` uses).
+// `*_arrow` assumes the data is already decompressed in memory; the
+// `*_decompress_arrow` pair pays the onpair decompress first, so it is the true
+// "decode then scan" alternative to compressed-domain search.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Count rows matching `needle` over a decompressed `(bytes, offsets)` buffer,
+/// Arrow-`StringArray`-style.
+fn arrow_count(bytes: &[u8], offsets: &[u64], needle: &Needle) -> usize {
+    let mut matches = 0usize;
+    match needle.mode {
+        Mode::Prefix => {
+            for w in offsets.windows(2) {
+                if bytes[w[0] as usize..w[1] as usize].starts_with(&needle.bytes) {
+                    matches += 1;
+                }
+            }
+        }
+        Mode::Contains => {
+            let finder = memchr::memmem::Finder::new(&needle.bytes);
+            for w in offsets.windows(2) {
+                if finder.find(&bytes[w[0] as usize..w[1] as usize]).is_some() {
+                    matches += 1;
+                }
+            }
+        }
+    }
+    matches
+}
+
+#[divan::bench(args = prefix_needles())]
+fn prefix_arrow(bencher: Bencher, needle: &Needle) {
+    let c = corpus();
+    bencher
+        .counter(BytesCount::new(c.total_bytes))
+        .counter(ItemsCount::new(c.rows.len()))
+        .bench_local(|| divan::black_box(arrow_count(&c.bytes, &c.offsets, needle)));
+}
+
+#[divan::bench(args = contains_needles())]
+fn contains_arrow(bencher: Bencher, needle: &Needle) {
+    let c = corpus();
+    bencher
+        .counter(BytesCount::new(c.total_bytes))
+        .counter(ItemsCount::new(c.rows.len()))
+        .bench_local(|| divan::black_box(arrow_count(&c.bytes, &c.offsets, needle)));
+}
+
+#[divan::bench(args = prefix_needles())]
+fn prefix_decompress_arrow(bencher: Bencher, needle: &Needle) {
+    let col = column();
+    let c = corpus();
+    bencher
+        .counter(BytesCount::new(c.total_bytes))
+        .counter(ItemsCount::new(c.rows.len()))
+        .bench_local(|| {
+            let bytes = decompress(col.as_parts());
+            divan::black_box(arrow_count(&bytes, &c.offsets, needle))
+        });
+}
+
+#[divan::bench(args = contains_needles())]
+fn contains_decompress_arrow(bencher: Bencher, needle: &Needle) {
+    let col = column();
+    let c = corpus();
+    bencher
+        .counter(BytesCount::new(c.total_bytes))
+        .counter(ItemsCount::new(c.rows.len()))
+        .bench_local(|| {
+            let bytes = decompress(col.as_parts());
+            divan::black_box(arrow_count(&bytes, &c.offsets, needle))
         });
 }
 
