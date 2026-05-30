@@ -46,6 +46,7 @@ mod hash;
 mod lpm;
 mod offset;
 mod parser;
+mod search;
 mod trainer;
 mod types;
 
@@ -67,6 +68,7 @@ pub use decompress::decompressed_len;
 pub use dict::Dictionary;
 pub use offset::Offset;
 pub use parser::Parser;
+pub use search::Pattern;
 pub use types::MAX_TOKEN_SIZE;
 
 /// Compress `bytes` / `offsets` end-to-end. Equivalent to
