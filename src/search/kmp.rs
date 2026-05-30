@@ -182,33 +182,52 @@ impl KmpAutomaton {
     }
 
     /// Per-token class table for the prefilter, one entry per token id:
-    ///   * [`CLASS_DEFINITE`] — feeding the token from state 0 reaches the match
-    ///     state, i.e. the token's bytes contain the whole needle. Any row with
-    ///     such a token matches outright (no row check needed).
-    ///   * [`CLASS_OPENER`] — the token advances the KMP off state 0 without
-    ///     completing (`base != 0`), i.e. a suffix of the token is a proper
-    ///     prefix of the needle. A match may continue into following tokens, so
-    ///     such a row is a candidate for the exact check.
-    ///   * `0` — the token leaves the KMP at state 0. A row built only from such
-    ///     tokens can never open a match and is rejected without any row check.
+    /// Per-token table for the Teddy-style 2-code chain prefilter. Each entry is
+    /// an OR of three independent bit flags:
+    ///   * [`CHAIN_DEFINITE`] — the token contains the whole needle
+    ///     (`base == match_state`); a row holding it matches outright.
+    ///   * [`CHAIN_OPEN`] — the token opens a partial match from state 0
+    ///     (`base != 0`); it can be the first token of a boundary-spanning match.
+    ///   * [`CHAIN_CONT`] — feeding the token from *some* positive entry state
+    ///     can leave the KMP positive (not dead); it can be the second token of a
+    ///     boundary-spanning pair. Computed as a sound superset: `base != 0`, or
+    ///     any sparse transition for any entry state has target `!= 0` and covers
+    ///     this token id.
     ///
-    /// Soundness of the prefilter: every matching row contains at least one
-    /// non-zero-class token (the one carrying the first matched needle byte), so
-    /// rejecting all-zero rows drops no true match.
-    pub(crate) fn class_table(&self) -> Vec<u8> {
+    /// The row scan then accepts a row iff it has a DEFINITE token, or a
+    /// consecutive pair `(open token, continue token)`. Soundness: in any
+    /// matching row with no DEFINITE token, walk the KMP state sequence back from
+    /// the match to the opener `j` (`s_{j-1}=0 < s_j`); token `j` is OPEN and the
+    /// next token `j+1` (which exists, since no token does `0 -> match` alone)
+    /// has a positive entry state staying positive, hence CONT. So every match
+    /// exhibits a DEFINITE token or an OPEN→CONT pair — no false negatives.
+    pub(crate) fn chain_table(&self) -> Vec<u8> {
         let m = self.match_state;
-        self.base
+        let mut t: Vec<u8> = self
+            .base
             .iter()
             .map(|&b| {
                 if b == m {
-                    CLASS_DEFINITE
+                    CHAIN_DEFINITE | CHAIN_OPEN | CHAIN_CONT
                 } else if b != 0 {
-                    CLASS_OPENER
+                    CHAIN_OPEN | CHAIN_CONT
                 } else {
                     0
                 }
             })
-            .collect()
+            .collect();
+        // Any sparse transition with a non-dead target means the covered tokens
+        // can continue a partial match from that entry state: mark CONT.
+        for tr in &self.sparse {
+            if tr.target != 0 {
+                let lo = tr.range.begin as usize;
+                let hi = tr.range.last as usize;
+                for cell in &mut t[lo..=hi] {
+                    *cell |= CHAIN_CONT;
+                }
+            }
+        }
+        t
     }
 
     /// Whether the needle is empty (matches every row); the prefilter is skipped
@@ -219,10 +238,13 @@ impl KmpAutomaton {
     }
 }
 
-/// A token whose bytes contain the whole needle — a row holding it matches.
-pub(crate) const CLASS_DEFINITE: u8 = 2;
-/// A token that can open (but not complete) a match — a candidate row.
-pub(crate) const CLASS_OPENER: u8 = 1;
+/// [`chain_table`](KmpAutomaton::chain_table) flags. A token containing the
+/// whole needle (definite match for any row holding it).
+pub(crate) const CHAIN_DEFINITE: u8 = 4;
+/// The token opens a partial match from state 0 (can start a spanning match).
+pub(crate) const CHAIN_OPEN: u8 = 1;
+/// The token can continue a partial match (can be the second of a spanning pair).
+pub(crate) const CHAIN_CONT: u8 = 2;
 
 /// Scratch state for the sparse-transition trie traversal. Kept in a struct so
 /// the recursion (bounded by `MAX_TOKEN_SIZE` depth) can be a method.

@@ -28,7 +28,7 @@ use crate::column::Column;
 use crate::offset::Offset;
 use crate::types::{MAX_TOKEN_SIZE, Token};
 
-use kmp::{CLASS_DEFINITE, CLASS_OPENER, KmpAutomaton};
+use kmp::{CHAIN_CONT, CHAIN_DEFINITE, CHAIN_OPEN, KmpAutomaton};
 use prefix::PrefixAutomaton;
 
 /// A search predicate evaluated against every row of a compressed column,
@@ -216,32 +216,47 @@ fn avx2_enabled() -> bool {
     on
 }
 
-/// OR-reduce a row's codes through the per-token `class` table into the union of
-/// their classes: the result has bit [`CLASS_DEFINITE`] set iff some token
-/// contains the whole needle, bit [`CLASS_OPENER`] set iff some token can open a
-/// match, and is `0` iff every token is inert (the row is rejected). The caller
-/// bit-tests the result.
+/// Verdict of the Teddy-style 2-code chain row filter; see [`row_chain`].
+enum RowChain {
+    /// A token contains the whole needle — the row matches outright.
+    Definite,
+    /// A consecutive open→continue token pair exists — confirm with exact KMP.
+    Candidate,
+    /// Neither — the row cannot contain the needle.
+    Reject,
+}
+
+/// Teddy-style 2-code chain filter over one row's codes, using the per-token
+/// [`chain_table`](kmp::KmpAutomaton::chain_table). Carries the previous token's
+/// `CHAIN_OPEN` bit and looks for a consecutive pair `(open, continue)` — far
+/// more selective than "any opener present", since a boundary-spanning match
+/// needs an opener token *immediately followed* by a continuation token.
 ///
-/// The early `return CLASS_DEFINITE` does double duty: it short-circuits a
-/// definite row, and (counter-intuitively) it makes this faster than a pure
-/// `|=` reduction. Without the branch LLVM auto-vectorizes the loop, but
-/// `class[code]` is a scattered lookup with no hardware gather, so the vector
-/// path degrades to a `vpmovzxwq` widen, a per-lane `vmovq`/`vpextr` extract,
-/// and a scalar `movzbl` byte load per element: strictly more work than the
-/// plain scalar loop. The branch keeps LLVM scalar (one `movzwl` plus one
-/// `movzbl` per iteration), which is what runs fast. Verified in the emitted
-/// asm and on the bench.
+/// Returns [`RowChain::Definite`] on the first DEFINITE token (the row matches
+/// with no KMP needed), [`RowChain::Candidate`] if an open→continue pair occurs
+/// (a spanning match is possible; the exact KMP confirms), else
+/// [`RowChain::Reject`]. The early `return` on a definite token keeps LLVM from
+/// the slower auto-vectorized gather (verified in the asm); the loop body is a
+/// single scattered `chain[code]` load plus a register-carried `prev_open`.
 #[inline]
-fn row_class(class: &[u8], codes: &[Token]) -> u8 {
-    let mut acc = 0u8;
+fn row_chain(chain: &[u8], codes: &[Token]) -> RowChain {
+    let mut prev_open = false;
+    let mut candidate = false;
     for &c in codes {
-        let cls = class[c as usize];
-        if cls == CLASS_DEFINITE {
-            return CLASS_DEFINITE;
+        let f = chain[c as usize];
+        if f & CHAIN_DEFINITE != 0 {
+            return RowChain::Definite;
         }
-        acc |= cls;
+        // Open token immediately followed by a continue token = possible
+        // boundary-spanning match.
+        candidate |= prev_open && (f & CHAIN_CONT != 0);
+        prev_open = f & CHAIN_OPEN != 0;
     }
-    acc
+    if candidate {
+        RowChain::Candidate
+    } else {
+        RowChain::Reject
+    }
 }
 
 /// Pass-1 accept filter: set bit `r` of `acc` iff `first_codes[r]` lies in the
@@ -634,18 +649,23 @@ impl<O: Offset> SearchParts<'_, O> {
             scan(aut, self.codes, self.code_offsets, on_match);
             return;
         }
-        let class = aut.class_table();
+        let chain = aut.chain_table();
         for r in 0..n {
             let s = self.code_offsets[r].to_usize().expect("valid code offsets");
             let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
-            // `acc` is the union of the row's token classes. A DEFINITE token
-            // (a single token containing the whole needle) is a match outright;
-            // otherwise an OPENER means run the exact KMP to confirm.
-            let acc = row_class(&class, &self.codes[s..e]);
-            let hit = acc & CLASS_DEFINITE != 0
-                || (acc & CLASS_OPENER != 0 && aut.matches(&self.codes[s..e]));
-            if hit {
-                on_match(r);
+            let codes = &self.codes[s..e];
+            match row_chain(&chain, codes) {
+                // A DEFINITE token: the row matches outright.
+                RowChain::Definite => on_match(r),
+                // An open→continue pair exists: a boundary-spanning match is
+                // possible; confirm with the exact KMP.
+                RowChain::Candidate => {
+                    if aut.matches(codes) {
+                        on_match(r);
+                    }
+                }
+                // Neither: the row cannot contain the needle.
+                RowChain::Reject => {}
             }
         }
     }
