@@ -29,7 +29,7 @@ use crate::offset::Offset;
 use crate::types::{MAX_TOKEN_SIZE, Token};
 
 use kmp::KmpAutomaton;
-use prefix::PrefixAutomaton;
+use prefix::{Decision, PrefixAutomaton};
 
 /// A search predicate evaluated against every row of a compressed column,
 /// without decompressing it. Borrows the needle bytes for the duration of the
@@ -170,42 +170,24 @@ impl<'a> DictView<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Automaton driver.
+// Row matcher.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Any type that can be driven token-by-token to detect a match within one
-/// row. Mirrors the C++ `TokenAutomaton` + `DeadDetectable` concepts: the
-/// driver feeds tokens until the row ends or [`is_dead`](Self::is_dead) reports
-/// the verdict can no longer change, then reads [`is_accepted`](Self::is_accepted).
-pub(crate) trait TokenAutomaton {
-    /// Rewind to the start state for a fresh row.
-    fn reset(&mut self);
-    /// Consume one token.
-    fn step(&mut self, t: Token);
-    /// Final verdict (only meaningful once the row is exhausted or dead).
-    fn is_accepted(&self) -> bool;
-    /// True once further tokens cannot change the verdict.
-    fn is_dead(&self) -> bool;
+/// A compiled query that decides whether one row's token sequence matches.
+///
+/// Stateless across rows: all per-row state lives in [`matches`](Self::matches)
+/// locals, so one matcher is built per query and reused for every row (no
+/// reset between rows, and it can be shared by reference).
+pub(crate) trait RowMatcher {
+    /// Whether the row whose codes are `codes` matches.
+    fn matches(&self, codes: &[Token]) -> bool;
 }
 
-/// Drive `aut` over one row's tokens, early-exiting on death.
-#[inline]
-fn drive(aut: &mut impl TokenAutomaton, codes: &[Token]) -> bool {
-    aut.reset();
-    for &t in codes {
-        aut.step(t);
-        if aut.is_dead() {
-            break;
-        }
-    }
-    aut.is_accepted()
-}
-
-/// Drive `aut` over every row delimited by `code_offsets`, invoking `on_match`
-/// with the row index of each accepting row.
+/// Run `matcher` over every row delimited by `code_offsets`, invoking
+/// `on_match` with the index of each matching row.
 #[inline]
 fn scan<O: Offset>(
-    aut: &mut impl TokenAutomaton,
+    matcher: &impl RowMatcher,
     codes: &[Token],
     code_offsets: &[O],
     mut on_match: impl FnMut(usize),
@@ -213,7 +195,7 @@ fn scan<O: Offset>(
     for r in 0..code_offsets.len() - 1 {
         let s = code_offsets[r].to_usize().expect("valid code offsets");
         let e = code_offsets[r + 1].to_usize().expect("valid code offsets");
-        if drive(aut, &codes[s..e]) {
+        if matcher.matches(&codes[s..e]) {
             on_match(r);
         }
     }
@@ -330,6 +312,9 @@ pub struct SearchParts<'a, O: Offset> {
     /// are `codes[code_offsets[r]..code_offsets[r + 1]]`. Mirrors
     /// [`Column::code_offsets`].
     pub code_offsets: &'a [O],
+    /// Per-row first token id (`R` entries); mirrors [`Column::first_codes`].
+    /// Used as a contiguous prefilter for [`Pattern::Prefix`] searches.
+    pub first_codes: &'a [u16],
 }
 
 impl<O: Offset> SearchParts<'_, O> {
@@ -354,12 +339,51 @@ impl<O: Offset> SearchParts<'_, O> {
         let dict = self.dict();
         match pattern {
             Pattern::Contains(needle) => {
-                let mut aut = KmpAutomaton::new(needle, dict);
-                scan(&mut aut, self.codes, self.code_offsets, on_match);
+                let aut = KmpAutomaton::new(needle, dict);
+                scan(&aut, self.codes, self.code_offsets, on_match);
             }
             Pattern::Prefix(needle) => {
-                let mut aut = PrefixAutomaton::new(needle, dict);
-                scan(&mut aut, self.codes, self.code_offsets, on_match);
+                let aut = PrefixAutomaton::new(needle, dict);
+                self.scan_prefix(&aut, dict.num_tokens(), on_match);
+            }
+        }
+    }
+
+    /// Prefix scan with the first-token prefilter. Most rows are decided from
+    /// the contiguous `first_codes` table alone — a linear scan, no scattered
+    /// `codes[code_offsets[r]]` gather — and only the ambiguous cases (a first
+    /// token equal to the query's multi-token head, or an empty row) fall
+    /// through to a full row check.
+    ///
+    /// The sentinel `u16::MAX` marks empty rows; it can only collide with a
+    /// real token id when the dictionary is fully saturated (`num_tokens ==
+    /// 65536`), so the prefilter is used only below that, falling back to the
+    /// generic per-row scan otherwise.
+    fn scan_prefix(
+        &self,
+        aut: &PrefixAutomaton,
+        num_tokens: usize,
+        mut on_match: impl FnMut(usize),
+    ) {
+        let n = self.code_offsets.len() - 1;
+        if num_tokens >= u16::MAX as usize + 1
+            || aut.is_empty_query()
+            || self.first_codes.len() != n
+        {
+            scan(aut, self.codes, self.code_offsets, on_match);
+            return;
+        }
+        for r in 0..n {
+            match aut.first_token_decision(self.first_codes[r]) {
+                Decision::Accept => on_match(r),
+                Decision::Reject => {}
+                Decision::Verify => {
+                    let s = self.code_offsets[r].to_usize().expect("valid code offsets");
+                    let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+                    if aut.matches(&self.codes[s..e]) {
+                        on_match(r);
+                    }
+                }
             }
         }
     }
@@ -385,6 +409,7 @@ impl<O: Offset> Column<O> {
             dict_offsets: &self.dict_offsets,
             codes: &self.codes,
             code_offsets: &self.code_offsets,
+            first_codes: &self.first_codes,
         }
     }
 }

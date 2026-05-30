@@ -3,7 +3,7 @@
 //
 // Port of `include/onpair/search/automata/kmp_automaton.h`.
 
-use super::{DictView, TokenAutomaton, TokenRange};
+use super::{DictView, RowMatcher, TokenRange};
 use crate::types::Token;
 
 /// KMP state. A byte-level KMP over a pattern of length `m` has states
@@ -29,11 +29,12 @@ struct SparseTransition {
 ///   * `sparse` — for each non-zero entry state, the few token ranges whose
 ///     exit state differs from `base[t]`, grouped by entry state via `offsets`.
 ///
-/// The automaton is dead-detectable: once the match state is reached the
-/// verdict can no longer change, so scanning of the row stops.
+/// [`matches`](RowMatcher::matches) splits the scan into a fast path (KMP
+/// state 0, the common case) whose `base[]` loads carry no state between
+/// iterations and so pipeline, and a slow partial-match path that consults the
+/// sparse table. It stops the row the moment the match state is reached.
 pub(crate) struct KmpAutomaton {
     match_state: State,
-    state: State,
     /// `base[token]` = KMP exit state after consuming the token from state 0.
     base: Vec<State>,
     /// Flattened sparse transitions grouped by entry state: the transitions for
@@ -73,7 +74,6 @@ impl KmpAutomaton {
         if m == 0 {
             return Self {
                 match_state: 0,
-                state: 0,
                 base: vec![0; num_tokens],
                 sparse: Vec::new(),
                 offsets: vec![0, 0],
@@ -158,11 +158,27 @@ impl KmpAutomaton {
 
         Self {
             match_state,
-            state: 0,
             base,
             sparse,
             offsets,
         }
+    }
+
+    /// Full KMP transition from `state` (in `1..match_state`) on token `t`:
+    /// consult the sparse exceptions for `state`, falling back to `base[t]`.
+    #[inline]
+    fn next_state(&self, state: State, t: Token) -> State {
+        let lo = self.offsets[state as usize] as usize;
+        let hi = self.offsets[state as usize + 1] as usize;
+        for tr in &self.sparse[lo..hi] {
+            if t < tr.range.begin {
+                break;
+            }
+            if t <= tr.range.last {
+                return tr.target;
+            }
+        }
+        self.base[t as usize]
     }
 }
 
@@ -269,40 +285,43 @@ impl SparsePass<'_> {
     }
 }
 
-impl TokenAutomaton for KmpAutomaton {
+impl RowMatcher for KmpAutomaton {
     #[inline]
-    fn reset(&mut self) {
-        self.state = 0;
-    }
-
-    #[inline]
-    fn step(&mut self, t: Token) {
-        if self.is_dead() {
-            return;
+    fn matches(&self, codes: &[Token]) -> bool {
+        // Empty needle matches every row.
+        if self.match_state == 0 {
+            return true;
         }
-        if self.state > 0 {
-            let lo = self.offsets[self.state as usize] as usize;
-            let hi = self.offsets[self.state as usize + 1] as usize;
-            for tr in &self.sparse[lo..hi] {
-                if t < tr.range.begin {
-                    break;
+        let base = self.base.as_slice();
+        let match_state = self.match_state;
+        let n = codes.len();
+        let mut i = 0usize;
+        while i < n {
+            // Fast path: KMP state 0. `base[code]` loads are independent across
+            // iterations (no state carried between them), so the CPU pipelines
+            // them — no `is_dead`/`state > 0` branch, no sparse lookup.
+            let s = base[codes[i] as usize];
+            i += 1;
+            if s != 0 {
+                if s == match_state {
+                    return true;
                 }
-                if t <= tr.range.last {
-                    self.state = tr.target;
-                    return;
+                // Slow path: a partial match is open. Step carefully (sparse
+                // exceptions + base) until it completes, dies back to state 0,
+                // or the row ends.
+                let mut state = s;
+                while i < n {
+                    state = self.next_state(state, codes[i]);
+                    i += 1;
+                    if state == match_state {
+                        return true;
+                    }
+                    if state == 0 {
+                        break;
+                    }
                 }
             }
         }
-        self.state = self.base[t as usize];
-    }
-
-    #[inline]
-    fn is_accepted(&self) -> bool {
-        self.state == self.match_state
-    }
-
-    #[inline]
-    fn is_dead(&self) -> bool {
-        self.state == self.match_state
+        false
     }
 }
