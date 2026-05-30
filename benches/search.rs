@@ -220,11 +220,27 @@ fn column() -> &'static Column<u64> {
             seed: Some(42),
         };
         let col = compress(&c.bytes, &c.offsets, cfg).unwrap();
+        let dict_b = col.dict_bytes.len() + col.dict_offsets.len() * 4;
+        let codes_b = col.codes.len() * 2;
+        let offs_b = col.code_offsets.len() * 8;
+        let first_b = col.first_codes.as_ref().map_or(0, |f| f.len() * 2);
+        let core = dict_b + codes_b + offs_b;
         eprintln!(
             "[onpair search] compressed @ bits={}: {} dict tokens, {} codes",
             col.bits,
             col.dict_offsets.len() - 1,
             col.codes.len(),
+        );
+        eprintln!(
+            "[onpair search] footprint: dict {:.0} KiB + codes {:.0} KiB + code_offsets {:.0} KiB = {:.0} KiB core; \
+             first_codes (search index) {:.0} KiB = +{:.2}% over core, +{:.2}% over input",
+            dict_b as f64 / 1024.0,
+            codes_b as f64 / 1024.0,
+            offs_b as f64 / 1024.0,
+            core as f64 / 1024.0,
+            first_b as f64 / 1024.0,
+            100.0 * first_b as f64 / core as f64,
+            100.0 * first_b as f64 / c.total_bytes as f64,
         );
         col
     })
@@ -411,6 +427,24 @@ fn contains(bencher: Bencher, needle: &Needle) {
 #[divan::bench(args = prefix_needles())]
 fn prefix(bencher: Bencher, needle: &Needle) {
     bench_search(bencher, needle);
+}
+
+/// A/B baseline: identical prefix search but with the first-token index
+/// suppressed (`first_codes = None`), forcing the generic per-row scan. The
+/// gap to `prefix` is the search index's runtime payoff.
+#[divan::bench(args = prefix_needles())]
+fn prefix_no_index(bencher: Bencher, needle: &Needle) {
+    let mut parts = column().as_search_parts();
+    parts.first_codes = None;
+    let c = corpus();
+    bencher
+        .counter(BytesCount::new(c.total_bytes))
+        .counter(ItemsCount::new(c.rows.len()))
+        .bench_local(|| {
+            let mut matches = 0usize;
+            parts.search_callback(Pattern::Prefix(&needle.bytes), |_| matches += 1);
+            divan::black_box(matches)
+        });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

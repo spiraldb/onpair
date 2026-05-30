@@ -69,7 +69,7 @@ impl Parser {
         // 1-byte final token needs MAX_TOKEN_SIZE - 1 trailing bytes). See
         // `Parts::validate_dictionary`.
         dict_bytes.resize(dict_bytes.len() + (MAX_TOKEN_SIZE - 1), 0);
-        let first_codes = first_codes(&codes, &code_offsets);
+        let first_codes = Some(first_codes(&codes, &code_offsets));
         Column {
             dict_bytes,
             dict_offsets: self.dict.offsets.clone(),

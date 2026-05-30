@@ -31,12 +31,14 @@ pub struct Column<O: Offset> {
     /// emits these because a token may span a row boundary, so the row
     /// structure cannot be recovered from the codes alone.
     pub code_offsets: Vec<O>,
-    /// Per-row first token id (`R` entries): `first_codes[r] == codes` of the
-    /// first token of row `r`, or [`u16::MAX`] for an empty row. A contiguous
-    /// side-table that lets prefix search prefilter rows with a single linear
-    /// scan instead of a scattered `codes[code_offsets[r]]` gather per row —
-    /// see [`crate::SearchParts::search`]. Costs 2 bytes per row.
-    pub first_codes: Vec<u16>,
+    /// Optional per-row first-token side-table (`R` entries when present):
+    /// `first_codes[r]` is the first code of row `r`, or [`u16::MAX`] for an
+    /// empty row. A contiguous child array that lets prefix search prefilter
+    /// rows with a single linear scan instead of a scattered
+    /// `codes[code_offsets[r]]` gather per row — see
+    /// [`crate::SearchParts::search`]. `None` when the column was built without
+    /// a search index; costs 2 bytes per row when present.
+    pub first_codes: Option<Vec<u16>>,
 }
 
 /// Borrowed view of the data the decoder needs, consumed by

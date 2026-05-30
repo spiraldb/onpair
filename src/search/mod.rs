@@ -29,7 +29,7 @@ use crate::offset::Offset;
 use crate::types::{MAX_TOKEN_SIZE, Token};
 
 use kmp::KmpAutomaton;
-use prefix::{Decision, PrefixAutomaton};
+use prefix::PrefixAutomaton;
 
 /// A search predicate evaluated against every row of a compressed column,
 /// without decompressing it. Borrows the needle bytes for the duration of the
@@ -201,6 +201,59 @@ fn scan<O: Offset>(
     }
 }
 
+/// Pass-1 accept filter: set bit `r` of `acc` iff `first_codes[r]` lies in the
+/// inclusive accept range `[alo, alo + awidth]` (unsigned). Fully branchless —
+/// `(fc - alo) <= awidth` lowers to a `sub` + unsigned compare with no branch,
+/// accumulated into one bitset word per 64 rows.
+#[inline]
+fn prefilter_accept(first_codes: &[u16], alo: u32, awidth: u32, acc: &mut [u64]) {
+    for (word, chunk) in acc.iter_mut().zip(first_codes.chunks(64)) {
+        let mut w = 0u64;
+        for (i, &fc) in chunk.iter().enumerate() {
+            w |= u64::from((fc as u32).wrapping_sub(alo) <= awidth) << i;
+        }
+        *word = w;
+    }
+}
+
+/// Pass-1 accept + verify filter: as [`prefilter_accept`], but also sets bit
+/// `r` of `ver` iff `first_codes[r] == vpoint`. The two predicates are disjoint
+/// (`vpoint < alo`), so no row lands in both. Fully branchless.
+#[inline]
+fn prefilter_accept_verify(
+    first_codes: &[u16],
+    alo: u32,
+    awidth: u32,
+    vpoint: u32,
+    acc: &mut [u64],
+    ver: &mut [u64],
+) {
+    for ((accw, verw), chunk) in acc.iter_mut().zip(ver.iter_mut()).zip(first_codes.chunks(64)) {
+        let mut a = 0u64;
+        let mut v = 0u64;
+        for (i, &fc) in chunk.iter().enumerate() {
+            let fc = fc as u32;
+            a |= u64::from(fc.wrapping_sub(alo) <= awidth) << i;
+            v |= u64::from(fc == vpoint) << i;
+        }
+        *accw = a;
+        *verw = v;
+    }
+}
+
+/// Invoke `f` with the index of every set bit in `words`, in ascending order.
+#[inline]
+fn for_each_set_bit(words: &[u64], mut f: impl FnMut(usize)) {
+    for (w, &word) in words.iter().enumerate() {
+        let mut bits = word;
+        let base = w * 64;
+        while bits != 0 {
+            f(base + bits.trailing_zeros() as usize);
+            bits &= bits - 1;
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RowMask — packed result bitset.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -312,9 +365,11 @@ pub struct SearchParts<'a, O: Offset> {
     /// are `codes[code_offsets[r]..code_offsets[r + 1]]`. Mirrors
     /// [`Column::code_offsets`].
     pub code_offsets: &'a [O],
-    /// Per-row first token id (`R` entries); mirrors [`Column::first_codes`].
-    /// Used as a contiguous prefilter for [`Pattern::Prefix`] searches.
-    pub first_codes: &'a [u16],
+    /// Optional per-row first token id (`R` entries); mirrors
+    /// [`Column::first_codes`]. When present, it is used as a contiguous
+    /// prefilter for [`Pattern::Prefix`] searches; when `None`, prefix search
+    /// falls back to the generic per-row scan.
+    pub first_codes: Option<&'a [u16]>,
 }
 
 impl<O: Offset> SearchParts<'_, O> {
@@ -349,16 +404,21 @@ impl<O: Offset> SearchParts<'_, O> {
         }
     }
 
-    /// Prefix scan with the first-token prefilter. Most rows are decided from
-    /// the contiguous `first_codes` table alone — a linear scan, no scattered
-    /// `codes[code_offsets[r]]` gather — and only the ambiguous cases (a first
-    /// token equal to the query's multi-token head, or an empty row) fall
-    /// through to a full row check.
+    /// Prefix scan in two passes over the contiguous first-token table.
     ///
-    /// The sentinel `u16::MAX` marks empty rows; it can only collide with a
-    /// real token id when the dictionary is fully saturated (`num_tokens ==
-    /// 65536`), so the prefilter is used only below that, falling back to the
-    /// generic per-row scan otherwise.
+    /// Pass 1 is a fully branchless range filter: a row is a candidate iff its
+    /// first token lies in the sound superset range `[lo, hi]` returned by
+    /// [`PrefixAutomaton::prefilter_range`]. It touches one code per row (the
+    /// linear `first_codes`, never the scattered code stream), so it is cheap
+    /// even at low selectivity, and is the part that vectorises.
+    ///
+    /// Pass 2 only visits candidates. For a single-token query the range is
+    /// exact, so candidates are emitted directly; otherwise each is confirmed
+    /// with a full row check — the only place the scattered codes are read.
+    ///
+    /// Falls back to the generic per-row scan for the empty query, or when the
+    /// dictionary is fully saturated (`num_tokens == 65536`) and the empty-row
+    /// sentinel `u16::MAX` could collide with a real token id.
     fn scan_prefix(
         &self,
         aut: &PrefixAutomaton,
@@ -366,26 +426,50 @@ impl<O: Offset> SearchParts<'_, O> {
         mut on_match: impl FnMut(usize),
     ) {
         let n = self.code_offsets.len() - 1;
-        if num_tokens >= u16::MAX as usize + 1
-            || aut.is_empty_query()
-            || self.first_codes.len() != n
-        {
+        // Use the prefilter only with a same-length first-token table and an
+        // unsaturated dictionary (so the u16::MAX empty-row sentinel cannot
+        // collide with a real id); otherwise scan generically.
+        let first_codes = match self.first_codes {
+            Some(fc) if fc.len() == n && num_tokens <= u16::MAX as usize => fc,
+            _ => {
+                scan(aut, self.codes, self.code_offsets, on_match);
+                return;
+            }
+        };
+        if aut.is_empty_query() {
             scan(aut, self.codes, self.code_offsets, on_match);
             return;
         }
-        for r in 0..n {
-            match aut.first_token_decision(self.first_codes[r]) {
-                Decision::Accept => on_match(r),
-                Decision::Reject => {}
-                Decision::Verify => {
-                    let s = self.code_offsets[r].to_usize().expect("valid code offsets");
-                    let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
-                    if aut.matches(&self.codes[s..e]) {
-                        on_match(r);
-                    }
-                }
-            }
+        let pf = aut.prefilter();
+        let words = n.div_ceil(64);
+
+        if !pf.needs_verify() {
+            // Single-token query: the accept range is exact. One branchless
+            // pass, emit directly — no row ever touches the scattered codes.
+            let mut acc = vec![0u64; words];
+            prefilter_accept(first_codes, pf.alo, pf.awidth, &mut acc);
+            for_each_set_bit(&acc, on_match);
+            return;
         }
+
+        // Multi-token query. Pass 1 splits rows into definite accepts (first
+        // token begins with the whole needle) and verify candidates (first
+        // token equals the query head). Both predicates are branchless.
+        let mut acc = vec![0u64; words];
+        let mut ver = vec![0u64; words];
+        prefilter_accept_verify(first_codes, pf.alo, pf.awidth, pf.vpoint, &mut acc, &mut ver);
+
+        // Definite accepts: emit directly.
+        for_each_set_bit(&acc, &mut on_match);
+        // Pass 2: confirm only the (usually few) verify candidates — the one
+        // place the scattered code stream is read.
+        for_each_set_bit(&ver, |r| {
+            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
+            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+            if aut.matches(&self.codes[s..e]) {
+                on_match(r);
+            }
+        });
     }
 
     /// Evaluate `pattern` against every row, returning a [`RowMask`] whose set
@@ -409,7 +493,7 @@ impl<O: Offset> Column<O> {
             dict_offsets: &self.dict_offsets,
             codes: &self.codes,
             code_offsets: &self.code_offsets,
-            first_codes: &self.first_codes,
+            first_codes: self.first_codes.as_deref(),
         }
     }
 }

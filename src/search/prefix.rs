@@ -24,16 +24,6 @@ pub(crate) struct PrefixAutomaton {
     intervals: Vec<TokenRange>,
 }
 
-/// Verdict of the first-token prefilter, before any full row check.
-pub(crate) enum Decision {
-    /// The row definitely matches (decided from its first token alone).
-    Accept,
-    /// The row definitely does not match.
-    Reject,
-    /// Ambiguous — run the full [`RowMatcher::matches`] on the row.
-    Verify,
-}
-
 impl PrefixAutomaton {
     pub(crate) fn new(prefix: &[u8], dv: DictView<'_>) -> Self {
         let query_tokens = tokenize(prefix, dv);
@@ -61,33 +51,67 @@ impl PrefixAutomaton {
         self.query_tokens.is_empty()
     }
 
-    /// Decide a row from its first token id alone where possible.
+    /// First-token prefilter parameters. Precondition: the query is non-empty.
     ///
-    /// Precondition: the query is non-empty and `first_code` is either a real
-    /// token id or the empty-row sentinel `u16::MAX` (which routes to
-    /// [`Decision::Verify`]).
+    /// A row matches only if its first token either begins with the whole
+    /// needle (`first_code ∈ intervals[0] = [begin, last]`) or equals the query
+    /// head `q0` (with the remaining query tokens still to be checked). Because
+    /// the dictionary is lexicographically sorted and `q0` is a prefix of the
+    /// needle, `q0 <= begin`, so the two id sets are disjoint for a multi-token
+    /// query — the [`Prefilter`] reports them separately:
+    ///
+    ///   * the **accept** range `[begin, last]` — a single unsigned range check
+    ///     `(fc - alo) <= awidth` — is a definite match (the first token alone
+    ///     begins with the needle), so it needs no row check;
+    ///   * the **verify** point `q0` flags the rare case where the needle is
+    ///     split at `q0`, which a full row check then settles.
+    ///
+    /// A single-token query *is* the whole needle, so `q0 == begin` and the
+    /// accept range is necessary and sufficient; [`Prefilter::vpoint`] is then
+    /// disabled. The `u16::MAX` empty-row sentinel exceeds `last` (when the
+    /// dictionary is not saturated) and equals neither, so empties drop out.
     #[inline]
-    pub(crate) fn first_token_decision(&self, first_code: Token) -> Decision {
+    pub(crate) fn prefilter(&self) -> Prefilter {
         let q0 = self.query_tokens[0];
-        if first_code == q0 {
-            // First token equals the query head. A single-token query is the
-            // whole needle, so the row starts with it; otherwise the remaining
-            // query tokens still have to be checked.
-            if self.query_tokens.len() == 1 {
-                Decision::Accept
-            } else {
-                Decision::Verify
-            }
-        } else if first_code != u16::MAX && self.intervals[0].contains(first_code) {
-            // First token diverges but still carries the whole needle as a
-            // prefix → the row starts with the needle.
-            Decision::Accept
-        } else if first_code == u16::MAX {
-            // Empty row (sentinel): let the full check settle it.
-            Decision::Verify
+        let iv = self.intervals[0];
+        // Empty accept range → match nothing: `alo` above any u16 makes
+        // `(fc - alo)` wrap past `awidth = 0` for every real first code.
+        let (alo, awidth) = if iv.empty() {
+            (u32::MAX, 0)
         } else {
-            Decision::Reject
+            (iv.begin as u32, (iv.last - iv.begin) as u32)
+        };
+        // Single-token query is exact; disable the verify point (no u16 first
+        // code can equal u32::MAX).
+        let vpoint = if self.query_tokens.len() == 1 {
+            u32::MAX
+        } else {
+            q0 as u32
+        };
+        Prefilter {
+            alo,
+            awidth,
+            vpoint,
         }
+    }
+}
+
+/// First-token prefilter parameters; see [`PrefixAutomaton::prefilter`].
+pub(crate) struct Prefilter {
+    /// Accept range lower bound. `u32::MAX` makes the range match nothing.
+    pub alo: u32,
+    /// Accept range width: `first_code` accepts iff `(first_code - alo) <= awidth`.
+    pub awidth: u32,
+    /// Verify point: `first_code == vpoint` needs a full row check. `u32::MAX`
+    /// (a value no `u16` first code can take) disables verification.
+    pub vpoint: u32,
+}
+
+impl Prefilter {
+    /// Whether any first code can route to a full row check.
+    #[inline]
+    pub(crate) fn needs_verify(&self) -> bool {
+        self.vpoint != u32::MAX
     }
 }
 
