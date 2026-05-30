@@ -69,6 +69,8 @@ pub use dict::Dictionary;
 pub use offset::Offset;
 pub use parser::Parser;
 pub use search::Pattern;
+pub use search::RowMask;
+pub use search::SearchParts;
 pub use types::MAX_TOKEN_SIZE;
 
 /// Compress `bytes` / `offsets` end-to-end. Equivalent to

@@ -220,38 +220,172 @@ fn scan<O: Offset>(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public entry points.
+// RowMask — packed result bitset.
 // ─────────────────────────────────────────────────────────────────────────────
 
-impl<O: Offset> Column<O> {
+/// Result of a [`search`](SearchParts::search): a packed bitmap over the
+/// column's rows, one bit per row. Bit `i` is set iff row `i` matched.
+///
+/// The packed `u64` representation composes directly with a query engine's
+/// own selection vectors (AND/OR of masks is word-wise), and is compact even
+/// when most rows match.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowMask {
+    words: Vec<u64>,
+    rows: usize,
+}
+
+impl RowMask {
+    /// All-zero mask sized for `rows` rows.
+    fn zeros(rows: usize) -> Self {
+        Self {
+            words: vec![0; rows.div_ceil(64)],
+            rows,
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize) {
+        self.words[i >> 6] |= 1u64 << (i & 63);
+    }
+
+    /// Number of rows the mask covers (set or not).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether the mask covers zero rows.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    /// Whether row `i` matched. Returns `false` for `i >= len()`.
+    #[inline]
+    pub fn contains(&self, i: usize) -> bool {
+        i < self.rows && (self.words[i >> 6] >> (i & 63)) & 1 == 1
+    }
+
+    /// Number of matching rows.
+    #[inline]
+    pub fn count_ones(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Iterate the indices of matching rows in ascending order.
+    pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(w, &word)| {
+            BitIndices { word }.map(move |b| w * 64 + b)
+        })
+    }
+
+    /// The packed bitmap words (LSB-first within each word). Length is
+    /// `len().div_ceil(64)`.
+    #[inline]
+    pub fn as_words(&self) -> &[u64] {
+        &self.words
+    }
+}
+
+/// Iterator over the set-bit positions of a single `u64`, ascending.
+struct BitIndices {
+    word: u64,
+}
+
+impl Iterator for BitIndices {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.word == 0 {
+            return None;
+        }
+        let b = self.word.trailing_zeros() as usize;
+        self.word &= self.word - 1;
+        Some(b)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SearchParts — borrowed view of the data search needs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Borrowed view of everything compressed-domain search needs: the sorted
+/// dictionary plus the per-row code stream. Mirrors [`crate::Parts`] (the
+/// decode view) but additionally carries `code_offsets`, the row delimiters a
+/// row-wise scan requires.
+///
+/// Build one cheaply from an owned column with
+/// [`Column::as_search_parts`], or by struct literal from data
+/// deserialized out of storage.
+#[derive(Copy, Clone, Debug)]
+pub struct SearchParts<'a, O: Offset> {
+    /// Dictionary bytes (sorted token order). Mirrors [`Column::dict_bytes`].
+    pub dict_bytes: &'a [u8],
+    /// Token byte ranges into `dict_bytes`. Mirrors [`Column::dict_offsets`].
+    pub dict_offsets: &'a [u32],
+    /// Encoded tokens, row-concatenated. Mirrors [`Column::codes`].
+    pub codes: &'a [u16],
+    /// `R + 1` offsets into `codes` delimiting the `R` rows: row `r`'s codes
+    /// are `codes[code_offsets[r]..code_offsets[r + 1]]`. Mirrors
+    /// [`Column::code_offsets`].
+    pub code_offsets: &'a [O],
+}
+
+impl<O: Offset> SearchParts<'_, O> {
+    #[inline]
+    fn dict(&self) -> DictView<'_> {
+        DictView {
+            bytes: self.dict_bytes,
+            offsets: self.dict_offsets,
+        }
+    }
+
+    /// Number of rows in the view.
+    #[inline]
+    fn num_rows(&self) -> usize {
+        self.code_offsets.len().saturating_sub(1)
+    }
+
     /// Evaluate `pattern` against every row, invoking `on_match` with the
-    /// 0-based index of each matching row, in order. The match is computed in
-    /// the compressed domain — rows are never decompressed.
+    /// 0-based index of each matching row, in order. The low-level primitive
+    /// [`search`](Self::search) builds its [`RowMask`] on top of.
     pub fn search_for_each(&self, pattern: Pattern<'_>, on_match: impl FnMut(usize)) {
-        let dict = DictView {
-            bytes: &self.dict_bytes,
-            offsets: &self.dict_offsets,
-        };
+        let dict = self.dict();
         match pattern {
             Pattern::Contains(needle) => {
                 let mut aut = KmpAutomaton::new(needle, dict);
-                scan(&mut aut, &self.codes, &self.code_offsets, on_match);
+                scan(&mut aut, self.codes, self.code_offsets, on_match);
             }
             Pattern::Prefix(needle) => {
                 let mut aut = PrefixAutomaton::new(needle, dict);
-                scan(&mut aut, &self.codes, &self.code_offsets, on_match);
+                scan(&mut aut, self.codes, self.code_offsets, on_match);
             }
         }
     }
 
-    /// Evaluate `pattern` against every row and collect the indices of the
-    /// matching rows. Convenience wrapper over [`search_for_each`].
-    ///
-    /// [`search_for_each`]: Self::search_for_each
-    pub fn search(&self, pattern: Pattern<'_>) -> Vec<usize> {
-        let mut out = Vec::new();
-        self.search_for_each(pattern, |r| out.push(r));
-        out
+    /// Evaluate `pattern` against every row, returning a [`RowMask`] whose set
+    /// bits are the matching row indices. The match is computed in the
+    /// compressed domain — rows are never decompressed.
+    pub fn search(&self, pattern: Pattern<'_>) -> RowMask {
+        let mut mask = RowMask::zeros(self.num_rows());
+        self.search_for_each(pattern, |r| mask.set(r));
+        mask
+    }
+}
+
+impl<O: Offset> Column<O> {
+    /// Zero-copy [`SearchParts`] view over this column, for
+    /// [`SearchParts::search`]. Parallels [`as_parts`](Column::as_parts), but
+    /// includes `code_offsets` (the row delimiters search needs).
+    #[inline]
+    pub fn as_search_parts(&self) -> SearchParts<'_, O> {
+        SearchParts {
+            dict_bytes: &self.dict_bytes,
+            dict_offsets: &self.dict_offsets,
+            codes: &self.codes,
+            code_offsets: &self.code_offsets,
+        }
     }
 }
 
@@ -286,13 +420,20 @@ mod tests {
     fn assert_matches(rows: &[&[u8]], pattern: Pattern<'_>, expect: impl Fn(&[u8]) -> bool) {
         let (bytes, offsets) = pack(rows);
         let col = compress(&bytes, &offsets, cfg()).unwrap();
-        let got = col.search(pattern);
+        let mask = col.as_search_parts().search(pattern);
+        let got: Vec<usize> = mask.iter_ones().collect();
         let want: Vec<usize> = rows
             .iter()
             .enumerate()
             .filter_map(|(i, r)| expect(r).then_some(i))
             .collect();
         assert_eq!(got, want, "pattern {pattern:?}");
+        assert_eq!(mask.len(), rows.len());
+        assert_eq!(mask.count_ones(), want.len());
+        // `contains` agrees with the index list.
+        for i in 0..rows.len() {
+            assert_eq!(mask.contains(i), want.contains(&i));
+        }
     }
 
     /// A corpus with heavy prefix sharing and repeated substrings so the

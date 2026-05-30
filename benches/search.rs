@@ -385,7 +385,7 @@ fn prefix_needles() -> Vec<&'static Needle> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bench_search(bencher: Bencher, needle: &Needle) {
-    let col = column();
+    let parts = column().as_search_parts();
     let c = corpus();
     bencher
         .counter(BytesCount::new(c.total_bytes))
@@ -395,8 +395,10 @@ fn bench_search(bencher: Bencher, needle: &Needle) {
                 Mode::Contains => Pattern::Contains(&needle.bytes),
                 Mode::Prefix => Pattern::Prefix(&needle.bytes),
             };
+            // Count via the callback primitive so the timing reflects the scan,
+            // not the result-mask allocation.
             let mut matches = 0usize;
-            col.search_for_each(pattern, |_| matches += 1);
+            parts.search_for_each(pattern, |_| matches += 1);
             divan::black_box(matches)
         });
 }
@@ -411,11 +413,59 @@ fn prefix(bencher: Bencher, needle: &Needle) {
     bench_search(bencher, needle);
 }
 
+/// Dump the corpus and selected needles as length-prefixed little-endian
+/// binary so the C++ harness (`search_bench.cpp`) searches byte-identical
+/// inputs. Triggered by `ONPAIR_SEARCH_DUMP=<dir>`.
+///
+/// `corpus.bin`: `u64 n_rows`, then `n_rows × u32 row_len`, then the
+/// concatenated row bytes. `needles.bin`: `u32 count`, then per needle
+/// `u8 mode (0=contains,1=prefix)`, `u8 bucket_len` + bucket, `f64 sel`,
+/// `u32 len` + needle bytes.
+fn dump_for_cpp(dir: &str) {
+    use std::io::Write;
+
+    let rows = &corpus().rows;
+    let mut cf = std::io::BufWriter::new(File::create(format!("{dir}/corpus.bin")).unwrap());
+    cf.write_all(&(rows.len() as u64).to_le_bytes()).unwrap();
+    for r in rows {
+        cf.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
+    }
+    for r in rows {
+        cf.write_all(r).unwrap();
+    }
+    cf.flush().unwrap();
+
+    let needles = select_needles();
+    let mut nf = std::io::BufWriter::new(File::create(format!("{dir}/needles.bin")).unwrap());
+    nf.write_all(&(needles.len() as u32).to_le_bytes()).unwrap();
+    for n in needles {
+        let mode: u8 = match n.mode {
+            Mode::Contains => 0,
+            Mode::Prefix => 1,
+        };
+        nf.write_all(&[mode]).unwrap();
+        nf.write_all(&[n.bucket.len() as u8]).unwrap();
+        nf.write_all(n.bucket.as_bytes()).unwrap();
+        nf.write_all(&n.selectivity.to_le_bytes()).unwrap();
+        nf.write_all(&(n.bytes.len() as u32).to_le_bytes()).unwrap();
+        nf.write_all(&n.bytes).unwrap();
+    }
+    nf.flush().unwrap();
+    eprintln!(
+        "[onpair search] dumped {} rows + {} needles to {dir}",
+        rows.len(),
+        needles.len()
+    );
+}
+
 fn main() {
     // Touch corpus, column, and needles so the report prints before divan runs,
     // and cross-check the compressed-domain count against brute force.
     let _ = column();
     let rows = &corpus().rows;
+    if let Ok(dir) = env::var("ONPAIR_SEARCH_DUMP") {
+        dump_for_cpp(&dir);
+    }
     eprintln!("[onpair search] selected needles (compressed-domain vs brute-force):");
     for n in select_needles() {
         let mode = match n.mode {
@@ -423,11 +473,12 @@ fn main() {
             Mode::Prefix => "prefix",
         };
         let cd = column()
+            .as_search_parts()
             .search(match n.mode {
                 Mode::Contains => Pattern::Contains(&n.bytes),
                 Mode::Prefix => Pattern::Prefix(&n.bytes),
             })
-            .len();
+            .count_ones();
         let bf = brute_count(rows, &n.bytes, n.mode);
         let ok = if cd == bf { "ok" } else { "MISMATCH" };
         eprintln!(
