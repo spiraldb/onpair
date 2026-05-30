@@ -48,6 +48,7 @@ mod offset;
 mod parser;
 mod trainer;
 mod types;
+mod view;
 
 #[cfg(test)]
 mod test_corpus;
@@ -68,6 +69,8 @@ pub use dict::Dictionary;
 pub use offset::Offset;
 pub use parser::Parser;
 pub use types::MAX_TOKEN_SIZE;
+pub use view::FsstView;
+pub use view::FsstViewColumn;
 
 /// Compress `bytes` / `offsets` end-to-end. Equivalent to
 /// `Parser::train(..)?.parse(..)`, but validates the offsets once instead of
