@@ -28,7 +28,7 @@ use crate::column::Column;
 use crate::offset::Offset;
 use crate::types::{MAX_TOKEN_SIZE, Token};
 
-use kmp::KmpAutomaton;
+use kmp::{CLASS_DEFINITE, CLASS_OPENER, KmpAutomaton};
 use prefix::PrefixAutomaton;
 
 /// A search predicate evaluated against every row of a compressed column,
@@ -214,6 +214,25 @@ fn avx2_enabled() -> bool {
     let on = std::is_x86_feature_detected!("avx2") && std::env::var_os("ONPAIR_NO_SIMD").is_none();
     STATE.store(on as u8, Ordering::Relaxed);
     on
+}
+
+/// Reduce a row's codes to a single class via the per-token `class` table:
+/// [`CLASS_DEFINITE`] if any token contains the whole needle, else
+/// [`CLASS_OPENER`] if any token can open a match, else `0` (reject). Short-
+/// circuits on the first definite token. This is the scalar contains pass 1;
+/// the dependent `class[code]` load pipelines across the loop (no carried
+/// state), the same shape as the KMP fast path but with a one-byte verdict.
+#[inline]
+fn row_class(class: &[u8], codes: &[Token]) -> u8 {
+    let mut acc = 0u8;
+    for &c in codes {
+        let cls = class[c as usize];
+        if cls == CLASS_DEFINITE {
+            return CLASS_DEFINITE;
+        }
+        acc |= cls;
+    }
+    acc
 }
 
 /// Pass-1 accept filter: set bit `r` of `acc` iff `first_codes[r]` lies in the
@@ -570,11 +589,54 @@ impl<O: Offset> SearchParts<'_, O> {
         match pattern {
             Pattern::Contains(needle) => {
                 let aut = KmpAutomaton::new(needle, dict);
-                scan(&aut, self.codes, self.code_offsets, on_match);
+                self.scan_contains(&aut, dict.num_tokens(), on_match);
             }
             Pattern::Prefix(needle) => {
                 let aut = PrefixAutomaton::new(needle, dict);
                 self.scan_prefix(&aut, dict.num_tokens(), on_match);
+            }
+        }
+    }
+
+    /// Contains scan in two passes over the whole code stream.
+    ///
+    /// Unlike prefix (which need only inspect each row's first token), a
+    /// substring can begin at any token, so pass 1 must stream every code. Using
+    /// the KMP [`class_table`](KmpAutomaton::class_table), each row is reduced to
+    /// one of three verdicts by OR-ing its tokens' classes:
+    ///   * a [`CLASS_DEFINITE`] token present → the row matches outright (a token
+    ///     contains the whole needle); emit without a row check;
+    ///   * else a [`CLASS_OPENER`] token present → the row is a candidate; the
+    ///     exact KMP confirms it in pass 2;
+    ///   * else (all classes zero) → reject, never touching the KMP.
+    ///
+    /// The dependent-load + branch chain of the KMP fast path is thus paid only
+    /// on candidate rows, not on the (dominant at low/medium selectivity)
+    /// reject majority. Falls back to the generic per-row scan for the empty
+    /// needle, a saturated dictionary, or a malformed code stream.
+    fn scan_contains(
+        &self,
+        aut: &KmpAutomaton,
+        num_tokens: usize,
+        mut on_match: impl FnMut(usize),
+    ) {
+        let n = self.code_offsets.len() - 1;
+        if aut.is_empty_needle() || num_tokens > u16::MAX as usize + 1 {
+            scan(aut, self.codes, self.code_offsets, on_match);
+            return;
+        }
+        let class = aut.class_table();
+        for r in 0..n {
+            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
+            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+            match row_class(&class, &self.codes[s..e]) {
+                CLASS_DEFINITE => on_match(r),
+                CLASS_OPENER => {
+                    if aut.matches(&self.codes[s..e]) {
+                        on_match(r);
+                    }
+                }
+                _ => {}
             }
         }
     }
