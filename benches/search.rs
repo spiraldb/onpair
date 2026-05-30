@@ -398,7 +398,7 @@ fn bench_search(bencher: Bencher, needle: &Needle) {
             // Count via the callback primitive so the timing reflects the scan,
             // not the result-mask allocation.
             let mut matches = 0usize;
-            parts.search_for_each(pattern, |_| matches += 1);
+            parts.search_callback(pattern, |_| matches += 1);
             divan::black_box(matches)
         });
 }
@@ -411,6 +411,64 @@ fn contains(bencher: Bencher, needle: &Needle) {
 #[divan::bench(args = prefix_needles())]
 fn prefix(bencher: Bencher, needle: &Needle) {
     bench_search(bencher, needle);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Roofline baselines.
+// ─────────────────────────────────────────────────────────────────────────────
+// All report throughput against the same logical corpus bytes as the search
+// benches, so the GB/s column is directly comparable.
+//
+//   copy_all_codes      — read + write the whole codes stream (a memcpy of the
+//                          compressed payload). The "decode would at least cost
+//                          this" reference, and what prefix must beat to win.
+//   scan_all_codes       — read every code once (no early exit). The hard floor
+//                          for `contains`: it must look at every token of a
+//                          non-matching row.
+//   first_code_per_row   — read code_offsets + the first code of each row. The
+//                          floor for `prefix`, which dies after ~one token.
+
+#[divan::bench]
+fn copy_all_codes(bencher: Bencher) {
+    let codes = &column().codes;
+    let mut dst = vec![0u16; codes.len()];
+    bencher
+        .counter(BytesCount::new(corpus().total_bytes))
+        .bench_local(|| {
+            dst.copy_from_slice(codes);
+            divan::black_box(&dst);
+        });
+}
+
+#[divan::bench]
+fn scan_all_codes(bencher: Bencher) {
+    let codes = &column().codes;
+    bencher
+        .counter(BytesCount::new(corpus().total_bytes))
+        .bench_local(|| {
+            let mut acc = 0u64;
+            for &c in codes {
+                acc = acc.wrapping_add(c as u64);
+            }
+            divan::black_box(acc)
+        });
+}
+
+#[divan::bench]
+fn first_code_per_row(bencher: Bencher) {
+    let col = column();
+    bencher
+        .counter(BytesCount::new(corpus().total_bytes))
+        .counter(ItemsCount::new(corpus().rows.len()))
+        .bench_local(|| {
+            let mut acc = 0u64;
+            for w in col.code_offsets.windows(2) {
+                if w[1] > w[0] {
+                    acc ^= col.codes[w[0] as usize] as u64;
+                }
+            }
+            divan::black_box(acc)
+        });
 }
 
 /// Dump the corpus and selected needles as length-prefixed little-endian

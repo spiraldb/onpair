@@ -350,7 +350,7 @@ impl<O: Offset> SearchParts<'_, O> {
     /// Evaluate `pattern` against every row, invoking `on_match` with the
     /// 0-based index of each matching row, in order. The low-level primitive
     /// [`search`](Self::search) builds its [`RowMask`] on top of.
-    pub fn search_for_each(&self, pattern: Pattern<'_>, on_match: impl FnMut(usize)) {
+    pub fn search_callback(&self, pattern: Pattern<'_>, on_match: impl FnMut(usize)) {
         let dict = self.dict();
         match pattern {
             Pattern::Contains(needle) => {
@@ -369,7 +369,7 @@ impl<O: Offset> SearchParts<'_, O> {
     /// compressed domain — rows are never decompressed.
     pub fn search(&self, pattern: Pattern<'_>) -> RowMask {
         let mut mask = RowMask::zeros(self.num_rows());
-        self.search_for_each(pattern, |r| mask.set(r));
+        self.search_callback(pattern, |r| mask.set(r));
         mask
     }
 }
