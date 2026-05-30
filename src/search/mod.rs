@@ -647,10 +647,67 @@ impl<O: Offset> SearchParts<'_, O> {
         });
     }
 
+    /// Prefix scan that writes its result directly as a [`RowMask`] bitset,
+    /// skipping the per-row callback. Pass 1's accept predicate already produces
+    /// the matching-rows bitmap, so it is written straight into the mask words
+    /// (a contiguous SIMD store) instead of being walked bit-by-bit; only the
+    /// verify candidates are confirmed and OR'd in individually. This is the
+    /// fast path behind [`search`](Self::search) for prefix queries — at high
+    /// selectivity it avoids emitting hundreds of thousands of bits one call at
+    /// a time.
+    ///
+    /// Returns `None` when the first-token prefilter is not applicable (empty
+    /// query, missing/short index, or saturated dictionary), so the caller can
+    /// fall back to the generic callback scan.
+    fn prefix_mask(&self, aut: &PrefixAutomaton, num_tokens: usize) -> Option<RowMask> {
+        let n = self.code_offsets.len() - 1;
+        let first_codes = match self.first_codes {
+            Some(fc) if fc.len() == n && num_tokens <= u16::MAX as usize => fc,
+            _ => return None,
+        };
+        if aut.is_empty_query() {
+            return None;
+        }
+        let pf = aut.prefilter();
+        let words = n.div_ceil(64);
+        let mut acc = vec![0u64; words];
+
+        if pf.needs_verify() {
+            // Multi-token: accepts go straight into `acc`; verify candidates are
+            // confirmed and OR'd in (they are disjoint from the accept range).
+            let mut ver = vec![0u64; words];
+            prefilter_accept_verify(first_codes, pf.alo, pf.awidth, pf.vpoint, &mut acc, &mut ver);
+            for_each_set_bit(&ver, |r| {
+                let s = self.code_offsets[r].to_usize().expect("valid code offsets");
+                let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+                if aut.matches(&self.codes[s..e]) {
+                    acc[r >> 6] |= 1u64 << (r & 63);
+                }
+            });
+        } else {
+            // Single-token: the accept range is exact — pass 1 is the answer.
+            prefilter_accept(first_codes, pf.alo, pf.awidth, &mut acc);
+        }
+        Some(RowMask {
+            words: acc,
+            rows: n,
+        })
+    }
+
     /// Evaluate `pattern` against every row, returning a [`RowMask`] whose set
     /// bits are the matching row indices. The match is computed in the
     /// compressed domain — rows are never decompressed.
     pub fn search(&self, pattern: Pattern<'_>) -> RowMask {
+        // Prefix queries take the bitmap-merge fast path: the prefilter writes
+        // the result bits straight into the mask instead of via a per-row
+        // callback. Falls through to the generic callback build otherwise.
+        if let Pattern::Prefix(needle) = pattern {
+            let dict = self.dict();
+            let aut = PrefixAutomaton::new(needle, dict);
+            if let Some(mask) = self.prefix_mask(&aut, dict.num_tokens()) {
+                return mask;
+            }
+        }
         let mut mask = RowMask::zeros(self.num_rows());
         self.search_callback(pattern, |r| mask.set(r));
         mask

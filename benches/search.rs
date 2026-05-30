@@ -463,6 +463,21 @@ fn prefix(bencher: Bencher, needle: &Needle) {
     bench_search(bencher, needle);
 }
 
+/// Prefix via `search()` → `RowMask` (the bitmap-merge fast path: pass-1 accept
+/// bits are written straight into the mask, no per-row callback). Contrast with
+/// `prefix`, which exercises the per-row `search_callback` path.
+#[divan::bench(args = prefix_needles())]
+fn prefix_mask(bencher: Bencher, needle: &Needle) {
+    let parts = column().as_search_parts();
+    let c = corpus();
+    bencher
+        .counter(BytesCount::new(c.rows.len() * 2))
+        .counter(ItemsCount::new(c.rows.len()))
+        .bench_local(|| {
+            divan::black_box(parts.search(Pattern::Prefix(&needle.bytes)).count_ones())
+        });
+}
+
 /// A/B baseline: identical prefix search but with the first-token index
 /// suppressed (`first_codes = None`), forcing the generic per-row scan. The
 /// gap to `prefix` is the search index's runtime payoff.
