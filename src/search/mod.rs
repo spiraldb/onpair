@@ -631,14 +631,14 @@ impl<O: Offset> SearchParts<'_, O> {
         for r in 0..n {
             let s = self.code_offsets[r].to_usize().expect("valid code offsets");
             let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
-            match row_class(&class, &self.codes[s..e]) {
-                CLASS_DEFINITE => on_match(r),
-                CLASS_OPENER => {
-                    if aut.matches(&self.codes[s..e]) {
-                        on_match(r);
-                    }
-                }
-                _ => {}
+            // `acc` is the union of the row's token classes. A DEFINITE token
+            // (a single token containing the whole needle) is a match outright;
+            // otherwise an OPENER means run the exact KMP to confirm.
+            let acc = row_class(&class, &self.codes[s..e]);
+            if acc & CLASS_DEFINITE != 0 {
+                on_match(r);
+            } else if acc & CLASS_OPENER != 0 && aut.matches(&self.codes[s..e]) {
+                on_match(r);
             }
         }
     }
