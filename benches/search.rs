@@ -118,7 +118,10 @@ fn read_parquet_strings(path: &PathBuf) -> Option<Vec<Vec<u8>>> {
         Some(name) => schema.fields().iter().position(|f| f.name() == name)?,
         None => schema.fields().iter().position(|f| {
             use arrow_schema::DataType::*;
-            matches!(f.data_type(), Utf8 | LargeUtf8 | Utf8View)
+            matches!(
+                f.data_type(),
+                Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView
+            )
         })?,
     };
     let col_field = schema.fields().get(picked)?.clone();
@@ -147,6 +150,30 @@ fn read_parquet_strings(path: &PathBuf) -> Option<Vec<Vec<u8>>> {
             Utf8View => {
                 for s in arr.as_string_view().iter() {
                     rows.push(s.unwrap_or("").as_bytes().to_vec());
+                }
+            }
+            Binary => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()?;
+                for b in a.iter() {
+                    rows.push(b.unwrap_or(b"").to_vec());
+                }
+            }
+            LargeBinary => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeBinaryArray>()?;
+                for b in a.iter() {
+                    rows.push(b.unwrap_or(b"").to_vec());
+                }
+            }
+            BinaryView => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryViewArray>()?;
+                for b in a.iter() {
+                    rows.push(b.unwrap_or(b"").to_vec());
                 }
             }
             _ => return None,
