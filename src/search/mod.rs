@@ -216,23 +216,30 @@ fn avx2_enabled() -> bool {
     on
 }
 
-/// OR-reduce a row's codes through the per-token `class` table into the union
-/// of token classes: bit [`CLASS_DEFINITE`] set iff any token contains the whole
-/// needle, bit [`CLASS_OPENER`] set iff any token can open a match, `0` if every
-/// token is inert (reject). This is the scalar contains pass 1.
+/// OR-reduce a row's codes through the per-token `class` table into the union of
+/// their classes: the result has bit [`CLASS_DEFINITE`] set iff some token
+/// contains the whole needle, bit [`CLASS_OPENER`] set iff some token can open a
+/// match, and is `0` iff every token is inert (the row is rejected). The caller
+/// bit-tests the result.
 ///
-/// Branchless: a plain `|=` per code with no in-loop early exit, so the loop
-/// body is `load code → load class[code] → or → loop` with no data-dependent
-/// branch capping the out-of-order window. The two dependent loads across
-/// iterations are independent, so they pipeline at load-port throughput. (An
-/// early return on the first DEFINITE token was measured slower: it adds a
-/// per-code branch to win only on the rare rows that have a DEFINITE token,
-/// which are short anyway.)
+/// The early `return CLASS_DEFINITE` does double duty: it short-circuits a
+/// definite row, and — counter-intuitively — it makes this *faster* than a pure
+/// `|=` reduction. Without it LLVM "auto-vectorizes" the loop, but since
+/// `class[code]` is a scattered lookup with no hardware gather it can use, the
+/// vector path degrades to `vpmovzxwq` widen + per-lane `vmovq`/`vpextr` extract
+/// + scalar `movzbl` byte load — strictly more work than the plain scalar loop.
+/// The branch keeps LLVM scalar (one `movzwl` code load + one `movzbl`
+/// `class[code]` load per iter), which is what actually runs fast here. Verified
+/// in the emitted asm and on the bench.
 #[inline]
 fn row_class(class: &[u8], codes: &[Token]) -> u8 {
     let mut acc = 0u8;
     for &c in codes {
-        acc |= class[c as usize];
+        let cls = class[c as usize];
+        if cls == CLASS_DEFINITE {
+            return CLASS_DEFINITE;
+        }
+        acc |= cls;
     }
     acc
 }
