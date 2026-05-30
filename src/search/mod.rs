@@ -201,12 +201,41 @@ fn scan<O: Offset>(
     }
 }
 
+/// Whether the AVX2 pass-1 kernels should be used: the CPU supports AVX2 and
+/// the `ONPAIR_NO_SIMD` benchmarking escape hatch is unset. Resolved once.
+#[cfg(target_arch = "x86_64")]
+fn avx2_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(u8::MAX); // MAX = not yet resolved
+    let cached = STATE.load(Ordering::Relaxed);
+    if cached != u8::MAX {
+        return cached == 1;
+    }
+    let on = std::is_x86_feature_detected!("avx2") && std::env::var_os("ONPAIR_NO_SIMD").is_none();
+    STATE.store(on as u8, Ordering::Relaxed);
+    on
+}
+
 /// Pass-1 accept filter: set bit `r` of `acc` iff `first_codes[r]` lies in the
-/// inclusive accept range `[alo, alo + awidth]` (unsigned). Fully branchless —
-/// `(fc - alo) <= awidth` lowers to a `sub` + unsigned compare with no branch,
-/// accumulated into one bitset word per 64 rows.
+/// inclusive accept range `[alo, alo + awidth]` (unsigned). Branchless;
+/// dispatches to AVX2 when available. Precondition for the SIMD path: the range
+/// is non-empty (`alo <= u16::MAX`), which holds for every single-token query.
 #[inline]
 fn prefilter_accept(first_codes: &[u16], alo: u32, awidth: u32, acc: &mut [u64]) {
+    #[cfg(target_arch = "x86_64")]
+    if alo <= u16::MAX as u32 && avx2_enabled() {
+        // SAFETY: avx2 just confirmed present.
+        unsafe { prefilter_accept_avx2(first_codes, alo as u16, awidth as u16, acc) };
+        return;
+    }
+    prefilter_accept_scalar(first_codes, alo, awidth, acc);
+}
+
+/// Scalar fully-branchless accept filter: `(fc - alo) <= awidth` lowers to a
+/// `sub` + unsigned compare with no branch, accumulated into one bitset word
+/// per 64 rows.
+#[inline]
+fn prefilter_accept_scalar(first_codes: &[u16], alo: u32, awidth: u32, acc: &mut [u64]) {
     for (word, chunk) in acc.iter_mut().zip(first_codes.chunks(64)) {
         let mut w = 0u64;
         for (i, &fc) in chunk.iter().enumerate() {
@@ -218,9 +247,39 @@ fn prefilter_accept(first_codes: &[u16], alo: u32, awidth: u32, acc: &mut [u64])
 
 /// Pass-1 accept + verify filter: as [`prefilter_accept`], but also sets bit
 /// `r` of `ver` iff `first_codes[r] == vpoint`. The two predicates are disjoint
-/// (`vpoint < alo`), so no row lands in both. Fully branchless.
+/// (`vpoint < alo`), so no row lands in both. Branchless; dispatches to AVX2.
 #[inline]
 fn prefilter_accept_verify(
+    first_codes: &[u16],
+    alo: u32,
+    awidth: u32,
+    vpoint: u32,
+    acc: &mut [u64],
+    ver: &mut [u64],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        // An empty accept range (alo > u16::MAX) is encoded by disabling the
+        // accept compare; vpoint is always a real `u16` here (multi-token q0).
+        let (alo16, awidth16, aenable) = if alo <= u16::MAX as u32 {
+            (alo as u16, awidth as u16, 0xFFFFu16)
+        } else {
+            (0, 0, 0)
+        };
+        // SAFETY: avx2 just confirmed present.
+        unsafe {
+            prefilter_accept_verify_avx2(
+                first_codes, alo16, awidth16, aenable, vpoint as u16, acc, ver,
+            )
+        };
+        return;
+    }
+    prefilter_accept_verify_scalar(first_codes, alo, awidth, vpoint, acc, ver);
+}
+
+/// Scalar fully-branchless accept + verify filter.
+#[inline]
+fn prefilter_accept_verify_scalar(
     first_codes: &[u16],
     alo: u32,
     awidth: u32,
@@ -251,6 +310,122 @@ fn for_each_set_bit(words: &[u64], mut f: impl FnMut(usize)) {
             f(base + bits.trailing_zeros() as usize);
             bits &= bits - 1;
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AVX2 pass-1 kernels. The range filter over the contiguous first-token table
+// is a pure SIMD shape: one `sub` + unsigned compare per lane, 16 u16 rows per
+// vector, packed straight into the candidate bitset words.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+/// Reduce 16 `u16` lanes that are each `0xFFFF` (true) or `0x0000` (false) to a
+/// 16-bit mask, bit `i` from lane `i`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn movemask_epu16(v: __m256i) -> u32 {
+    // Saturating pack i16->i8 maps 0xFFFF (-1) -> 0xFF and 0 -> 0, preserving
+    // lane order across the two 128-bit halves, then one byte movemask.
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256::<1>(v);
+    _mm_movemask_epi8(_mm_packs_epi16(lo, hi)) as u32
+}
+
+/// Lanewise `(fc - alo) <= awidth`, unsigned, as a `0xFFFF`/`0` mask vector.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn in_range_epu16(v: __m256i, valo: __m256i, vawidth: __m256i) -> __m256i {
+    let sub = _mm256_sub_epi16(v, valo);
+    // Unsigned `sub <= awidth` == `min_epu16(sub, awidth) == sub`.
+    _mm256_cmpeq_epi16(_mm256_min_epu16(sub, vawidth), sub)
+}
+
+/// AVX2 accept filter; see [`prefilter_accept`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn prefilter_accept_avx2(first_codes: &[u16], alo: u16, awidth: u16, acc: &mut [u64]) {
+    let valo = _mm256_set1_epi16(alo as i16);
+    let vawidth = _mm256_set1_epi16(awidth as i16);
+    let n = first_codes.len();
+    let ptr = first_codes.as_ptr();
+    let mut r = 0usize;
+    let mut wi = 0usize;
+    while r + 64 <= n {
+        let mut word = 0u64;
+        for k in 0..4 {
+            // SAFETY: r + k*16 + 16 <= r + 64 <= n, in bounds; both helpers are
+            // avx2, confirmed present.
+            let v = unsafe { _mm256_loadu_si256(ptr.add(r + k * 16) as *const __m256i) };
+            let m = unsafe { movemask_epu16(in_range_epu16(v, valo, vawidth)) };
+            word |= (m as u64) << (k * 16);
+        }
+        acc[wi] = word;
+        wi += 1;
+        r += 64;
+    }
+    if r < n {
+        prefilter_accept_scalar(&first_codes[r..], alo as u32, awidth as u32, &mut acc[wi..]);
+    }
+}
+
+/// AVX2 accept + verify filter; see [`prefilter_accept_verify`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn prefilter_accept_verify_avx2(
+    first_codes: &[u16],
+    alo: u16,
+    awidth: u16,
+    aenable: u16,
+    vpoint: u16,
+    acc: &mut [u64],
+    ver: &mut [u64],
+) {
+    let valo = _mm256_set1_epi16(alo as i16);
+    let vawidth = _mm256_set1_epi16(awidth as i16);
+    let vaenable = _mm256_set1_epi16(aenable as i16);
+    let vvpoint = _mm256_set1_epi16(vpoint as i16);
+    let n = first_codes.len();
+    let ptr = first_codes.as_ptr();
+    let mut r = 0usize;
+    let mut wi = 0usize;
+    while r + 64 <= n {
+        let mut accword = 0u64;
+        let mut verword = 0u64;
+        for k in 0..4 {
+            // SAFETY: r + k*16 + 16 <= r + 64 <= n, in bounds; helpers are avx2.
+            let v = unsafe { _mm256_loadu_si256(ptr.add(r + k * 16) as *const __m256i) };
+            // Accept, masked off when the range is empty (aenable == 0).
+            let accl = _mm256_and_si256(unsafe { in_range_epu16(v, valo, vawidth) }, vaenable);
+            let verl = _mm256_cmpeq_epi16(v, vvpoint);
+            accword |= (unsafe { movemask_epu16(accl) } as u64) << (k * 16);
+            verword |= (unsafe { movemask_epu16(verl) } as u64) << (k * 16);
+        }
+        acc[wi] = accword;
+        ver[wi] = verword;
+        wi += 1;
+        r += 64;
+    }
+    if r < n {
+        // Reproduce the empty-range encoding for the scalar tail: alo = u32::MAX
+        // makes `(fc - alo) <= 0` false for every real first code.
+        let (talo, tawidth) = if aenable != 0 {
+            (alo as u32, awidth as u32)
+        } else {
+            (u32::MAX, 0)
+        };
+        prefilter_accept_verify_scalar(
+            &first_codes[r..],
+            talo,
+            tawidth,
+            vpoint as u32,
+            &mut acc[wi..],
+            &mut ver[wi..],
+        );
     }
 }
 

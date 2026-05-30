@@ -403,8 +403,15 @@ fn prefix_needles() -> Vec<&'static Needle> {
 fn bench_search(bencher: Bencher, needle: &Needle) {
     let parts = column().as_search_parts();
     let c = corpus();
+    // Throughput is reported over the bytes the scan must stream and the rows
+    // it covers. `Contains` walks the whole code stream; `Prefix` (with the
+    // index) streams only the first-code table (2 B/row) in pass 1.
+    let bytes_scanned = match needle.mode {
+        Mode::Contains => parts.codes.len() * 2,
+        Mode::Prefix => c.rows.len() * 2,
+    };
     bencher
-        .counter(BytesCount::new(c.total_bytes))
+        .counter(BytesCount::new(bytes_scanned))
         .counter(ItemsCount::new(c.rows.len()))
         .bench_local(|| {
             let pattern = match needle.mode {
@@ -437,8 +444,10 @@ fn prefix_no_index(bencher: Bencher, needle: &Needle) {
     let mut parts = column().as_search_parts();
     parts.first_codes = None;
     let c = corpus();
+    // Same denominator as `prefix` (rows × 2) so the two are directly
+    // comparable, though the no-index path actually streams the code stream.
     bencher
-        .counter(BytesCount::new(c.total_bytes))
+        .counter(BytesCount::new(c.rows.len() * 2))
         .counter(ItemsCount::new(c.rows.len()))
         .bench_local(|| {
             let mut matches = 0usize;
