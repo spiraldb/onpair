@@ -43,6 +43,7 @@ use onpair::Column;
 use onpair::Config;
 use onpair::Pattern;
 use onpair::Threshold;
+use arrow_array::cast::AsArray;
 use onpair::compress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
