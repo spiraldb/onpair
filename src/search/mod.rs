@@ -223,14 +223,14 @@ fn avx2_enabled() -> bool {
 /// bit-tests the result.
 ///
 /// The early `return CLASS_DEFINITE` does double duty: it short-circuits a
-/// definite row, and — counter-intuitively — it makes this *faster* than a pure
-/// `|=` reduction. Without it LLVM "auto-vectorizes" the loop, but since
-/// `class[code]` is a scattered lookup with no hardware gather it can use, the
-/// vector path degrades to `vpmovzxwq` widen + per-lane `vmovq`/`vpextr` extract
-/// + scalar `movzbl` byte load — strictly more work than the plain scalar loop.
-/// The branch keeps LLVM scalar (one `movzwl` code load + one `movzbl`
-/// `class[code]` load per iter), which is what actually runs fast here. Verified
-/// in the emitted asm and on the bench.
+/// definite row, and (counter-intuitively) it makes this faster than a pure
+/// `|=` reduction. Without the branch LLVM auto-vectorizes the loop, but
+/// `class[code]` is a scattered lookup with no hardware gather, so the vector
+/// path degrades to a `vpmovzxwq` widen, a per-lane `vmovq`/`vpextr` extract,
+/// and a scalar `movzbl` byte load per element: strictly more work than the
+/// plain scalar loop. The branch keeps LLVM scalar (one `movzwl` plus one
+/// `movzbl` per iteration), which is what runs fast. Verified in the emitted
+/// asm and on the bench.
 #[inline]
 fn row_class(class: &[u8], codes: &[Token]) -> u8 {
     let mut acc = 0u8;
@@ -642,9 +642,9 @@ impl<O: Offset> SearchParts<'_, O> {
             // (a single token containing the whole needle) is a match outright;
             // otherwise an OPENER means run the exact KMP to confirm.
             let acc = row_class(&class, &self.codes[s..e]);
-            if acc & CLASS_DEFINITE != 0 {
-                on_match(r);
-            } else if acc & CLASS_OPENER != 0 && aut.matches(&self.codes[s..e]) {
+            let hit = acc & CLASS_DEFINITE != 0
+                || (acc & CLASS_OPENER != 0 && aut.matches(&self.codes[s..e]));
+            if hit {
                 on_match(r);
             }
         }
