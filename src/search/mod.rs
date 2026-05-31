@@ -890,6 +890,85 @@ mod tests {
         eprintln!("         {total_sparse} sparse exception ranges across the partial-match states.");
     }
 
+    /// Temporary: measure the selectivity of the SIMD-able INNER filter — a row
+    /// is a candidate iff it has a DEFINITE token or an INNER token (one covered
+    /// by a sparse continuation range, which are contiguous id ranges). This is
+    /// a sound necessary filter (the token completing any match is DEFINITE or
+    /// INNER), and unlike the open-set it IS range-testable with SIMD. Compares
+    /// its candidate rate to the current adjacency chain.
+    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
+    ///   cargo test --lib inner_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn inner_probe() {
+        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
+        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
+        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let mut o = 8;
+        let mut lens = Vec::with_capacity(n);
+        for _ in 0..n {
+            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
+            o += 4;
+        }
+        let mut bytes = Vec::new();
+        let mut offs = vec![0u32];
+        for &l in &lens {
+            bytes.extend_from_slice(&raw[o..o + l]);
+            o += l;
+            offs.push(bytes.len() as u32);
+        }
+        let col = compress(
+            &bytes,
+            &offs,
+            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+        )
+        .unwrap();
+        let parts = col.as_search_parts();
+        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let nt = dict.num_tokens();
+        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
+        let (base_runs, per_state) = aut.dump_dfa();
+        // INNER set: DEFINITE tokens (base==m) + every token in a sparse range
+        // whose target != 0. Collect the contiguous INNER ranges (these are what
+        // SIMD range-tests check).
+        let m = needle.len() as u8;
+        let mut inner = vec![false; nt];
+        let mut ranges: Vec<(u16, u16)> = Vec::new();
+        for &(lo, hi, t) in &base_runs {
+            if t == m {
+                for i in lo..=hi { inner[i as usize] = true; }
+                ranges.push((lo as u16, hi as u16));
+            }
+        }
+        for trs in &per_state {
+            for &(lo, hi, t) in trs {
+                if t != 0 {
+                    for i in lo..=hi { inner[i as usize] = true; }
+                    ranges.push((lo, hi));
+                }
+            }
+        }
+        ranges.sort_unstable();
+        let n_inner: usize = inner.iter().filter(|&&b| b).count();
+        // Per-row: candidate iff any INNER token present.
+        let codes = parts.codes;
+        let co = parts.code_offsets;
+        let mut cand_inner = 0usize;
+        for r in 0..co.len() - 1 {
+            let (s, e) = (co[r] as usize, co[r + 1] as usize);
+            if codes[s..e].iter().any(|&c| inner[c as usize]) { cand_inner += 1; }
+        }
+        let rows = co.len() - 1;
+        eprintln!("=== INNER (SIMD-rangeable) filter for {needle:?} ===");
+        eprintln!("INNER tokens: {n_inner} in {} contiguous ranges (SIMD: {} lt/gt range tests)",
+            ranges.len(), ranges.len());
+        eprintln!("ranges: {ranges:?}");
+        eprintln!("candidate rows (INNER present): {cand_inner} / {rows} ({:.2}%)",
+            100.0 * cand_inner as f64 / rows as f64);
+        eprintln!("(for comparison the adjacency chain marked ~0.5% candidate on i.yandex)");
+    }
+
     /// Pack rows into the Arrow `(bytes, offsets)` pair `compress` expects.
     fn pack(rows: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
         let mut bytes = Vec::new();
