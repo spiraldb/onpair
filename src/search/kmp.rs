@@ -260,10 +260,28 @@ impl KmpAutomaton {
                 i += 1;
             }
         }
-        // Sparse continuation ranges (non-dead target).
-        for tr in &self.sparse {
-            if tr.target != 0 {
-                raw.push((tr.range.begin, tr.range.last));
+        // Completing sparse transitions only (target == match state), and only
+        // from a boundary-reachable entry state. Two sound tightenings:
+        //  1. A row matches iff some boundary reaches `m`; the token completing
+        //     that step enters from state 0 (DEFINITE, above) or via a sparse
+        //     transition with target `m`. Partial→partial transitions can never
+        //     be the completing token, so dropping them adds no false negative.
+        //  2. A completing transition from entry state `s` can only fire if a
+        //     boundary ever lands on `s`. `reachable_states` over-approximates
+        //     the reachable boundary states from the dictionary alone, so
+        //     skipping transitions from unreachable `s` drops no true match.
+        // Both only ever remove false positives — KMP still confirms survivors.
+        let reach = self.reachable_states();
+        for s in 1..m as usize {
+            if !reach[s] {
+                continue;
+            }
+            let lo = self.offsets[s] as usize;
+            let hi = self.offsets[s + 1] as usize;
+            for tr in &self.sparse[lo..hi] {
+                if tr.target == m {
+                    raw.push((tr.range.begin, tr.range.last));
+                }
             }
         }
         if raw.is_empty() {
@@ -286,6 +304,47 @@ impl KmpAutomaton {
         } else {
             Some(merged)
         }
+    }
+
+    /// The set of DFA states that can occur at a token boundary, as a sound
+    /// over-approximation computed from the dictionary alone (no row data).
+    ///
+    /// Fixpoint over the real per-token transition function: state 0 (row start
+    /// / KMP death) is always reachable; state `s'` is reachable if some
+    /// boundary-reachable state `s` has a token `t` with `step(s, t) == s'`.
+    ///
+    /// Soundness: any boundary an actual row reaches is the image of a
+    /// (previous boundary state, token) pair, so it is included. This does NOT
+    /// model LPM (greedy tokenisation never taking a shorter token when a longer
+    /// one fits), so it can mark a state reachable that LPM forbids in practice
+    /// — that only adds false positives to a prefilter built from it, never a
+    /// false negative.
+    fn reachable_states(&self) -> Vec<bool> {
+        let m = self.match_state as usize;
+        let mut reach = vec![false; m + 1];
+        reach[0] = true;
+        let nt = self.base.len();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for s in 0..m {
+                if !reach[s] {
+                    continue;
+                }
+                for t in 0..nt {
+                    let ns = if s == 0 {
+                        self.base[t] as usize
+                    } else {
+                        self.next_state(s as State, t as Token) as usize
+                    };
+                    if !reach[ns] {
+                        reach[ns] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        reach
     }
 
     /// Whether the needle is empty (matches every row); the prefilter is skipped
