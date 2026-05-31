@@ -201,6 +201,36 @@ Even at 100% match the DEFINITE-token shortcut settles many rows without the ful
 KMP, and rejecting inert tokens still trims work — so the prefilter helps in both
 regimes. No crossover ⇒ no adaptive switch. Gate removed.
 
+## Experiment #10 / #8 — TPC-H search + corpus characterization
+
+Ran prefix/contains on real TPC-H string columns (added `tpch_dump_parquet` to
+benches/tpch.rs: ONPAIR_TPCH_DUMP_PATH dumps a column to parquet for the search
+bench). SF1, bits=16, cross-checks pass:
+
+| corpus / query              | sel   | onpair  | arrow(memmem) | dec+arrow |
+|-----------------------------|-------|---------|---------------|-----------|
+| l_comment %carefully%       | 9.6%  | 35.4 ms | 70.0 ms       | 161 ms    |
+| l_comment %the%             | 34.5% | 38.7 ms | 76.1 ms       | 164 ms    |
+| l_comment final%  (prefix)  | 0.5%  | 363 us  | 16.9 ms       | 105 ms    |
+| p_name %red%                | 5.5%  | 2.11 ms | 4.22 ms       | 5.68 ms   |
+| p_name antique% (prefix)    | 1.1%  | 782 us  | 1.04 ms       | 2.44 ms   |
+
+**Key finding — row length decides contains, and TPC-H flips the FineWeb loss:**
+onpair contains is ~2x FASTER than memmem-on-decompressed on l_comment (35 vs
+70 ms), the opposite of FineWeb (3-4x loss). The driver is codes/row:
+- TPC-H l_comment: ~2.5 codes/row (short) → chain prefilter dominates → win.
+- URLs: ~9.5 codes/row → ~tie.
+- FineWeb: ~499 codes/row (long docs) → per-code scalar-gather wall → loss.
+So compressed-domain contains beats in-memory memmem for SHORT-row corpora and
+loses for long-document corpora. Prefix wins everywhere (TPC-H final% ~46x).
+
+**Index-cost model: first_codes = rows*2, scales with ROW COUNT not data size.**
+Relative index cost: l_comment +14.8% (2.5M short rows), URL +7.2%, FineWeb
++0.07% (50k long rows). So the prefix index is cheapest exactly where rows are
+long (and is essentially free there), and priciest for many-short-rows columns —
+the inverse of where contains needs help. An "auto-enable index" heuristic could
+gate on rows-per-byte if size matters.
+
 ## Public API (matcher)
 
 - `Column::as_search_parts() -> SearchParts` (or build `SearchParts` by struct
