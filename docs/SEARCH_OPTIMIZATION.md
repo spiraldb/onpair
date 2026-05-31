@@ -153,6 +153,25 @@ to AVX2 then scalar. `ONPAIR_NO_AVX512` forces AVX2 for A/B; `ONPAIR_NO_SIMD`
 forces scalar. Lesson: do not assume memory-bound — the scalar A/B is the cheap
 test for compute-vs-bandwidth before writing a wider kernel.
 
+## Experiment #2 — packed/narrower first_codes index: NOT WORTH IT
+
+Hypothesis: the u16 first_codes index (rows*2 bytes) could be packed narrower,
+saving size and AVX bandwidth. **Two parts, both negative:**
+
+- **Fixed-width bit-packing: dead.** Measured (`first_codes_dist` probe): on
+  ClickBench URL the max first-token id is 45739 → needs the full 16 bits. No
+  fixed width below 16 fits, so bit-packing saves nothing.
+- **Order-preserving u8 remap: possible but narrow, not built.** URL has only 138
+  *distinct* first-token ids, so an order-preserving rank remap to u8 would fit
+  (index 2MB→1MB, 2x SIMD lanes, range test preserved). BUT FineWeb has 7828
+  distinct first-ids → does NOT fit u8, needs u16, no remap. So the win is
+  corpus-dependent (low-cardinality-first-token columns only) and requires a
+  remap table + query-range translation + a u8 kernel + a >256 fallback —
+  substantial machinery for a ~3.5% size cut (2MB on a 27MB column) and a
+  speculative speed gain on a path that is already fast (273us) and compute-bound.
+  Recall #3 proved prefix is compute- not bandwidth-bound, so "less bandwidth"
+  was never the win anyway. Verdict: not worth the complexity.
+
 ## Public API (matcher)
 
 - `Column::as_search_parts() -> SearchParts` (or build `SearchParts` by struct

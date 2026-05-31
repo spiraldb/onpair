@@ -1157,6 +1157,43 @@ mod tests {
         }
     }
 
+    /// EXPERIMENT #2 (packed first_codes). Measure the value distribution of the
+    /// per-row first-token ids: max id, bits needed, and how many distinct ids —
+    /// to judge whether the u16 first_codes index can be packed narrower.
+    /// ONPAIR_CORPUS=/tmp/cppdump/corpus.bin cargo test --lib first_codes_dist
+    ///   -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn first_codes_dist() {
+        let col = load_corpus_col();
+        let fc = col.first_codes.as_ref().expect("index built");
+        let n = fc.len();
+        let mut max = 0u16;
+        let mut distinct = std::collections::HashSet::new();
+        let mut hist = [0usize; 17]; // bits-needed histogram
+        for &c in fc {
+            if c != u16::MAX {
+                max = max.max(c);
+                distinct.insert(c);
+                let bits = (16 - (c | 1).leading_zeros()) as usize;
+                hist[bits] += 1;
+            }
+        }
+        let bits_needed = 32 - (max as u32 | 1).leading_zeros();
+        eprintln!("=== first_codes distribution ({n} rows) ===");
+        eprintln!("max id = {max}  → {bits_needed} bits needed for the widest");
+        eprintln!("distinct first ids = {}", distinct.len());
+        eprintln!("u16 index size = {} KiB; at {bits_needed}-bit packing = {} KiB",
+            n * 2 / 1024, n * bits_needed as usize / 8 / 1024);
+        eprintln!("bits-needed histogram (rows whose first id needs k bits):");
+        for (k, &c) in hist.iter().enumerate() {
+            if c > 0 {
+                eprintln!("  {k:>2} bits: {c} rows ({:.1}%)", 100.0 * c as f64 / n as f64);
+            }
+        }
+    }
+
     /// Load the dumped corpus, compress it, and return the owned column.
     #[cfg(test)]
     fn load_corpus_col() -> Column<u32> {
