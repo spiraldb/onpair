@@ -28,7 +28,9 @@ view" kernel) but expressed in this crate's types.
 - `decompress_view(parts, code_offsets)` — decode `values` (== `decompress`) plus
   per-row `offsets`, recovering row boundaries from the compressor's
   `code_offsets` (a token may straddle a row boundary, so rows can't be recovered
-  from codes alone).
+  from codes alone). Two passes over the codes: `row_byte_offsets` (which also
+  yields the total decoded length and validates the code range) then an
+  *unchecked* decode. It validates the dictionary once up front.
 - `row_byte_offsets(parts, code_offsets)` — the per-row offset prefix sum alone
   (no values).
 - `build_views(view)` / `build_views_into(view, &mut out)` — one `BinaryView`
@@ -91,6 +93,27 @@ RUSTC_WRAPPER= cargo bench --bench view_compute build_views_only \
 ```
 
 (`RUSTC_WRAPPER=` only needed if sccache errors in the sandbox.)
+
+## Measured negative results — do NOT re-try
+
+- **`build_views`: carry `start = previous end` to read each offset once.** The
+  two per-row offset reads (`offsets[r]`, `offsets[r+1]`) look redundant, but
+  carrying `end` forward serializes the loop (a loop-carried dependency through
+  `start`) and measured *slower*: url_short 354→447 µs, words 496→820 µs. The
+  independent loads have no cross-iteration dependency, so the out-of-order
+  engine keeps many iterations in flight. The kernel is near store-bandwidth
+  bound; removing the "redundant" load loses ILP. Reverted.
+
+## Done this round (perf)
+
+- **`decompress_view`: 3 passes → 2.** It used to call `crate::decompress`
+  (which itself walks all codes once for `decompressed_len` to size the buffer,
+  then again to decode with per-code bounds checks) and *then* `row_byte_offsets`
+  — three full passes computing the same length sums twice. Now: validate the
+  dictionary once, `row_byte_offsets` (one pass; gives offsets + total + code
+  range validation), then an *unchecked* decode (one pass, no per-code branch).
+  View overhead vs the flat decode dropped from ~35 % (url_short) / ~90 %
+  (words) to ~5 % / ~30 %.
 
 ## Not done / next ideas (unmeasured — measure before keeping)
 

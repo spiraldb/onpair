@@ -239,6 +239,10 @@ impl std::fmt::Debug for BinaryView {
 /// identical to [`crate::decompress`]; the added work is the per-row offset
 /// prefix sum over the codes' token lengths.
 ///
+/// Single offset + single decode pass: [`row_byte_offsets`] yields both the
+/// per-row offsets and the total decoded length (so no separate length pass) and
+/// panics on any out-of-range code (so the decode below runs unchecked).
+///
 /// ## Panics
 ///
 /// Panics if `parts` is malformed (see [`Parts::validate`]) or if `code_offsets`
@@ -247,13 +251,24 @@ impl std::fmt::Debug for BinaryView {
 /// [`Column::code_offsets`]: crate::Column::code_offsets
 #[must_use]
 pub fn decompress_view<O: Offset>(parts: Parts<'_>, code_offsets: &[O]) -> DecodedView {
-    let values = crate::decompress(parts);
+    // The unchecked decode below over-reads the dictionary (fixed 16-byte token
+    // reads), so the padding invariant must hold; validate it once, off the hot
+    // loop. Code range is validated by `row_byte_offsets` (it indexes the
+    // dictionary per code), so the decode needs no per-code bounds check.
+    if let Err(e) = parts.validate_dictionary() {
+        panic!("onpair: {e}");
+    }
     let offsets = row_byte_offsets(parts, code_offsets);
-    debug_assert_eq!(
-        offsets.last().copied().unwrap_or(0) as usize,
-        values.len(),
-        "row offsets must cover the decoded values"
-    );
+    let total = offsets.last().copied().unwrap_or(0) as usize;
+    let mut values: Vec<u8> = Vec::with_capacity(total);
+    // SAFETY: the dictionary is validated (padding ⇒ the over-copy decode's
+    // fixed-width reads are in bounds); `row_byte_offsets` panicked unless every
+    // code indexes the dictionary; and `total` is the exact decoded length, so
+    // the output store cannot overrun.
+    let n = unsafe { crate::decompress_into_unchecked(parts, values.spare_capacity_mut()) };
+    debug_assert_eq!(n, total, "decoded length must equal the row offsets total");
+    // SAFETY: `decompress_into_unchecked` initialized exactly `n` bytes.
+    unsafe { values.set_len(n) };
     DecodedView { values, offsets }
 }
 
@@ -353,6 +368,11 @@ pub fn build_views_into(view: &DecodedView, out: &mut Vec<BinaryView>) {
     let vbase = values.as_ptr();
     let dst = out.as_mut_ptr();
     let mut r = 0usize;
+    // `start` and `end` are read independently per row rather than carried
+    // (`start = previous end`): the independent loads have no loop-carried
+    // dependency, so the out-of-order engine keeps many iterations in flight.
+    // Carrying `end` forward to save one load measured *slower* (it serializes
+    // the loop) — measure before "deduplicating" this read.
     while r < rows {
         let start = offsets[r] as usize;
         if safe_end.is_none_or(|se| start > se) {
