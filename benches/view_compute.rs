@@ -115,34 +115,6 @@ fn decompress_view_full(bencher: Bencher, param: (&'static str, u8)) {
         .bench(|| divan::black_box(decompress_view(col.as_parts(), &col.code_offsets)));
 }
 
-/// The previous two-pass `decompress_view` (offsets via `dict_offsets`, then a
-/// separate unchecked decode that builds its own fat table), reconstructed from
-/// the public API. Kept as a controlled A/B baseline for the fat-shared
-/// `decompress_view_full` in the same binary.
-fn decompress_view_prev<O: onpair::Offset>(
-    parts: onpair::Parts<'_>,
-    code_offsets: &[O],
-) -> (Vec<u8>, Vec<u32>) {
-    parts.validate_dictionary().expect("valid dict");
-    let offsets = row_byte_offsets(parts, code_offsets);
-    let total = offsets.last().copied().unwrap_or(0) as usize;
-    let mut values: Vec<u8> = Vec::with_capacity(total);
-    // SAFETY: dict validated; row_byte_offsets validated code range; total is the
-    // exact decoded length.
-    let n = unsafe { onpair::decompress_into_unchecked(parts, values.spare_capacity_mut()) };
-    unsafe { values.set_len(n) };
-    (values, offsets)
-}
-
-#[divan::bench(args = PARAMS)]
-fn decompress_view_prev_2pass(bencher: Bencher, param: (&'static str, u8)) {
-    let (kind, bits) = param;
-    let (c, col) = build_column(kind, bits);
-    bencher
-        .counter(BytesCount::new(c.total_bytes))
-        .bench(|| divan::black_box(decompress_view_prev(col.as_parts(), &col.code_offsets)));
-}
-
 #[divan::bench(args = PARAMS)]
 fn build_views_only(bencher: Bencher, param: (&'static str, u8)) {
     let (kind, bits) = param;

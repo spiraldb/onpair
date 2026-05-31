@@ -195,7 +195,7 @@ impl Parts<'_> {
 /// Panic helper for the safe decoders: assert the dictionary is valid before
 /// running the (otherwise unchecked) decode loop.
 #[inline]
-fn assert_valid_dictionary(parts: Parts<'_>) {
+pub(crate) fn assert_valid_dictionary(parts: Parts<'_>) {
     if let Err(e) = parts.validate_dictionary() {
         panic!("onpair: {e}");
     }
