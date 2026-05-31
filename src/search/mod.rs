@@ -797,8 +797,19 @@ impl<O: Offset> SearchParts<'_, O> {
 
     /// SIMD INNER contains scan. Pass 1 marks each code that lies in any INNER
     /// range (AVX2 multi-range test over the whole stream) into a per-code
-    /// bitset; pass 2 visits rows holding a marked code and confirms with the
-    /// exact KMP. INNER presence is a sound necessary condition for a match.
+    /// bitset; pass 2 confirms the rows that hold a marked code with the exact
+    /// KMP. INNER presence is a sound necessary condition for a match.
+    ///
+    /// Pass 2 is chosen by how selective pass 1 was. When the filter is sparse
+    /// (the win after LPM pruning — `%google%` marks only a few hundred of ~9.5M
+    /// codes), it walks the *set bits* and binary-searches each to its row,
+    /// skipping the reject-row majority entirely — far cheaper than the per-row
+    /// `any_bit_in_range` scan, which paid ~22 instructions for every one of the
+    /// 1M rows regardless of hits. When the filter is dense it falls back to that
+    /// per-row scan, which is cheaper than touching every (then numerous) set
+    /// bit. The SIMD `classify_inner` pass is kept either way: rows are too short
+    /// (~9.5 codes on URLs) to vectorise a per-row range test, so classifying the
+    /// flat code stream is what keeps pass 1 in AVX2.
     fn scan_contains_inner(
         &self,
         aut: &KmpAutomaton,
@@ -809,9 +820,30 @@ impl<O: Offset> SearchParts<'_, O> {
         let words = m.div_ceil(64);
         let mut inner_bits = vec![0u64; words];
         classify_inner(self.codes, ranges, &mut inner_bits);
-        for r in 0..self.code_offsets.len() - 1 {
-            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
-            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+        let co = self.code_offsets;
+        let nrows = co.len() - 1;
+        let set: usize = inner_bits.iter().map(|w| w.count_ones() as usize).sum();
+        // Sparse: visit only marked codes; map each to its row by binary search
+        // (set bits ascend, so rows ascend — dedup consecutive hits in one row).
+        if set <= nrows / 4 {
+            let mut last = usize::MAX;
+            for_each_set_bit(&inner_bits, |ci| {
+                let r = co.partition_point(|o| o.to_usize().expect("valid code offsets") <= ci) - 1;
+                if r != last {
+                    last = r;
+                    let s = co[r].to_usize().expect("valid code offsets");
+                    let e = co[r + 1].to_usize().expect("valid code offsets");
+                    if aut.matches(&self.codes[s..e]) {
+                        on_match(r);
+                    }
+                }
+            });
+            return;
+        }
+        // Dense: the per-row scan touches fewer elements than the set bits would.
+        for r in 0..nrows {
+            let s = co[r].to_usize().expect("valid code offsets");
+            let e = co[r + 1].to_usize().expect("valid code offsets");
             if any_bit_in_range(&inner_bits, s, e) && aut.matches(&self.codes[s..e]) {
                 on_match(r);
             }
