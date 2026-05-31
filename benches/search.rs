@@ -333,6 +333,32 @@ fn select_needles() -> &'static [Needle] {
     static NEEDLES: OnceLock<Vec<Needle>> = OnceLock::new();
     NEEDLES.get_or_init(|| {
         let rows = &corpus().rows;
+
+        // Explicit override: `ONPAIR_NEEDLES="contains:google,prefix:http://"`.
+        // Each spec is `mode:text` (mode = contains|prefix); the bucket label is
+        // the literal text so the report and the C++ dump name it. Real
+        // selectivity is computed over the full corpus. Lets a specific query
+        // (e.g. the ClickBench `URL LIKE '%google%'`) be benchmarked directly.
+        if let Ok(spec) = env::var("ONPAIR_NEEDLES") {
+            let mut out = Vec::new();
+            for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let (mode, text) = match item.split_once(':') {
+                    Some(("prefix", t)) => (Mode::Prefix, t),
+                    Some(("contains", t)) => (Mode::Contains, t),
+                    _ => panic!("ONPAIR_NEEDLES item must be `contains:TEXT` or `prefix:TEXT`, got {item:?}"),
+                };
+                let bytes = text.as_bytes().to_vec();
+                let sel = brute_count(rows, &bytes, mode) as f64 / rows.len() as f64;
+                out.push(Needle {
+                    bucket: Box::leak(text.to_string().into_boxed_str()),
+                    mode,
+                    bytes,
+                    selectivity: sel,
+                });
+            }
+            return out;
+        }
+
         // Deterministic sampler shared across phases.
         let mut x = 0xD1B54A32D192ED03u64;
         let mut next = |bound: usize| -> usize {
