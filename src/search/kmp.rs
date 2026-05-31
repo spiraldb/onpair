@@ -108,11 +108,21 @@ impl KmpAutomaton {
         }
 
         // ── 2. Base pass ────────────────────────────────────────────────────
+        // base[t] = KMP state after feeding token t from state 0. A token whose
+        // bytes do not contain p[0] can never leave state 0, so it is skipped.
+        // The presence test is a branchless inline scan rather than
+        // `tok.contains(&p0)`: std specialises the latter to a `memchr()` *call*,
+        // and the call overhead dominates on these ≤16-byte tokens (one call per
+        // dictionary token — up to 64K of them per query build).
         let mut base = vec![0 as State; num_tokens];
         let p0 = p[0];
         for t in 0..num_tokens {
             let tok = dict.data(t as Token);
-            base[t] = if tok.contains(&p0) {
+            let mut has = false;
+            for &b in tok {
+                has |= b == p0;
+            }
+            base[t] = if has {
                 step_bytes(p, &fail, m, 0, tok)
             } else {
                 0
