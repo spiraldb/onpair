@@ -188,6 +188,19 @@ negligible. A `first_two_codes` index (+~7% column size, a second SIMD pass)
 would remove a handful of `matches()` calls for no measurable benefit. Verdict:
 not worth it.
 
+## Experiment #5 — selectivity-adaptive contains: DISPROVED (no crossover)
+
+Hypothesis: at high match-rate the two-pass split (chain prefilter → KMP) is
+wasted overhead vs a fused single per-row KMP, so a candidate-rate sample could
+pick the faster path. **Disproved — the chain prefilter wins at every
+selectivity, so there is nothing to switch to.** A/B on real ClickBench URL
+(chain default vs plain KMP via a temporary ONPAIR_NO_CHAIN gate):
+  - `http`   (100% sel): chain 6.4 ms  vs plain KMP 10.1 ms
+  - `google` (0.009% sel): chain 28.3 ms vs plain KMP 36.2 ms
+Even at 100% match the DEFINITE-token shortcut settles many rows without the full
+KMP, and rejecting inert tokens still trims work — so the prefilter helps in both
+regimes. No crossover ⇒ no adaptive switch. Gate removed.
+
 ## Public API (matcher)
 
 - `Column::as_search_parts() -> SearchParts` (or build `SearchParts` by struct
