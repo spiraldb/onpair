@@ -230,6 +230,64 @@ impl KmpAutomaton {
         t
     }
 
+    /// Contiguous token-id ranges of INNER tokens: those that complete or
+    /// continue a partial match — `base[t] == match_state` (DEFINITE) or covered
+    /// by a sparse transition with a non-dead target. Merged and sorted.
+    ///
+    /// INNER is a *sound necessary* contains filter: the token that completes any
+    /// match enters from state 0 (then `base == match_state`, DEFINITE) or from a
+    /// positive state via a sparse transition (INNER), so every matching row
+    /// holds an INNER token. Unlike the scattered open-set, these tokens cluster
+    /// into few contiguous ranges (the dictionary sorts by leading byte and a
+    /// continuation needs a specific next byte), so the filter is SIMD
+    /// range-testable. Returns `None` if there are more ranges than `max` (not
+    /// worth a per-code multi-range test).
+    pub(crate) fn inner_ranges(&self, max: usize) -> Option<Vec<(Token, Token)>> {
+        let m = self.match_state;
+        let mut raw: Vec<(Token, Token)> = Vec::new();
+        // DEFINITE runs in base.
+        let mut i = 0u32;
+        let n = self.base.len() as u32;
+        while i < n {
+            if self.base[i as usize] == m {
+                let mut j = i + 1;
+                while j < n && self.base[j as usize] == m {
+                    j += 1;
+                }
+                raw.push((i as Token, (j - 1) as Token));
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        // Sparse continuation ranges (non-dead target).
+        for tr in &self.sparse {
+            if tr.target != 0 {
+                raw.push((tr.range.begin, tr.range.last));
+            }
+        }
+        if raw.is_empty() {
+            return Some(Vec::new());
+        }
+        // Merge overlapping/adjacent ranges.
+        raw.sort_unstable();
+        let mut merged: Vec<(Token, Token)> = Vec::with_capacity(raw.len());
+        for (lo, hi) in raw {
+            if let Some(last) = merged.last_mut()
+                && lo <= last.1.saturating_add(1)
+            {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+            merged.push((lo, hi));
+        }
+        if merged.len() > max {
+            None
+        } else {
+            Some(merged)
+        }
+    }
+
     /// Whether the needle is empty (matches every row); the prefilter is skipped
     /// for it.
     #[inline]

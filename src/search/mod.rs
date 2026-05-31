@@ -343,6 +343,51 @@ fn prefilter_accept_verify_scalar(
     }
 }
 
+/// Maximum INNER range count for which the SIMD multi-range contains pass-1 is
+/// attempted; above this the per-code range chain outweighs the scalar gather.
+const INNER_RANGE_BUDGET: usize = 16;
+
+/// Set bit `i` of `bits` iff `codes[i]` lies in any of the (sorted, merged)
+/// INNER `ranges`. Dispatches to AVX2 when available.
+fn classify_inner(codes: &[Token], ranges: &[(Token, Token)], bits: &mut [u64]) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        // SAFETY: avx2 confirmed present.
+        unsafe { classify_inner_avx2(codes, ranges, bits) };
+        return;
+    }
+    classify_inner_scalar(codes, ranges, bits);
+}
+
+/// Scalar reference for [`classify_inner`].
+fn classify_inner_scalar(codes: &[Token], ranges: &[(Token, Token)], bits: &mut [u64]) {
+    for (i, &c) in codes.iter().enumerate() {
+        if ranges.iter().any(|&(lo, hi)| c >= lo && c <= hi) {
+            bits[i >> 6] |= 1u64 << (i & 63);
+        }
+    }
+}
+
+/// Whether any bit in `bits[lo..hi]` (bit indices) is set.
+#[inline]
+fn any_bit_in_range(bits: &[u64], lo: usize, hi: usize) -> bool {
+    if lo >= hi {
+        return false;
+    }
+    let (wlo, whi) = (lo >> 6, (hi - 1) >> 6);
+    if wlo == whi {
+        let mask = (!0u64 << (lo & 63)) & (!0u64 >> (63 - ((hi - 1) & 63)));
+        return bits[wlo] & mask != 0;
+    }
+    if bits[wlo] & (!0u64 << (lo & 63)) != 0 {
+        return true;
+    }
+    if bits[wlo + 1..whi].iter().any(|&w| w != 0) {
+        return true;
+    }
+    bits[whi] & (!0u64 >> (63 - ((hi - 1) & 63))) != 0
+}
+
 /// Invoke `f` with the index of every set bit in `words`, in ascending order.
 #[inline]
 fn for_each_set_bit(words: &[u64], mut f: impl FnMut(usize)) {
@@ -413,6 +458,46 @@ unsafe fn prefilter_accept_avx2(first_codes: &[u16], alo: u16, awidth: u16, acc:
     }
     if r < n {
         prefilter_accept_scalar(&first_codes[r..], alo as u32, awidth as u32, &mut acc[wi..]);
+    }
+}
+
+/// AVX2 multi-range INNER classifier; see [`classify_inner`]. For each 16-code
+/// vector, OR together one `in_range_epu16` per INNER range, pack to a 16-bit
+/// mask, and accumulate into the per-code bitset words (64 codes per word).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn classify_inner_avx2(codes: &[Token], ranges: &[(Token, Token)], bits: &mut [u64]) {
+    // Preload (lo, width) vectors for each range.
+    let zero = _mm256_setzero_si256();
+    let mut vlo = [zero; INNER_RANGE_BUDGET];
+    let mut vw = [zero; INNER_RANGE_BUDGET];
+    for (i, &(lo, hi)) in ranges.iter().enumerate() {
+        vlo[i] = _mm256_set1_epi16(lo as i16);
+        vw[i] = _mm256_set1_epi16((hi - lo) as i16);
+    }
+    let nr = ranges.len();
+    let n = codes.len();
+    let ptr = codes.as_ptr();
+    let (mut r, mut wi) = (0usize, 0usize);
+    while r + 64 <= n {
+        let mut word = 0u64;
+        for k in 0..4 {
+            // SAFETY: r + k*16 + 16 <= r + 64 <= n.
+            let v = unsafe { _mm256_loadu_si256(ptr.add(r + k * 16) as *const __m256i) };
+            let mut hit = zero;
+            for vrange in vlo.iter().zip(vw.iter()).take(nr) {
+                // SAFETY: both helpers are avx2, enabled for this fn.
+                hit = _mm256_or_si256(hit, unsafe { in_range_epu16(v, *vrange.0, *vrange.1) });
+            }
+            // SAFETY: avx2 enabled for this fn.
+            word |= (unsafe { movemask_epu16(hit) } as u64) << (k * 16);
+        }
+        bits[wi] = word;
+        wi += 1;
+        r += 64;
+    }
+    if r < n {
+        classify_inner_scalar(&codes[r..], ranges, &mut bits[wi..]);
     }
 }
 
@@ -649,6 +734,23 @@ impl<O: Offset> SearchParts<'_, O> {
             scan(aut, self.codes, self.code_offsets, on_match);
             return;
         }
+
+        // Optional SIMD INNER pass-1: when the INNER token set collapses into a
+        // small number of contiguous id ranges, classify the whole code stream
+        // with AVX2 range tests (any-INNER per code), reduce to candidate rows,
+        // and confirm with the exact KMP. Sound (every match holds an INNER
+        // token). Gated behind a small range budget — above it the per-code
+        // range chain is longer than the scalar gather it replaces.
+        if std::env::var_os("ONPAIR_INNER_SIMD").is_some()
+            && let Some(ranges) = aut.inner_ranges(INNER_RANGE_BUDGET)
+        {
+            if ranges.is_empty() {
+                return; // no INNER token ⇒ no match possible.
+            }
+            self.scan_contains_inner(aut, &ranges, on_match);
+            return;
+        }
+
         let chain = aut.chain_table();
         for r in 0..n {
             let s = self.code_offsets[r].to_usize().expect("valid code offsets");
@@ -666,6 +768,29 @@ impl<O: Offset> SearchParts<'_, O> {
                 }
                 // Neither: the row cannot contain the needle.
                 RowChain::Reject => {}
+            }
+        }
+    }
+
+    /// SIMD INNER contains scan. Pass 1 marks each code that lies in any INNER
+    /// range (AVX2 multi-range test over the whole stream) into a per-code
+    /// bitset; pass 2 visits rows holding a marked code and confirms with the
+    /// exact KMP. INNER presence is a sound necessary condition for a match.
+    fn scan_contains_inner(
+        &self,
+        aut: &KmpAutomaton,
+        ranges: &[(Token, Token)],
+        mut on_match: impl FnMut(usize),
+    ) {
+        let m = self.codes.len();
+        let words = m.div_ceil(64);
+        let mut inner_bits = vec![0u64; words];
+        classify_inner(self.codes, ranges, &mut inner_bits);
+        for r in 0..self.code_offsets.len() - 1 {
+            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
+            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+            if any_bit_in_range(&inner_bits, s, e) && aut.matches(&self.codes[s..e]) {
+                on_match(r);
             }
         }
     }
