@@ -172,6 +172,22 @@ saving size and AVX bandwidth. **Two parts, both negative:**
   Recall #3 proved prefix is compute- not bandwidth-bound, so "less bandwidth"
   was never the win anyway. Verdict: not worth the complexity.
 
+## Experiment #4 — first_two_codes for multi-token prefix: DISPROVED (pointless)
+
+Hypothesis: multi-token prefixes (e.g. `http://k`) fall to the verify lane
+(`first_code == q0` → scattered exact row check), and a second per-row token
+index would make 2-token prefixes exact via two SIMD range tests, removing the
+scatter. **Disproved by measuring the scatter it would remove.** Verify-candidate
+counts on real ClickBench URL (1M rows):
+  - `http://k` (11.7% sel, 116784 matches): takes the EXACT single-token-range
+    path (`!needs_verify`) — 0 scatter rows; the SIMD accept lane alone is exact.
+  - `http://www.google` (multi-token): only **8** verify-candidate rows hit the
+    scatter `aut.matches` call.
+So the scatter the second-token index would eliminate is 0–52 rows out of 1M —
+negligible. A `first_two_codes` index (+~7% column size, a second SIMD pass)
+would remove a handful of `matches()` calls for no measurable benefit. Verdict:
+not worth it.
+
 ## Public API (matcher)
 
 - `Column::as_search_parts() -> SearchParts` (or build `SearchParts` by struct
