@@ -45,6 +45,7 @@ mod dict;
 mod hash;
 mod lpm;
 mod offset;
+pub mod onpairview;
 mod parser;
 mod trainer;
 mod types;

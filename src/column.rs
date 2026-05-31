@@ -67,4 +67,13 @@ impl<O: Offset> Column<O> {
             codes: &self.codes,
         }
     }
+
+    /// Decode this column into [view shape](crate::onpairview::DecodedView): a
+    /// flat `values` buffer plus per-row offsets recovered from
+    /// [`code_offsets`](Self::code_offsets). See
+    /// [`crate::onpairview::decompress_view`].
+    #[inline]
+    pub fn decompress_view(&self) -> crate::onpairview::DecodedView {
+        crate::onpairview::decompress_view(self.as_parts(), &self.code_offsets)
+    }
 }
