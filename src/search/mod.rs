@@ -739,9 +739,7 @@ impl<O: Offset> SearchParts<'_, O> {
 
         let chain = aut.chain_table();
         for r in 0..n {
-            let s = self.code_offsets[r].as_usize();
-            let e = self.code_offsets[r + 1].as_usize();
-            let codes = &self.codes[s..e];
+            let codes = self.row_codes(r);
             match row_chain(&chain, codes) {
                 // A DEFINITE token: the row matches outright.
                 RowChain::Definite => on_match(r),
@@ -879,9 +877,7 @@ impl<O: Offset> SearchParts<'_, O> {
         // Pass 2: confirm only the (usually few) verify candidates — the one
         // place the scattered code stream is read.
         for_each_set_bit(&ver, |r| {
-            let s = self.code_offsets[r].as_usize();
-            let e = self.code_offsets[r + 1].as_usize();
-            if aut.matches(&self.codes[s..e]) {
+            if aut.matches(self.row_codes(r)) {
                 on_match(r);
             }
         });
@@ -918,9 +914,7 @@ impl<O: Offset> SearchParts<'_, O> {
             let mut ver = vec![0u64; words];
             prefilter_accept_verify(first_codes, pf.alo, pf.awidth, pf.vpoint, &mut acc, &mut ver);
             for_each_set_bit(&ver, |r| {
-                let s = self.code_offsets[r].as_usize();
-                let e = self.code_offsets[r + 1].as_usize();
-                if aut.matches(&self.codes[s..e]) {
+                if aut.matches(self.row_codes(r)) {
                     acc[r >> 6] |= 1u64 << (r & 63);
                 }
             });
