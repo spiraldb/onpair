@@ -350,7 +350,12 @@ fn select_needles() -> &'static [Needle] {
         // (e.g. the ClickBench `URL LIKE '%google%'`) be benchmarked directly.
         if let Ok(spec) = env::var("ONPAIR_NEEDLES") {
             let mut out = Vec::new();
-            for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+                // Trim only the leading whitespace that separates list items
+                // (`a, b`) — the needle text after `mode:` is taken verbatim so
+                // patterns with significant trailing spaces (e.g. `% Google %`)
+                // round-trip faithfully.
+                let item = item.trim_start();
                 let (mode, text) = match item.split_once(':') {
                     Some(("prefix", t)) => (Mode::Prefix, t),
                     Some(("contains", t)) => (Mode::Contains, t),
