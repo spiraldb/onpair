@@ -664,6 +664,16 @@ impl<O: Offset> SearchParts<'_, O> {
         self.code_offsets.len().saturating_sub(1)
     }
 
+    /// Codes of row `r`: `codes[code_offsets[r]..code_offsets[r + 1]]`. Offsets
+    /// are validated at construction (monotonic, in bounds), so the conversion
+    /// is the branchless [`Offset::as_usize`].
+    #[inline]
+    fn row_codes(&self, r: usize) -> &[Token] {
+        let s = self.code_offsets[r].as_usize();
+        let e = self.code_offsets[r + 1].as_usize();
+        &self.codes[s..e]
+    }
+
     /// Evaluate `pattern` against every row, invoking `on_match` with the
     /// 0-based index of each matching row, in order. The low-level primitive
     /// [`search`](Self::search) builds its [`RowMask`] on top of.
