@@ -979,6 +979,129 @@ mod tests {
     use super::*;
     use crate::{Bits, Config, Threshold, compress};
 
+    /// EXPERIMENT #1 (LPM-aware reachability soundness). For each needle, tries
+    /// hard to CONSTRUCT a real byte string whose LPM tokenisation (using the
+    /// trained dictionary) lands a token boundary at each partial DFA state — in
+    /// particular the "unreachable" deep states. If any partial state is
+    /// witnessed reachable by a constructed/random string, dropping its
+    /// completion range from the prefilter would be UNSOUND. Proves whether the
+    /// empirical "0× in corpus" is a real dictionary-level impossibility.
+    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
+    ///   cargo test --lib lpm_reach_witness -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn lpm_reach_witness() {
+        use crate::Parser;
+        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
+        let p = needle.as_bytes();
+        let m = p.len();
+        // Train on the real corpus, then re-tokenise arbitrary probe strings
+        // through the SAME dictionary via Parser::parse.
+        let col0 = load_corpus_col();
+        let parts0 = col0.as_search_parts();
+        // Reconstruct training bytes is unnecessary: re-train a Parser on the
+        // corpus rows so we can parse() probe strings.
+        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
+        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let mut o = 8;
+        let mut lens = Vec::with_capacity(n);
+        for _ in 0..n {
+            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
+            o += 4;
+        }
+        let mut cbytes = Vec::new();
+        let mut coffs = vec![0u32];
+        for &l in &lens {
+            cbytes.extend_from_slice(&raw[o..o + l]);
+            o += l;
+            coffs.push(cbytes.len() as u32);
+        }
+        let parser = Parser::train(
+            &cbytes,
+            &coffs,
+            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+        )
+        .unwrap();
+
+        let dict = DictView { bytes: parts0.dict_bytes, offsets: parts0.dict_offsets };
+        let aut = KmpAutomaton::new(p, dict);
+
+        // Run a probe string through LPM tokenisation and return the set of
+        // boundary states it reaches (excluding 0).
+        let probe = |s: &[u8], reached: &mut [bool], witness: &mut Vec<Option<Vec<u8>>>| {
+            let pcol = parser.parse(s, &[0u32, s.len() as u32]).unwrap();
+            let pp = pcol.as_search_parts();
+            let mut st = 0u8;
+            for &c in pp.codes {
+                st = aut.step_from(st, c);
+                if !reached[st as usize] {
+                    reached[st as usize] = true;
+                    witness[st as usize] = Some(s.to_vec());
+                }
+                if st as usize == m {
+                    break;
+                }
+            }
+        };
+
+        let mut reached = vec![false; m + 1];
+        let mut witness: Vec<Option<Vec<u8>>> = vec![None; m + 1];
+        // 1. Crafted witnesses: for each partial state s, the s-byte prefix of
+        //    the needle, sandwiched between filler designed to force boundaries.
+        let fillers: &[&[u8]] = &[b"", b" ", b"/", b"x", b"zz", b"://", b".", b"=", b"?", b"&"];
+        for s in 1..m {
+            for fa in fillers {
+                for fb in fillers {
+                    let mut v = Vec::new();
+                    v.extend_from_slice(fa);
+                    v.extend_from_slice(&p[..s]);
+                    v.extend_from_slice(fb);
+                    probe(&v, &mut reached, &mut witness);
+                    // also doubled-prefix tricks: googgl-style to force a split
+                    let mut v2 = Vec::new();
+                    v2.extend_from_slice(&p[..s]);
+                    v2.extend_from_slice(&p[..s]);
+                    v2.extend_from_slice(fb);
+                    probe(&v2, &mut reached, &mut witness);
+                }
+            }
+        }
+        // 2. Random fuzz around needle bytes.
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let alpha = {
+            let mut a: Vec<u8> = p.to_vec();
+            a.extend_from_slice(b" /.:=?&-_0123456789abcdefghijklmnopqrstuvwxyz");
+            a.sort_unstable();
+            a.dedup();
+            a
+        };
+        for _ in 0..2_000_000u64 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let len = 2 + (x as usize % 14);
+            let mut v = Vec::with_capacity(len);
+            let mut y = x;
+            for _ in 0..len {
+                y = y.wrapping_mul(6364136223846793005).wrapping_add(1);
+                v.push(alpha[(y >> 33) as usize % alpha.len()]);
+            }
+            probe(&v, &mut reached, &mut witness);
+        }
+
+        eprintln!("=== LPM reachability witnesses for {needle:?} (m={m}) ===");
+        for s in 1..m {
+            let w = witness[s]
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .unwrap_or_default();
+            eprintln!(
+                "  state {s} (prefix {:?}): {}  witness={w:?}",
+                std::str::from_utf8(&p[..s]).unwrap_or("?"),
+                if reached[s] { "REACHABLE — prune UNSOUND" } else { "no witness found" }
+            );
+        }
+    }
+
     /// Load the dumped corpus, compress it, and return the owned column.
     #[cfg(test)]
     fn load_corpus_col() -> Column<u32> {

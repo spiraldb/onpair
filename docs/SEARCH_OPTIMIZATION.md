@@ -90,17 +90,28 @@ this), but they're a weak filter, so SIMD-izing them is a wash (above). A sound
 SIMD contains filter only exists on **decoded bytes** (classic byte-Teddy/memmem)
 — which costs the ~86 ms decode, more than the scan saves.
 
-## The open lever (recommended next step): LPM-aware INNER pruning
+## Experiment #1 — LPM-aware INNER pruning: DISPROVED (unsound)
 
-For `%google%` the INNER filter is dominated by the state-5 (`googl`+`e…`)
-completion ranges: ~1554 of 1565 filtered tokens are "starts with e / le".
-**Empirically, state 5 is reached 0 times across all 1M rows** (greedy LPM never
-pauses a boundary at `googl` when a longer `google` token exists). The
-transition fixpoint (`reachable_states`) can't prove this — it ignores LPM and
-marks state 5 reachable via `goog`→`l`→`e`. **A sound LPM-aware reachability
-proof** ("no token chain lands a boundary at state s that a longer token would
-absorb") would drop google's filter from ~1559 tokens to ~5, turning the wash
-into a likely decisive win that could beat memmem. Not yet attempted.
+Hypothesis: for `%google%` the INNER filter is dominated by the state-5
+(`googl`+`e…`) completion ranges (~1554 of 1565 tokens, "starts with e / le"),
+and state 5 is reached **0 times across all 1M corpus rows**, so maybe greedy LPM
+makes it unreachable and the range can be dropped (collapsing the filter to ~5
+tokens, possibly beating memmem).
+
+**Result: UNSOUND — disproved by construction.** The `lpm_reach_witness` probe
+(in the test module) feeds crafted + 2M random strings through the *real* LPM
+tokenisation and records which DFA boundary states each reaches. Every partial
+state is witnessed reachable, including state 5: the byte string `"googl"` itself
+tokenises with a boundary at state 5 (there is no `"google"` token to absorb it
+without a trailing `e`). So a value like `"…googl"` adjacent to an `e…` token
+DOES complete a match via state 5 — dropping that range would cause false
+negatives. The empirical "0×" was a property of the URL *corpus*, not the
+*dictionary*. Witnesses: state1 "g", s2 "go", s3 "goo", s4 "googoo", s5 "googl".
+
+Conclusion: boundary-state reachability cannot be tightened by an LPM argument —
+any prefix of the needle is a constructible boundary value. The INNER filter
+(and the `reachable_states` transition fixpoint) is already as tight as soundness
+allows. **No remaining lever to make contains beat memmem on the token stream.**
 
 ## Public API (matcher)
 
