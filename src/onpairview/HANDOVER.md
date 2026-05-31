@@ -36,11 +36,17 @@ view" kernel) but expressed in this crate's types.
   (no values).
 - `build_views(view)` / `build_views_into(view, &mut out)` — one `BinaryView`
   per row; `_into` reuses a caller buffer (real export loops want this).
-- `Column::decompress_view(&self)` convenience method (`src/column.rs`).
+- `decompress_row(parts, code_offsets, r)` /
+  `decompress_row_into(.., &mut out)` — decode a single row, `O(row)` not
+  `O(column)`. Copies only that row's tokens straight from the dictionary (no fat
+  table, no decoder padding needed). The random-access primitive.
+- `Column::decompress_view(&self)` / `Column::decompress_row(&self, r)`
+  convenience methods (`src/column.rs`).
 
-Tests: `src/onpairview/tests.rs` (10 tests, incl. an oracle cross-check of the
+Tests: `src/onpairview/tests.rs` (12 tests, incl. an oracle cross-check of the
 optimized `build_views` against a naive scalar builder across the fast/tail
-boundary and tiny (<16 byte) buffers, and an explicit Arrow-layout check).
+boundary and tiny (<16 byte) buffers, an explicit Arrow-layout check, and a
+single-row-vs-whole-column decode check).
 
 Bench: `benches/view_compute.rs` (divan), registered in `Cargo.toml`.
 
@@ -89,7 +95,7 @@ bench arm is kept as the regression guard that proves this stays won.
 
 ```
 RUSTC_WRAPPER= cargo build
-RUSTC_WRAPPER= cargo test --lib                 # 101 pass
+RUSTC_WRAPPER= cargo test --lib                 # 103 pass
 RUSTC_WRAPPER= cargo clippy --all-targets       # clean
 RUSTC_WRAPPER= cargo +nightly fmt --check       # clean
 RUSTC_WRAPPER= cargo bench --bench view_compute build_views_only \
@@ -128,6 +134,11 @@ RUSTC_WRAPPER= cargo bench --bench view_compute build_views_only \
 
 ## Done this round (perf)
 
+- **Single-row random access (`decompress_row` / `_into`).** Decode just row
+  `r`'s tokens straight from the dictionary — `O(row)`, no fat table, no padding.
+  `random_rows_single` vs `random_rows_via_full` bench (fetch 1000 scattered rows
+  of 200k): **~64× (url_short) / ~83× (words)** faster than decoding the whole
+  column first. Different complexity class, not a micro-opt.
 - **`decompress_view`: 3 passes → 2.** It used to call `crate::decompress`
   (which itself walks all codes once for `decompressed_len` to size the buffer,
   then again to decode with per-code bounds checks) and *then* `row_byte_offsets`
@@ -139,10 +150,9 @@ RUSTC_WRAPPER= cargo bench --bench view_compute build_views_only \
 
 ## Not done / next ideas (unmeasured — measure before keeping)
 
-- **`decompress_view_into` / random single-row access.** Today `decompress_view`
-  always materializes the whole `values` buffer + offsets. A single-row decode
-  (`row r` only, via `code_offsets[r]..code_offsets[r+1]`) would make true random
-  access O(row), not O(column) — arguably the headline reason a "view" exists.
+- **Multi-row gather.** `decompress_row` handles one row; a `decompress_rows`
+  taking a sorted index set could amortize the per-call setup, but the per-call
+  cost is already tiny (no fat build), so likely not worth it.
 - **Fuse offset computation into the decode loop.** `decompress_view` currently
   does two passes (decode, then `row_byte_offsets`). Recording the write cursor
   at each row boundary inside the decode could fuse them — but the decode loop is

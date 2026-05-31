@@ -269,6 +269,55 @@ pub fn decompress_view<O: Offset>(parts: Parts<'_>, code_offsets: &[O]) -> Decod
     DecodedView { values, offsets }
 }
 
+/// Decode a single row `r` to a fresh `Vec`, without touching the rest of the
+/// column. `O(row)`, not `O(column)` — the random-access primitive OnPair exists
+/// for. See [`decompress_row_into`] to reuse a buffer.
+///
+/// ## Panics
+///
+/// Panics if `r` is out of range, `code_offsets` is malformed, or a code is out
+/// of range.
+#[must_use]
+pub fn decompress_row<O: Offset>(parts: Parts<'_>, code_offsets: &[O], r: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    decompress_row_into(parts, code_offsets, r, &mut out);
+    out
+}
+
+/// Decode a single row `r` into `out` (cleared, then filled), reusing its
+/// allocation. `O(row)`: it copies only row `r`'s tokens straight from the
+/// dictionary, so it needs neither a fat table nor the decoder padding — unlike
+/// the whole-column [`decompress_view`].
+///
+/// ## Panics
+///
+/// Panics if `r` is out of range, `code_offsets` is malformed, or a code is out
+/// of range.
+pub fn decompress_row_into<O: Offset>(
+    parts: Parts<'_>,
+    code_offsets: &[O],
+    r: usize,
+    out: &mut Vec<u8>,
+) {
+    let start = code_offsets[r]
+        .to_usize()
+        .expect("code offset exceeds usize");
+    let end = code_offsets[r + 1]
+        .to_usize()
+        .expect("code offset exceeds usize");
+    assert!(
+        start <= end && end <= parts.codes.len(),
+        "code_offsets must be non-decreasing and within codes"
+    );
+    out.clear();
+    for &code in &parts.codes[start..end] {
+        let c = code as usize;
+        let s = parts.dict_offsets[c] as usize;
+        let e = parts.dict_offsets[c + 1] as usize;
+        out.extend_from_slice(&parts.dict_bytes[s..e]);
+    }
+}
+
 /// Compute the `R + 1` per-row byte offsets for `code_offsets` over `parts`,
 /// without materializing the decoded bytes.
 ///

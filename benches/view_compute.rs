@@ -27,6 +27,7 @@ use divan::counter::ItemsCount;
 use onpair::onpairview::BinaryView;
 use onpair::onpairview::DecodedView;
 use onpair::onpairview::build_views_into;
+use onpair::onpairview::decompress_row_into;
 use onpair::onpairview::decompress_view;
 use onpair::onpairview::row_byte_offsets;
 use onpair::{Bits, Column, Config, Threshold, compress, decompress};
@@ -113,6 +114,45 @@ fn decompress_view_full(bencher: Bencher, param: (&'static str, u8)) {
     bencher
         .counter(BytesCount::new(c.total_bytes))
         .bench(|| divan::black_box(decompress_view(col.as_parts(), &col.code_offsets)));
+}
+
+/// Number of scattered rows fetched by the random-access benches.
+const SAMPLE_ROWS: usize = 1000;
+
+/// `SAMPLE_ROWS` row indices spread across the column (a coprime stride so they
+/// don't cluster), reused by both random-access arms.
+fn scattered_indices(rows: usize) -> Vec<usize> {
+    (0..SAMPLE_ROWS).map(|k| (k * 7919) % rows).collect()
+}
+
+#[divan::bench(args = PARAMS)]
+fn random_rows_single(bencher: Bencher, param: (&'static str, u8)) {
+    let (kind, bits) = param;
+    let (_, col) = build_column(kind, bits);
+    let idx = scattered_indices(col.code_offsets.len() - 1);
+    let mut buf = Vec::new();
+    // Fetch a sparse set of rows one at a time — O(row) each, no full decode.
+    bencher.counter(ItemsCount::new(idx.len())).bench_local(|| {
+        for &r in &idx {
+            decompress_row_into(col.as_parts(), &col.code_offsets, r, &mut buf);
+            divan::black_box(&buf);
+        }
+    });
+}
+
+#[divan::bench(args = PARAMS)]
+fn random_rows_via_full(bencher: Bencher, param: (&'static str, u8)) {
+    let (kind, bits) = param;
+    let (_, col) = build_column(kind, bits);
+    let idx = scattered_indices(col.code_offsets.len() - 1);
+    // The same sparse fetch, but paying a whole-column decode first — the cost a
+    // view encoding avoids for sparse random access.
+    bencher.counter(ItemsCount::new(idx.len())).bench(|| {
+        let view = decompress_view(col.as_parts(), &col.code_offsets);
+        for &r in &idx {
+            divan::black_box(view.row(r));
+        }
+    });
 }
 
 #[divan::bench(args = PARAMS)]

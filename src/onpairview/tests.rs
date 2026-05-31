@@ -39,6 +39,37 @@ fn decompress_view_recovers_rows() {
 }
 
 #[test]
+fn decompress_row_matches_whole_column() {
+    let rows: &[&[u8]] = &[
+        b"alpha",
+        b"",
+        b"beta beta beta beta",
+        b"g",
+        b"a-much-longer-string-than-twelve-bytes",
+    ];
+    let (bytes, offsets) = corpus(rows);
+    let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+
+    // Each single-row decode must equal the corresponding row of a full decode,
+    // for every row (including the empty one, the first, and the last).
+    let view = col.decompress_view();
+    let mut buf = Vec::new();
+    for r in 0..rows.len() {
+        assert_eq!(col.decompress_row(r), rows[r], "row {r} (owned)");
+        decompress_row_into(col.as_parts(), &col.code_offsets, r, &mut buf);
+        assert_eq!(buf, view.row(r), "row {r} (into, vs view)");
+    }
+}
+
+#[test]
+#[should_panic]
+fn decompress_row_out_of_range_panics() {
+    let (bytes, offsets) = corpus(&[b"a", b"bc"]);
+    let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+    let _ = col.decompress_row(2); // only rows 0 and 1 exist
+}
+
+#[test]
 fn row_byte_offsets_matches_input_offsets() {
     let rows: &[&[u8]] = &[b"one", b"", b"three!!", b"four four four four"];
     let (bytes, offsets) = corpus(rows);

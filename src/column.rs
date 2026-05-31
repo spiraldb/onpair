@@ -76,4 +76,11 @@ impl<O: Offset> Column<O> {
     pub fn decompress_view(&self) -> crate::onpairview::DecodedView {
         crate::onpairview::decompress_view(self.as_parts(), &self.code_offsets)
     }
+
+    /// Decode a single row `r` of this column, without decoding the rest. See
+    /// [`crate::onpairview::decompress_row`].
+    #[inline]
+    pub fn decompress_row(&self, r: usize) -> Vec<u8> {
+        crate::onpairview::decompress_row(self.as_parts(), &self.code_offsets, r)
+    }
 }
