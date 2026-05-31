@@ -236,6 +236,40 @@ impl KmpAutomaton {
     pub(crate) fn is_empty_needle(&self) -> bool {
         self.match_state == 0
     }
+
+    /// Debug: render the token-level DFA. For each entry state `s` returns the
+    /// list of `(token-id range, target state)` transitions that differ from the
+    /// state-0 default, plus the run-length encoding of `base` (the state-0 row).
+    /// `(base_runs, per_state_sparse)`.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn dump_dfa(&self) -> (Vec<(u32, u32, u8)>, Vec<Vec<(u16, u16, u8)>>) {
+        // RLE of base[]: contiguous id ranges mapping to the same target state.
+        let mut base_runs = Vec::new();
+        let mut i = 0u32;
+        let n = self.base.len() as u32;
+        while i < n {
+            let t = self.base[i as usize];
+            let mut j = i + 1;
+            while j < n && self.base[j as usize] == t {
+                j += 1;
+            }
+            base_runs.push((i, j - 1, t));
+            i = j;
+        }
+        let mut per_state = Vec::new();
+        for s in 0..self.match_state as usize {
+            let lo = self.offsets[s] as usize;
+            let hi = self.offsets[s + 1] as usize;
+            per_state.push(
+                self.sparse[lo..hi]
+                    .iter()
+                    .map(|tr| (tr.range.begin, tr.range.last, tr.target))
+                    .collect(),
+            );
+        }
+        (base_runs, per_state)
+    }
 }
 
 /// [`chain_table`](KmpAutomaton::chain_table) flags. A token containing the

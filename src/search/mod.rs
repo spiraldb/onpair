@@ -826,6 +826,70 @@ mod tests {
     use super::*;
     use crate::{Bits, Config, Threshold, compress};
 
+    /// Temporary: dump the TOKEN-LEVEL DFA for a needle over the real dict
+    /// (alphabet = token ids, not bytes).
+    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
+    ///   cargo test --lib token_dfa -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn token_dfa() {
+        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
+        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
+        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let mut o = 8;
+        let mut lens = Vec::with_capacity(n);
+        for _ in 0..n {
+            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
+            o += 4;
+        }
+        let mut bytes = Vec::new();
+        let mut offs = vec![0u32];
+        for &l in &lens {
+            bytes.extend_from_slice(&raw[o..o + l]);
+            o += l;
+            offs.push(bytes.len() as u32);
+        }
+        let col = compress(
+            &bytes,
+            &offs,
+            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+        )
+        .unwrap();
+        let parts = col.as_search_parts();
+        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let nt = dict.num_tokens();
+        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
+        let (base_runs, per_state) = aut.dump_dfa();
+        let m = needle.len();
+        let tokstr = |id: u16| String::from_utf8_lossy(dict.data(id)).into_owned();
+
+        eprintln!("=== TOKEN-LEVEL DFA for {needle:?}  ({nt} tokens = the alphabet, {m}+1 states) ===\n");
+        eprintln!("STATE 0 (no partial match) — base[] table, run-length encoded:");
+        eprintln!("  {} non-zero runs out of {} total runs:", base_runs.iter().filter(|r| r.2 != 0).count(), base_runs.len());
+        for &(lo, hi, t) in base_runs.iter().filter(|r| r.2 != 0) {
+            let lbl = if lo == hi { format!("token {lo} {:?}", tokstr(lo as u16)) }
+                      else { format!("tokens {lo}..={hi} (e.g. {:?})", tokstr(lo as u16)) };
+            eprintln!("    →state {t}: {lbl}");
+        }
+        for (s, trs) in per_state.iter().enumerate() {
+            let s = s + 1;
+            if s >= m { continue; }
+            eprintln!("\nSTATE {s} (matched {} needle bytes) — {} sparse exceptions over base:", s, trs.len());
+            for &(lo, hi, t) in trs.iter().take(12) {
+                let lbl = if lo == hi { format!("token {lo} {:?}", tokstr(lo)) }
+                          else { format!("tokens {lo}..={hi}") };
+                eprintln!("    on {lbl} → state {t}");
+            }
+            if trs.len() > 12 { eprintln!("    … {} more", trs.len() - 12); }
+        }
+        let total_sparse: usize = per_state.iter().map(|v| v.len()).sum();
+        let nz_base: u32 = base_runs.iter().filter(|r| r.2 != 0).map(|&(lo, hi, _)| hi - lo + 1).sum();
+        eprintln!("\nSUMMARY: state-0 alphabet that matters = {nz_base} token ids in {} runs;",
+            base_runs.iter().filter(|r| r.2 != 0).count());
+        eprintln!("         {total_sparse} sparse exception ranges across the partial-match states.");
+    }
+
     /// Pack rows into the Arrow `(bytes, offsets)` pair `compress` expects.
     fn pack(rows: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
         let mut bytes = Vec::new();
