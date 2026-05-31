@@ -746,6 +746,23 @@ impl<O: Offset> SearchParts<'_, O> {
             return;
         }
 
+        // Optional 3-layer funnel: a cheap SIMD INNER reject (layer 1) over the
+        // whole stream, then the precise scalar adjacency chain (layer 2) only on
+        // layer-1 survivors, then exact KMP (layer 3) on chain candidates. Both
+        // INNER-presence and the open→cont chain are independently necessary for
+        // a match, so ANDing them drops no true match. The point: replace
+        // row_chain over ALL codes with classify_inner over all codes (SIMD) +
+        // row_chain over only the survivors (13–38%).
+        if std::env::var_os("ONPAIR_FUNNEL").is_some()
+            && let Some(ranges) = aut.inner_ranges(INNER_RANGE_BUDGET)
+        {
+            if ranges.is_empty() {
+                return;
+            }
+            self.scan_contains_funnel(aut, &ranges, on_match);
+            return;
+        }
+
         let chain = aut.chain_table();
         for r in 0..n {
             let s = self.code_offsets[r].to_usize().expect("valid code offsets");
@@ -786,6 +803,44 @@ impl<O: Offset> SearchParts<'_, O> {
             let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
             if any_bit_in_range(&inner_bits, s, e) && aut.matches(&self.codes[s..e]) {
                 on_match(r);
+            }
+        }
+    }
+
+    /// 3-layer funnel contains scan. Layer 1: SIMD INNER classify over the whole
+    /// code stream into a per-code bitset (cheap, but only ~13–38% selective).
+    /// Layer 2: for rows surviving layer 1, the precise scalar adjacency chain
+    /// (`row_chain`) — run only on survivors, not all rows. Layer 3: exact KMP on
+    /// chain candidates. Both INNER-presence and the open→cont chain are
+    /// necessary for a match, so ANDing the layers drops no true match.
+    fn scan_contains_funnel(
+        &self,
+        aut: &KmpAutomaton,
+        ranges: &[(Token, Token)],
+        mut on_match: impl FnMut(usize),
+    ) {
+        let words = self.codes.len().div_ceil(64);
+        let mut inner_bits = vec![0u64; words];
+        classify_inner(self.codes, ranges, &mut inner_bits);
+        let chain = aut.chain_table();
+        for r in 0..self.code_offsets.len() - 1 {
+            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
+            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+            // Layer 1: SIMD INNER reject — skip the scalar chain entirely if no
+            // INNER code is present.
+            if !any_bit_in_range(&inner_bits, s, e) {
+                continue;
+            }
+            let codes = &self.codes[s..e];
+            // Layer 2+3: precise chain, then exact KMP.
+            match row_chain(&chain, codes) {
+                RowChain::Definite => on_match(r),
+                RowChain::Candidate => {
+                    if aut.matches(codes) {
+                        on_match(r);
+                    }
+                }
+                RowChain::Reject => {}
             }
         }
     }
