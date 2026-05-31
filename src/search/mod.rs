@@ -477,15 +477,25 @@ unsafe fn prefilter_accept_avx2(first_codes: &[u16], alo: u16, awidth: u16, acc:
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn classify_inner_avx2(codes: &[Token], ranges: &[(Token, Token)], bits: &mut [u64]) {
-    // Preload (lo, width) vectors for each range.
+    // Split the INNER set into singletons (exact token ids — the common shape
+    // after LPM pruning) and true ranges. A singleton needs one `cmpeq`; a range
+    // needs `in_range_epu16` (sub + min + cmpeq = 3 ops). Testing singletons with
+    // equality is the cheaper hot-loop path.
     let zero = _mm256_setzero_si256();
+    let mut veq = [zero; INNER_RANGE_BUDGET];
     let mut vlo = [zero; INNER_RANGE_BUDGET];
     let mut vw = [zero; INNER_RANGE_BUDGET];
-    for (i, &(lo, hi)) in ranges.iter().enumerate() {
-        vlo[i] = _mm256_set1_epi16(lo as i16);
-        vw[i] = _mm256_set1_epi16((hi - lo) as i16);
+    let (mut neq, mut nrg) = (0usize, 0usize);
+    for &(lo, hi) in ranges {
+        if lo == hi {
+            veq[neq] = _mm256_set1_epi16(lo as i16);
+            neq += 1;
+        } else {
+            vlo[nrg] = _mm256_set1_epi16(lo as i16);
+            vw[nrg] = _mm256_set1_epi16((hi - lo) as i16);
+            nrg += 1;
+        }
     }
-    let nr = ranges.len();
     let n = codes.len();
     let ptr = codes.as_ptr();
     let (mut r, mut wi) = (0usize, 0usize);
@@ -495,7 +505,10 @@ unsafe fn classify_inner_avx2(codes: &[Token], ranges: &[(Token, Token)], bits: 
             // SAFETY: r + k*16 + 16 <= r + 64 <= n.
             let v = unsafe { _mm256_loadu_si256(ptr.add(r + k * 16) as *const __m256i) };
             let mut hit = zero;
-            for vrange in vlo.iter().zip(vw.iter()).take(nr) {
+            for veqi in veq.iter().take(neq) {
+                hit = _mm256_or_si256(hit, _mm256_cmpeq_epi16(v, *veqi));
+            }
+            for vrange in vlo.iter().zip(vw.iter()).take(nrg) {
                 // SAFETY: both helpers are avx2, enabled for this fn.
                 hit = _mm256_or_si256(hit, unsafe { in_range_epu16(v, *vrange.0, *vrange.1) });
             }
