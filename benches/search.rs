@@ -510,7 +510,7 @@ fn prefix_mask(bencher: Bencher, needle: &Needle) {
         .counter(BytesCount::new(c.rows.len() * 2))
         .counter(ItemsCount::new(c.rows.len()))
         .bench_local(|| {
-            divan::black_box(parts.search(Pattern::Prefix(&needle.bytes)).count_ones())
+            divan::black_box(parts.search(Pattern::Prefix(&needle.bytes)).as_words().iter().map(|w| w.count_ones()).sum::<u32>())
         });
 }
 

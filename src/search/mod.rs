@@ -587,7 +587,9 @@ impl RowMask {
         self.words[i >> 6] |= 1u64 << (i & 63);
     }
 
-    /// Number of rows the mask covers (set or not).
+    /// Number of rows the mask covers (set or not). The bitmap has
+    /// `len().div_ceil(64)` words; bits at indices `>= len()` in the final word
+    /// are zero.
     #[inline]
     pub fn len(&self) -> usize {
         self.rows
@@ -599,48 +601,20 @@ impl RowMask {
         self.rows == 0
     }
 
-    /// Whether row `i` matched. Returns `false` for `i >= len()`.
-    #[inline]
-    pub fn contains(&self, i: usize) -> bool {
-        i < self.rows && (self.words[i >> 6] >> (i & 63)) & 1 == 1
-    }
-
-    /// Number of matching rows.
-    #[inline]
-    pub fn count_ones(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
-    }
-
-    /// Iterate the indices of matching rows in ascending order.
-    pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
-        self.words.iter().enumerate().flat_map(|(w, &word)| {
-            BitIndices { word }.map(move |b| w * 64 + b)
-        })
-    }
-
-    /// The packed bitmap words (LSB-first within each word). Length is
-    /// `len().div_ceil(64)`.
+    /// Borrow the packed bitmap words (bit `i` = row `i`, LSB-first within each
+    /// word). Compose directly with a query engine's own selection vectors via
+    /// word-wise AND/OR. Length is `len().div_ceil(64)`.
     #[inline]
     pub fn as_words(&self) -> &[u64] {
         &self.words
     }
-}
 
-/// Iterator over the set-bit positions of a single `u64`, ascending.
-struct BitIndices {
-    word: u64,
-}
-
-impl Iterator for BitIndices {
-    type Item = usize;
+    /// Consume the mask into its owned `(words, len)` parts: the packed bitmap
+    /// and the row count it covers. Inverse shape of the borrowed
+    /// [`as_words`](Self::as_words) + [`len`](Self::len).
     #[inline]
-    fn next(&mut self) -> Option<usize> {
-        if self.word == 0 {
-            return None;
-        }
-        let b = self.word.trailing_zeros() as usize;
-        self.word &= self.word - 1;
-        Some(b)
+    pub fn into_parts(self) -> (Vec<u64>, usize) {
+        (self.words, self.rows)
     }
 }
 
@@ -1301,11 +1275,24 @@ mod tests {
         needle.is_empty() || row.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// Materialise the set-row indices of a mask from its packed words.
+    fn mask_ones(mask: &RowMask) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (w, &word) in mask.as_words().iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                out.push(w * 64 + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+        out
+    }
+
     fn assert_matches(rows: &[&[u8]], pattern: Pattern<'_>, expect: impl Fn(&[u8]) -> bool) {
         let (bytes, offsets) = pack(rows);
         let col = compress(&bytes, &offsets, cfg()).unwrap();
         let mask = col.as_search_parts().search(pattern);
-        let got: Vec<usize> = mask.iter_ones().collect();
+        let got = mask_ones(&mask);
         let want: Vec<usize> = rows
             .iter()
             .enumerate()
@@ -1313,11 +1300,6 @@ mod tests {
             .collect();
         assert_eq!(got, want, "pattern {pattern:?}");
         assert_eq!(mask.len(), rows.len());
-        assert_eq!(mask.count_ones(), want.len());
-        // `contains` agrees with the index list.
-        for i in 0..rows.len() {
-            assert_eq!(mask.contains(i), want.contains(&i));
-        }
     }
 
     /// A corpus with heavy prefix sharing and repeated substrings so the
