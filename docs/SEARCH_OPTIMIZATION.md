@@ -134,6 +134,25 @@ is marginally faster at 12 bits (2.75 vs 3.22 ms) — a selectivity-specific qui
 not a trend. Conclusion: default bits=16 is also search-optimal; no width tradeoff
 to exploit.
 
+## Experiment #3 — AVX-512 prefix kernel: WIN (~1.2x), shipped default
+
+Hypothesis: the AVX2 prefix pass-1 might be memory-bound (reads the 2 MB
+first_codes table), in which case AVX-512 won't help. **First reasoning was wrong,
+corrected by measurement:** the scalar-vs-AVX2 A/B shows AVX2 is 3.6x faster than
+scalar (330us vs ~1250us on 1M ClickBench `prefix:https`), so the kernel is
+COMPUTE-bound, not memory-bound — there is ALU headroom AVX-512 can use.
+
+Built `prefilter_accept_avx512` (AVX-512BW): 32 u16 codes/vector, one
+`vpsubw` + `vpcmpuw` (cmple_epu16) → `__mmask32` directly, two masks compose a
+u64 word — no pack/movemask reduction the AVX2 path needs. Measured A/B (same
+data, back-to-back): AVX2 ~330us → AVX-512 ~273us = **1.2x** (best 252 vs 328 =
+1.3x). Correctness verified (cross-checks cd==bf on https/http://k/h).
+
+Shipped as the default when AVX-512BW is detected (`avx512_enabled`); falls back
+to AVX2 then scalar. `ONPAIR_NO_AVX512` forces AVX2 for A/B; `ONPAIR_NO_SIMD`
+forces scalar. Lesson: do not assume memory-bound — the scalar A/B is the cheap
+test for compute-vs-bandwidth before writing a wider kernel.
+
 ## Public API (matcher)
 
 - `Column::as_search_parts() -> SearchParts` (or build `SearchParts` by struct
