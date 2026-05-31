@@ -951,6 +951,90 @@ mod tests {
     use super::*;
     use crate::{Bits, Config, Threshold, compress};
 
+    /// Load the dumped corpus, compress it, and return the owned column.
+    #[cfg(test)]
+    fn load_corpus_col() -> Column<u32> {
+        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
+        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let mut o = 8;
+        let mut lens = Vec::with_capacity(n);
+        for _ in 0..n {
+            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
+            o += 4;
+        }
+        let mut bytes = Vec::new();
+        let mut offs = vec![0u32];
+        for &l in &lens {
+            bytes.extend_from_slice(&raw[o..o + l]);
+            o += l;
+            offs.push(bytes.len() as u32);
+        }
+        compress(
+            &bytes,
+            &offs,
+            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+        )
+        .unwrap()
+    }
+
+    /// Temporary: how many tokens land in each DFA state via `base[]` — i.e.
+    /// which partial-match states are reachable at a token boundary at all.
+    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
+    ///   cargo test --lib boundary_states -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn boundary_states() {
+        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
+        let col = load_corpus_col();
+        let parts = col.as_search_parts();
+        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
+        let counts = aut.boundary_state_counts();
+        eprintln!("=== boundary-reachable states for {needle:?} ===");
+        for (s, &c) in counts.iter().enumerate() {
+            let what = if s == 0 { "inert" } else if s == needle.len() { "MATCH (definite)" } else { "partial" };
+            eprintln!("  state {s} ({what}): {c} tokens end here (base==s)");
+        }
+    }
+
+    /// Temporary: across ALL rows, which DFA boundary states actually occur?
+    /// Re-runs the token automaton over every row recording the set of states
+    /// seen at token boundaries — to test whether LPM makes deep partial states
+    /// unreachable in practice (so their continuation ranges can be pruned).
+    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
+    ///   cargo test --lib reached_states -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn reached_states() {
+        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
+        let col = load_corpus_col();
+        let parts = col.as_search_parts();
+        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
+        let m = needle.len();
+        // Per-state count of how often a boundary lands there (across all rows).
+        let mut seen = vec![0u64; m + 1];
+        let codes = parts.codes;
+        let co = parts.code_offsets;
+        for r in 0..co.len() - 1 {
+            let (s0, e0) = (co[r] as usize, co[r + 1] as usize);
+            let mut st = 0u8;
+            for &c in &codes[s0..e0] {
+                st = aut.step_from(st, c);
+                seen[st as usize] += 1;
+                if st as usize == m {
+                    break;
+                }
+            }
+        }
+        eprintln!("=== boundary states actually REACHED across all rows, {needle:?} ===");
+        for (s, &c) in seen.iter().enumerate() {
+            eprintln!("  state {s}: reached {c} times");
+        }
+    }
+
     /// Temporary: dump EXACTLY what the SIMD INNER prefilter range-tests for a
     /// needle — the merged INNER id ranges (each one AVX2 `in_range_epu16` test)
     /// with their token byte content.

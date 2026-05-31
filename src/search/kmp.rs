@@ -295,6 +295,32 @@ impl KmpAutomaton {
         self.match_state == 0
     }
 
+    /// Debug: full token transition from any entry state (0..match_state).
+    #[cfg(test)]
+    pub(crate) fn step_from(&self, state: u8, t: Token) -> u8 {
+        if state == 0 {
+            self.base[t as usize]
+        } else if state == self.match_state {
+            self.match_state
+        } else {
+            self.next_state(state, t)
+        }
+    }
+
+    /// Debug: for each entry state `s` in `1..match_state`, how many tokens
+    /// leave the DFA in exactly state `s` when fed from state 0 (i.e. end in the
+    /// `s`-byte needle prefix) — `base[t] == s`. A state with zero such tokens
+    /// can only be reached at a token boundary through a multi-token chain.
+    #[cfg(test)]
+    pub(crate) fn boundary_state_counts(&self) -> Vec<usize> {
+        let m = self.match_state as usize;
+        let mut counts = vec![0usize; m + 1];
+        for &b in &self.base {
+            counts[b as usize] += 1;
+        }
+        counts
+    }
+
     /// Debug: render the token-level DFA. For each entry state `s` returns the
     /// list of `(token-id range, target state)` transitions that differ from the
     /// state-0 default, plus the run-length encoding of `base` (the state-0 row).
