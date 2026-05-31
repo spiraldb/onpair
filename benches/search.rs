@@ -510,8 +510,14 @@ fn prefix_mask(bencher: Bencher, needle: &Needle) {
         .counter(BytesCount::new(c.rows.len() * 2))
         .counter(ItemsCount::new(c.rows.len()))
         .bench_local(|| {
-            divan::black_box(parts.search(Pattern::Prefix(&needle.bytes)).as_words().iter().map(|w| w.count_ones()).sum::<u32>())
+            let mask = parts.search(Pattern::Prefix(&needle.bytes));
+            divan::black_box(popcount(mask.as_words()))
         });
+}
+
+/// Count set bits across packed mask words.
+fn popcount(words: &[u64]) -> usize {
+    words.iter().map(|w| w.count_ones() as usize).sum()
 }
 
 /// A/B baseline: identical prefix search but with the first-token index
@@ -729,13 +735,11 @@ fn main() {
             Mode::Contains => "contains",
             Mode::Prefix => "prefix",
         };
-        let cd = column()
-            .as_search_parts()
-            .search(match n.mode {
-                Mode::Contains => Pattern::Contains(&n.bytes),
-                Mode::Prefix => Pattern::Prefix(&n.bytes),
-            })
-            .count_ones();
+        let mask = column().as_search_parts().search(match n.mode {
+            Mode::Contains => Pattern::Contains(&n.bytes),
+            Mode::Prefix => Pattern::Prefix(&n.bytes),
+        });
+        let cd = popcount(mask.as_words());
         let bf = brute_count(rows, &n.bytes, n.mode);
         let ok = if cd == bf { "ok" } else { "MISMATCH" };
         eprintln!(
