@@ -372,20 +372,43 @@ impl KmpAutomaton {
         let m = self.match_state as usize;
         let mut reach = vec![false; m + 1];
         reach[0] = true;
-        let nt = self.base.len();
+
+        // States reachable in one token step from state 0 are exactly the
+        // distinct values in `base[]`; collect them in a single linear pass
+        // instead of re-scanning all tokens for every (state, fixpoint round) as
+        // the naive transition fixpoint did (its `next_state` probe per token per
+        // state dominated query build time).
+        let mut base_target = vec![false; m + 1];
+        for &b in &self.base {
+            base_target[b as usize] = true;
+        }
+
+        // Fixpoint over the `m` states only. From a reachable state you can land
+        // on any base target (the non-overridden tokens), plus — from a positive
+        // state — any of its sparse override targets. Using *all* base targets
+        // from every state over-approximates the exact transition image, so this
+        // can only ever mark MORE states reachable, never fewer: for every real
+        // edge `s --t--> ns`, `ns` is either `base[t]` (a base target) or a sparse
+        // override target of `s`, so it is included. A sound over-approximation is
+        // all the INNER filter needs (it only drops completions from states that
+        // are provably never boundaries).
         let mut changed = true;
         while changed {
             changed = false;
-            for s in 0..m {
+            for ns in 0..=m {
+                if base_target[ns] && !reach[ns] {
+                    reach[ns] = true;
+                    changed = true;
+                }
+            }
+            for s in 1..m {
                 if !reach[s] {
                     continue;
                 }
-                for t in 0..nt {
-                    let ns = if s == 0 {
-                        self.base[t] as usize
-                    } else {
-                        self.next_state(s as State, t as Token) as usize
-                    };
+                let lo = self.offsets[s] as usize;
+                let hi = self.offsets[s + 1] as usize;
+                for tr in &self.sparse[lo..hi] {
+                    let ns = tr.target as usize;
                     if !reach[ns] {
                         reach[ns] = true;
                         changed = true;
