@@ -94,10 +94,27 @@ fn corpus() -> &'static Corpus {
 }
 
 fn load_corpus() -> (String, Vec<Vec<u8>>) {
-    if let Ok(path) = env::var("ONPAIR_BENCH_PARQUET")
-        && let Some(rows) = read_parquet_strings(&PathBuf::from(&path))
-    {
-        return (format!("{path} (env)"), rows);
+    if let Ok(spec) = env::var("ONPAIR_BENCH_PARQUET") {
+        // Comma-separated paths are concatenated in order (so several ClickBench
+        // `hits_N.parquet` shards form one ~1 GB corpus). ONPAIR_BENCH_MAX_ROWS
+        // still caps the total.
+        let max_rows = env::var("ONPAIR_BENCH_MAX_ROWS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        for p in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(rows) = read_parquet_strings(&PathBuf::from(p)) {
+                all.extend(rows);
+            }
+            if all.len() >= max_rows {
+                all.truncate(max_rows);
+                break;
+            }
+        }
+        if !all.is_empty() {
+            return (format!("{spec} (env)"), all);
+        }
     }
     let fallback = PathBuf::from("/tmp/userdata1.parquet");
     if fallback.exists()
