@@ -37,13 +37,17 @@ decompress+arrow**. This is the clear, shippable win.
 | query | onpair | arrow memmem (decompressed) | decompress+arrow |
 |---|---|---|---|
 | ClickBench `%http:%` 53% | ~9.4 ms | ~11.3 ms | ~53 ms |
-| ClickBench `%i.yandex%` 0.2% | ~19 ms | ~16 ms | ~57 ms |
-| ClickBench `%google%` 0.009% | ~18.7 ms | ~15.4 ms | ~61 ms |
+| ClickBench `%i.yandex%` 0.2% | ~15.5 ms | ~16.9 ms | ~62 ms |
+| ClickBench `%google%` 0.009% | ~10.4 ms | ~16.7 ms | ~63 ms |
 | FineWeb `%photosynthesis%` 0.01% | ~34 ms | ~9 ms | ~107 ms |
 
 Contains beats `decompress+memmem` 3–6× (decode alone is ~46–100 ms and
-dominates), but does **not** beat in-memory memmem in general, and **loses 3–4×
-on FineWeb** (long ~499-codes/row documents).
+dominates). With **LPM-aware INNER pruning + `ONPAIR_INNER_SIMD`** (see below),
+low-selectivity needles whose INNER set collapses now **beat in-memory memmem**
+too — `%google%` 1.6×, `%i.yandex%` ~1.1× (the `google`/`i.yandex` rows above
+are `ONPAIR_INNER_SIMD=1`; default scalar chain is unchanged). It still **loses
+3–4× on FineWeb** (long ~499-codes/row documents), where no single needle
+collapses the filter that far.
 
 ## How it works
 
@@ -96,18 +100,57 @@ Proven by measurement (analysis tools kept in the test module, see below):
 - A *sound* SIMD contains filter only exists on **decoded bytes** (classic
   byte-Teddy/memmem), which costs the ~86 ms decode — more than the scan saves.
 
-## Open lever (not done): LPM-aware INNER pruning
+## DONE: LPM-aware INNER pruning (the lever — now landed & proven)
 
-For `%google%` the SIMD INNER filter is dominated by the state-5 (`googl`+`e…`)
-completion ranges: ~1554 of 1565 filtered tokens are "starts with e / le".
-**Empirically, state 5 is reached 0 times across all 1M rows** (tool:
-`reached_states`) because greedy LPM never pauses a token boundary at `googl`
-when a longer `google` token exists. The transition-fixpoint (`reachable_states`)
-can't prove this (it ignores LPM, marks state 5 reachable via `goog`→`l`→`e`).
-**A sound LPM-aware reachability proof** — "no token chain can land a boundary at
-state s that a longer token would have absorbed" — would drop google's filter
-from ~1559 tokens to ~5, turning the wash into a likely decisive win and
-plausibly beating memmem. This is the recommended next step.
+`kmp::range_completion_lpm_dead` soundly drops INNER completing ranges that
+greedy LPM tokenisation makes unreachable. For `%google%` it collapses the SIMD
+INNER filter from **1565 → 5 token ids** (4 ranges: `gle`, `google`, `ogle`,
+`oogle`), turning the old wash into a clear win over in-memory `memmem`.
+
+**The proof (full version in the method's doc comment).** A boundary at partial
+state `s` followed by a *sparse* completer `u` means a token `t` ended exactly
+there (`step(e,t)=s`, `e` a reachable boundary state) and the input at `t`'s
+start begins with `t·u`. If `t·u` carries *any* dictionary token strictly longer
+than `t` as a prefix, greedy LPM would have taken that longer token, not `t` — so
+that boundary, and the completion, cannot occur. Checked per completing range
+over `Cand(s) × range`; `Cand(s)` is built over a superset of real boundary
+states, so it can only over-include candidates (sound). Checking the *whole*
+`t·u` (not just `t·u[0]`) is what prunes the `goog|le = google` boundary, not
+just `googl|e`.
+
+**Zero false negatives — verified three ways, no hand-waving:**
+- `inner_filter_sound` (test): the *production* `inner_ranges` covers every
+  matching row across 1M ClickBench rows — checked on 17 needles from `google`
+  (5 INNER ids) to `e` (18 392 INNER ids / 930 724 matches). 0 misses.
+- `lpm_prune_probe` (test): re-simulates the automaton over the corpus — no
+  pruned completion ever fires (`completed_via == 0` for every pruned state).
+- bench `cd == bf` cross-check passes end-to-end with `ONPAIR_INNER_SIMD=1`.
+
+**Measured win (`%google%`, real ClickBench URL):**
+- *Scan instructions* (callgrind, deterministic, 200k rows, INNER_SIMD): onpair
+  pruned INNER **6.85M Ir** (`any_bit_in_range` 4.9M + `classify_inner_avx2`
+  1.9M + KMP confirm 0.26M) vs `memmem` **22.88M Ir** → **3.34× fewer
+  instructions**. KMP confirm is ~0 because the 5-token filter rejects nearly
+  every row before the exact check.
+- *End-to-end wall* (1M rows, divan medians, contended box — ratios robust,
+  absolutes noisy): `%google%` onpair **10.38 ms** vs `memmem` **16.66 ms**
+  (**1.6×**) vs decompress+`memmem` 62.6 ms (6×). `%i.yandex%` 15.5 ms vs
+  16.9 ms. Pre-pruning this was a ~1.2× *loss* to memmem.
+- The per-query automaton build (`KmpAutomaton::new` ~5.5M + `inner_ranges`
+  ~25.5M Ir, fixed) is why a 200k full-query Ir still favours memmem but the
+  1M-row scan-dominated wall does not — the build amortises over rows.
+
+Tools kept (ignored): `inner_filter_sound`, `lpm_prune_probe` (+ the earlier
+`reached_states`/`boundary_states`/`inner_ranges_dump`/`token_dfa`).
+
+**Still opt-in, recommended next step:** `ONPAIR_INNER_SIMD` is not the default.
+The pruning is pure-win for `inner_ranges` (sound, always applied there), but the
+SIMD INNER *scan path* only helps when the filter collapses enough; on needles
+that don't collapse it is a wash/loss, and on FineWeb it loses. Auto-enabling it
+in `scan_contains` when `inner_ranges` returns a small token set (e.g. gate on
+total INNER ids and/or the build cost) would make `%google%`-class queries fast
+by default — but needs a tuned threshold and a full-suite regression sweep
+(http:, i.yandex, com, www, le, e, FineWeb) under callgrind before flipping.
 
 ## Benchmarks & how to run
 
