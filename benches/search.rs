@@ -133,8 +133,13 @@ fn read_parquet_strings(path: &PathBuf) -> Option<Vec<Vec<u8>>> {
     );
 
     let mut rows: Vec<Vec<u8>> = Vec::new();
+    // Optional cap so huge corpora (e.g. FineWeb `text`) fit in memory.
+    let max_rows = env::var("ONPAIR_BENCH_MAX_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
     let reader = builder.build().ok()?;
-    for batch in reader.flatten() {
+    'outer: for batch in reader.flatten() {
         let arr = batch.column(picked);
         use arrow_schema::DataType::*;
         match arr.data_type() {
@@ -178,6 +183,10 @@ fn read_parquet_strings(path: &PathBuf) -> Option<Vec<Vec<u8>>> {
                 }
             }
             _ => return None,
+        }
+        if rows.len() >= max_rows {
+            rows.truncate(max_rows);
+            break 'outer;
         }
     }
     Some(rows)
