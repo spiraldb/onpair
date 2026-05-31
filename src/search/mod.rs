@@ -951,6 +951,56 @@ mod tests {
     use super::*;
     use crate::{Bits, Config, Threshold, compress};
 
+    /// Temporary: dump EXACTLY what the SIMD INNER prefilter range-tests for a
+    /// needle — the merged INNER id ranges (each one AVX2 `in_range_epu16` test)
+    /// with their token byte content.
+    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
+    ///   cargo test --lib inner_ranges_dump -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn inner_ranges_dump() {
+        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
+        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
+        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let mut o = 8;
+        let mut lens = Vec::with_capacity(n);
+        for _ in 0..n {
+            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
+            o += 4;
+        }
+        let mut bytes = Vec::new();
+        let mut offs = vec![0u32];
+        for &l in &lens {
+            bytes.extend_from_slice(&raw[o..o + l]);
+            o += l;
+            offs.push(bytes.len() as u32);
+        }
+        let col = compress(
+            &bytes,
+            &offs,
+            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+        )
+        .unwrap();
+        let parts = col.as_search_parts();
+        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
+        let ranges = aut.inner_ranges(64).expect("within budget");
+        let tok = |id: u16| String::from_utf8_lossy(dict.data(id)).into_owned();
+        eprintln!("=== SIMD prefilter for {needle:?}: {} range tests ===", ranges.len());
+        let mut total = 0usize;
+        for (lo, hi) in &ranges {
+            let cnt = (hi - lo + 1) as usize;
+            total += cnt;
+            eprintln!(
+                "  ids {lo}..={hi} ({cnt} tok): {:?} .. {:?}",
+                tok(*lo),
+                tok(*hi)
+            );
+        }
+        eprintln!("a code is a candidate iff it falls in ANY of those {} ranges ({total} token ids)", ranges.len());
+    }
+
     /// Temporary: dump the TOKEN-LEVEL DFA for a needle over the real dict
     /// (alphabet = token ids, not bytes).
     /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
