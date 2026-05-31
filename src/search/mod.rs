@@ -698,7 +698,7 @@ impl<O: Offset> SearchParts<'_, O> {
         match pattern {
             Pattern::Contains(needle) => {
                 let aut = KmpAutomaton::new(needle, dict);
-                self.scan_contains(&aut, dict.num_tokens(), on_match);
+                self.scan_contains(&aut, on_match);
             }
             Pattern::Prefix(needle) => {
                 let aut = PrefixAutomaton::new(needle, dict);
@@ -721,16 +721,11 @@ impl<O: Offset> SearchParts<'_, O> {
     ///
     /// The dependent-load + branch chain of the KMP fast path is thus paid only
     /// on candidate rows, not on the (dominant at low/medium selectivity)
-    /// reject majority. Falls back to the generic per-row scan for the empty
-    /// needle, a saturated dictionary, or a malformed code stream.
-    fn scan_contains(
-        &self,
-        aut: &KmpAutomaton,
-        num_tokens: usize,
-        mut on_match: impl FnMut(usize),
-    ) {
+    /// reject majority. Falls back to the generic per-row scan only for the empty
+    /// needle (which matches every row).
+    fn scan_contains(&self, aut: &KmpAutomaton, mut on_match: impl FnMut(usize)) {
         let n = self.code_offsets.len() - 1;
-        if aut.is_empty_needle() || num_tokens > u16::MAX as usize + 1 {
+        if aut.is_empty_needle() {
             scan(aut, self.codes, self.code_offsets, on_match);
             return;
         }
