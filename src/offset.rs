@@ -14,6 +14,13 @@ pub trait Offset: sealed::Sealed + Copy + Clone + Default + std::fmt::Debug + 's
     fn to_usize(self) -> Option<usize>;
     /// Construct from a `usize`, truncating if it does not fit.
     fn from_usize(n: usize) -> Self;
+    /// Convert to `usize` by truncation — the exact inverse of
+    /// [`from_usize`](Self::from_usize). For offsets that were validated at
+    /// construction (fit in `usize`, ≤ buffer length) this is lossless, and
+    /// unlike [`to_usize`](Self::to_usize) it is branchless: no fallible check,
+    /// no panic path. Use it on hot per-row paths over already-validated
+    /// offsets.
+    fn as_usize(self) -> usize;
 }
 
 impl Offset for u32 {
@@ -25,6 +32,10 @@ impl Offset for u32 {
     fn from_usize(n: usize) -> Self {
         n as u32
     }
+    #[inline]
+    fn as_usize(self) -> usize {
+        self as usize
+    }
 }
 
 impl Offset for u64 {
@@ -35,5 +46,9 @@ impl Offset for u64 {
     #[inline]
     fn from_usize(n: usize) -> Self {
         n as u64
+    }
+    #[inline]
+    fn as_usize(self) -> usize {
+        self as usize
     }
 }

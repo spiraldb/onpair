@@ -88,8 +88,8 @@ pub(crate) fn first_codes<O: Offset>(codes: &[u16], code_offsets: &[O]) -> Vec<u
     let n = code_offsets.len() - 1;
     let mut out = Vec::with_capacity(n);
     for r in 0..n {
-        let s = code_offsets[r].to_usize().expect("valid code offsets");
-        let e = code_offsets[r + 1].to_usize().expect("valid code offsets");
+        let s = code_offsets[r].as_usize();
+        let e = code_offsets[r + 1].as_usize();
         out.push(if s < e { codes[s] } else { u16::MAX });
     }
     out

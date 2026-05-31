@@ -193,8 +193,8 @@ fn scan<O: Offset>(
     mut on_match: impl FnMut(usize),
 ) {
     for r in 0..code_offsets.len() - 1 {
-        let s = code_offsets[r].to_usize().expect("valid code offsets");
-        let e = code_offsets[r + 1].to_usize().expect("valid code offsets");
+        let s = code_offsets[r].as_usize();
+        let e = code_offsets[r + 1].as_usize();
         if matcher.matches(&codes[s..e]) {
             on_match(r);
         }
@@ -739,8 +739,8 @@ impl<O: Offset> SearchParts<'_, O> {
 
         let chain = aut.chain_table();
         for r in 0..n {
-            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
-            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+            let s = self.code_offsets[r].as_usize();
+            let e = self.code_offsets[r + 1].as_usize();
             let codes = &self.codes[s..e];
             match row_chain(&chain, codes) {
                 // A DEFINITE token: the row matches outright.
@@ -773,8 +773,8 @@ impl<O: Offset> SearchParts<'_, O> {
         let mut inner_bits = vec![0u64; words];
         classify_inner(self.codes, ranges, &mut inner_bits);
         for r in 0..self.code_offsets.len() - 1 {
-            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
-            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+            let s = self.code_offsets[r].as_usize();
+            let e = self.code_offsets[r + 1].as_usize();
             if any_bit_in_range(&inner_bits, s, e) && aut.matches(&self.codes[s..e]) {
                 on_match(r);
             }
@@ -798,8 +798,8 @@ impl<O: Offset> SearchParts<'_, O> {
         classify_inner(self.codes, ranges, &mut inner_bits);
         let chain = aut.chain_table();
         for r in 0..self.code_offsets.len() - 1 {
-            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
-            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+            let s = self.code_offsets[r].as_usize();
+            let e = self.code_offsets[r + 1].as_usize();
             // Layer 1: SIMD INNER reject — skip the scalar chain entirely if no
             // INNER code is present.
             if !any_bit_in_range(&inner_bits, s, e) {
@@ -879,8 +879,8 @@ impl<O: Offset> SearchParts<'_, O> {
         // Pass 2: confirm only the (usually few) verify candidates — the one
         // place the scattered code stream is read.
         for_each_set_bit(&ver, |r| {
-            let s = self.code_offsets[r].to_usize().expect("valid code offsets");
-            let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+            let s = self.code_offsets[r].as_usize();
+            let e = self.code_offsets[r + 1].as_usize();
             if aut.matches(&self.codes[s..e]) {
                 on_match(r);
             }
@@ -918,8 +918,8 @@ impl<O: Offset> SearchParts<'_, O> {
             let mut ver = vec![0u64; words];
             prefilter_accept_verify(first_codes, pf.alo, pf.awidth, pf.vpoint, &mut acc, &mut ver);
             for_each_set_bit(&ver, |r| {
-                let s = self.code_offsets[r].to_usize().expect("valid code offsets");
-                let e = self.code_offsets[r + 1].to_usize().expect("valid code offsets");
+                let s = self.code_offsets[r].as_usize();
+                let e = self.code_offsets[r + 1].as_usize();
                 if aut.matches(&self.codes[s..e]) {
                     acc[r >> 6] |= 1u64 << (r & 63);
                 }
