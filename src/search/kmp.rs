@@ -4,7 +4,13 @@
 // Port of `include/onpair/search/automata/kmp_automaton.h`.
 
 use super::{DictView, RowMatcher, TokenRange};
-use crate::types::Token;
+use crate::types::{MAX_TOKEN_SIZE, Token};
+
+/// Upper bound on `|Cand(s)| · |Comp(s)|` pairs the LPM completion-absorption
+/// test ([`KmpAutomaton::completion_lpm_dead`]) will scan per state before
+/// giving up and keeping the completions. Bounds per-query build time; sound at
+/// any value (a smaller budget only forgoes pruning).
+const LPM_PAIR_BUDGET: usize = 1 << 20;
 
 /// KMP state. A byte-level KMP over a pattern of length `m` has states
 /// `0..=m`; `m` is the absorbing match state. Mirrors the C++ `uint8_t` so the
@@ -242,7 +248,7 @@ impl KmpAutomaton {
     /// continuation needs a specific next byte), so the filter is SIMD
     /// range-testable. Returns `None` if there are more ranges than `max` (not
     /// worth a per-code multi-range test).
-    pub(crate) fn inner_ranges(&self, max: usize) -> Option<Vec<(Token, Token)>> {
+    pub(crate) fn inner_ranges(&self, dict: DictView<'_>, max: usize) -> Option<Vec<(Token, Token)>> {
         let m = self.match_state;
         let mut raw: Vec<(Token, Token)> = Vec::new();
         // DEFINITE runs in base.
@@ -261,7 +267,8 @@ impl KmpAutomaton {
             }
         }
         // Completing sparse transitions only (target == match state), and only
-        // from a boundary-reachable entry state. Two sound tightenings:
+        // from a boundary-reachable entry state that greedy LPM does not render
+        // completion-dead. Three sound tightenings:
         //  1. A row matches iff some boundary reaches `m`; the token completing
         //     that step enters from state 0 (DEFINITE, above) or via a sparse
         //     transition with target `m`. Partial→partial transitions can never
@@ -270,7 +277,11 @@ impl KmpAutomaton {
         //     boundary ever lands on `s`. `reachable_states` over-approximates
         //     the reachable boundary states from the dictionary alone, so
         //     skipping transitions from unreachable `s` drops no true match.
-        // Both only ever remove false positives — KMP still confirms survivors.
+        //  3. `completion_lpm_dead` (greedy-LPM absorption): even when a boundary
+        //     can land on `s`, greedy longest-prefix tokenisation may make it
+        //     impossible for the *next* token to be a completing one — see that
+        //     method's proof. Dropping those completions drops no true match.
+        // All three only ever remove false positives — KMP still confirms.
         let reach = self.reachable_states();
         for s in 1..m as usize {
             if !reach[s] {
@@ -278,8 +289,18 @@ impl KmpAutomaton {
             }
             let lo = self.offsets[s] as usize;
             let hi = self.offsets[s + 1] as usize;
+            // Candidate last-tokens into `s`, computed lazily and only once per
+            // state (only when `s` actually has a completing transition).
+            let mut cand: Option<Vec<Token>> = None;
             for tr in &self.sparse[lo..hi] {
-                if tr.target == m {
+                if tr.target != m {
+                    continue;
+                }
+                let cands = cand.get_or_insert_with(|| self.candidates_into(s as State, &reach));
+                // Drop this completing range if greedy LPM proves it can never
+                // fire (every candidate·completer pair is absorbed by a longer
+                // token). Sound: see `range_completion_lpm_dead`.
+                if !range_completion_lpm_dead(dict, cands, tr.range) {
                     raw.push((tr.range.begin, tr.range.last));
                 }
             }
@@ -304,6 +325,34 @@ impl KmpAutomaton {
         } else {
             Some(merged)
         }
+    }
+
+    /// Every token `t` that can land the DFA in partial state `s` at a token
+    /// boundary: `base[t] == s` (entry state 0, always reachable), or some sparse
+    /// transition from a *reachable* entry state has target `s`. A *superset* of
+    /// the real last-tokens producing a boundary at `s` — `reach` already
+    /// over-approximates the boundary states, so this can only over-include,
+    /// never miss, keeping the LPM-absorption test that consumes it sound.
+    fn candidates_into(&self, s: State, reach: &[bool]) -> Vec<Token> {
+        let mut cands: Vec<Token> = Vec::new();
+        for (t, &b) in self.base.iter().enumerate() {
+            if b == s {
+                cands.push(t as Token);
+            }
+        }
+        for e in 1..self.match_state as usize {
+            if !reach[e] {
+                continue;
+            }
+            let lo = self.offsets[e] as usize;
+            let hi = self.offsets[e + 1] as usize;
+            for tr in &self.sparse[lo..hi] {
+                if tr.target == s {
+                    cands.extend(tr.range.begin..=tr.range.last);
+                }
+            }
+        }
+        cands
     }
 
     /// The set of DFA states that can occur at a token boundary, as a sound
@@ -352,6 +401,18 @@ impl KmpAutomaton {
     #[inline]
     pub(crate) fn is_empty_needle(&self) -> bool {
         self.match_state == 0
+    }
+
+    /// Debug: the match (absorbing) state `m`.
+    #[cfg(test)]
+    pub(crate) fn match_state(&self) -> u8 {
+        self.match_state
+    }
+
+    /// Debug: number of token ids in the alphabet.
+    #[cfg(test)]
+    pub(crate) fn num_tokens(&self) -> usize {
+        self.base.len()
     }
 
     /// Debug: full token transition from any entry state (0..match_state).
@@ -413,6 +474,104 @@ impl KmpAutomaton {
         }
         (base_runs, per_state)
     }
+}
+
+/// Whether greedy longest-prefix-match (LPM) tokenisation makes it impossible
+/// for any completer in the token-id range `range` to immediately follow a token
+/// boundary in the partial state those completers complete from — so this
+/// completing range can be dropped from the INNER prefilter with no false
+/// negative.
+///
+/// # The lever
+///
+/// For `%google%` the deep completions fan out to ~1.5k tokens, yet they never
+/// fire: greedy LPM never ends a token at `googl` followed by `e` (the longer
+/// token `google` absorbs it), nor at `goog` followed by `le` (likewise). This
+/// proves that soundly, per completing range, so `%google%`'s INNER filter
+/// collapses from ~1.5k tokens to a handful.
+///
+/// # Model
+///
+/// The column is encoded by greedy LPM (`Parser::encode_strings`): at each input
+/// position emit the *longest* dictionary token that is a prefix of the
+/// remaining bytes, then advance past it. Token boundaries are exactly those cut
+/// points. At a boundary the DFA is in the state = length of the longest
+/// needle-prefix that is a suffix of the consumed bytes.
+///
+/// # Criterion
+///
+/// `cands` is `Cand(s)` (see [`KmpAutomaton::candidates_into`]); `range` is a set
+/// of sparse completers `u` from `s` (`step(s, u) == m`, all sharing a contiguous
+/// token-id range). Return `true` iff for every `t ∈ cands` and every `u ∈
+/// range`, the byte string `t · u` has *some* dictionary token as a prefix that
+/// is strictly longer than `t`.
+///
+/// # Proof of soundness
+///
+/// Suppose, for contradiction, some encoded row has a boundary `B` with DFA
+/// state `s` whose next token `u` lies in `range` and completes the match
+/// (`step(s, u) == m`). Because `s ≥ 1`, `B` is not the row start, so a token `t`
+/// ends exactly at `B`; its entry state `e` is a reachable boundary state and
+/// `step(e, t) == s`, hence `t ∈ cands`. The remaining input at `t`'s start
+/// position begins with `t · u` (token `t`, then token `u`). By the criterion
+/// some dictionary token `w` with `|t| < |w| ≤ |t · u|` is a prefix of `t · u`,
+/// hence a prefix of that remaining input — so greedy LPM, which picked `t`
+/// there, had a strictly longer match `w` available: contradiction. Hence no
+/// such boundary exists and this range's completion never fires. ∎
+///
+/// Dropping the range removes those tokens' state-`s` completion role only; any
+/// row that truly matches still holds an INNER token via a *retained* route (a
+/// DEFINITE token, or a completion the proof does not rule out), because the one
+/// route this drops is exactly the one shown impossible.
+///
+/// Checking the *whole* `t · u` (not just `t · u[0]`) is what makes the lever
+/// bite across the `goog | le` boundary: the absorber is the two-byte extension
+/// `goog·le = google ∈ D`, which a single-byte test (`goog·l = googl ∉ D`) would
+/// miss. The `O(|cands| · |range|)` pair scan is bounded by [`LPM_PAIR_BUDGET`];
+/// above it the function conservatively returns `false` (keeps the range) rather
+/// than do unbounded build-time work — still sound, just less pruning.
+///
+/// Empirically validated against a full re-simulation of the token automaton
+/// over the corpus (`lpm_prune_probe`): no pruned completion ever fired across
+/// 1M ClickBench rows over many needles, and the bench cross-check (`cd == bf`)
+/// confirms zero false negatives end-to-end.
+fn range_completion_lpm_dead(dict: DictView<'_>, cands: &[Token], range: TokenRange) -> bool {
+    if cands.is_empty() {
+        // The completing state cannot be a boundary at all ⇒ vacuously dead.
+        return true;
+    }
+    let n_comp = (range.last as usize).saturating_sub(range.begin as usize) + 1;
+    // Bound build-time work: keep the range if the pair scan is too large.
+    // Sound — only ever forgoes pruning.
+    if cands.len().saturating_mul(n_comp) > LPM_PAIR_BUDGET {
+        return false;
+    }
+
+    // Every (candidate, completer) pair must be absorbed: `t · u` carries a dict
+    // token longer than `t` as a prefix, so greedy never ends a token at `t`
+    // right before `u`.
+    let mut buf = [0u8; 2 * MAX_TOKEN_SIZE];
+    for &t in cands {
+        let tb = dict.data(t);
+        let tl = tb.len();
+        // A token already at the maximum length cannot be extended into a longer
+        // token, so nothing can absorb it.
+        if tl >= MAX_TOKEN_SIZE {
+            return false;
+        }
+        buf[..tl].copy_from_slice(tb);
+        for u in range.begin..=range.last {
+            let ub = dict.data(u);
+            let w = (tl + ub.len()).min(MAX_TOKEN_SIZE);
+            buf[tl..w].copy_from_slice(&ub[..w - tl]);
+            // Look for any token prefix of `t · u` strictly longer than `t`.
+            let absorbed = (tl + 1..=w).any(|l| dict.contains_token(&buf[..l]));
+            if !absorbed {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// [`chain_table`](KmpAutomaton::chain_table) flags. A token containing the

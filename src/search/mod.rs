@@ -124,6 +124,16 @@ impl<'a> DictView<'a> {
         lo
     }
 
+    /// Whether `bytes` is exactly a token in the dictionary. O(log n) via the
+    /// same sorted lower-bound prefix-search the rest of search uses.
+    fn contains_token(self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() || bytes.len() > MAX_TOKEN_SIZE {
+            return false;
+        }
+        let lb = self.lower_bound(bytes, 0) as usize;
+        lb < self.num_tokens() && self.data(lb as Token) == bytes
+    }
+
     /// `[lo, hi]` token-id range whose byte sequences share `prefix`, or the
     /// empty range if none do. Port of `DictionaryView::prefix_range`.
     fn prefix_range(self, prefix: &[u8]) -> TokenRange {
@@ -729,6 +739,7 @@ impl<O: Offset> SearchParts<'_, O> {
             scan(aut, self.codes, self.code_offsets, on_match);
             return;
         }
+        let dict = self.dict();
 
         // Optional SIMD INNER pass-1: when the INNER token set collapses into a
         // small number of contiguous id ranges, classify the whole code stream
@@ -737,7 +748,7 @@ impl<O: Offset> SearchParts<'_, O> {
         // token). Gated behind a small range budget — above it the per-code
         // range chain is longer than the scalar gather it replaces.
         if std::env::var_os("ONPAIR_INNER_SIMD").is_some()
-            && let Some(ranges) = aut.inner_ranges(INNER_RANGE_BUDGET)
+            && let Some(ranges) = aut.inner_ranges(dict, INNER_RANGE_BUDGET)
         {
             if ranges.is_empty() {
                 return; // no INNER token ⇒ no match possible.
@@ -754,7 +765,7 @@ impl<O: Offset> SearchParts<'_, O> {
         // row_chain over ALL codes with classify_inner over all codes (SIMD) +
         // row_chain over only the survivors (13–38%).
         if std::env::var_os("ONPAIR_FUNNEL").is_some()
-            && let Some(ranges) = aut.inner_ranges(INNER_RANGE_BUDGET)
+            && let Some(ranges) = aut.inner_ranges(dict, INNER_RANGE_BUDGET)
         {
             if ranges.is_empty() {
                 return;
@@ -1119,7 +1130,7 @@ mod tests {
         let parts = col.as_search_parts();
         let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
         let aut = KmpAutomaton::new(needle.as_bytes(), dict);
-        let ranges = aut.inner_ranges(64).expect("within budget");
+        let ranges = aut.inner_ranges(dict, 64).expect("within budget");
         let tok = |id: u16| String::from_utf8_lossy(dict.data(id)).into_owned();
         eprintln!("=== SIMD prefilter for {needle:?}: {} range tests ===", ranges.len());
         let mut total = 0usize;
@@ -1276,6 +1287,191 @@ mod tests {
         eprintln!("candidate rows (INNER present): {cand_inner} / {rows} ({:.2}%)",
             100.0 * cand_inner as f64 / rows as f64);
         eprintln!("(for comparison the adjacency chain marked ~0.5% candidate on i.yandex)");
+    }
+
+    /// Temporary: validate the LPM-absorption pruning analysis against the
+    /// empirically-measured boundary states. For each partial state `s`, decide
+    /// whether greedy LPM makes a *completing* boundary at `s` impossible (every
+    /// token that can land the DFA in `s`, when extended by the completion byte
+    /// `c = needle[s]`, is itself a dictionary token, so greedy always absorbs
+    /// the boundary into the longer token). Cross-check: any state we prune MUST
+    /// have been reached 0 times across the whole corpus.
+    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
+    ///   cargo test --lib lpm_prune_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn lpm_prune_probe() {
+        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
+        let col = load_corpus_col();
+        let parts = col.as_search_parts();
+        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let p = needle.as_bytes();
+        let aut = KmpAutomaton::new(p, dict);
+        let m = aut.match_state() as usize;
+        let nt = aut.num_tokens();
+
+        // Dictionary membership: is byte string `b` a token?
+        use std::collections::HashSet;
+        let tokset: HashSet<&[u8]> = (0..nt).map(|i| dict.data(i as Token)).collect();
+
+        // Loose transition-fixpoint reachability (the current over-approx).
+        let mut reach = vec![false; m + 1];
+        reach[0] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for s in 0..m {
+                if !reach[s] {
+                    continue;
+                }
+                for t in 0..nt {
+                    let ns = aut.step_from(s as u8, t as Token) as usize;
+                    if !reach[ns] {
+                        reach[ns] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // Empirical: how often each boundary state actually occurs, and — the
+        // precise soundness measure — how often a *completion* fires FROM a
+        // boundary at state s (the previous boundary state was s and the next
+        // token drives the DFA straight to the match state). Dropping state s's
+        // completing transitions is sound iff `completed_via[s] == 0`.
+        let mut seen = vec![0u64; m + 1];
+        let mut completed_via = vec![0u64; m + 1];
+        let (codes, co) = (parts.codes, parts.code_offsets);
+        for r in 0..co.len() - 1 {
+            let (s0, e0) = (co[r] as usize, co[r + 1] as usize);
+            let mut st = 0u8;
+            for &c in &codes[s0..e0] {
+                let prev = st;
+                st = aut.step_from(st, c);
+                seen[st as usize] += 1;
+                if st as usize == m {
+                    completed_via[prev as usize] += 1;
+                    break;
+                }
+            }
+        }
+
+        eprintln!("=== LPM prune analysis for {needle:?} (m={m}) ===");
+        for s in 1..m {
+            // Completing tokens from s: step(s,u)=m but NOT definite (base!=m).
+            // Collect their distinct first bytes.
+            let mut cbytes: HashSet<u8> = HashSet::new();
+            let mut n_complete = 0usize;
+            for u in 0..nt {
+                if aut.step_from(s as u8, u as Token) as usize == m
+                    && aut.step_from(0, u as Token) as usize != m
+                {
+                    n_complete += 1;
+                    let b = dict.data(u as Token);
+                    if !b.is_empty() {
+                        cbytes.insert(b[0]);
+                    }
+                }
+            }
+            if n_complete == 0 {
+                eprintln!("  state {s}: no sparse completion (reached {})", seen[s]);
+                continue;
+            }
+            // Candidate last-tokens into s: t with step(e,t)=s for a reachable e.
+            let mut cands: Vec<Token> = Vec::new();
+            for t in 0..nt {
+                for e in 0..m {
+                    if reach[e] && aut.step_from(e as u8, t as Token) as usize == s {
+                        cands.push(t as Token);
+                        break;
+                    }
+                }
+            }
+            // Absorption: every candidate t, extended by every completion byte c,
+            // is itself a token (so greedy never stops a boundary right after t
+            // when c follows).
+            let mut all_absorbed = true;
+            let mut witness: Option<(Token, u8)> = None;
+            'outer: for &t in &cands {
+                let tb = dict.data(t);
+                for &c in &cbytes {
+                    let mut ext = tb.to_vec();
+                    ext.push(c);
+                    if !tokset.contains(ext.as_slice()) {
+                        all_absorbed = false;
+                        witness = Some((t, c));
+                        break 'outer;
+                    }
+                }
+            }
+            let prune = all_absorbed; // also true vacuously if cands empty
+            eprintln!(
+                "  state {s}: {n_complete} completing toks, cbytes={:?}, {} cand last-toks, PRUNE={prune} (reached {}, completed_via {})",
+                cbytes.iter().map(|&b| b as char).collect::<Vec<_>>(),
+                cands.len(),
+                seen[s],
+                completed_via[s],
+            );
+            if let Some((t, c)) = witness {
+                eprintln!(
+                    "      blocked by candidate {t} {:?} + {:?} not in dict",
+                    String::from_utf8_lossy(dict.data(t)),
+                    c as char
+                );
+            }
+            // The precise soundness invariant: a state we prune must never have
+            // produced an actual completion across the whole corpus.
+            if prune {
+                assert_eq!(
+                    completed_via[s], 0,
+                    "UNSOUND: pruned state {s} but a completion fired from it {} times",
+                    completed_via[s]
+                );
+            }
+        }
+    }
+
+    /// Directly validate that the *production* INNER filter (`inner_ranges`,
+    /// with LPM completion pruning) is a sound necessary filter on real data:
+    /// EVERY row that actually contains the needle must hold a token inside the
+    /// (pruned) INNER ranges. A single uncovered match would be a false negative.
+    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
+    ///   cargo test --lib inner_filter_sound -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[allow(clippy::use_debug)]
+    fn inner_filter_sound() {
+        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
+        let col = load_corpus_col();
+        let parts = col.as_search_parts();
+        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
+        let ranges = aut.inner_ranges(dict, 1 << 16).expect("within budget");
+        let total: usize = ranges.iter().map(|&(lo, hi)| (hi - lo + 1) as usize).sum();
+        let in_inner = |c: u16| ranges.iter().any(|&(lo, hi)| c >= lo && c <= hi);
+
+        let (codes, co) = (parts.codes, parts.code_offsets);
+        let (mut matches, mut covered) = (0u64, 0u64);
+        for r in 0..co.len() - 1 {
+            let (s, e) = (co[r] as usize, co[r + 1] as usize);
+            let row = &codes[s..e];
+            if !aut.matches(row) {
+                continue;
+            }
+            matches += 1;
+            if row.iter().any(|&c| in_inner(c)) {
+                covered += 1;
+            } else {
+                panic!("FALSE NEGATIVE: matching row {r} holds no INNER token");
+            }
+        }
+        eprintln!(
+            "=== INNER filter soundness for {needle:?} ===\n  {} INNER ranges ({total} token ids); \
+             {matches} matching rows, {covered} covered (must be equal)",
+            ranges.len(),
+        );
+        assert_eq!(matches, covered, "INNER filter missed a real match");
     }
 
     /// Pack rows into the Arrow `(bytes, offsets)` pair `compress` expects.
