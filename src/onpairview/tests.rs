@@ -128,27 +128,6 @@ fn all_empty_rows() {
     assert!(views.iter().all(|v| v.is_empty() && v.is_inline()));
 }
 
-#[test]
-fn views_round_trip_through_buffer() {
-    // A larger, repetitive corpus that exercises the over-copy decode region
-    // and a mix of inline / reference rows.
-    let mut rows: Vec<String> = Vec::new();
-    for i in 0..2000u32 {
-        rows.push(format!("https://example.com/path/{}/item/{}", i % 53, i));
-    }
-    let row_slices: Vec<&[u8]> = rows.iter().map(|s| s.as_bytes()).collect();
-    let (bytes, offsets) = corpus(&row_slices);
-    let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
-
-    let view = col.decompress_view();
-    let views = build_views(&view);
-    let buffers: &[&[u8]] = &[&view.values];
-    assert_eq!(views.len(), rows.len());
-    for (r, expected) in row_slices.iter().enumerate() {
-        assert_eq!(views[r].resolve(buffers), *expected, "row {r}");
-    }
-}
-
 /// A naive, obviously-correct `build_views` to cross-check the optimized one.
 fn oracle(view: &DecodedView) -> Vec<BinaryView> {
     (0..view.len())

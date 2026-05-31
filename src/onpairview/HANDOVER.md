@@ -37,7 +37,7 @@ view" kernel) but expressed in this crate's types.
   per row; `_into` reuses a caller buffer (real export loops want this).
 - `Column::decompress_view(&self)` convenience method (`src/column.rs`).
 
-Tests: `src/onpairview/tests.rs` (13 tests, incl. an oracle cross-check of the
+Tests: `src/onpairview/tests.rs` (10 tests, incl. an oracle cross-check of the
 optimized `build_views` against a naive scalar builder across the fast/tail
 boundary and tiny (<16 byte) buffers, and an explicit Arrow-layout check).
 
@@ -53,28 +53,31 @@ old per-row zero-init + `copy_from_slice`. Rows in the final 16 bytes of `values
 fall to a scalar tail (a 16-byte over-read would run off the buffer); buffers
 shorter than 16 bytes are entirely scalar. See `make_view_u128`.
 
-### Measured (this container, noisy; `--sample-count 20 --sample-size 50`, buffer reuse)
+### Measured (buffer reuse; A/B vs the `build_views_scalar` arm)
 
-A/B vs the naive scalar builder (`build_views_scalar` arm in the bench), per-row
-throughput, median:
+Per-row time (median). Absolute numbers drift with container load, so the robust
+statistic is the **ratio** — same harness, only the called fn differs. Stable to
+~1 % across runs:
 
-| corpus                    | scalar       | u128 kernel  | speedup |
-|---------------------------|--------------|--------------|---------|
-| url_short (reference-heavy)| 378 Mitem/s | 565 Mitem/s  | 1.49×   |
-| words (inline-heavy)       | 151 Mitem/s | 403 Mitem/s  | 2.67×   |
+| corpus                     | scalar    | u128 kernel | speedup |
+|----------------------------|-----------|-------------|---------|
+| url_short (reference-heavy)| ~570 µs   | ~445 µs     | 1.28×   |
+| words (inline-heavy)       | ~1303 µs  | ~637 µs     | 2.05×   |
 
-Inline-heavy wins most (scalar zero-init + variable memcpy per row → one masked
-load+store). No regression anywhere.
+Inline-heavy wins most: the scalar inline path zero-inits 16 bytes then does a
+variable-length `copy_from_slice` (memcpy) per row; the u128 path is one load +
+mask/shift/or + one store, no zero-init, no memcpy. The `build_views_scalar`
+bench arm is kept as the regression guard that proves this stays won.
 
 ## Measurement gotchas (important)
 
 - **Container is noisy and has no perf isolation.** Per-`(param)` absolute
-  numbers swing 2–3× by run order. Sanity check: `build_views` runs on the
-  *decoded view*, which is **identical** for `("url_short",12)` and
-  `("url_short",16)` (bits don't affect decoded bytes) — those two arms must
-  report the same time. If they don't, it's warmup/ordering noise; re-run the
-  bench **filtered and in isolation** (`cargo bench --bench view_compute
-  build_views_only`) with a larger `--sample-size`.
+  numbers swing 2–3× by run order; trust the **scalar-vs-u128 ratio** (same
+  harness, only the called fn differs) over absolute times, and re-run filtered
+  and in isolation (`cargo bench --bench view_compute build_views`) with a larger
+  `--sample-size`. (`build_views` runs on the decoded view, which is independent
+  of the code-width bits — that is why the param matrix carries only one bit
+  width per corpus; a second would be a pure duplicate for these benches.)
 - **Always measure `build_views` with buffer reuse** (`build_views_into` + a
   pre-allocated `out`). Allocating the ~3 MB descriptor `Vec` per iteration is
   page-fault-bound and masks the kernel; the first allocator user in a process

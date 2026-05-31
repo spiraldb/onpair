@@ -31,8 +31,12 @@ use onpair::onpairview::decompress_view;
 use onpair::onpairview::row_byte_offsets;
 use onpair::{Bits, Column, Config, Threshold, compress, decompress};
 
-// (label, mean row length, share of rows that are reference-length > 12 bytes).
-const PARAMS: &[(&str, u8)] = &[("url_short", 12), ("url_short", 16), ("words", 16)];
+// (corpus, code-width bits). `url_short` is reference-heavy (> 12 byte rows),
+// `words` inline-heavy (≤ 12 byte rows), so `build_views` exercises both arms of
+// its split. Only one bit width per corpus: the `build_views` benches operate on
+// the decoded view, which is identical across bit widths, so a second width
+// would be a pure duplicate there.
+const PARAMS: &[(&str, u8)] = &[("url_short", 16), ("words", 16)];
 
 const ROWS: usize = 200_000;
 
