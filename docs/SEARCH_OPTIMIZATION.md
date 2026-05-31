@@ -113,6 +113,27 @@ any prefix of the needle is a constructible boundary value. The INNER filter
 (and the `reachable_states` transition fixpoint) is already as tight as soundness
 allows. **No remaining lever to make contains beat memmem on the token stream.**
 
+## Experiment #7 — search bits sweep: bits=16 wins everything (no tradeoff)
+
+Hypothesis: lower `bits` → smaller dict + tighter `first_codes`, but more
+codes/row → slower contains, so maybe a search-optimal width sits below the
+compression-optimal one. **Disproved.** Real ClickBench URL, 1M rows:
+
+| bits | dict toks | codes | core    | prefix http://www | contains google |
+|------|-----------|-------|---------|-------------------|-----------------|
+| 12   | 4096      | 16.4M | 39.8MiB | 307 us            | 23.9 ms         |
+| 14   | 16384     | 12.0M | 31.5MiB | 237 us            | 19.9 ms         |
+| 16   | 65191     |  9.5M | 27.1MiB | 113 us            | 18.2 ms         |
+
+More bits → fewer codes → faster everywhere (prefix 2.7x from 12→16 bits, tracking
+the 1.7x code-count drop). The `first_codes` index is a constant 1953 KiB
+(rows*2, bit-width-independent) so its absolute cost does not grow with bits; the
+core shrinks, so higher bits wins compression, search speed, AND absolute index
+size simultaneously. Only wrinkle: contains `http` (100% sel, DEFINITE-dominated)
+is marginally faster at 12 bits (2.75 vs 3.22 ms) — a selectivity-specific quirk,
+not a trend. Conclusion: default bits=16 is also search-optimal; no width tradeoff
+to exploit.
+
 ## Public API (matcher)
 
 - `Column::as_search_parts() -> SearchParts` (or build `SearchParts` by struct
