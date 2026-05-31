@@ -239,9 +239,12 @@ impl std::fmt::Debug for BinaryView {
 /// identical to [`crate::decompress`]; the added work is the per-row offset
 /// prefix sum over the codes' token lengths.
 ///
-/// Single offset + single decode pass: [`row_byte_offsets`] yields both the
-/// per-row offsets and the total decoded length (so no separate length pass) and
-/// panics on any out-of-range code (so the decode below runs unchecked).
+/// Two passes sharing one fat token table: the table is built once, the per-row
+/// offset prefix sum reads its compact `u8` token lengths (rather than the wider
+/// dictionary offsets — fewer bytes touched, more cache-resident), and the
+/// decode reuses the same table. The offset pass also yields the total decoded
+/// length (so no separate length pass) and validates every code is in range (by
+/// indexing the length table), so the decode runs unchecked.
 ///
 /// ## Panics
 ///
@@ -251,25 +254,57 @@ impl std::fmt::Debug for BinaryView {
 /// [`Column::code_offsets`]: crate::Column::code_offsets
 #[must_use]
 pub fn decompress_view<O: Offset>(parts: Parts<'_>, code_offsets: &[O]) -> DecodedView {
-    // The unchecked decode below over-reads the dictionary (fixed 16-byte token
-    // reads), so the padding invariant must hold; validate it once, off the hot
-    // loop. Code range is validated by `row_byte_offsets` (it indexes the
-    // dictionary per code), so the decode needs no per-code bounds check.
+    // The decode over-reads the dictionary (fixed 16-byte token reads), so the
+    // padding invariant must hold; validate it once, off the hot loop.
     if let Err(e) = parts.validate_dictionary() {
         panic!("onpair: {e}");
     }
-    let offsets = row_byte_offsets(parts, code_offsets);
+    // SAFETY: the dictionary is validated, so its padding makes the fat build's
+    // fixed-width reads in bounds.
+    let fat = unsafe { crate::decompress::fat::build(parts) };
+    let offsets = row_offsets_from_lens(fat.lens(), parts.codes, code_offsets);
     let total = offsets.last().copied().unwrap_or(0) as usize;
     let mut values: Vec<u8> = Vec::with_capacity(total);
-    // SAFETY: the dictionary is validated (padding ⇒ the over-copy decode's
-    // fixed-width reads are in bounds); `row_byte_offsets` panicked unless every
-    // code indexes the dictionary; and `total` is the exact decoded length, so
-    // the output store cannot overrun.
-    let n = unsafe { crate::decompress_into_unchecked(parts, values.spare_capacity_mut()) };
+    // SAFETY: `fat` is built from `parts`; `row_offsets_from_lens` panicked
+    // unless every code indexes the length table (so the fat reads stay in
+    // range); and `total` is the exact decoded length, so the store cannot
+    // overrun `values`.
+    let n = unsafe {
+        crate::decompress::fat::decode_loop::<false>(parts.codes, &fat, values.spare_capacity_mut())
+    };
     debug_assert_eq!(n, total, "decoded length must equal the row offsets total");
-    // SAFETY: `decompress_into_unchecked` initialized exactly `n` bytes.
+    // SAFETY: `decode_loop` initialized exactly `n` leading bytes.
     unsafe { values.set_len(n) };
     DecodedView { values, offsets }
+}
+
+/// Per-row byte-offset prefix sum, reading token lengths from the fat table's
+/// compact `lens` (one `u8` per code) instead of the dictionary offsets. Indexes
+/// `lens[code]`, so an out-of-range code panics — which is what lets
+/// [`decompress_view`]'s decode run unchecked.
+fn row_offsets_from_lens<O: Offset>(lens: &[u8], codes: &[u16], code_offsets: &[O]) -> Vec<u32> {
+    assert!(!code_offsets.is_empty(), "code_offsets must have R + 1 ≥ 1");
+    let rows = code_offsets.len() - 1;
+    let mut offsets = Vec::with_capacity(rows + 1);
+    offsets.push(0u32);
+
+    let mut acc = 0u32;
+    let mut ci = 0usize;
+    for r in 0..rows {
+        let end = code_offsets[r + 1]
+            .to_usize()
+            .expect("code offset exceeds usize");
+        assert!(
+            end >= ci && end <= codes.len(),
+            "code_offsets must be non-decreasing and within codes"
+        );
+        while ci < end {
+            acc += u32::from(lens[codes[ci] as usize]);
+            ci += 1;
+        }
+        offsets.push(acc);
+    }
+    offsets
 }
 
 /// Compute the `R + 1` per-row byte offsets for `code_offsets` over `parts`,

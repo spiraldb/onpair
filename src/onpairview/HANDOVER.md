@@ -28,9 +28,11 @@ view" kernel) but expressed in this crate's types.
 - `decompress_view(parts, code_offsets)` — decode `values` (== `decompress`) plus
   per-row `offsets`, recovering row boundaries from the compressor's
   `code_offsets` (a token may straddle a row boundary, so rows can't be recovered
-  from codes alone). Two passes over the codes: `row_byte_offsets` (which also
-  yields the total decoded length and validates the code range) then an
-  *unchecked* decode. It validates the dictionary once up front.
+  from codes alone). Builds the fat table once and shares it: the per-row offset
+  prefix sum reads its compact `u8` `lens` (`row_offsets_from_lens`, which also
+  yields the total length and validates the code range), then an *unchecked*
+  decode (`fat::decode_loop`) reuses the same table. Validates the dictionary
+  once up front. Tight allocation (no over-copy capacity).
 - `row_byte_offsets(parts, code_offsets)` — the per-row offset prefix sum alone
   (no values).
 - `build_views(view)` / `build_views_into(view, &mut out)` — one `BinaryView`
@@ -99,6 +101,13 @@ RUSTC_WRAPPER= cargo bench --bench view_compute build_views_only \
 
 ## Measured negative results — do NOT re-try
 
+- **`decompress_view`: fuse offsets into the decode (true single pass).** Decode
+  row-by-row into a buffer over-allocated by 16 bytes (so every token over-copies
+  with no exact-tail branch) and capture each row's offset as the write cursor —
+  one pass instead of two. Measured only +3 % (words) … +8 % (url_short), and it
+  over-allocates `values` to `codes.len() * 16` (up to ~4× the real size). The
+  tight fat-shared two-pass below beat it on speed *and* memory, so the fused
+  loop was removed. (The short-row case loses the gain to per-row loop overhead.)
 - **`build_views`: carry `start = previous end` to read each offset once.** The
   two per-row offset reads (`offsets[r]`, `offsets[r+1]`) look redundant, but
   carrying `end` forward serializes the loop (a loop-carried dependency through
@@ -109,6 +118,13 @@ RUSTC_WRAPPER= cargo bench --bench view_compute build_views_only \
 
 ## Done this round (perf)
 
+- **`decompress_view`: fat-shared two-pass (tight).** Build the fat token table
+  once; the offset prefix sum reads its compact `u8` `lens` (1 byte/code, ≤64 KB
+  table) instead of `dict_offsets` (2×`u32`/code, ≤256 KB), and the decode reuses
+  the same table. Controlled single-binary A/B vs the previous two-pass
+  (`decompress_view_prev_2pass` bench arm), median over 3 runs: **~6 % faster
+  (url_short), ~20 % faster (words)** — the `lens` table is far more cache-
+  resident at bits=16 where `words` has many codes/byte. Tight allocation.
 - **`decompress_view`: 3 passes → 2.** It used to call `crate::decompress`
   (which itself walks all codes once for `decompressed_len` to size the buffer,
   then again to decode with per-code bounds checks) and *then* `row_byte_offsets`

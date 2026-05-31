@@ -26,6 +26,16 @@ pub(crate) struct FatTable {
     lens: Vec<u8>,
 }
 
+impl FatTable {
+    /// Per-token true lengths, indexed by code (`lens[code]`). One `u8` per
+    /// token — a smaller, denser table than the dictionary offsets, so summing
+    /// token lengths through it touches less memory.
+    #[inline]
+    pub(crate) fn lens(&self) -> &[u8] {
+        &self.lens
+    }
+}
+
 /// Materialize the [`FatTable`] for a column. Built once per decode call.
 ///
 /// Each token is over-copied into its 16-byte row with a single branchless
