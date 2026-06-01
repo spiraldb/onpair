@@ -339,7 +339,13 @@ fn prefilter_accept_verify(
         // SAFETY: avx2 just confirmed present.
         unsafe {
             prefilter_accept_verify_avx2(
-                first_codes, alo16, awidth16, aenable, vpoint as u16, acc, ver,
+                first_codes,
+                alo16,
+                awidth16,
+                aenable,
+                vpoint as u16,
+                acc,
+                ver,
             )
         };
         return;
@@ -357,7 +363,11 @@ fn prefilter_accept_verify_scalar(
     acc: &mut [u64],
     ver: &mut [u64],
 ) {
-    for ((accw, verw), chunk) in acc.iter_mut().zip(ver.iter_mut()).zip(first_codes.chunks(64)) {
+    for ((accw, verw), chunk) in acc
+        .iter_mut()
+        .zip(ver.iter_mut())
+        .zip(first_codes.chunks(64))
+    {
         let mut a = 0u64;
         let mut v = 0u64;
         for (i, &fc) in chunk.iter().enumerate() {
@@ -935,7 +945,14 @@ impl<O: Offset> SearchParts<'_, O> {
         // token equals the query head). Both predicates are branchless.
         let mut acc = vec![0u64; words];
         let mut ver = vec![0u64; words];
-        prefilter_accept_verify(first_codes, pf.alo, pf.awidth, pf.vpoint, &mut acc, &mut ver);
+        prefilter_accept_verify(
+            first_codes,
+            pf.alo,
+            pf.awidth,
+            pf.vpoint,
+            &mut acc,
+            &mut ver,
+        );
 
         // Definite accepts: emit directly.
         for_each_set_bit(&acc, &mut on_match);
@@ -977,7 +994,14 @@ impl<O: Offset> SearchParts<'_, O> {
             // Multi-token: accepts go straight into `acc`; verify candidates are
             // confirmed and OR'd in (they are disjoint from the accept range).
             let mut ver = vec![0u64; words];
-            prefilter_accept_verify(first_codes, pf.alo, pf.awidth, pf.vpoint, &mut acc, &mut ver);
+            prefilter_accept_verify(
+                first_codes,
+                pf.alo,
+                pf.awidth,
+                pf.vpoint,
+                &mut acc,
+                &mut ver,
+            );
             for_each_set_bit(&ver, |r| {
                 if aut.matches(self.row_codes(r)) {
                     acc[r >> 6] |= 1u64 << (r & 63);
@@ -1075,11 +1099,18 @@ mod tests {
         let parser = Parser::train(
             &cbytes,
             &coffs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+            Config {
+                bits: Bits::new(16).unwrap(),
+                threshold: Threshold::new(0.5).unwrap(),
+                seed: Some(42),
+            },
         )
         .unwrap();
 
-        let dict = DictView { bytes: parts0.dict_bytes, offsets: parts0.dict_offsets };
+        let dict = DictView {
+            bytes: parts0.dict_bytes,
+            offsets: parts0.dict_offsets,
+        };
         let aut = KmpAutomaton::new(p, dict);
 
         // Run a probe string through LPM tokenisation and return the set of
@@ -1132,7 +1163,9 @@ mod tests {
             a
         };
         for _ in 0..2_000_000u64 {
-            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
             let len = 2 + (x as usize % 14);
             let mut v = Vec::with_capacity(len);
             let mut y = x;
@@ -1152,7 +1185,11 @@ mod tests {
             eprintln!(
                 "  state {s} (prefix {:?}): {}  witness={w:?}",
                 std::str::from_utf8(&p[..s]).unwrap_or("?"),
-                if reached[s] { "REACHABLE — prune UNSOUND" } else { "no witness found" }
+                if reached[s] {
+                    "REACHABLE — prune UNSOUND"
+                } else {
+                    "no witness found"
+                }
             );
         }
     }
@@ -1184,12 +1221,18 @@ mod tests {
         eprintln!("=== first_codes distribution ({n} rows) ===");
         eprintln!("max id = {max}  → {bits_needed} bits needed for the widest");
         eprintln!("distinct first ids = {}", distinct.len());
-        eprintln!("u16 index size = {} KiB; at {bits_needed}-bit packing = {} KiB",
-            n * 2 / 1024, n * bits_needed as usize / 8 / 1024);
+        eprintln!(
+            "u16 index size = {} KiB; at {bits_needed}-bit packing = {} KiB",
+            n * 2 / 1024,
+            n * bits_needed as usize / 8 / 1024
+        );
         eprintln!("bits-needed histogram (rows whose first id needs k bits):");
         for (k, &c) in hist.iter().enumerate() {
             if c > 0 {
-                eprintln!("  {k:>2} bits: {c} rows ({:.1}%)", 100.0 * c as f64 / n as f64);
+                eprintln!(
+                    "  {k:>2} bits: {c} rows ({:.1}%)",
+                    100.0 * c as f64 / n as f64
+                );
             }
         }
     }
@@ -1215,7 +1258,11 @@ mod tests {
         compress(
             &bytes,
             &offs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+            Config {
+                bits: Bits::new(16).unwrap(),
+                threshold: Threshold::new(0.5).unwrap(),
+                seed: Some(42),
+            },
         )
         .unwrap()
     }
@@ -1231,12 +1278,21 @@ mod tests {
         let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
         let col = load_corpus_col();
         let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let dict = DictView {
+            bytes: parts.dict_bytes,
+            offsets: parts.dict_offsets,
+        };
         let aut = KmpAutomaton::new(needle.as_bytes(), dict);
         let counts = aut.boundary_state_counts();
         eprintln!("=== boundary-reachable states for {needle:?} ===");
         for (s, &c) in counts.iter().enumerate() {
-            let what = if s == 0 { "inert" } else if s == needle.len() { "MATCH (definite)" } else { "partial" };
+            let what = if s == 0 {
+                "inert"
+            } else if s == needle.len() {
+                "MATCH (definite)"
+            } else {
+                "partial"
+            };
             eprintln!("  state {s} ({what}): {c} tokens end here (base==s)");
         }
     }
@@ -1254,7 +1310,10 @@ mod tests {
         let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
         let col = load_corpus_col();
         let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let dict = DictView {
+            bytes: parts.dict_bytes,
+            offsets: parts.dict_offsets,
+        };
         let aut = KmpAutomaton::new(needle.as_bytes(), dict);
         let m = needle.len();
         // Per-state count of how often a boundary lands there (across all rows).
@@ -1306,15 +1365,25 @@ mod tests {
         let col = compress(
             &bytes,
             &offs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+            Config {
+                bits: Bits::new(16).unwrap(),
+                threshold: Threshold::new(0.5).unwrap(),
+                seed: Some(42),
+            },
         )
         .unwrap();
         let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let dict = DictView {
+            bytes: parts.dict_bytes,
+            offsets: parts.dict_offsets,
+        };
         let aut = KmpAutomaton::new(needle.as_bytes(), dict);
         let ranges = aut.inner_ranges(64).expect("within budget");
         let tok = |id: u16| String::from_utf8_lossy(dict.data(id)).into_owned();
-        eprintln!("=== SIMD prefilter for {needle:?}: {} range tests ===", ranges.len());
+        eprintln!(
+            "=== SIMD prefilter for {needle:?}: {} range tests ===",
+            ranges.len()
+        );
         let mut total = 0usize;
         for (lo, hi) in &ranges {
             let cnt = (hi - lo + 1) as usize;
@@ -1325,7 +1394,10 @@ mod tests {
                 tok(*hi)
             );
         }
-        eprintln!("a code is a candidate iff it falls in ANY of those {} ranges ({total} token ids)", ranges.len());
+        eprintln!(
+            "a code is a candidate iff it falls in ANY of those {} ranges ({total} token ids)",
+            ranges.len()
+        );
     }
 
     /// Temporary: dump the TOKEN-LEVEL DFA for a needle over the real dict
@@ -1355,41 +1427,76 @@ mod tests {
         let col = compress(
             &bytes,
             &offs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+            Config {
+                bits: Bits::new(16).unwrap(),
+                threshold: Threshold::new(0.5).unwrap(),
+                seed: Some(42),
+            },
         )
         .unwrap();
         let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let dict = DictView {
+            bytes: parts.dict_bytes,
+            offsets: parts.dict_offsets,
+        };
         let nt = dict.num_tokens();
         let aut = KmpAutomaton::new(needle.as_bytes(), dict);
         let (base_runs, per_state) = aut.dump_dfa();
         let m = needle.len();
         let tokstr = |id: u16| String::from_utf8_lossy(dict.data(id)).into_owned();
 
-        eprintln!("=== TOKEN-LEVEL DFA for {needle:?}  ({nt} tokens = the alphabet, {m}+1 states) ===\n");
+        eprintln!(
+            "=== TOKEN-LEVEL DFA for {needle:?}  ({nt} tokens = the alphabet, {m}+1 states) ===\n"
+        );
         eprintln!("STATE 0 (no partial match) — base[] table, run-length encoded:");
-        eprintln!("  {} non-zero runs out of {} total runs:", base_runs.iter().filter(|r| r.2 != 0).count(), base_runs.len());
+        eprintln!(
+            "  {} non-zero runs out of {} total runs:",
+            base_runs.iter().filter(|r| r.2 != 0).count(),
+            base_runs.len()
+        );
         for &(lo, hi, t) in base_runs.iter().filter(|r| r.2 != 0) {
-            let lbl = if lo == hi { format!("token {lo} {:?}", tokstr(lo as u16)) }
-                      else { format!("tokens {lo}..={hi} (e.g. {:?})", tokstr(lo as u16)) };
+            let lbl = if lo == hi {
+                format!("token {lo} {:?}", tokstr(lo as u16))
+            } else {
+                format!("tokens {lo}..={hi} (e.g. {:?})", tokstr(lo as u16))
+            };
             eprintln!("    →state {t}: {lbl}");
         }
         for (s, trs) in per_state.iter().enumerate() {
             let s = s + 1;
-            if s >= m { continue; }
-            eprintln!("\nSTATE {s} (matched {} needle bytes) — {} sparse exceptions over base:", s, trs.len());
+            if s >= m {
+                continue;
+            }
+            eprintln!(
+                "\nSTATE {s} (matched {} needle bytes) — {} sparse exceptions over base:",
+                s,
+                trs.len()
+            );
             for &(lo, hi, t) in trs.iter().take(12) {
-                let lbl = if lo == hi { format!("token {lo} {:?}", tokstr(lo)) }
-                          else { format!("tokens {lo}..={hi}") };
+                let lbl = if lo == hi {
+                    format!("token {lo} {:?}", tokstr(lo))
+                } else {
+                    format!("tokens {lo}..={hi}")
+                };
                 eprintln!("    on {lbl} → state {t}");
             }
-            if trs.len() > 12 { eprintln!("    … {} more", trs.len() - 12); }
+            if trs.len() > 12 {
+                eprintln!("    … {} more", trs.len() - 12);
+            }
         }
         let total_sparse: usize = per_state.iter().map(|v| v.len()).sum();
-        let nz_base: u32 = base_runs.iter().filter(|r| r.2 != 0).map(|&(lo, hi, _)| hi - lo + 1).sum();
-        eprintln!("\nSUMMARY: state-0 alphabet that matters = {nz_base} token ids in {} runs;",
-            base_runs.iter().filter(|r| r.2 != 0).count());
-        eprintln!("         {total_sparse} sparse exception ranges across the partial-match states.");
+        let nz_base: u32 = base_runs
+            .iter()
+            .filter(|r| r.2 != 0)
+            .map(|&(lo, hi, _)| hi - lo + 1)
+            .sum();
+        eprintln!(
+            "\nSUMMARY: state-0 alphabet that matters = {nz_base} token ids in {} runs;",
+            base_runs.iter().filter(|r| r.2 != 0).count()
+        );
+        eprintln!(
+            "         {total_sparse} sparse exception ranges across the partial-match states."
+        );
     }
 
     /// Temporary: measure the selectivity of the SIMD-able INNER filter — a row
@@ -1423,11 +1530,18 @@ mod tests {
         let col = compress(
             &bytes,
             &offs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
+            Config {
+                bits: Bits::new(16).unwrap(),
+                threshold: Threshold::new(0.5).unwrap(),
+                seed: Some(42),
+            },
         )
         .unwrap();
         let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
+        let dict = DictView {
+            bytes: parts.dict_bytes,
+            offsets: parts.dict_offsets,
+        };
         let nt = dict.num_tokens();
         let aut = KmpAutomaton::new(needle.as_bytes(), dict);
         let (base_runs, per_state) = aut.dump_dfa();
@@ -1439,14 +1553,18 @@ mod tests {
         let mut ranges: Vec<(u16, u16)> = Vec::new();
         for &(lo, hi, t) in &base_runs {
             if t == m {
-                for i in lo..=hi { inner[i as usize] = true; }
+                for i in lo..=hi {
+                    inner[i as usize] = true;
+                }
                 ranges.push((lo as u16, hi as u16));
             }
         }
         for trs in &per_state {
             for &(lo, hi, t) in trs {
                 if t != 0 {
-                    for i in lo..=hi { inner[i as usize] = true; }
+                    for i in lo..=hi {
+                        inner[i as usize] = true;
+                    }
                     ranges.push((lo, hi));
                 }
             }
@@ -1459,15 +1577,22 @@ mod tests {
         let mut cand_inner = 0usize;
         for r in 0..co.len() - 1 {
             let (s, e) = (co[r] as usize, co[r + 1] as usize);
-            if codes[s..e].iter().any(|&c| inner[c as usize]) { cand_inner += 1; }
+            if codes[s..e].iter().any(|&c| inner[c as usize]) {
+                cand_inner += 1;
+            }
         }
         let rows = co.len() - 1;
         eprintln!("=== INNER (SIMD-rangeable) filter for {needle:?} ===");
-        eprintln!("INNER tokens: {n_inner} in {} contiguous ranges (SIMD: {} lt/gt range tests)",
-            ranges.len(), ranges.len());
+        eprintln!(
+            "INNER tokens: {n_inner} in {} contiguous ranges (SIMD: {} lt/gt range tests)",
+            ranges.len(),
+            ranges.len()
+        );
         eprintln!("ranges: {ranges:?}");
-        eprintln!("candidate rows (INNER present): {cand_inner} / {rows} ({:.2}%)",
-            100.0 * cand_inner as f64 / rows as f64);
+        eprintln!(
+            "candidate rows (INNER present): {cand_inner} / {rows} ({:.2}%)",
+            100.0 * cand_inner as f64 / rows as f64
+        );
         eprintln!("(for comparison the adjacency chain marked ~0.5% candidate on i.yandex)");
     }
 
@@ -1525,7 +1650,11 @@ mod tests {
     /// trainer emits multi-byte tokens (exercising the sparse KMP transitions
     /// and prefix-divergence intervals rather than only single-byte tokens).
     fn url_corpus() -> Vec<Vec<u8>> {
-        let hosts = ["https://www.example.com", "https://api.example.org", "ftp://x.example.net"];
+        let hosts = [
+            "https://www.example.com",
+            "https://api.example.org",
+            "ftp://x.example.net",
+        ];
         let paths = ["/index.html", "/search?q=onpair", "/a/b/c", "", "/login"];
         let mut out = Vec::new();
         let mut x = 0x1234_5678u64;
@@ -1551,7 +1680,9 @@ mod tests {
             b"e".as_slice(),
             b"".as_slice(),
         ] {
-            assert_matches(&rows, Pattern::Contains(needle), |r| naive_contains(r, needle));
+            assert_matches(&rows, Pattern::Contains(needle), |r| {
+                naive_contains(r, needle)
+            });
         }
     }
 
@@ -1585,7 +1716,9 @@ mod tests {
         // A 20-byte needle exceeds MAX_TOKEN_SIZE; prefix_range short-circuits.
         let rows: &[&[u8]] = &[b"this is a fairly long row of text", b"short"];
         let needle = b"fairly long row of t"; // 20 bytes
-        assert_matches(rows, Pattern::Contains(needle), |r| naive_contains(r, needle));
+        assert_matches(rows, Pattern::Contains(needle), |r| {
+            naive_contains(r, needle)
+        });
         let pneedle = b"this is a fairly lon"; // 20 bytes
         assert_matches(rows, Pattern::Prefix(pneedle), |r| r.starts_with(pneedle));
     }

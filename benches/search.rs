@@ -159,9 +159,7 @@ fn read_parquet_strings(path: &PathBuf) -> Option<Vec<Vec<u8>>> {
                 }
             }
             Binary => {
-                let a = arr
-                    .as_any()
-                    .downcast_ref::<arrow_array::BinaryArray>()?;
+                let a = arr.as_any().downcast_ref::<arrow_array::BinaryArray>()?;
                 for b in a.iter() {
                     rows.push(b.unwrap_or(b"").to_vec());
                 }
@@ -354,7 +352,9 @@ fn select_needles() -> &'static [Needle] {
                 let (mode, text) = match item.split_once(':') {
                     Some(("prefix", t)) => (Mode::Prefix, t),
                     Some(("contains", t)) => (Mode::Contains, t),
-                    _ => panic!("ONPAIR_NEEDLES item must be `contains:TEXT` or `prefix:TEXT`, got {item:?}"),
+                    _ => panic!(
+                        "ONPAIR_NEEDLES item must be `contains:TEXT` or `prefix:TEXT`, got {item:?}"
+                    ),
                 };
                 let bytes = text.as_bytes().to_vec();
                 let sel = brute_count(rows, &bytes, mode) as f64 / rows.len() as f64;
@@ -371,7 +371,9 @@ fn select_needles() -> &'static [Needle] {
         // Deterministic sampler shared across phases.
         let mut x = 0xD1B54A32D192ED03u64;
         let mut next = |bound: usize| -> usize {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((x >> 33) as usize) % bound.max(1)
         };
 
@@ -419,9 +421,7 @@ fn select_needles() -> &'static [Needle] {
                         continue;
                     }
                     let dist = (sel - tgt).abs();
-                    let better = best[bi]
-                        .as_ref()
-                        .is_none_or(|(bdist, _)| dist < *bdist);
+                    let better = best[bi].as_ref().is_none_or(|(bdist, _)| dist < *bdist);
                     if better {
                         best[bi] = Some((dist, cand.clone()));
                     }
@@ -748,7 +748,10 @@ fn main() {
             n.bytes.escape_ascii(),
             n.selectivity * 100.0,
         );
-        assert_eq!(cd, bf, "compressed-domain search disagrees with brute force");
+        assert_eq!(
+            cd, bf,
+            "compressed-domain search disagrees with brute force"
+        );
     }
     divan::main();
 }

@@ -263,7 +263,10 @@ fn tpch_dump_parquet() {
     let mut w = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
-    eprintln!("[tpch dump] wrote {} rows of {col} to {path}", offsets.len() - 1);
+    eprintln!(
+        "[tpch dump] wrote {} rows of {col} to {path}",
+        offsets.len() - 1
+    );
 }
 
 fn main() {
