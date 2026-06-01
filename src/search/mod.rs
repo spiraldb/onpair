@@ -217,10 +217,9 @@ fn avx2_enabled() -> bool {
 }
 
 /// Whether the AVX-512BW prefix kernel should be used: the CPU supports
-/// AVX-512BW and SIMD is not disabled. Measured ~1.2× faster than the AVX2
-/// prefix kernel (32 `u16`/vector + mask-register output, no pack/movemask).
-/// `ONPAIR_NO_SIMD` disables it; `ONPAIR_NO_AVX512` forces the AVX2 path for A/B.
-/// Resolved once.
+/// AVX-512BW and SIMD is not disabled. Faster than the AVX2 prefix kernel
+/// (32 `u16`/vector + mask-register output, no pack/movemask). `ONPAIR_NO_SIMD`
+/// disables it (falling back to AVX2, then scalar). Resolved once.
 #[cfg(target_arch = "x86_64")]
 fn avx512_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -230,8 +229,7 @@ fn avx512_enabled() -> bool {
         return cached == 1;
     }
     let on = std::is_x86_feature_detected!("avx512bw")
-        && std::env::var_os("ONPAIR_NO_SIMD").is_none()
-        && std::env::var_os("ONPAIR_NO_AVX512").is_none();
+        && std::env::var_os("ONPAIR_NO_SIMD").is_none();
     STATE.store(on as u8, Ordering::Relaxed);
     on
 }
@@ -370,51 +368,6 @@ fn prefilter_accept_verify_scalar(
     }
 }
 
-/// Maximum INNER range count for which the SIMD multi-range contains pass-1 is
-/// attempted; above this the per-code range chain outweighs the scalar gather.
-const INNER_RANGE_BUDGET: usize = 16;
-
-/// Set bit `i` of `bits` iff `codes[i]` lies in any of the (sorted, merged)
-/// INNER `ranges`. Dispatches to AVX2 when available.
-fn classify_inner(codes: &[Token], ranges: &[(Token, Token)], bits: &mut [u64]) {
-    #[cfg(target_arch = "x86_64")]
-    if avx2_enabled() {
-        // SAFETY: avx2 confirmed present.
-        unsafe { classify_inner_avx2(codes, ranges, bits) };
-        return;
-    }
-    classify_inner_scalar(codes, ranges, bits);
-}
-
-/// Scalar reference for [`classify_inner`].
-fn classify_inner_scalar(codes: &[Token], ranges: &[(Token, Token)], bits: &mut [u64]) {
-    for (i, &c) in codes.iter().enumerate() {
-        if ranges.iter().any(|&(lo, hi)| c >= lo && c <= hi) {
-            bits[i >> 6] |= 1u64 << (i & 63);
-        }
-    }
-}
-
-/// Whether any bit in `bits[lo..hi]` (bit indices) is set.
-#[inline]
-fn any_bit_in_range(bits: &[u64], lo: usize, hi: usize) -> bool {
-    if lo >= hi {
-        return false;
-    }
-    let (wlo, whi) = (lo >> 6, (hi - 1) >> 6);
-    if wlo == whi {
-        let mask = (!0u64 << (lo & 63)) & (!0u64 >> (63 - ((hi - 1) & 63)));
-        return bits[wlo] & mask != 0;
-    }
-    if bits[wlo] & (!0u64 << (lo & 63)) != 0 {
-        return true;
-    }
-    if bits[wlo + 1..whi].iter().any(|&w| w != 0) {
-        return true;
-    }
-    bits[whi] & (!0u64 >> (63 - ((hi - 1) & 63))) != 0
-}
-
 /// Invoke `f` with the index of every set bit in `words`, in ascending order.
 #[inline]
 fn for_each_set_bit(words: &[u64], mut f: impl FnMut(usize)) {
@@ -488,7 +441,7 @@ unsafe fn prefilter_accept_avx2(first_codes: &[u16], alo: u16, awidth: u16, acc:
     }
 }
 
-/// AVX-512BW accept filter (experiment #3): 32 `u16` codes per vector, one
+/// AVX-512BW accept filter: 32 `u16` codes per vector, one
 /// `vpsubw` + `vpcmpuw` (`cmple_epu16`) yielding a `__mmask32` directly — no
 /// pack/movemask reduction. Two masks compose one 64-bit bitset word.
 #[cfg(target_arch = "x86_64")]
@@ -513,46 +466,6 @@ unsafe fn prefilter_accept_avx512(first_codes: &[u16], alo: u16, awidth: u16, ac
     }
     if r < n {
         prefilter_accept_scalar(&first_codes[r..], alo as u32, awidth as u32, &mut acc[wi..]);
-    }
-}
-
-/// AVX2 multi-range INNER classifier; see [`classify_inner`]. For each 16-code
-/// vector, OR together one `in_range_epu16` per INNER range, pack to a 16-bit
-/// mask, and accumulate into the per-code bitset words (64 codes per word).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn classify_inner_avx2(codes: &[Token], ranges: &[(Token, Token)], bits: &mut [u64]) {
-    // Preload (lo, width) vectors for each range.
-    let zero = _mm256_setzero_si256();
-    let mut vlo = [zero; INNER_RANGE_BUDGET];
-    let mut vw = [zero; INNER_RANGE_BUDGET];
-    for (i, &(lo, hi)) in ranges.iter().enumerate() {
-        vlo[i] = _mm256_set1_epi16(lo as i16);
-        vw[i] = _mm256_set1_epi16((hi - lo) as i16);
-    }
-    let nr = ranges.len();
-    let n = codes.len();
-    let ptr = codes.as_ptr();
-    let (mut r, mut wi) = (0usize, 0usize);
-    while r + 64 <= n {
-        let mut word = 0u64;
-        for k in 0..4 {
-            // SAFETY: r + k*16 + 16 <= r + 64 <= n.
-            let v = unsafe { _mm256_loadu_si256(ptr.add(r + k * 16) as *const __m256i) };
-            let mut hit = zero;
-            for vrange in vlo.iter().zip(vw.iter()).take(nr) {
-                // SAFETY: both helpers are avx2, enabled for this fn.
-                hit = _mm256_or_si256(hit, unsafe { in_range_epu16(v, *vrange.0, *vrange.1) });
-            }
-            // SAFETY: avx2 enabled for this fn.
-            word |= (unsafe { movemask_epu16(hit) } as u64) << (k * 16);
-        }
-        bits[wi] = word;
-        wi += 1;
-        r += 64;
-    }
-    if r < n {
-        classify_inner_scalar(&codes[r..], ranges, &mut bits[wi..]);
     }
 }
 
@@ -746,17 +659,17 @@ impl<O: Offset> SearchParts<'_, O> {
         }
     }
 
-    /// Contains scan in two passes over the whole code stream.
+    /// Contains scan over the whole code stream.
     ///
     /// Unlike prefix (which need only inspect each row's first token), a
-    /// substring can begin at any token, so pass 1 must stream every code. Using
-    /// the KMP [`class_table`](KmpAutomaton::class_table), each row is reduced to
-    /// one of three verdicts by OR-ing its tokens' classes:
-    ///   * a [`CLASS_DEFINITE`] token present → the row matches outright (a token
-    ///     contains the whole needle); emit without a row check;
-    ///   * else a [`CLASS_OPENER`] token present → the row is a candidate; the
-    ///     exact KMP confirms it in pass 2;
-    ///   * else (all classes zero) → reject, never touching the KMP.
+    /// substring can begin at any token, so every code must be streamed. Each
+    /// row is reduced to one of three verdicts by [`row_chain`] over the KMP
+    /// [`chain_table`](KmpAutomaton::chain_table):
+    ///   * a [`RowChain::Definite`] token present → the row matches outright (a
+    ///     token contains the whole needle); emit without a row check;
+    ///   * else an open→continue pair exists ([`RowChain::Candidate`]) → a
+    ///     boundary-spanning match is possible; the exact KMP confirms it;
+    ///   * else ([`RowChain::Reject`]) → the row cannot match; never touch KMP.
     ///
     /// The dependent-load + branch chain of the KMP fast path is thus paid only
     /// on candidate rows, not on the (dominant at low/medium selectivity)
@@ -766,39 +679,6 @@ impl<O: Offset> SearchParts<'_, O> {
         let n = self.code_offsets.len() - 1;
         if aut.is_empty_needle() {
             scan(aut, self.codes, self.code_offsets, on_match);
-            return;
-        }
-
-        // Optional SIMD INNER pass-1: when the INNER token set collapses into a
-        // small number of contiguous id ranges, classify the whole code stream
-        // with AVX2 range tests (any-INNER per code), reduce to candidate rows,
-        // and confirm with the exact KMP. Sound (every match holds an INNER
-        // token). Gated behind a small range budget — above it the per-code
-        // range chain is longer than the scalar gather it replaces.
-        if std::env::var_os("ONPAIR_INNER_SIMD").is_some()
-            && let Some(ranges) = aut.inner_ranges(INNER_RANGE_BUDGET)
-        {
-            if ranges.is_empty() {
-                return; // no INNER token ⇒ no match possible.
-            }
-            self.scan_contains_inner(aut, &ranges, on_match);
-            return;
-        }
-
-        // Optional 3-layer funnel: a cheap SIMD INNER reject (layer 1) over the
-        // whole stream, then the precise scalar adjacency chain (layer 2) only on
-        // layer-1 survivors, then exact KMP (layer 3) on chain candidates. Both
-        // INNER-presence and the open→cont chain are independently necessary for
-        // a match, so ANDing them drops no true match. The point: replace
-        // row_chain over ALL codes with classify_inner over all codes (SIMD) +
-        // row_chain over only the survivors (13–38%).
-        if std::env::var_os("ONPAIR_FUNNEL").is_some()
-            && let Some(ranges) = aut.inner_ranges(INNER_RANGE_BUDGET)
-        {
-            if ranges.is_empty() {
-                return;
-            }
-            self.scan_contains_funnel(aut, &ranges, on_match);
             return;
         }
 
@@ -816,67 +696,6 @@ impl<O: Offset> SearchParts<'_, O> {
                     }
                 }
                 // Neither: the row cannot contain the needle.
-                RowChain::Reject => {}
-            }
-        }
-    }
-
-    /// SIMD INNER contains scan. Pass 1 marks each code that lies in any INNER
-    /// range (AVX2 multi-range test over the whole stream) into a per-code
-    /// bitset; pass 2 visits rows holding a marked code and confirms with the
-    /// exact KMP. INNER presence is a sound necessary condition for a match.
-    fn scan_contains_inner(
-        &self,
-        aut: &KmpAutomaton,
-        ranges: &[(Token, Token)],
-        mut on_match: impl FnMut(usize),
-    ) {
-        let m = self.codes.len();
-        let words = m.div_ceil(64);
-        let mut inner_bits = vec![0u64; words];
-        classify_inner(self.codes, ranges, &mut inner_bits);
-        for r in 0..self.code_offsets.len() - 1 {
-            let s = self.code_offsets[r].as_usize();
-            let e = self.code_offsets[r + 1].as_usize();
-            if any_bit_in_range(&inner_bits, s, e) && aut.matches(&self.codes[s..e]) {
-                on_match(r);
-            }
-        }
-    }
-
-    /// 3-layer funnel contains scan. Layer 1: SIMD INNER classify over the whole
-    /// code stream into a per-code bitset (cheap, but only ~13–38% selective).
-    /// Layer 2: for rows surviving layer 1, the precise scalar adjacency chain
-    /// (`row_chain`) — run only on survivors, not all rows. Layer 3: exact KMP on
-    /// chain candidates. Both INNER-presence and the open→cont chain are
-    /// necessary for a match, so ANDing the layers drops no true match.
-    fn scan_contains_funnel(
-        &self,
-        aut: &KmpAutomaton,
-        ranges: &[(Token, Token)],
-        mut on_match: impl FnMut(usize),
-    ) {
-        let words = self.codes.len().div_ceil(64);
-        let mut inner_bits = vec![0u64; words];
-        classify_inner(self.codes, ranges, &mut inner_bits);
-        let chain = aut.chain_table();
-        for r in 0..self.code_offsets.len() - 1 {
-            let s = self.code_offsets[r].as_usize();
-            let e = self.code_offsets[r + 1].as_usize();
-            // Layer 1: SIMD INNER reject — skip the scalar chain entirely if no
-            // INNER code is present.
-            if !any_bit_in_range(&inner_bits, s, e) {
-                continue;
-            }
-            let codes = &self.codes[s..e];
-            // Layer 2+3: precise chain, then exact KMP.
-            match row_chain(&chain, codes) {
-                RowChain::Definite => on_match(r),
-                RowChain::Candidate => {
-                    if aut.matches(codes) {
-                        on_match(r);
-                    }
-                }
                 RowChain::Reject => {}
             }
         }
@@ -1033,443 +852,6 @@ impl<O: Offset> Column<O> {
 mod tests {
     use super::*;
     use crate::{Bits, Config, Threshold, compress};
-
-    /// EXPERIMENT #1 (LPM-aware reachability soundness). For each needle, tries
-    /// hard to CONSTRUCT a real byte string whose LPM tokenisation (using the
-    /// trained dictionary) lands a token boundary at each partial DFA state — in
-    /// particular the "unreachable" deep states. If any partial state is
-    /// witnessed reachable by a constructed/random string, dropping its
-    /// completion range from the prefilter would be UNSOUND. Proves whether the
-    /// empirical "0× in corpus" is a real dictionary-level impossibility.
-    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
-    ///   cargo test --lib lpm_reach_witness -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[allow(clippy::use_debug)]
-    fn lpm_reach_witness() {
-        use crate::Parser;
-        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
-        let p = needle.as_bytes();
-        let m = p.len();
-        // Train on the real corpus, then re-tokenise arbitrary probe strings
-        // through the SAME dictionary via Parser::parse.
-        let col0 = load_corpus_col();
-        let parts0 = col0.as_search_parts();
-        // Reconstruct training bytes is unnecessary: re-train a Parser on the
-        // corpus rows so we can parse() probe strings.
-        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
-        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
-        let mut o = 8;
-        let mut lens = Vec::with_capacity(n);
-        for _ in 0..n {
-            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
-            o += 4;
-        }
-        let mut cbytes = Vec::new();
-        let mut coffs = vec![0u32];
-        for &l in &lens {
-            cbytes.extend_from_slice(&raw[o..o + l]);
-            o += l;
-            coffs.push(cbytes.len() as u32);
-        }
-        let parser = Parser::train(
-            &cbytes,
-            &coffs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
-        )
-        .unwrap();
-
-        let dict = DictView { bytes: parts0.dict_bytes, offsets: parts0.dict_offsets };
-        let aut = KmpAutomaton::new(p, dict);
-
-        // Run a probe string through LPM tokenisation and return the set of
-        // boundary states it reaches (excluding 0).
-        let probe = |s: &[u8], reached: &mut [bool], witness: &mut Vec<Option<Vec<u8>>>| {
-            let pcol = parser.parse(s, &[0u32, s.len() as u32]).unwrap();
-            let pp = pcol.as_search_parts();
-            let mut st = 0u8;
-            for &c in pp.codes {
-                st = aut.step_from(st, c);
-                if !reached[st as usize] {
-                    reached[st as usize] = true;
-                    witness[st as usize] = Some(s.to_vec());
-                }
-                if st as usize == m {
-                    break;
-                }
-            }
-        };
-
-        let mut reached = vec![false; m + 1];
-        let mut witness: Vec<Option<Vec<u8>>> = vec![None; m + 1];
-        // 1. Crafted witnesses: for each partial state s, the s-byte prefix of
-        //    the needle, sandwiched between filler designed to force boundaries.
-        let fillers: &[&[u8]] = &[b"", b" ", b"/", b"x", b"zz", b"://", b".", b"=", b"?", b"&"];
-        for s in 1..m {
-            for fa in fillers {
-                for fb in fillers {
-                    let mut v = Vec::new();
-                    v.extend_from_slice(fa);
-                    v.extend_from_slice(&p[..s]);
-                    v.extend_from_slice(fb);
-                    probe(&v, &mut reached, &mut witness);
-                    // also doubled-prefix tricks: googgl-style to force a split
-                    let mut v2 = Vec::new();
-                    v2.extend_from_slice(&p[..s]);
-                    v2.extend_from_slice(&p[..s]);
-                    v2.extend_from_slice(fb);
-                    probe(&v2, &mut reached, &mut witness);
-                }
-            }
-        }
-        // 2. Random fuzz around needle bytes.
-        let mut x = 0x2545F4914F6CDD1Du64;
-        let alpha = {
-            let mut a: Vec<u8> = p.to_vec();
-            a.extend_from_slice(b" /.:=?&-_0123456789abcdefghijklmnopqrstuvwxyz");
-            a.sort_unstable();
-            a.dedup();
-            a
-        };
-        for _ in 0..2_000_000u64 {
-            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-            let len = 2 + (x as usize % 14);
-            let mut v = Vec::with_capacity(len);
-            let mut y = x;
-            for _ in 0..len {
-                y = y.wrapping_mul(6364136223846793005).wrapping_add(1);
-                v.push(alpha[(y >> 33) as usize % alpha.len()]);
-            }
-            probe(&v, &mut reached, &mut witness);
-        }
-
-        eprintln!("=== LPM reachability witnesses for {needle:?} (m={m}) ===");
-        for s in 1..m {
-            let w = witness[s]
-                .as_ref()
-                .map(|v| String::from_utf8_lossy(v).into_owned())
-                .unwrap_or_default();
-            eprintln!(
-                "  state {s} (prefix {:?}): {}  witness={w:?}",
-                std::str::from_utf8(&p[..s]).unwrap_or("?"),
-                if reached[s] { "REACHABLE — prune UNSOUND" } else { "no witness found" }
-            );
-        }
-    }
-
-    /// EXPERIMENT #2 (packed first_codes). Measure the value distribution of the
-    /// per-row first-token ids: max id, bits needed, and how many distinct ids —
-    /// to judge whether the u16 first_codes index can be packed narrower.
-    /// ONPAIR_CORPUS=/tmp/cppdump/corpus.bin cargo test --lib first_codes_dist
-    ///   -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[allow(clippy::use_debug)]
-    fn first_codes_dist() {
-        let col = load_corpus_col();
-        let fc = col.first_codes.as_ref().expect("index built");
-        let n = fc.len();
-        let mut max = 0u16;
-        let mut distinct = std::collections::HashSet::new();
-        let mut hist = [0usize; 17]; // bits-needed histogram
-        for &c in fc {
-            if c != u16::MAX {
-                max = max.max(c);
-                distinct.insert(c);
-                let bits = (16 - (c | 1).leading_zeros()) as usize;
-                hist[bits] += 1;
-            }
-        }
-        let bits_needed = 32 - (max as u32 | 1).leading_zeros();
-        eprintln!("=== first_codes distribution ({n} rows) ===");
-        eprintln!("max id = {max}  → {bits_needed} bits needed for the widest");
-        eprintln!("distinct first ids = {}", distinct.len());
-        eprintln!("u16 index size = {} KiB; at {bits_needed}-bit packing = {} KiB",
-            n * 2 / 1024, n * bits_needed as usize / 8 / 1024);
-        eprintln!("bits-needed histogram (rows whose first id needs k bits):");
-        for (k, &c) in hist.iter().enumerate() {
-            if c > 0 {
-                eprintln!("  {k:>2} bits: {c} rows ({:.1}%)", 100.0 * c as f64 / n as f64);
-            }
-        }
-    }
-
-    /// Load the dumped corpus, compress it, and return the owned column.
-    #[cfg(test)]
-    fn load_corpus_col() -> Column<u32> {
-        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
-        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
-        let mut o = 8;
-        let mut lens = Vec::with_capacity(n);
-        for _ in 0..n {
-            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
-            o += 4;
-        }
-        let mut bytes = Vec::new();
-        let mut offs = vec![0u32];
-        for &l in &lens {
-            bytes.extend_from_slice(&raw[o..o + l]);
-            o += l;
-            offs.push(bytes.len() as u32);
-        }
-        compress(
-            &bytes,
-            &offs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
-        )
-        .unwrap()
-    }
-
-    /// Temporary: how many tokens land in each DFA state via `base[]` — i.e.
-    /// which partial-match states are reachable at a token boundary at all.
-    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
-    ///   cargo test --lib boundary_states -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[allow(clippy::use_debug)]
-    fn boundary_states() {
-        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
-        let col = load_corpus_col();
-        let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
-        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
-        let counts = aut.boundary_state_counts();
-        eprintln!("=== boundary-reachable states for {needle:?} ===");
-        for (s, &c) in counts.iter().enumerate() {
-            let what = if s == 0 { "inert" } else if s == needle.len() { "MATCH (definite)" } else { "partial" };
-            eprintln!("  state {s} ({what}): {c} tokens end here (base==s)");
-        }
-    }
-
-    /// Temporary: across ALL rows, which DFA boundary states actually occur?
-    /// Re-runs the token automaton over every row recording the set of states
-    /// seen at token boundaries — to test whether LPM makes deep partial states
-    /// unreachable in practice (so their continuation ranges can be pruned).
-    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
-    ///   cargo test --lib reached_states -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[allow(clippy::use_debug)]
-    fn reached_states() {
-        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
-        let col = load_corpus_col();
-        let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
-        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
-        let m = needle.len();
-        // Per-state count of how often a boundary lands there (across all rows).
-        let mut seen = vec![0u64; m + 1];
-        let codes = parts.codes;
-        let co = parts.code_offsets;
-        for r in 0..co.len() - 1 {
-            let (s0, e0) = (co[r] as usize, co[r + 1] as usize);
-            let mut st = 0u8;
-            for &c in &codes[s0..e0] {
-                st = aut.step_from(st, c);
-                seen[st as usize] += 1;
-                if st as usize == m {
-                    break;
-                }
-            }
-        }
-        eprintln!("=== boundary states actually REACHED across all rows, {needle:?} ===");
-        for (s, &c) in seen.iter().enumerate() {
-            eprintln!("  state {s}: reached {c} times");
-        }
-    }
-
-    /// Temporary: dump EXACTLY what the SIMD INNER prefilter range-tests for a
-    /// needle — the merged INNER id ranges (each one AVX2 `in_range_epu16` test)
-    /// with their token byte content.
-    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
-    ///   cargo test --lib inner_ranges_dump -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[allow(clippy::use_debug)]
-    fn inner_ranges_dump() {
-        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
-        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
-        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
-        let mut o = 8;
-        let mut lens = Vec::with_capacity(n);
-        for _ in 0..n {
-            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
-            o += 4;
-        }
-        let mut bytes = Vec::new();
-        let mut offs = vec![0u32];
-        for &l in &lens {
-            bytes.extend_from_slice(&raw[o..o + l]);
-            o += l;
-            offs.push(bytes.len() as u32);
-        }
-        let col = compress(
-            &bytes,
-            &offs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
-        )
-        .unwrap();
-        let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
-        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
-        let ranges = aut.inner_ranges(64).expect("within budget");
-        let tok = |id: u16| String::from_utf8_lossy(dict.data(id)).into_owned();
-        eprintln!("=== SIMD prefilter for {needle:?}: {} range tests ===", ranges.len());
-        let mut total = 0usize;
-        for (lo, hi) in &ranges {
-            let cnt = (hi - lo + 1) as usize;
-            total += cnt;
-            eprintln!(
-                "  ids {lo}..={hi} ({cnt} tok): {:?} .. {:?}",
-                tok(*lo),
-                tok(*hi)
-            );
-        }
-        eprintln!("a code is a candidate iff it falls in ANY of those {} ranges ({total} token ids)", ranges.len());
-    }
-
-    /// Temporary: dump the TOKEN-LEVEL DFA for a needle over the real dict
-    /// (alphabet = token ids, not bytes).
-    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
-    ///   cargo test --lib token_dfa -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[allow(clippy::use_debug)]
-    fn token_dfa() {
-        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
-        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
-        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
-        let mut o = 8;
-        let mut lens = Vec::with_capacity(n);
-        for _ in 0..n {
-            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
-            o += 4;
-        }
-        let mut bytes = Vec::new();
-        let mut offs = vec![0u32];
-        for &l in &lens {
-            bytes.extend_from_slice(&raw[o..o + l]);
-            o += l;
-            offs.push(bytes.len() as u32);
-        }
-        let col = compress(
-            &bytes,
-            &offs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
-        )
-        .unwrap();
-        let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
-        let nt = dict.num_tokens();
-        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
-        let (base_runs, per_state) = aut.dump_dfa();
-        let m = needle.len();
-        let tokstr = |id: u16| String::from_utf8_lossy(dict.data(id)).into_owned();
-
-        eprintln!("=== TOKEN-LEVEL DFA for {needle:?}  ({nt} tokens = the alphabet, {m}+1 states) ===\n");
-        eprintln!("STATE 0 (no partial match) — base[] table, run-length encoded:");
-        eprintln!("  {} non-zero runs out of {} total runs:", base_runs.iter().filter(|r| r.2 != 0).count(), base_runs.len());
-        for &(lo, hi, t) in base_runs.iter().filter(|r| r.2 != 0) {
-            let lbl = if lo == hi { format!("token {lo} {:?}", tokstr(lo as u16)) }
-                      else { format!("tokens {lo}..={hi} (e.g. {:?})", tokstr(lo as u16)) };
-            eprintln!("    →state {t}: {lbl}");
-        }
-        for (s, trs) in per_state.iter().enumerate() {
-            let s = s + 1;
-            if s >= m { continue; }
-            eprintln!("\nSTATE {s} (matched {} needle bytes) — {} sparse exceptions over base:", s, trs.len());
-            for &(lo, hi, t) in trs.iter().take(12) {
-                let lbl = if lo == hi { format!("token {lo} {:?}", tokstr(lo)) }
-                          else { format!("tokens {lo}..={hi}") };
-                eprintln!("    on {lbl} → state {t}");
-            }
-            if trs.len() > 12 { eprintln!("    … {} more", trs.len() - 12); }
-        }
-        let total_sparse: usize = per_state.iter().map(|v| v.len()).sum();
-        let nz_base: u32 = base_runs.iter().filter(|r| r.2 != 0).map(|&(lo, hi, _)| hi - lo + 1).sum();
-        eprintln!("\nSUMMARY: state-0 alphabet that matters = {nz_base} token ids in {} runs;",
-            base_runs.iter().filter(|r| r.2 != 0).count());
-        eprintln!("         {total_sparse} sparse exception ranges across the partial-match states.");
-    }
-
-    /// Temporary: measure the selectivity of the SIMD-able INNER filter — a row
-    /// is a candidate iff it has a DEFINITE token or an INNER token (one covered
-    /// by a sparse continuation range, which are contiguous id ranges). This is
-    /// a sound necessary filter (the token completing any match is DEFINITE or
-    /// INNER), and unlike the open-set it IS range-testable with SIMD. Compares
-    /// its candidate rate to the current adjacency chain.
-    /// ONPAIR_NEEDLE=google ONPAIR_CORPUS=/tmp/cppdump/corpus.bin \
-    ///   cargo test --lib inner_probe -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[allow(clippy::use_debug)]
-    fn inner_probe() {
-        let needle = std::env::var("ONPAIR_NEEDLE").unwrap_or_else(|_| "google".into());
-        let raw = std::fs::read(std::env::var("ONPAIR_CORPUS").unwrap()).unwrap();
-        let n = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
-        let mut o = 8;
-        let mut lens = Vec::with_capacity(n);
-        for _ in 0..n {
-            lens.push(u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize);
-            o += 4;
-        }
-        let mut bytes = Vec::new();
-        let mut offs = vec![0u32];
-        for &l in &lens {
-            bytes.extend_from_slice(&raw[o..o + l]);
-            o += l;
-            offs.push(bytes.len() as u32);
-        }
-        let col = compress(
-            &bytes,
-            &offs,
-            Config { bits: Bits::new(16).unwrap(), threshold: Threshold::new(0.5).unwrap(), seed: Some(42) },
-        )
-        .unwrap();
-        let parts = col.as_search_parts();
-        let dict = DictView { bytes: parts.dict_bytes, offsets: parts.dict_offsets };
-        let nt = dict.num_tokens();
-        let aut = KmpAutomaton::new(needle.as_bytes(), dict);
-        let (base_runs, per_state) = aut.dump_dfa();
-        // INNER set: DEFINITE tokens (base==m) + every token in a sparse range
-        // whose target != 0. Collect the contiguous INNER ranges (these are what
-        // SIMD range-tests check).
-        let m = needle.len() as u8;
-        let mut inner = vec![false; nt];
-        let mut ranges: Vec<(u16, u16)> = Vec::new();
-        for &(lo, hi, t) in &base_runs {
-            if t == m {
-                for i in lo..=hi { inner[i as usize] = true; }
-                ranges.push((lo as u16, hi as u16));
-            }
-        }
-        for trs in &per_state {
-            for &(lo, hi, t) in trs {
-                if t != 0 {
-                    for i in lo..=hi { inner[i as usize] = true; }
-                    ranges.push((lo, hi));
-                }
-            }
-        }
-        ranges.sort_unstable();
-        let n_inner: usize = inner.iter().filter(|&&b| b).count();
-        // Per-row: candidate iff any INNER token present.
-        let codes = parts.codes;
-        let co = parts.code_offsets;
-        let mut cand_inner = 0usize;
-        for r in 0..co.len() - 1 {
-            let (s, e) = (co[r] as usize, co[r + 1] as usize);
-            if codes[s..e].iter().any(|&c| inner[c as usize]) { cand_inner += 1; }
-        }
-        let rows = co.len() - 1;
-        eprintln!("=== INNER (SIMD-rangeable) filter for {needle:?} ===");
-        eprintln!("INNER tokens: {n_inner} in {} contiguous ranges (SIMD: {} lt/gt range tests)",
-            ranges.len(), ranges.len());
-        eprintln!("ranges: {ranges:?}");
-        eprintln!("candidate rows (INNER present): {cand_inner} / {rows} ({:.2}%)",
-            100.0 * cand_inner as f64 / rows as f64);
-        eprintln!("(for comparison the adjacency chain marked ~0.5% candidate on i.yandex)");
-    }
 
     /// Pack rows into the Arrow `(bytes, offsets)` pair `compress` expects.
     fn pack(rows: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
