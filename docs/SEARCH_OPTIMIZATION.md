@@ -1,0 +1,300 @@
+# Compressed-domain LIKE search — optimization memory
+
+Durable record of the prefix/contains search work: what was built, what won,
+what was tried and **failed (with the reason)**, so future sessions don't
+re-walk dead ends. Code lives in `src/search/`; benches in `benches/search.rs`.
+
+> Process note (learned the hard way): **never quote a benchmark number you have
+> not printed and read from raw output.** If a measurement command yields empty
+> output, fix the command — do not infer. Verify `cargo test` + `clippy` before
+> every commit. The box is contended; prefer callgrind for deterministic perf.
+
+## Data model (why prefix and contains differ fundamentally)
+
+A column compresses each string into a stream of `u16` dictionary token-ids
+("codes") over a **lexicographically-sorted** dictionary (ids in sort order; 256
+single-byte tokens always present). LIKE runs token-level automata directly over
+codes — rows are never decompressed.
+
+The sort key is the token's **leading** bytes. This is the hinge for everything:
+
+- **Prefix** ("starts with N") needs tokens whose *leading* bytes = N → that's
+  **one contiguous id range** (`DictView::prefix_range`) → a single SIMD range
+  test. Aligned with the sort ⇒ huge structural win.
+- **Contains** ("N anywhere") needs tokens by their *suffix/internal* bytes,
+  which the leading-byte sort scatters uniformly across the id space. Not a
+  range; not fingerprint-able on ids (they're structureless labels). This is why
+  every SIMD attempt on the contains code stream fails (see "dead ends").
+
+## What shipped (default)
+
+### Prefix — the strong, structural win
+- `Column::first_codes: Option<Vec<u16>>` — one first-token id per row, built at
+  compress time (+~7% column size on URLs; `None` ⇒ generic scan).
+- `scan_prefix`: pass 1 = branchless SIMD unsigned range test
+  `begin ≤ first_code ≤ last`, plus an equality lane `== q0` for multi-token
+  needles; pass 2 confirms only the `== q0` candidates.
+- AVX2 kernels (`prefilter_accept*_avx2`), runtime-detected (`avx2_enabled`),
+  scalar fallback. `ONPAIR_NO_SIMD=1` forces scalar.
+- `prefix_mask`: `search()` writes accept bits straight into `RowMask` words
+  (no per-row callback).
+- **Result (real ClickBench URL, 1M rows): ~30–40× over memmem/starts_with on
+  *decompressed* bytes, ~350–600× over decompress+scan.** Same on FineWeb.
+
+### Contains — scalar 2-code chain in front of exact KMP
+- `KmpAutomaton`: token-level KMP. `base[t]` = exit state feeding token `t` from
+  state 0; `sparse` = per-state exception ranges; `matches()` is the exact
+  confirmer.
+- `chain_table` + `row_chain`: per token, three sound flags — DEFINITE (token
+  contains the whole needle ⇒ row matches), OPEN (`base≠0`, can start a spanning
+  match), CONT (can continue one). A row is a candidate iff DEFINITE present or
+  an **adjacent OPEN→CONT pair** (Teddy-*inspired* but scalar). Only candidates
+  pay the exact KMP.
+- **Result:** beats `decompress+memmem` 3–6× (decode ~46–100 ms dominates), but
+  ~parity-to-loss vs in-memory memmem; **loses 3–4× on FineWeb** (long
+  ~499-codes/row docs hit the per-code scalar-gather throughput wall).
+
+## Evaluated and removed (measured no net win)
+
+These contains paths were implemented, measured, and **removed** — recorded here
+only as evidence of what was tried and why it lost. Neither beat the scalar
+chain, so neither is in the shipped code.
+
+- **SIMD INNER classify** (`scan_contains_inner`): AVX2 multi-range test of the
+  INNER token set (DEFINITE + completing/reachable sparse ranges) over the whole
+  code stream. Sound necessary filter; ranges are contiguous so it vectorises. **A
+  needle-dependent wash** — INNER is far less selective (13–38% candidate) than
+  the scalar chain (~0.5%).
+- **3-layer funnel** (`scan_contains_funnel`): SIMD INNER reject → scalar chain on
+  survivors → KMP. **No net win** — callgrind: scalar 570,409,783 Ir → funnel
+  574,155,207 Ir (+0.66%). Both passes must touch every code, so layering is
+  "scalar + one extra full pass"; running the chain on only ~13% survivors only
+  just pays that back. **Layering cannot break the per-code throughput wall.**
+
+The INNER-range computation these relied on (`inner_ranges`, tightened by two
+proven-sound prunes — completing-only `target == match_state` and a
+reachable-entry fixpoint, verified by brute-force cross-checks) was removed with
+them.
+
+## Dead ends — SIMD on the contains code stream (all measured, all fail)
+
+The recurring question "can't we SIMD-filter the codes for contains?" — answered
+no, three ways, because token ids encode *prefix* order but contains needs
+*suffix* structure:
+
+- **lt/gt id ranges**: the OPEN set scatters (`google`: 782 tokens in ~1000
+  runs). Even 64 ranges give 19–63× false positives.
+- **Teddy nibble/byte fingerprint of the code id**: 25–63× FP — code ids are
+  arbitrary labels, no fingerprint structure (measured low-byte, high-byte, and
+  both-byte AND).
+- **gather `class[code]`**: slower than the scalar pipelined loads (no hardware
+  gather win on this µarch).
+
+The DFA's *continuation* transitions ARE contiguous (the INNER filter exploits
+this), but they're a weak filter, so SIMD-izing them is a wash (above). A sound
+SIMD contains filter only exists on **decoded bytes** (classic byte-Teddy/memmem)
+— which costs the ~86 ms decode, more than the scan saves.
+
+## Experiment #1 — LPM-aware INNER pruning: DISPROVED (unsound)
+
+Hypothesis: for `%google%` the INNER filter is dominated by the state-5
+(`googl`+`e…`) completion ranges (~1554 of 1565 tokens, "starts with e / le"),
+and state 5 is reached **0 times across all 1M corpus rows**, so maybe greedy LPM
+makes it unreachable and the range can be dropped (collapsing the filter to ~5
+tokens, possibly beating memmem).
+
+**Result: UNSOUND — disproved by construction.** The `lpm_reach_witness` probe
+(in the test module) feeds crafted + 2M random strings through the *real* LPM
+tokenisation and records which DFA boundary states each reaches. Every partial
+state is witnessed reachable, including state 5: the byte string `"googl"` itself
+tokenises with a boundary at state 5 (there is no `"google"` token to absorb it
+without a trailing `e`). So a value like `"…googl"` adjacent to an `e…` token
+DOES complete a match via state 5 — dropping that range would cause false
+negatives. The empirical "0×" was a property of the URL *corpus*, not the
+*dictionary*. Witnesses: state1 "g", s2 "go", s3 "goo", s4 "googoo", s5 "googl".
+
+Conclusion: boundary-state reachability cannot be tightened by an LPM argument —
+any prefix of the needle is a constructible boundary value. The INNER filter
+(and the `reachable_states` transition fixpoint) is already as tight as soundness
+allows. **No remaining lever to make contains beat memmem on the token stream.**
+
+## Experiment #7 — search bits sweep: bits=16 wins everything (no tradeoff)
+
+Hypothesis: lower `bits` → smaller dict + tighter `first_codes`, but more
+codes/row → slower contains, so maybe a search-optimal width sits below the
+compression-optimal one. **Disproved.** Real ClickBench URL, 1M rows:
+
+| bits | dict toks | codes | core    | prefix http://www | contains google |
+|------|-----------|-------|---------|-------------------|-----------------|
+| 12   | 4096      | 16.4M | 39.8MiB | 307 us            | 23.9 ms         |
+| 14   | 16384     | 12.0M | 31.5MiB | 237 us            | 19.9 ms         |
+| 16   | 65191     |  9.5M | 27.1MiB | 113 us            | 18.2 ms         |
+
+More bits → fewer codes → faster everywhere (prefix 2.7x from 12→16 bits, tracking
+the 1.7x code-count drop). The `first_codes` index is a constant 1953 KiB
+(rows*2, bit-width-independent) so its absolute cost does not grow with bits; the
+core shrinks, so higher bits wins compression, search speed, AND absolute index
+size simultaneously. Only wrinkle: contains `http` (100% sel, DEFINITE-dominated)
+is marginally faster at 12 bits (2.75 vs 3.22 ms) — a selectivity-specific quirk,
+not a trend. Conclusion: default bits=16 is also search-optimal; no width tradeoff
+to exploit.
+
+## Experiment #3 — AVX-512 prefix kernel: WIN (~1.2x), shipped default
+
+Hypothesis: the AVX2 prefix pass-1 might be memory-bound (reads the 2 MB
+first_codes table), in which case AVX-512 won't help. **First reasoning was wrong,
+corrected by measurement:** the scalar-vs-AVX2 A/B shows AVX2 is 3.6x faster than
+scalar (330us vs ~1250us on 1M ClickBench `prefix:https`), so the kernel is
+COMPUTE-bound, not memory-bound — there is ALU headroom AVX-512 can use.
+
+Built `prefilter_accept_avx512` (AVX-512BW): 32 u16 codes/vector, one
+`vpsubw` + `vpcmpuw` (cmple_epu16) → `__mmask32` directly, two masks compose a
+u64 word — no pack/movemask reduction the AVX2 path needs. Measured A/B (same
+data, back-to-back): AVX2 ~330us → AVX-512 ~273us = **1.2x** (best 252 vs 328 =
+1.3x). Correctness verified (cross-checks cd==bf on https/http://k/h).
+
+Shipped as the default when AVX-512BW is detected (`avx512_enabled`); falls back
+to AVX2 then scalar. `ONPAIR_NO_AVX512` forces AVX2 for A/B; `ONPAIR_NO_SIMD`
+forces scalar. Lesson: do not assume memory-bound — the scalar A/B is the cheap
+test for compute-vs-bandwidth before writing a wider kernel.
+
+## Experiment #2 — packed/narrower first_codes index: NOT WORTH IT
+
+Hypothesis: the u16 first_codes index (rows*2 bytes) could be packed narrower,
+saving size and AVX bandwidth. **Two parts, both negative:**
+
+- **Fixed-width bit-packing: dead.** Measured (`first_codes_dist` probe): on
+  ClickBench URL the max first-token id is 45739 → needs the full 16 bits. No
+  fixed width below 16 fits, so bit-packing saves nothing.
+- **Order-preserving u8 remap: possible but narrow, not built.** URL has only 138
+  *distinct* first-token ids, so an order-preserving rank remap to u8 would fit
+  (index 2MB→1MB, 2x SIMD lanes, range test preserved). BUT FineWeb has 7828
+  distinct first-ids → does NOT fit u8, needs u16, no remap. So the win is
+  corpus-dependent (low-cardinality-first-token columns only) and requires a
+  remap table + query-range translation + a u8 kernel + a >256 fallback —
+  substantial machinery for a ~3.5% size cut (2MB on a 27MB column) and a
+  speculative speed gain on a path that is already fast (273us) and compute-bound.
+  Recall #3 proved prefix is compute- not bandwidth-bound, so "less bandwidth"
+  was never the win anyway. Verdict: not worth the complexity.
+
+## Experiment #4 — first_two_codes for multi-token prefix: DISPROVED (pointless)
+
+Hypothesis: multi-token prefixes (e.g. `http://k`) fall to the verify lane
+(`first_code == q0` → scattered exact row check), and a second per-row token
+index would make 2-token prefixes exact via two SIMD range tests, removing the
+scatter. **Disproved by measuring the scatter it would remove.** Verify-candidate
+counts on real ClickBench URL (1M rows):
+  - `http://k` (11.7% sel, 116784 matches): takes the EXACT single-token-range
+    path (`!needs_verify`) — 0 scatter rows; the SIMD accept lane alone is exact.
+  - `http://www.google` (multi-token): only **8** verify-candidate rows hit the
+    scatter `aut.matches` call.
+So the scatter the second-token index would eliminate is 0–52 rows out of 1M —
+negligible. A `first_two_codes` index (+~7% column size, a second SIMD pass)
+would remove a handful of `matches()` calls for no measurable benefit. Verdict:
+not worth it.
+
+## Experiment #5 — selectivity-adaptive contains: DISPROVED (no crossover)
+
+Hypothesis: at high match-rate the two-pass split (chain prefilter → KMP) is
+wasted overhead vs a fused single per-row KMP, so a candidate-rate sample could
+pick the faster path. **Disproved — the chain prefilter wins at every
+selectivity, so there is nothing to switch to.** A/B on real ClickBench URL
+(chain default vs plain KMP via a temporary ONPAIR_NO_CHAIN gate):
+  - `http`   (100% sel): chain 6.4 ms  vs plain KMP 10.1 ms
+  - `google` (0.009% sel): chain 28.3 ms vs plain KMP 36.2 ms
+Even at 100% match the DEFINITE-token shortcut settles many rows without the full
+KMP, and rejecting inert tokens still trims work — so the prefilter helps in both
+regimes. No crossover ⇒ no adaptive switch. Gate removed.
+
+## Experiment #10 / #8 — TPC-H search + corpus characterization
+
+Ran prefix/contains on real TPC-H string columns (added `tpch_dump_parquet` to
+benches/tpch.rs: ONPAIR_TPCH_DUMP_PATH dumps a column to parquet for the search
+bench). SF1, bits=16, cross-checks pass:
+
+| corpus / query              | sel   | onpair  | arrow(memmem) | dec+arrow |
+|-----------------------------|-------|---------|---------------|-----------|
+| l_comment %carefully%       | 9.6%  | 35.4 ms | 70.0 ms       | 161 ms    |
+| l_comment %the%             | 34.5% | 38.7 ms | 76.1 ms       | 164 ms    |
+| l_comment final%  (prefix)  | 0.5%  | 363 us  | 16.9 ms       | 105 ms    |
+| p_name %red%                | 5.5%  | 2.11 ms | 4.22 ms       | 5.68 ms   |
+| p_name antique% (prefix)    | 1.1%  | 782 us  | 1.04 ms       | 2.44 ms   |
+
+**Key finding — row length decides contains, and TPC-H flips the FineWeb loss:**
+onpair contains is ~2x FASTER than memmem-on-decompressed on l_comment (35 vs
+70 ms), the opposite of FineWeb (3-4x loss). The driver is codes/row:
+- TPC-H l_comment: ~2.5 codes/row (short) → chain prefilter dominates → win.
+- URLs: ~9.5 codes/row → ~tie.
+- FineWeb: ~499 codes/row (long docs) → per-code scalar-gather wall → loss.
+So compressed-domain contains beats in-memory memmem for SHORT-row corpora and
+loses for long-document corpora. Prefix wins everywhere (TPC-H final% ~46x).
+
+**Index-cost model: first_codes = rows*2, scales with ROW COUNT not data size.**
+Relative index cost: l_comment +14.8% (2.5M short rows), URL +7.2%, FineWeb
++0.07% (50k long rows). So the prefix index is cheapest exactly where rows are
+long (and is essentially free there), and priciest for many-short-rows columns —
+the inverse of where contains needs help. An "auto-enable index" heuristic could
+gate on rows-per-byte if size matters.
+
+## Public API (matcher)
+
+- `Column::as_search_parts() -> SearchParts` (or build `SearchParts` by struct
+  literal from deserialized storage; fields are `pub`).
+- `SearchParts::search(Pattern) -> RowMask` / `search_callback(Pattern, |row|…)`.
+- `Pattern::{Prefix, Contains}(&[u8])`.
+- `RowMask`: `len()`, `is_empty()`, `as_words() -> &[u64]` (compose with engine
+  selection vectors via word-wise AND/OR), `into_parts() -> (Vec<u64>, usize)`.
+
+## Hot-path notes (cleanup applied)
+
+- Per-row offset conversion uses `Offset::as_usize()` (branchless truncating
+  inverse of `from_usize`), not `to_usize().expect(...)` — offsets are validated
+  at construction, so the conversion is infallible by construction. `to_usize`
+  remains for the genuinely-fallible validation paths.
+- `SearchParts::row_codes(r)` factors the per-row slice.
+- The `vec![0u64; words]` filter buffers are per-*query*, not per-row, and the
+  zero-fill is required (SIMD kernels assign only full words; the tail needs 0).
+- The decompress in-loop code bounds check is already a `#[cold]` never-taken
+  branch — not excess.
+
+## C++ comparison
+`benchmarks/onpair-bench/cpp-bench` is the reference C++ (token automata, the
+Rust port's origin). Head-to-head on identical data: **prefix Rust 15–35× over
+C++** (C++ lacks the `first_codes` side-table + SIMD); **contains within ~10%**
+(same LLVM, instruction-identical hot loop, verified in asm). The gap is
+algorithm (the side-table), not language. Bit-packing was disproven as a factor
+(a bits sweep showed tighter packing made C++ *slower*).
+
+## Benchmarks & reproduction
+
+`benches/search.rs`. Env: `ONPAIR_BENCH_PARQUET`, `ONPAIR_BENCH_COLUMN`,
+`ONPAIR_BENCH_MAX_ROWS`, `ONPAIR_SEARCH_BITS` (default 16),
+`ONPAIR_NEEDLES="mode:text,…"` (mode = contains|prefix). Runtime toggle:
+`ONPAIR_NO_SIMD`. Every run cross-checks compressed-domain counts vs brute
+force.
+
+```bash
+# Real ClickBench (URL column), incl. the real `URL LIKE '%google%'` query
+curl -sSL https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet -o /tmp/hits_0.parquet
+ONPAIR_BENCH_PARQUET=/tmp/hits_0.parquet ONPAIR_BENCH_COLUMN=URL \
+  ONPAIR_NEEDLES="contains:google,prefix:http://www.google" cargo bench --bench search
+
+# FineWeb (long documents): cap rows to fit memory
+curl -sSL "https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/data/CC-MAIN-2013-20/000_00000.parquet" -o /tmp/fineweb.parquet
+ONPAIR_BENCH_PARQUET=/tmp/fineweb.parquet ONPAIR_BENCH_COLUMN=text ONPAIR_BENCH_MAX_ROWS=50000 \
+  ONPAIR_NEEDLES="contains:photosynthesis,prefix:The " cargo bench --bench search
+```
+
+Bench groups: `prefix` / `prefix_mask` / `prefix_no_index` (index A/B),
+`contains`, `*_arrow` (memmem/starts_with + `BooleanBuffer::collect_bool` over
+decompressed bytes — faithful Arrow kernel), `*_decompress_arrow` (decode then
+scan), `copy_all_codes` / `scan_all_codes` / `first_code_per_row` (rooflines).
+
+## Analysis tools (in the `src/search/mod.rs` test module, `#[ignore]`)
+
+Run with `--ignored --nocapture`; need a dumped corpus
+(`ONPAIR_SEARCH_DUMP=/tmp/cppdump` on a bench writes `corpus.bin`, then
+`ONPAIR_CORPUS=/tmp/cppdump/corpus.bin ONPAIR_NEEDLE=google`):
+- `token_dfa` — token-level DFA in dict space (base RLE + sparse ranges).
+- `boundary_states` / `reached_states` — DFA reachability (the LPM-pruning probe).
+- `inner_probe` — INNER-filter candidate-rate vs the scalar chain.
