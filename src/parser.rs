@@ -69,14 +69,30 @@ impl Parser {
         // 1-byte final token needs MAX_TOKEN_SIZE - 1 trailing bytes). See
         // `Parts::validate_dictionary`.
         dict_bytes.resize(dict_bytes.len() + (MAX_TOKEN_SIZE - 1), 0);
+        let first_codes = Some(first_codes(&codes, &code_offsets));
         Column {
             dict_bytes,
             dict_offsets: self.dict.offsets.clone(),
             bits: self.dict.bits,
             codes,
             code_offsets,
+            first_codes,
         }
     }
+}
+
+/// Build the per-row first-token side-table: `first_codes[r]` is the first
+/// code of row `r`, or `u16::MAX` for an empty row (a sentinel that never
+/// equals a real token id when the dictionary is not fully saturated).
+pub(crate) fn first_codes<O: Offset>(codes: &[u16], code_offsets: &[O]) -> Vec<u16> {
+    let n = code_offsets.len() - 1;
+    let mut out = Vec::with_capacity(n);
+    for r in 0..n {
+        let s = code_offsets[r].as_usize();
+        let e = code_offsets[r + 1].as_usize();
+        out.push(if s < e { codes[s] } else { u16::MAX });
+    }
+    out
 }
 
 /// Encode every string into a flat `Vec<u16>` of codes plus per-row
