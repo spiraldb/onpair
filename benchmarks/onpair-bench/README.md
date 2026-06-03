@@ -89,28 +89,6 @@ uv sync --extra paper   # HuggingFace datasets only
 uv sync --extra full    # both
 ```
 
-## Compressed-domain search comparison
-
-`benches/search.rs` (Rust, divan) and `cpp-bench/search_bench.cpp` (C++)
-benchmark the same `Contains` / `Prefix` searches over the same corpus and
-needles. The Rust bench's pre-pass buckets needles by selectivity (rare /
-medium / common) and, when `ONPAIR_SEARCH_DUMP=<dir>` is set, dumps
-`corpus.bin` + `needles.bin` so the C++ harness searches byte-identical
-inputs. Both count matches via a callback and cross-check against brute force.
-
-```bash
-# Rust side (+ dump shared inputs). Defaults to a synthetic URL corpus;
-# point ONPAIR_BENCH_PARQUET at a parquet file for real data.
-mkdir -p /tmp/onpair_dump
-ONPAIR_SEARCH_DUMP=/tmp/onpair_dump cargo bench --bench search
-
-# C++ side, on the dumped inputs (needs the submodule + Boost.Unordered ≥ 1.81):
-cmake -S benchmarks/onpair-bench/cpp-bench -B benchmarks/onpair-bench/cpp-bench/build \
-      -DCMAKE_BUILD_TYPE=Release
-cmake --build benchmarks/onpair-bench/cpp-bench/build --target search_bench -j
-benchmarks/onpair-bench/cpp-bench/build/search_bench /tmp/onpair_dump --bits 16
-```
-
 ## Implementations
 
 - **Rust**: `rust-bench` is a separate workspace whose `Cargo.toml` carries a

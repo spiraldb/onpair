@@ -242,40 +242,7 @@ fn decompress_all(bencher: Bencher, param: (&'static str, u8)) {
         .bench(|| divan::black_box(decompress(column.as_parts())));
 }
 
-/// EXPERIMENT #10: dump a TPC-H string column to parquet so the search bench can
-/// run prefix/contains on it.
-/// `ONPAIR_TPCH_DUMP_COL=l_comment ONPAIR_TPCH_DUMP_PATH=/tmp/tpch_lc.parquet \
-///   ONPAIR_TPCH_DUMP_PATH=/tmp/tpch_lc.parquet cargo bench --bench tpch`
-fn tpch_dump_parquet() {
-    use arrow_array::{ArrayRef, RecordBatch, StringArray};
-    use parquet::arrow::arrow_writer::ArrowWriter;
-    use std::sync::Arc;
-    let col = env::var("ONPAIR_TPCH_DUMP_COL").unwrap_or_else(|_| "l_comment".into());
-    let path = env::var("ONPAIR_TPCH_DUMP_PATH").unwrap_or_else(|_| "/tmp/tpch.parquet".into());
-    let (bytes, offsets) = generate_column(&col, scale_factor(), max_bytes());
-    let strings: Vec<&str> = offsets
-        .windows(2)
-        .map(|w| std::str::from_utf8(&bytes[w[0] as usize..w[1] as usize]).unwrap_or(""))
-        .collect();
-    let arr: ArrayRef = Arc::new(StringArray::from(strings));
-    let batch = RecordBatch::try_from_iter([(col.as_str(), arr)]).unwrap();
-    let file = std::fs::File::create(&path).unwrap();
-    let mut w = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
-    w.write(&batch).unwrap();
-    w.close().unwrap();
-    eprintln!(
-        "[tpch dump] wrote {} rows of {col} to {path}",
-        offsets.len() - 1
-    );
-}
-
 fn main() {
-    // Experiment #10: if ONPAIR_TPCH_DUMP_PATH is set, dump one TPC-H string
-    // column to parquet (for the search bench) and exit instead of benchmarking.
-    if env::var_os("ONPAIR_TPCH_DUMP_PATH").is_some() {
-        tpch_dump_parquet();
-        return;
-    }
     // Pre-warm every (col, bits) combo so the source + compression-ratio lines
     // print before divan starts emitting per-bench output.
     eprintln!("\n[onpair tpch bench] === corpora + compression ratios ===");
