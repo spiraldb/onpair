@@ -353,7 +353,6 @@ impl KmpAutomaton {
     pub(crate) fn is_empty_needle(&self) -> bool {
         self.match_state == 0
     }
-
 }
 
 /// [`chain_table`](KmpAutomaton::chain_table) flags. A token containing the
