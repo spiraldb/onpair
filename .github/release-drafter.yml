@@ -25,6 +25,10 @@ categories:
     labels:
       - "changelog/chore"
     collapse-after: 3
+  - title: "👷 CI"
+    labels:
+      - "changelog/ci"
+    collapse-after: 3
 
 version-resolver:
   major:
