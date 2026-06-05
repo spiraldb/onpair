@@ -35,9 +35,7 @@ The representation is defined in two layers:
    stream does not depend on it.
 
 The layering is one-directional: the decodable data is meaningful on its own,
-and the row layer is meaningful only in terms of the data it partitions. A
-consumer that needs only the concatenated payload uses the first layer; a consumer that
-needs the original records back uses both.
+and the row layer is meaningful only in terms of the data it partitions.
 
 ## 1. Conventions
 
@@ -50,8 +48,13 @@ needs the original records back uses both.
 - `MAX_TOKEN_SIZE = 16` — the maximum token length in bytes, and the fixed read
   width a decoder uses per token (§3.1).
 - `N` — the number of dictionary tokens, `256 <= N <= 2^16` (§3).
-- `M` — the number of codes (= number of tokens emitted on decode).
-- `R` — the number of rows, when the row layer is present (§4).
+- `M` — the number of codes (= number of tokens emitted on decode). Since tokens
+  are at least one byte, `M` is at most the decoded byte length.
+- `R` — the number of rows in a column's row layer (§4).
+- `dict_offsets` — the `N + 1` offsets delimiting tokens within `dict_bytes`
+  (§3.2); `o_i` denotes its `i`-th entry.
+- `row_offsets` — the `R + 1` offsets delimiting rows within the code stream
+  (§4); `r_k` denotes its `k`-th entry.
 - **Element count vs. byte length.** Sequence sizes are stated as *logical
   element counts*, independent of how the elements are encoded; raw byte buffers
   are stated as *byte lengths*. The distinction is maintained deliberately
@@ -85,16 +88,19 @@ stream (e.g. equality by comparing code sequences) because encoding can never
 fail. Consequently `N >= 256` for every dictionary; there is no empty
 dictionary.
 
+**Uniqueness.** No two dictionary tokens are equal: each byte string appears at
+most once. This keeps the encoding of any input unambiguous — essential for
+compressed-domain operations such as equality search, where distinct code
+sequences must denote distinct byte strings.
+
 **Dictionary ordering.** A dictionary **MAY** have its tokens arranged in
-ascending bytewise-lexicographic order (token `i` is `<=` token `i+1` under
-unsigned byte comparison). Sortedness affects only the order of the tokens, not
-the structure of the buffers or how they are decoded; the `is_sorted` flag (§5)
-asserts that order rather than encoding it. It is advertised so that a consumer
-may use order-dependent operations — binary search over tokens, prefix-range
-queries, compressed pattern matching — without itself having to verify the
-ordering. When the flag is set, the ordering invariant **MUST** hold; a producer
-**MUST NOT** set it otherwise. When it is clear, no ordering is implied and
-order-dependent operations are unavailable.
+ascending bytewise-lexicographic order, advertised by the `is_sorted` flag (§5).
+Because tokens are unique, this order is strict: token `i` `<` token `i+1` under
+unsigned byte comparison. When the flag is set, the ordering invariant **MUST**
+hold; a producer **MUST NOT** set it otherwise. Ordering is a property of the
+token arrangement only — it does not change the buffer layout or how the column
+is decoded — and it enables order-dependent operations such as binary search,
+prefix-range queries, and compressed pattern matching.
 
 ### 3.1 Dictionary bytes
 
@@ -197,14 +203,20 @@ The fast path reads a fixed `MAX_TOKEN_SIZE` bytes from `dict_offsets[c]` and
 advances the output cursor by the token's true length; the read-padding (§3.1)
 keeps that read in bounds.
 
-Decode consults only the dictionary and the code stream. It does not reference
-the row layer (§4).
+The loop above is the **bulk decode** of the whole concatenated payload, using
+only the dictionary and the code stream. Because each code indexes the
+dictionary independently, decoding generalizes to any contiguous range of the
+code stream: a consumer can decode a single row `k` by running the same loop over
+`code_stream[r_k .. r_{k+1})` (§4), producing exactly that row's bytes without
+reading codes outside the range or emitting any adjacent row's output. The row
+offsets thus give random access to individual records at no extra decoding cost.
 
-## 4. Row partitioning (optional)
+## 4. Row partitioning
 
-An OnPair column **MAY** add a row layer over the decodable data: `R + 1`
-little-endian **`u64`** offsets (§2) **into the code stream** (code positions, not
-byte positions) that delimit `R` rows. Each adjacent pair brackets one row:
+The **row layer** records where each row begins and ends within the code
+stream: `R + 1` little-endian **`u64`** offsets (§2) **into the code stream**
+(code positions, not byte positions) that delimit `R` rows. Each adjacent pair
+brackets one row:
 
 ```
 index:          0     1     2     3   …    R
@@ -218,20 +230,23 @@ e.g. M = 9 codes, offsets = [0, 4, 4, 9]:
         row 2 = codes[4..9)   (5 codes)      (R = 3, r_R = 9 = M)
 ```
 
-The row layer enables random access to individual rows and per-row operations.
-Because the code stream is a flat concatenation with no in-band record
+The row layer enables random access to individual rows and per-row operations
+(§3.4). Because the code stream is a flat concatenation with no in-band record
 delimiters, row structure cannot be recovered from the codes alone; the row
-layer carries it explicitly. The decodable data is fully usable without it.
+layer carries it explicitly. A column with zero rows has the single-element
+offset array `[0]` (so `R = 0` and `M = 0`). A consumer that needs no row
+structure at all uses the decodable data (§3) on its own, without a row layer.
 
-Invariants when present:
+Invariants:
 
-- `r_0 == 0` and `r_R == M` (the final offset is the total code count).
+- `r_0 == 0` and `r_R == M` (the final offset is the total code count). For the
+  zero-row array `[0]`, these coincide: `r_0 == r_R == 0 == M`.
 - **Non-decreasing**: `r_k <= r_{k+1}`. Unlike dictionary offsets these need not
   strictly increase — an empty row is a legal `r_k == r_{k+1}`.
 - Element count is `R + 1`.
 
-**Width.** Row offsets are `u64`, which indexes any code stream (`r_R == M`,
-`M <= 2^64`).
+**Width.** Row offsets are `u64`, which indexes a code stream of any length
+(offsets run up to `r_R == M`).
 
 ## 5. In-memory layout
 
@@ -268,20 +283,28 @@ typedef struct OnPairData {
     OnPairCodes      codes;        // §3.3
 } OnPairData;
 
+// The row layer (§4): R+1 u64 offsets into the code stream.
+typedef struct OnPairRowOffsets {
+    const uint64_t* data;        // §4; R+1 offsets (the empty column is [0])
+    uint64_t        count;       // R + 1 (>= 1)
+} OnPairRowOffsets;
+
 // A row-partitioned column (§4): decodable data plus a row layer.
+// A consumer that does not need row structure uses OnPairData directly.
 typedef struct OnPairColumn {
-    OnPairData      data;          // §3
-    const uint64_t* row_offsets;   // §4; R+1 u64 offsets into the code stream
-    uint64_t        row_offsets_len; // R + 1 (0 if no row layer)
+    OnPairData       data;         // §3
+    OnPairRowOffsets rows;         // §4; always present (R >= 0)
 } OnPairColumn;
 ```
 
 `OnPairData` yields the decompressed bytes as a single concatenated payload: it
 recovers the token content but not the boundaries between the original strings,
 so it supports bulk decompression but not reconstruction of individual records.
-`OnPairColumn` adds the row layer that delimits those records, enabling
-per-string reconstruction and random access. A column with no row layer sets
-`row_offsets == NULL` and `row_offsets_len == 0`.
+A consumer that needs only the payload — or that tracks record boundaries
+separately — uses `OnPairData` directly. `OnPairColumn` pairs that data with a
+row layer that delimits the records, enabling per-string reconstruction and
+random access (§3.4). Its `rows` is always a valid `R + 1` offset array; a column
+with zero rows has `rows = [0]` (`count == 1`, `M == 0`).
 
 ### Layout rules (normative)
 
@@ -314,23 +337,34 @@ type with no byte-swapping. The inner loop is monomorphic.
 
 ## 6. Validation
 
-Before decoding untrusted or deserialized input, a consumer should verify, in
-`O(N)` over the dictionary plus `O(M)` over the codes:
+A column is conformant if and only if all of the following hold.
 
-1. All reserved bytes are zero (§5).
-2. Dictionary offsets: `o_0 == 0`, strictly increasing, each token length
-   `<= MAX_TOKEN_SIZE` (§3.2).
-3. Completeness: all 256 single-byte tokens are present, so `N >= 256` (§3).
-   This can be folded into the dictionary scan of check 2 by recording which
-   byte values appear as length-1 tokens.
-4. `dict_bytes` is readable for `MAX_TOKEN_SIZE` past the last token offset
-   (§3.1).
-5. Every code is `< N` (§3.3).
-6. If a row layer is present: `r_0 == 0`, non-decreasing, and `r_R == M` (§4).
-7. If `is_sorted` is set: tokens are non-decreasing in bytewise-lexicographic
-   order (§3). This check is optional — a consumer that does not use
-   order-dependent operations may skip it.
+**Dictionary** (§3):
 
-All checks except 5 are up-front and run once (checks 1–4 and 6, plus the
-optional 7); check 5 is the per-code `O(M)` bound, typically folded into the
-decode loop.
+- `dict_offsets_len == N + 1`, with `N >= 256`.
+- `o_0 == 0`.
+- Strictly increasing: `o_i < o_{i+1}` for all `i`.
+- Every token length `o_{i+1} - o_i` is in `1 ..= MAX_TOKEN_SIZE`.
+- All 256 single-byte tokens are present (completeness, §3).
+- No two tokens are equal (uniqueness, §3).
+- `dict_bytes_len >= o_N + MAX_TOKEN_SIZE` (the read-padding bound, §3.1).
+- `is_sorted` is `0` or `1`; if `1`, tokens are strictly increasing in
+  bytewise-lexicographic order.
+
+**Code stream** (§3.3):
+
+- Every code is `< N`.
+
+**Row layer** (§4), for an `OnPairColumn`:
+
+- `rows.count == R + 1` (so `rows.count >= 1`).
+- `r_0 == 0` and `r_R == M`.
+- Non-decreasing: `r_k <= r_{k+1}` for all `k`.
+
+**Other** (§5):
+
+- All reserved bytes are zero.
+
+A consumer of untrusted or deserialized input should check the invariants for
+the parts it uses — the ordering check, for instance, matters only to consumers
+that rely on `is_sorted` for order-dependent operations.
