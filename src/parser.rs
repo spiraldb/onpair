@@ -81,9 +81,9 @@ impl Parser {
 
 /// Encode every string into a flat `Vec<u16>` of codes plus per-row
 /// `code_offsets`. Offset `[i]..[i + 1]` indexes the codes for row `i`. The
-/// offsets are compressor metadata — a token may span a row boundary, so the
-/// row structure cannot be recovered from the codes alone — and are not needed
-/// to decode the column as one flat stream.
+/// offsets are compressor metadata — the codes are a flat concatenation with no
+/// in-band row delimiter, so the row structure cannot be recovered from the
+/// codes alone — and are not needed to decode the column as one flat stream.
 pub(crate) fn encode_strings<O: Offset>(
     bytes: &[u8],
     offsets: &[O],
