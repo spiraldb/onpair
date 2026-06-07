@@ -31,7 +31,7 @@ impl Parser {
     /// Train a dictionary against `bytes` / `offsets` and build the matching
     /// LPM. `offsets` has length `n + 1`. Returns [`Error::InvalidArg`] if
     /// `offsets` is empty or its last (maximum) offset cannot be represented in
-    /// `usize` or exceeds `bytes.len()` — see [`validate_offsets`]. The `cfg`
+    /// `usize` or exceeds `bytes.len()`. The `cfg`
     /// is valid by construction ([`Bits`](crate::Bits) /
     /// [`Threshold`](crate::Threshold)).
     pub fn train<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Self, Error> {
@@ -52,8 +52,8 @@ impl Parser {
     /// Encode `bytes` / `offsets` using this parser. The dictionary is cloned
     /// into the returned [`Column`] so the column is fully decode-self-
     /// contained — the strings need not be the corpus the parser was trained
-    /// on. Returns [`Error::InvalidArg`] on invalid offsets — see
-    /// [`validate_offsets`].
+    /// on. Returns [`Error::InvalidArg`] if `offsets` is empty or its last
+    /// offset cannot be represented in `usize` or exceeds `bytes.len()`.
     pub fn parse<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Result<Column<O>, Error> {
         validate_offsets(bytes, offsets)?;
         Ok(self.parse_unchecked(bytes, offsets))

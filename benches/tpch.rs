@@ -19,7 +19,7 @@
 //
 // Run with: cargo bench --bench tpch
 //
-// Targets the slim public API in PUBLIC_API.md
+// Targets the slim public API
 // (`compress` / `decompress` free fns + `Column::as_parts()`).
 
 use std::collections::HashMap;
