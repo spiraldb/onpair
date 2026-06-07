@@ -583,8 +583,8 @@ mod tests {
     }
 
     /// Exercise the full decode width sweep against a corpus large enough to
-    /// drive the batched AVX-512 prefix, the scalar 16-byte remainder, and the
-    /// exact tail in a single call.
+    /// drive the 16-byte over-copy fast region and the exact, length-aware
+    /// tail in a single call.
     #[test]
     fn decompress_matches_input_across_widths() {
         let mut bytes = Vec::new();
