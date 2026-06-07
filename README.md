@@ -3,10 +3,14 @@
 OnPair is a dictionary-based string compression algorithm designed for on-disk and in-memory database workloads that need both strong compression ratios and fast random access to individual values. 
 It builds its dictionary in a single sequential pass by incrementally merging frequent adjacent substrings, achieving compression comparable to BPE while being substantially faster and more memory-efficient. 
 
-## Format
+## Interchange format
 
-The binary layout of a compressed column — dictionary bytes, dictionary
-offsets, and codes — is specified in [docs/binary-format.md](docs/binary-format.md).
+OnPair defines a shared in-memory representation — the *plain interchange form*
+that independent implementations exchange so a column produced by one is
+readable by another. It fixes the buffers (dictionary bytes, dictionary
+offsets, codes, and row offsets) and their invariants; denser internal
+encodings and on-disk serialization are out of scope. See
+[docs/interchange-format.md](docs/interchange-format.md).
 
 ## References
 
