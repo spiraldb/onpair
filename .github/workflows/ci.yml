@@ -23,6 +23,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Rust Lint - Clippy
         run: cargo clippy --all-features --all-targets
+      - name: Rust Lint - Docs
+        run: cargo doc --no-deps --all-features --document-private-items
       - name: Rust Test
         run: cargo test --workspace --all-features
 
