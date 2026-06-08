@@ -35,7 +35,7 @@ pub struct Column<O: Offset> {
 }
 
 /// Borrowed view of the data the decoder needs, consumed by
-/// [`crate::decompress`] and [`crate::decompress_into`].
+/// [`fn@crate::decompress`] and [`crate::decompress_into`].
 /// Downstream consumers deserializing from storage build this via struct
 /// literal — there is no constructor.
 #[derive(Copy, Clone, Debug)]
@@ -57,7 +57,7 @@ pub struct Parts<'a> {
 
 impl<O: Offset> Column<O> {
     /// Zero-copy view over this column's decode arrays. Pass directly to
-    /// [`crate::decompress`] or [`crate::decompress_into`]. `code_offsets` is
+    /// [`fn@crate::decompress`] or [`crate::decompress_into`]. `code_offsets` is
     /// compressor metadata and is not part of the view.
     #[inline]
     pub fn as_parts(&self) -> Parts<'_> {
