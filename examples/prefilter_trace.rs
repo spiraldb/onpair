@@ -223,4 +223,91 @@ fn main() {
         );
         println!("    trigger = candidate token \"{}\"", trigger(r));
     }
+
+    // ── Extra: how do frequency-free anchor choices compare? ────────────────
+    // For each query, pick the anchor by (a) sampled code frequencies (what
+    // `compile` does), (b) candidate-set size only, (c) a dictionary length
+    // prior (weight 4^-len: shorter tokens presumed more frequent) — then
+    // report the realized candidate-ROW rate of each choice on a full scan.
+    println!("\n== frequency-free anchor selection comparison ==");
+    let queries: &[&[u8]] = &[
+        b"kinopoisk.ru",
+        b"avtomobil",
+        b"google",
+        b"no-such-string-xq",
+    ];
+    let nrows = offsets.len() - 1;
+    for &q in queries {
+        let mq = q.len();
+        let mut qsets: Vec<Vec<bool>> = vec![vec![false; ntok]; mq];
+        for c in 0..ntok {
+            let t = tok(c);
+            let len = t.len() as isize;
+            for s in (1 - len)..mq as isize {
+                let lo = s.max(0);
+                let hi = (s + len).min(mq as isize);
+                if (lo..hi).all(|j| t[(j - s) as usize] == q[j as usize]) {
+                    for i in lo..hi {
+                        qsets[i as usize][c] = true;
+                    }
+                }
+            }
+        }
+        // Per-anchor scores under each criterion.
+        let stride = (col.codes.len() / (1 << 16)).max(1);
+        let sampled: Vec<usize> = qsets
+            .iter()
+            .map(|set| {
+                col.codes
+                    .iter()
+                    .step_by(stride)
+                    .filter(|&&c| set[c as usize])
+                    .count()
+            })
+            .collect();
+        let popcount: Vec<usize> = qsets
+            .iter()
+            .map(|set| set.iter().filter(|&&b| b).count())
+            .collect();
+        let prior: Vec<f64> = qsets
+            .iter()
+            .map(|set| {
+                (0..ntok)
+                    .filter(|&c| set[c])
+                    .map(|c| 0.25f64.powi(tok(c).len() as i32))
+                    .sum()
+            })
+            .collect();
+        let argmin_u = |v: &[usize]| v.iter().enumerate().min_by_key(|&(_, x)| *x).unwrap().0;
+        let argmin_f = |v: &[f64]| {
+            v.iter()
+                .enumerate()
+                .min_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        let picks = [
+            ("sampled ", argmin_u(&sampled)),
+            ("popcount", argmin_u(&popcount)),
+            ("prior   ", argmin_f(&prior)),
+        ];
+        println!("  query \"{}\":", esc(q));
+        for (name, i) in picks {
+            let set = &qsets[i];
+            let rows_hit = col
+                .code_offsets
+                .windows(2)
+                .filter(|w| {
+                    col.codes[w[0] as usize..w[1] as usize]
+                        .iter()
+                        .any(|&c| set[c as usize])
+                })
+                .count();
+            println!(
+                "    {name} picks anchor {i:>2} ('{}')  -> {rows_hit} candidate rows ({:.4}%)",
+                q[i] as char,
+                100.0 * rows_hit as f64 / nrows as f64
+            );
+        }
+    }
 }

@@ -114,6 +114,40 @@ impl ContainsSearcher {
         )
     }
 
+    /// Compile a searcher from the dictionary alone, with **no** frequency
+    /// information: anchor choice is deferred to scan time, where each
+    /// [`matching_rows`](Self::matching_rows) call samples the code stream it
+    /// was handed before scanning it (the stream is its own frequency
+    /// sample). Equivalent results to [`compile`](Self::compile), at the cost
+    /// of a sub-millisecond warmup per scan and the candidate sets staying
+    /// resident (`pattern.len()` × `ntokens / 8` bytes).
+    ///
+    /// ## Panics
+    ///
+    /// Panics if the dictionary fails [`Parts::validate_dictionary`] or if
+    /// `pattern.len() > MAX_PATTERN_LEN`.
+    pub fn compile_dict_only(dict_bytes: &[u8], dict_offsets: &[u32], pattern: &[u8]) -> Self {
+        let parts = Parts {
+            dict_bytes,
+            dict_offsets,
+            bits: 16, // decode metadata only; irrelevant to validation
+            codes: &[],
+        };
+        if let Err(e) = parts.validate_dictionary() {
+            panic!("onpair: {e}");
+        }
+        if pattern.is_empty() {
+            return Self {
+                dfa: None,
+                prefilter: None,
+            };
+        }
+        Self {
+            dfa: Some(TokenDfa::build(pattern, dict_bytes, dict_offsets)),
+            prefilter: Prefilter::build_deferred(pattern, dict_bytes, dict_offsets),
+        }
+    }
+
     fn compile_inner(
         dict_bytes: &[u8],
         dict_offsets: &[u32],
@@ -145,12 +179,14 @@ impl ContainsSearcher {
     /// for `codes`) or if a code is out of range for the dictionary this
     /// searcher was compiled against.
     pub fn matching_rows<O: Offset>(&self, codes: &[u16], code_offsets: &[O]) -> Vec<u64> {
-        match (&self.dfa, &self.prefilter) {
-            (None, _) => (0..code_offsets.len().saturating_sub(1) as u64).collect(),
-            (Some(dfa), None) => Self::scan_rows(codes, code_offsets, |row| dfa.row_matches(row)),
-            (Some(dfa), Some(pf)) => {
+        let Some(dfa) = &self.dfa else {
+            return (0..code_offsets.len().saturating_sub(1) as u64).collect();
+        };
+        match self.prefilter.as_ref().and_then(|pf| pf.resolve(codes)) {
+            None => Self::scan_rows(codes, code_offsets, |row| dfa.row_matches(row)),
+            Some(filter) => {
                 let mut mask = vec![0u64; codes.len().div_ceil(64)];
-                pf.candidate_mask(codes, &mut mask);
+                filter.candidate_mask(codes, &mut mask);
                 let mut out = Vec::new();
                 Self::for_each_row(codes, code_offsets, |r, a, b, row| {
                     if prefilter::any_bit_in_range(&mask, a, b) && dfa.row_matches(row) {
@@ -181,11 +217,11 @@ impl ContainsSearcher {
     /// false-positive-inclusive pass rate. Without a prefilter, every row is a
     /// candidate.
     pub fn candidate_rows<O: Offset>(&self, codes: &[u16], code_offsets: &[O]) -> Vec<u64> {
-        match &self.prefilter {
+        match self.prefilter.as_ref().and_then(|pf| pf.resolve(codes)) {
             None => (0..code_offsets.len().saturating_sub(1) as u64).collect(),
-            Some(pf) => {
+            Some(filter) => {
                 let mut mask = vec![0u64; codes.len().div_ceil(64)];
-                pf.candidate_mask(codes, &mut mask);
+                filter.candidate_mask(codes, &mut mask);
                 let mut out = Vec::new();
                 Self::for_each_row(codes, code_offsets, |r, a, b, _| {
                     if prefilter::any_bit_in_range(&mask, a, b) {
@@ -197,12 +233,11 @@ impl ContainsSearcher {
         }
     }
 
-    /// Prefilter diagnostics: `(strategy, expected per-code hit rate)`, or
-    /// `None` when the searcher runs unfiltered.
+    /// Prefilter diagnostics: `(strategy, expected per-code hit rate)`.
+    /// `None` when the searcher runs unfiltered or the anchor choice is
+    /// deferred to scan time ([`compile_dict_only`](Self::compile_dict_only)).
     pub fn prefilter_info(&self) -> Option<(&'static str, f64)> {
-        self.prefilter
-            .as_ref()
-            .map(|pf| (pf.strategy(), pf.expected_hit_rate()))
+        self.prefilter.as_ref().and_then(|pf| pf.info())
     }
 
     /// Iterate rows, handing each `(row, code_start, code_end, row_codes)` to
@@ -307,6 +342,20 @@ mod tests {
                 assert_eq!(got, expect, "bits={bits} pattern={:?}", pattern);
                 let unfiltered = s.matching_rows_unfiltered(&col.codes, &col.code_offsets);
                 assert_eq!(unfiltered, expect, "unfiltered bits={bits}");
+
+                // Dictionary-only compile (anchor deferred to scan time)
+                // must agree as well.
+                let sd = ContainsSearcher::compile_dict_only(
+                    &col.dict_bytes,
+                    &col.dict_offsets,
+                    pattern,
+                );
+                assert_eq!(
+                    sd.matching_rows(&col.codes, &col.code_offsets),
+                    expect,
+                    "dict-only bits={bits} pattern={:?}",
+                    pattern
+                );
 
                 // Candidates must be a superset of matches (no false negatives).
                 let cand = s.candidate_rows(&col.codes, &col.code_offsets);

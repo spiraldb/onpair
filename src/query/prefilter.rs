@@ -34,6 +34,7 @@
 type Intervals = Vec<(u16, u16)>;
 
 /// How candidate membership is tested during the scan.
+#[derive(Clone)]
 enum Kind {
     /// Few intervals: SIMD range checks (AVX2 when available).
     Intervals(Intervals),
@@ -48,12 +49,26 @@ const MAX_SCAN_INTERVALS: usize = 16;
 /// At most this many codes are sampled from the stream to score anchors.
 const FREQ_SAMPLES: usize = 1 << 16;
 
-/// Compiled prefilter for one pattern over one dictionary.
-pub(crate) struct Prefilter {
+/// A prefilter whose anchor has been chosen: a candidate-membership test plus
+/// its estimated firing rate.
+#[derive(Clone)]
+pub(crate) struct Filter {
     kind: Kind,
-    /// Estimated fraction of stream codes that are candidates, from the
-    /// build-time [`ScoreSource`] (diagnostic; drives nothing at runtime).
+    /// Estimated fraction of stream codes that are candidates, from whatever
+    /// frequency source chose the anchor (diagnostic; drives nothing at
+    /// runtime).
     expected_hit_rate: f64,
+}
+
+/// Compiled prefilter for one pattern over one dictionary.
+pub(crate) enum Prefilter {
+    /// Anchor chosen at compile time, from a code-stream sample or stored
+    /// [`crate::query::CodeStats`].
+    Fixed(Filter),
+    /// Dictionary-only compile: every anchor's candidate set is kept and the
+    /// rarest is chosen per scan by sampling the code stream being scanned —
+    /// no frequency information is needed before the scan.
+    Deferred { sets: Vec<Vec<u64>>, ntokens: usize },
 }
 
 /// Per-anchor candidate bitmaps over `ntokens` codes.
@@ -149,11 +164,43 @@ fn bitmap_to_intervals(set: &[u64], ntokens: usize) -> Intervals {
     out
 }
 
+/// Pick the rarest anchor by `rates` and package its set as a [`Filter`].
+/// Returns `None` when no anchor is selective enough to pay for the extra
+/// pass (the caller then runs the DFA unfiltered).
+fn select_filter(sets: &[Vec<u64>], rates: &[f64], ntokens: usize) -> Option<Filter> {
+    // Argmin by rate, tie-broken toward the smaller candidate set.
+    let (best, &expected_hit_rate) = rates.iter().enumerate().min_by(|&(i, ra), &(j, rb)| {
+        let pop = |k: usize| sets[k].iter().map(|w| w.count_ones()).sum::<u32>();
+        ra.total_cmp(rb).then_with(|| pop(i).cmp(&pop(j)))
+    })?;
+
+    // A prefilter that fires on most codes only adds a pass; let the DFA
+    // run unassisted. (A row has many codes, so even a small per-code rate
+    // means many rows pass; the verify step keeps the result exact either
+    // way.)
+    if expected_hit_rate > 0.25 {
+        return None;
+    }
+
+    let set = &sets[best];
+    let intervals = bitmap_to_intervals(set, ntokens);
+    let kind = if intervals.len() <= MAX_SCAN_INTERVALS {
+        Kind::Intervals(intervals)
+    } else {
+        let mut bm = Box::new([0u64; 1024]);
+        bm[..set.len()].copy_from_slice(set);
+        Kind::Bitmap(bm)
+    };
+    Some(Filter {
+        kind,
+        expected_hit_rate,
+    })
+}
+
 impl Prefilter {
-    /// Build the prefilter for `pattern`, choosing the rarest anchor by the
-    /// frequency estimates in `source`. Returns `None` when no anchor is
-    /// selective enough to pay for the extra pass (the caller then runs the
-    /// DFA unfiltered).
+    /// Build a prefilter for `pattern` with its anchor chosen now, by the
+    /// frequency estimates in `source`. `None` when no anchor is selective
+    /// enough.
     pub(crate) fn build(
         pattern: &[u8],
         dict_bytes: &[u8],
@@ -166,42 +213,50 @@ impl Prefilter {
         }
         let sets = anchor_candidates(pattern, dict_bytes, dict_offsets);
         let rates = anchor_hit_rates(&sets, source);
+        select_filter(&sets, &rates, ntokens).map(Self::Fixed)
+    }
 
-        // Argmin by rate, tie-broken toward the smaller candidate set.
-        let (best, &expected_hit_rate) =
-            rates.iter().enumerate().min_by(|&(i, ra), &(j, rb)| {
-                let pop = |k: usize| sets[k].iter().map(|w| w.count_ones()).sum::<u32>();
-                ra.total_cmp(rb).then_with(|| pop(i).cmp(&pop(j)))
-            })?;
-
-        // A prefilter that fires on most codes only adds a pass; let the DFA
-        // run unassisted. (A row has many codes, so even a small per-code rate
-        // means many rows pass; the verify step keeps the result exact either
-        // way.)
-        if expected_hit_rate > 0.25 {
+    /// Build a prefilter from the dictionary alone, deferring anchor choice
+    /// to scan time (each scan samples the codes it is given).
+    pub(crate) fn build_deferred(
+        pattern: &[u8],
+        dict_bytes: &[u8],
+        dict_offsets: &[u32],
+    ) -> Option<Self> {
+        let ntokens = dict_offsets.len().saturating_sub(1);
+        if pattern.is_empty() || ntokens == 0 {
             return None;
         }
-
-        let set = &sets[best];
-        let intervals = bitmap_to_intervals(set, ntokens);
-        let kind = if intervals.len() <= MAX_SCAN_INTERVALS {
-            Kind::Intervals(intervals)
-        } else {
-            let mut bm = Box::new([0u64; 1024]);
-            bm[..set.len()].copy_from_slice(set);
-            Kind::Bitmap(bm)
-        };
-        Some(Self {
-            kind,
-            expected_hit_rate,
-        })
+        let sets = anchor_candidates(pattern, dict_bytes, dict_offsets);
+        Some(Self::Deferred { sets, ntokens })
     }
 
-    /// Expected fraction of codes that are candidates (sampled at build time).
-    pub(crate) fn expected_hit_rate(&self) -> f64 {
-        self.expected_hit_rate
+    /// The filter to scan `codes` with: the compile-time choice, or — when
+    /// deferred — the rarest anchor on a strided sample of `codes` (costing
+    /// `pattern_len` bit-tests per sampled code, negligible next to the
+    /// scan). `None` means no anchor is selective enough for this stream and
+    /// the caller should run the DFA over every row.
+    pub(crate) fn resolve(&self, codes: &[u16]) -> Option<std::borrow::Cow<'_, Filter>> {
+        match self {
+            Self::Fixed(f) => Some(std::borrow::Cow::Borrowed(f)),
+            Self::Deferred { sets, ntokens } => {
+                let rates = anchor_hit_rates(sets, &ScoreSource::SampledCodes(codes));
+                select_filter(sets, &rates, *ntokens).map(std::borrow::Cow::Owned)
+            }
+        }
     }
 
+    /// Compile-time diagnostics: `(strategy, expected per-code hit rate)`.
+    /// `None` for a deferred prefilter (nothing is known until a scan).
+    pub(crate) fn info(&self) -> Option<(&'static str, f64)> {
+        match self {
+            Self::Fixed(f) => Some((f.strategy(), f.expected_hit_rate)),
+            Self::Deferred { .. } => None,
+        }
+    }
+}
+
+impl Filter {
     /// Human-readable scan strategy, for diagnostics.
     pub(crate) fn strategy(&self) -> &'static str {
         match self.kind {

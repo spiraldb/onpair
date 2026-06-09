@@ -307,6 +307,18 @@ fn validate_and_report(c: &Corpus) {
                 truth,
                 "stats-compiled mismatch: query={q}"
             );
+            // Dictionary-only compile (no frequency information at all;
+            // anchor deferred to scan time) is exact too.
+            let sdo = ContainsSearcher::compile_dict_only(
+                &f.col.dict_bytes,
+                &f.col.dict_offsets,
+                q.as_bytes(),
+            );
+            assert_eq!(
+                sdo.matching_rows(&f.col.codes, &f.col.code_offsets),
+                truth,
+                "dict-only mismatch: query={q}"
+            );
             matches += truth.len();
             candidates += s.candidate_rows(&f.col.codes, &f.col.code_offsets).len();
             stats_candidates += ss.candidate_rows(&f.col.codes, &f.col.code_offsets).len();
