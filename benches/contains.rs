@@ -326,6 +326,146 @@ fn memmem_rows(file: &CompressedFile, finder: &memmem::Finder<'_>) -> Vec<u64> {
     out
 }
 
+/// Decompressed text of one chunk plus its per-row byte offsets — the input
+/// a raw-text scanner gets for free (decompression cost excluded).
+struct TextChunk {
+    text: Vec<u8>,
+    row_offsets: Vec<u64>,
+}
+
+/// Cached decompressed text per dataset. Takes the `Dataset` directly (not
+/// the name) so it is callable during corpus init without re-entering the
+/// corpus `OnceLock`.
+fn text_chunks_for(d: &Dataset) -> &'static Vec<TextChunk> {
+    static CACHE: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, &'static Vec<TextChunk>>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut guard = cache.lock().unwrap();
+    guard.entry(d.name.to_string()).or_insert_with(|| {
+        let chunks: Vec<TextChunk> = d
+            .files
+            .iter()
+            .map(|f| {
+                let parts = f.col.as_parts();
+                let text = decompress(parts);
+                let mut row_offsets = vec![0u64];
+                let mut pos = 0u64;
+                for w in f.col.code_offsets.windows(2) {
+                    pos += parts.codes[w[0] as usize..w[1] as usize]
+                        .iter()
+                        .map(|&c| {
+                            (parts.dict_offsets[c as usize + 1] - parts.dict_offsets[c as usize])
+                                as u64
+                        })
+                        .sum::<u64>();
+                    row_offsets.push(pos);
+                }
+                TextChunk { text, row_offsets }
+            })
+            .collect();
+        Box::leak(Box::new(chunks))
+    })
+}
+
+/// Raw-text scan with `memchr::memmem` (its widest x86 kernel is AVX2):
+/// rows whose text contains the needle, exact. Whole-buffer search with a
+/// row cursor; a hit inside a row skips to the row's end, a hit straddling
+/// a row boundary resumes one byte later so no in-row match is missed.
+fn text_rows_memmem(tc: &TextChunk, finder: &memmem::Finder<'_>, m: usize) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut row = 0usize;
+    while let Some(off) = finder.find(&tc.text[start..]) {
+        let pos = start + off;
+        while (tc.row_offsets[row + 1] as usize) <= pos {
+            row += 1;
+        }
+        let row_end = tc.row_offsets[row + 1] as usize;
+        if pos + m <= row_end {
+            out.push(row as u64);
+            start = row_end;
+        } else {
+            start = pos + 1;
+        }
+    }
+    out
+}
+
+/// Raw-text scan with a hand-rolled AVX-512BW substring search (memchr has
+/// no AVX-512 kernels): a two-byte anchor prefilter — `vpcmpeqb` 64 bytes
+/// per compare at the needle's two rarest byte offsets, AND the `k` masks —
+/// then verify candidates and attribute them to rows. Exact. Falls back to
+/// `memmem` when AVX-512BW is unavailable.
+fn text_rows_avx512(tc: &TextChunk, pattern: &[u8]) -> Vec<u64> {
+    if !is_x86_feature_detected!("avx512bw") || pattern.len() < 2 {
+        return text_rows_memmem(tc, &memmem::Finder::new(pattern), pattern.len());
+    }
+    // Rarest two pattern bytes by sampled background frequency of this text.
+    let mut freq = [0u64; 256];
+    for &b in tc.text.iter().step_by(64).take(1 << 16) {
+        freq[b as usize] += 1;
+    }
+    let mut idx: Vec<usize> = (0..pattern.len()).collect();
+    idx.sort_by_key(|&i| freq[pattern[i] as usize]);
+    let (o0, o1) = if idx[0] < idx[1] {
+        (idx[0], idx[1])
+    } else {
+        (idx[1], idx[0])
+    };
+    // SAFETY: AVX-512BW presence checked above.
+    unsafe { avx512_two_byte_scan(tc, pattern, o0, o1) }
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn avx512_two_byte_scan(tc: &TextChunk, pattern: &[u8], o0: usize, o1: usize) -> Vec<u64> {
+    use std::arch::x86_64::*;
+    let text = &tc.text;
+    let m = pattern.len();
+    let mut out: Vec<u64> = Vec::new();
+    let mut row = 0usize;
+    // Candidate verification + row attribution; positions arrive ascending,
+    // so the row cursor only moves forward and dedupe is a last-check.
+    let mut emit = |pos: usize| {
+        if text[pos..pos + m] == *pattern {
+            while (tc.row_offsets[row + 1] as usize) <= pos {
+                row += 1;
+            }
+            if pos + m <= tc.row_offsets[row + 1] as usize && out.last() != Some(&(row as u64)) {
+                out.push(row as u64);
+            }
+        }
+    };
+
+    let last_start = text.len().saturating_sub(m); // last valid match start
+    let b0 = _mm512_set1_epi8(pattern[o0] as i8);
+    let b1 = _mm512_set1_epi8(pattern[o1] as i8);
+    let mut i = 0usize;
+    // Vector body: anchor loads must stay in bounds: i + o1 + 64 <= len.
+    while i + 64 <= text.len().saturating_sub(o1) {
+        // SAFETY: 64-byte loads at i + o0 / i + o1 are in bounds.
+        let v0 = unsafe { _mm512_loadu_si512(text.as_ptr().add(i + o0).cast()) };
+        let v1 = unsafe { _mm512_loadu_si512(text.as_ptr().add(i + o1).cast()) };
+        let mut k = _mm512_cmpeq_epi8_mask(v0, b0) & _mm512_cmpeq_epi8_mask(v1, b1);
+        while k != 0 {
+            let pos = i + k.trailing_zeros() as usize;
+            k &= k - 1;
+            if pos <= last_start {
+                emit(pos);
+            }
+        }
+        i += 64;
+    }
+    // Scalar tail.
+    while i <= last_start {
+        if text[i + o0] == pattern[o0] && text[i + o1] == pattern[o1] {
+            emit(i);
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Compile one searcher per dataset chunk under the given anchor-selection
 /// mode: `sampled` (code-stream sample), `stats` (stored `CodeStats`),
 /// `heuristic` (length prior, no frequency info), `deferred` (chosen per
@@ -386,8 +526,20 @@ fn validate_and_report(c: &Corpus) {
         let finder = memmem::Finder::new(pattern.as_bytes());
         let mut matches = 0usize;
         let mut candidates = [0usize; 4];
-        for f in &d.files {
+        let texts = text_chunks_for(d);
+        for (f, tc) in d.files.iter().zip(texts) {
             let truth = memmem_rows(f, &finder);
+            // Raw-text scans (the comparison baselines) must be exact too.
+            assert_eq!(
+                text_rows_memmem(tc, &finder, pattern.len()),
+                truth,
+                "text memmem mismatch: {arg}"
+            );
+            assert_eq!(
+                text_rows_avx512(tc, pattern.as_bytes()),
+                truth,
+                "text avx512 mismatch: {arg}"
+            );
             // The unfiltered DFA is mode-independent; check it once.
             let s = compile_mode("sampled", f, pattern.as_bytes());
             assert_eq!(
@@ -486,6 +638,44 @@ fn prefilter_dfa_stats(bencher: Bencher, query_arg: &str) {
 #[divan::bench(args = QUERIES, sample_count = 10, sample_size = 1)]
 fn prefilter_dfa_heuristic(bencher: Bencher, query_arg: &str) {
     bench_prefilter_dfa(bencher, "heuristic", query_arg);
+}
+
+/// Raw-text substring scan over pre-decompressed text (decompression cost
+/// EXCLUDED — generous to the text side) with `memchr::memmem`, whose widest
+/// x86 kernel is AVX2.
+#[divan::bench(args = QUERIES, sample_count = 10, sample_size = 1)]
+fn text_scan_memmem(bencher: Bencher, query_arg: &str) {
+    let (ds, pattern) = parse_query(query_arg);
+    let d = dataset(ds);
+    let texts = text_chunks_for(d);
+    let finder = memmem::Finder::new(pattern.as_bytes());
+    bencher
+        .counter(divan::counter::BytesCount::new(d.total_bytes))
+        .bench(|| {
+            let mut n = 0usize;
+            for tc in texts {
+                n += text_rows_memmem(divan::black_box(tc), &finder, pattern.len()).len();
+            }
+            n
+        });
+}
+
+/// Raw-text substring scan over pre-decompressed text (decompression cost
+/// EXCLUDED) with the hand-rolled AVX-512 two-byte-anchor search.
+#[divan::bench(args = QUERIES, sample_count = 10, sample_size = 1)]
+fn text_scan_avx512(bencher: Bencher, query_arg: &str) {
+    let (ds, pattern) = parse_query(query_arg);
+    let d = dataset(ds);
+    let texts = text_chunks_for(d);
+    bencher
+        .counter(divan::counter::BytesCount::new(d.total_bytes))
+        .bench(|| {
+            let mut n = 0usize;
+            for tc in texts {
+                n += text_rows_avx512(divan::black_box(tc), pattern.as_bytes()).len();
+            }
+            n
+        });
 }
 
 #[divan::bench(args = QUERIES, sample_count = 10, sample_size = 1)]

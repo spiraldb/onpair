@@ -362,11 +362,25 @@ pub(crate) fn any_bit_in_range(mask: &[u64], a: usize, b: usize) -> bool {
     mask[wa + 1..wb].iter().any(|&w| w != 0)
 }
 
-/// Interval-membership scan, dispatching to AVX2 when available.
+/// Interval-membership scan, dispatching to the widest SIMD available
+/// (AVX-512BW, then AVX2, then scalar). The `ONPAIR_SIMD` env var
+/// (`avx512` / `avx2` / `scalar`, read once) caps the dispatch — a
+/// diagnostic escape hatch for benchmarking kernels against each other, not
+/// a stable interface.
 fn scan_intervals(codes: &[u16], intervals: &Intervals, mask: &mut [u64]) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        static OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let force = OVERRIDE
+            .get_or_init(|| std::env::var("ONPAIR_SIMD").ok())
+            .as_deref();
+        let allow = |name: &str| force.is_none_or(|f| f == name);
+        if allow("avx512") && is_x86_feature_detected!("avx512bw") {
+            // SAFETY: AVX-512BW presence checked at runtime.
+            unsafe { avx512::scan(codes, intervals, mask) };
+            return;
+        }
+        if allow("avx2") && is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 presence checked at runtime.
             unsafe { avx2::scan(codes, intervals, mask) };
             return;
@@ -383,6 +397,45 @@ fn scan_intervals_scalar(codes: &[u16], intervals: &[(u16, u16)], mask: &mut [u6
             word |= (hit as u64) << b;
         }
         mask[w] = word;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use std::arch::x86_64::*;
+
+    /// One AVX-512 iteration handles 64 codes — exactly one output mask
+    /// word: two 32-lane `u16` vectors, one unsigned range test per interval
+    /// (`vpcmpuw` writes straight to a `k` mask register), OR-accumulated and
+    /// stored. No pack/permute/movemask tail like AVX2 needs.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn scan(codes: &[u16], intervals: &[(u16, u16)], mask: &mut [u64]) {
+        let bounds: Vec<(__m512i, __m512i)> = intervals
+            .iter()
+            .map(|&(lo, hi)| (_mm512_set1_epi16(lo as i16), _mm512_set1_epi16(hi as i16)))
+            .collect();
+
+        let mut word = 0usize;
+        let mut chunks = codes.chunks_exact(64);
+        for chunk in &mut chunks {
+            // SAFETY: chunk holds 64 u16s = two 512-bit unaligned loads.
+            let v0 = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
+            let v1 = unsafe { _mm512_loadu_si512(chunk.as_ptr().add(32).cast()) };
+            let mut k0: __mmask32 = 0;
+            let mut k1: __mmask32 = 0;
+            for &(lo, hi) in &bounds {
+                k0 |= _mm512_cmpge_epu16_mask(v0, lo) & _mm512_cmple_epu16_mask(v0, hi);
+                k1 |= _mm512_cmpge_epu16_mask(v1, lo) & _mm512_cmple_epu16_mask(v1, hi);
+            }
+            mask[word] = (k0 as u64) | ((k1 as u64) << 32);
+            word += 1;
+        }
+
+        // Scalar tail (< 64 codes).
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            super::scan_intervals_scalar(rem, intervals, &mut mask[word..]);
+        }
     }
 }
 
@@ -462,6 +515,28 @@ mod tests {
         for (i, &c) in codes.iter().enumerate() {
             let expect = intervals.iter().any(|&(lo, hi)| lo <= c && c <= hi);
             assert_eq!(scalar[i / 64] >> (i % 64) & 1 == 1, expect, "code {c}");
+        }
+        // Every available vector kernel must agree with scalar bit-for-bit,
+        // including boundary codes (0, u16::MAX) and odd tails.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut edge: Vec<u16> = codes.clone();
+            edge.extend([0, 1, 2, 3, 7, 8, 99, 100, 101, 59999, 60000, 65534, 65535]);
+            let words = edge.len().div_ceil(64);
+            let mut expect = vec![0u64; words];
+            scan_intervals_scalar(&edge, &intervals, &mut expect);
+            if is_x86_feature_detected!("avx2") {
+                let mut got = vec![0u64; words];
+                // SAFETY: AVX2 presence checked above.
+                unsafe { avx2::scan(&edge, &intervals, &mut got) };
+                assert_eq!(got, expect, "avx2 kernel diverges from scalar");
+            }
+            if is_x86_feature_detected!("avx512bw") {
+                let mut got = vec![0u64; words];
+                // SAFETY: AVX-512BW presence checked above.
+                unsafe { avx512::scan(&edge, &intervals, &mut got) };
+                assert_eq!(got, expect, "avx512 kernel diverges from scalar");
+            }
         }
     }
 
