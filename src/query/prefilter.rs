@@ -46,8 +46,16 @@ enum Kind {
 /// bitmap probe, so the scan switches representation.
 const MAX_SCAN_INTERVALS: usize = 16;
 
-/// At most this many codes are sampled from the stream to score anchors.
-const FREQ_SAMPLES: usize = 1 << 16;
+/// Sample cap for compile-time anchor selection: paid once per query, so
+/// spend more for a steadier estimate.
+const COMPILE_SAMPLES: usize = 1 << 16;
+
+/// Sample cap for deferred (per-scan) anchor selection: paid on every scan,
+/// so keep the warmup well under the scan itself. Anchor selection only
+/// separates hit rates that differ by orders of magnitude, so a few thousand
+/// samples are statistically ample; near-zero anchors that tie at 0 hits fall
+/// back to the set-size tie-break.
+const SCAN_SAMPLES: usize = 1 << 13;
 
 /// A prefilter whose anchor has been chosen: a candidate-membership test plus
 /// its estimated firing rate.
@@ -109,20 +117,41 @@ pub(crate) enum ScoreSource<'a> {
 }
 
 /// Estimated fraction of stream codes hitting each anchor's candidate set.
-fn anchor_hit_rates(sets: &[Vec<u64>], source: &ScoreSource<'_>) -> Vec<f64> {
+/// `max_samples` bounds the sample size when `source` is a code stream.
+fn anchor_hit_rates(sets: &[Vec<u64>], source: &ScoreSource<'_>, max_samples: usize) -> Vec<f64> {
     match source {
         ScoreSource::SampledCodes(codes) => {
-            let stride = (codes.len() / FREQ_SAMPLES).max(1);
+            // Sampling cost is dominated by cache misses on the touched
+            // stream locations, not the per-anchor bit tests, so samples are
+            // taken as 32-code blocks (one cache line each) at evenly spaced
+            // offsets. The sample budget scales down with anchor count and is
+            // capped; anchor selection only separates rates that differ by
+            // orders of magnitude, so a few thousand samples are ample (and a
+            // misrank costs speed, never correctness).
+            let m = sets.len().max(1);
+            let target = (codes.len() / (16 * m)).clamp(256, max_samples);
             let mut hits = vec![0usize; sets.len()];
             let mut sampled = 0usize;
-            for &c in codes.iter().step_by(stride) {
-                let (w, b) = (c as usize / 64, c as usize % 64);
-                for (set, hit) in sets.iter().zip(hits.iter_mut()) {
-                    // Codes are validated against the dictionary before
-                    // compile, so `w` is in range.
-                    *hit += (set[w] >> b & 1) as usize;
+            let mut tally = |block: &[u16]| {
+                for &c in block {
+                    let (w, b) = (c as usize / 64, c as usize % 64);
+                    for (set, hit) in sets.iter().zip(hits.iter_mut()) {
+                        // Codes are validated against the dictionary before
+                        // compile, so `w` is in range.
+                        *hit += (set[w] >> b & 1) as usize;
+                    }
                 }
-                sampled += 1;
+                sampled += block.len();
+            };
+            if codes.len() <= target {
+                tally(codes);
+            } else {
+                const BLOCK: usize = 32;
+                let nblocks = target / BLOCK; // >= 8 (target >= 256)
+                let stride = codes.len() / nblocks; // >= BLOCK as len > target
+                for b in 0..nblocks {
+                    tally(&codes[b * stride..b * stride + BLOCK]);
+                }
             }
             hits.iter()
                 .map(|&h| h as f64 / sampled.max(1) as f64)
@@ -144,22 +173,34 @@ fn anchor_hit_rates(sets: &[Vec<u64>], source: &ScoreSource<'_>) -> Vec<f64> {
 }
 
 /// Maximal runs of consecutive set bits, as inclusive code intervals.
+/// Word-skipping (candidate sets are sparse), so the common cost is
+/// `ntokens / 64` word tests plus one popcount-loop step per candidate.
 fn bitmap_to_intervals(set: &[u64], ntokens: usize) -> Intervals {
     let mut out = Intervals::new();
-    let mut run: Option<u16> = None;
-    for c in 0..ntokens {
-        let bit = set[c / 64] >> (c % 64) & 1 == 1;
-        match (bit, run) {
-            (true, None) => run = Some(c as u16),
-            (false, Some(start)) => {
-                out.push((start, (c - 1) as u16));
-                run = None;
+    let mut run: Option<(u16, u16)> = None; // (start, last seen)
+    for (w, &word) in set.iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        let mut x = word;
+        while x != 0 {
+            let c = w * 64 + x.trailing_zeros() as usize;
+            x &= x - 1;
+            if c >= ntokens {
+                break;
             }
-            _ => {}
+            run = match run {
+                Some((start, last)) if c as u16 == last + 1 => Some((start, c as u16)),
+                Some((start, last)) => {
+                    out.push((start, last));
+                    Some((c as u16, c as u16))
+                }
+                None => Some((c as u16, c as u16)),
+            };
         }
     }
-    if let Some(start) = run {
-        out.push((start, (ntokens - 1) as u16));
+    if let Some((start, last)) = run {
+        out.push((start, last));
     }
     out
 }
@@ -212,7 +253,7 @@ impl Prefilter {
             return None;
         }
         let sets = anchor_candidates(pattern, dict_bytes, dict_offsets);
-        let rates = anchor_hit_rates(&sets, source);
+        let rates = anchor_hit_rates(&sets, source, COMPILE_SAMPLES);
         select_filter(&sets, &rates, ntokens).map(Self::Fixed)
     }
 
@@ -240,7 +281,7 @@ impl Prefilter {
         match self {
             Self::Fixed(f) => Some(std::borrow::Cow::Borrowed(f)),
             Self::Deferred { sets, ntokens } => {
-                let rates = anchor_hit_rates(sets, &ScoreSource::SampledCodes(codes));
+                let rates = anchor_hit_rates(sets, &ScoreSource::SampledCodes(codes), SCAN_SAMPLES);
                 select_filter(sets, &rates, *ntokens).map(std::borrow::Cow::Owned)
             }
         }

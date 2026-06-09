@@ -268,6 +268,30 @@ fn searchers(pattern: &str) -> &'static Vec<ContainsSearcher> {
     })
 }
 
+/// Dictionary-only searchers: anchor selection deferred to each scan, so the
+/// per-call warmup (sample + interval extraction) is included in scan time.
+fn searchers_deferred(pattern: &str) -> &'static Vec<ContainsSearcher> {
+    static CACHE: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, &'static Vec<ContainsSearcher>>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut guard = cache.lock().unwrap();
+    guard.entry(pattern.to_string()).or_insert_with(|| {
+        let s: Vec<ContainsSearcher> = corpus()
+            .files
+            .iter()
+            .map(|f| {
+                ContainsSearcher::compile_dict_only(
+                    &f.col.dict_bytes,
+                    &f.col.dict_offsets,
+                    pattern.as_bytes(),
+                )
+            })
+            .collect();
+        Box::leak(Box::new(s))
+    })
+}
+
 /// Cross-check the strategies on every file and print per-query stats.
 fn validate_and_report(c: &Corpus) {
     let rows: usize = c.files.iter().map(|f| f.rows).sum();
@@ -395,6 +419,25 @@ fn prefilter_dfa(bencher: Bencher, query: &str) {
             for (f, s) in c.files.iter().zip(s) {
                 n += s
                     .matching_rows(divan::black_box(&f.col.codes), &f.col.code_offsets)
+                    .len();
+            }
+            n
+        });
+}
+
+/// `prefilter_only` with deferred (dictionary-only) searchers: the difference
+/// to `prefilter_only` is the per-scan anchor-selection warmup.
+#[divan::bench(args = QUERIES, sample_count = 10, sample_size = 1)]
+fn prefilter_only_deferred(bencher: Bencher, query: &str) {
+    let c = corpus();
+    let s = searchers_deferred(query);
+    bencher
+        .counter(divan::counter::BytesCount::new(c.total_bytes))
+        .bench(|| {
+            let mut n = 0usize;
+            for (f, s) in c.files.iter().zip(s) {
+                n += s
+                    .candidate_rows(divan::black_box(&f.col.codes), &f.col.code_offsets)
                     .len();
             }
             n
