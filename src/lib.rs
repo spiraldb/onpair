@@ -46,6 +46,7 @@ mod hash;
 mod lpm;
 mod offset;
 mod parser;
+pub mod query;
 mod trainer;
 mod types;
 
