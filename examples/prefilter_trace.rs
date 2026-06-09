@@ -79,8 +79,7 @@ fn main() {
     println!("\n== step 1: anchor candidate sets C_i ==");
     let mut sets: Vec<Vec<bool>> = vec![vec![false; ntok]; m];
     // Remember one witness alignment per (anchor, code) for display.
-    let mut witness: Vec<std::collections::HashMap<usize, isize>> =
-        vec![Default::default(); m];
+    let mut witness: Vec<std::collections::HashMap<usize, isize>> = vec![Default::default(); m];
     for c in 0..ntok {
         let t = tok(c);
         let len = t.len() as isize;
@@ -125,7 +124,10 @@ fn main() {
         }
     }
     let bi = best.2;
-    println!("  -> chosen anchor: i={bi} (P[{bi}]='{}')", PATTERN[bi] as char);
+    println!(
+        "  -> chosen anchor: i={bi} (P[{bi}]='{}')",
+        PATTERN[bi] as char
+    );
 
     // ── Step 3: candidate codes -> intervals over the sorted dictionary ─────
     println!("\n== step 3: chosen C_{bi} as code intervals (dict is lex-sorted) ==");
@@ -163,11 +165,7 @@ fn main() {
 
     // ── Step 4: scan the code stream + row mapping + DFA verify ─────────────
     println!("\n== step 4: scan ==");
-    let cand_codes = col
-        .codes
-        .iter()
-        .filter(|&&c| set[c as usize])
-        .count();
+    let cand_codes = col.codes.iter().filter(|&&c| set[c as usize]).count();
     let mut cand_rows: Vec<usize> = Vec::new();
     for (r, w) in col.code_offsets.windows(2).enumerate() {
         if col.codes[w[0] as usize..w[1] as usize]
@@ -195,10 +193,7 @@ fn main() {
         matches.len(),
         100.0 * matches.len() as f64 / (offsets.len() - 1) as f64
     );
-    println!(
-        "  sanity: prefilter_info = {:?}",
-        searcher.prefilter_info()
-    );
+    println!("  sanity: prefilter_info = {:?}", searcher.prefilter_info());
 
     // Show one true match and one false positive, with the triggering token.
     let row_bytes = |r: usize| &bytes[offsets[r] as usize..offsets[r + 1] as usize];
@@ -219,11 +214,13 @@ fn main() {
         println!("    ...{}...", esc(&row[a..b]));
         println!("    trigger = candidate token \"{}\"", trigger(r));
     }
-    let match_set: std::collections::HashSet<usize> =
-        matches.iter().map(|&r| r as usize).collect();
+    let match_set: std::collections::HashSet<usize> = matches.iter().map(|&r| r as usize).collect();
     if let Some(&r) = cand_rows.iter().find(|r| !match_set.contains(r)) {
         println!("\n  example FALSE POSITIVE row {r} (killed by DFA verify):");
-        println!("    url     = \"{}\"", esc(&row_bytes(r)[..row_bytes(r).len().min(100)]));
+        println!(
+            "    url     = \"{}\"",
+            esc(&row_bytes(r)[..row_bytes(r).len().min(100)])
+        );
         println!("    trigger = candidate token \"{}\"", trigger(r));
     }
 }

@@ -25,14 +25,17 @@
 
 mod dfa;
 mod prefilter;
+mod stats;
 
 use crate::Offset;
 use crate::Parts;
 
 use dfa::TokenDfa;
 use prefilter::Prefilter;
+use prefilter::ScoreSource;
 
 pub use dfa::MAX_PATTERN_LEN;
+pub use stats::CodeStats;
 
 /// A `contains` query compiled against one column's dictionary (and tuned on
 /// its code stream). Reusable across [`matching_rows`] calls for any code
@@ -62,15 +65,69 @@ impl ContainsSearcher {
         if let Err(e) = parts.validate() {
             panic!("onpair: {e}");
         }
+        Self::compile_inner(
+            parts.dict_bytes,
+            parts.dict_offsets,
+            pattern,
+            &ScoreSource::SampledCodes(parts.codes),
+        )
+    }
+
+    /// Compile a searcher from the dictionary alone, scoring prefilter
+    /// anchors with a stored [`CodeStats`] instead of reading the code
+    /// stream. Use this when the codes are not resident at compile time —
+    /// e.g. to build the searcher (or estimate selectivity via
+    /// [`prefilter_info`](Self::prefilter_info)) before deciding to read a
+    /// row group. The result is exact either way; stats quality only affects
+    /// speed.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if the dictionary fails [`Parts::validate_dictionary`], if
+    /// `stats` does not cover exactly the dictionary's tokens, or if
+    /// `pattern.len() > MAX_PATTERN_LEN`.
+    pub fn compile_with_stats(
+        dict_bytes: &[u8],
+        dict_offsets: &[u32],
+        pattern: &[u8],
+        stats: &CodeStats,
+    ) -> Self {
+        let parts = Parts {
+            dict_bytes,
+            dict_offsets,
+            bits: 16, // decode metadata only; irrelevant to validation
+            codes: &[],
+        };
+        if let Err(e) = parts.validate_dictionary() {
+            panic!("onpair: {e}");
+        }
+        assert_eq!(
+            stats.num_tokens(),
+            dict_offsets.len().saturating_sub(1),
+            "CodeStats does not match the dictionary"
+        );
+        Self::compile_inner(
+            dict_bytes,
+            dict_offsets,
+            pattern,
+            &ScoreSource::Stats(stats),
+        )
+    }
+
+    fn compile_inner(
+        dict_bytes: &[u8],
+        dict_offsets: &[u32],
+        pattern: &[u8],
+        source: &ScoreSource<'_>,
+    ) -> Self {
         if pattern.is_empty() {
             return Self {
                 dfa: None,
                 prefilter: None,
             };
         }
-        let dfa = TokenDfa::build(pattern, parts.dict_bytes, parts.dict_offsets);
-        let prefilter =
-            Prefilter::build(pattern, parts.dict_bytes, parts.dict_offsets, parts.codes);
+        let dfa = TokenDfa::build(pattern, dict_bytes, dict_offsets);
+        let prefilter = Prefilter::build(pattern, dict_bytes, dict_offsets, source);
         Self {
             dfa: Some(dfa),
             prefilter,
@@ -260,6 +317,53 @@ mod tests {
                     pattern
                 );
             }
+        }
+    }
+
+    /// Compiling from stored stats (no code stream access) must stay exact,
+    /// and the stats must be small relative to the dictionary.
+    #[test]
+    fn stats_compile_agrees_without_codes() {
+        let rows_owned = corpus();
+        let rows: Vec<&[u8]> = rows_owned.iter().map(|r| r.as_slice()).collect();
+        let (bytes, offsets) = pack(&rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+
+        let ntok = col.dict_offsets.len() - 1;
+        let stats = CodeStats::from_codes(ntok, &col.codes);
+        assert_eq!(stats.num_tokens(), ntok);
+        assert!(
+            stats.as_bytes().len() < col.dict_bytes.len() / 2,
+            "stats ({} B) should be a fraction of the dictionary ({} B)",
+            stats.as_bytes().len(),
+            col.dict_bytes.len()
+        );
+
+        for pattern in [&b"google"[..], b"maps/place", b"zzz-no-match", b"g", b""] {
+            let s = ContainsSearcher::compile_with_stats(
+                &col.dict_bytes,
+                &col.dict_offsets,
+                pattern,
+                &stats,
+            );
+            assert_eq!(
+                s.matching_rows(&col.codes, &col.code_offsets),
+                naive(&rows, pattern),
+                "stats-compiled mismatch for {:?}",
+                String::from_utf8_lossy(pattern)
+            );
+            // Round-tripping the serialized form changes nothing.
+            let rt = CodeStats::from_bytes(stats.as_bytes());
+            let s2 = ContainsSearcher::compile_with_stats(
+                &col.dict_bytes,
+                &col.dict_offsets,
+                pattern,
+                &rt,
+            );
+            assert_eq!(
+                s2.matching_rows(&col.codes, &col.code_offsets),
+                naive(&rows, pattern),
+            );
         }
     }
 

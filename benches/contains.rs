@@ -41,6 +41,7 @@ use onpair::Config;
 use onpair::Threshold;
 use onpair::compress;
 use onpair::decompress;
+use onpair::query::CodeStats;
 use onpair::query::ContainsSearcher;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -67,6 +68,9 @@ const QUERIES: &[&str] = &[
 struct CompressedFile {
     col: Column<u64>,
     rows: usize,
+    /// Stored per-token frequency summary (1 byte/token), captured at
+    /// compression time so queries can compile without reading the codes.
+    stats: CodeStats,
 }
 
 struct Corpus {
@@ -95,9 +99,11 @@ fn corpus() -> &'static Corpus {
                 bytes.len() as f64 / (1024.0 * 1024.0),
             );
             total_bytes += bytes.len();
+            let stats = CodeStats::from_codes(col.dict_offsets.len() - 1, &col.codes);
             out.push(CompressedFile {
                 col,
                 rows: offsets.len() - 1,
+                stats,
             });
         }
         eprintln!(
@@ -262,14 +268,26 @@ fn searchers(pattern: &str) -> &'static Vec<ContainsSearcher> {
     })
 }
 
-/// Cross-check the three strategies on every file and print per-query stats.
+/// Cross-check the strategies on every file and print per-query stats.
 fn validate_and_report(c: &Corpus) {
     let rows: usize = c.files.iter().map(|f| f.rows).sum();
+    if let Some(f) = c.files.first() {
+        eprintln!(
+            "[contains bench] stored CodeStats: {} B/file vs {} B dict bytes ({:.1}%), \
+             {:.4}% of codes",
+            f.stats.as_bytes().len(),
+            f.col.dict_bytes.len(),
+            100.0 * f.stats.as_bytes().len() as f64 / f.col.dict_bytes.len() as f64,
+            100.0 * f.stats.as_bytes().len() as f64 / (f.col.codes.len() * 2) as f64,
+        );
+    }
     for &q in QUERIES {
         let finder = memmem::Finder::new(q.as_bytes());
         let mut matches = 0usize;
         let mut candidates = 0usize;
+        let mut stats_candidates = 0usize;
         let mut info: Option<(&str, f64)> = None;
+        let mut stats_info: Option<(&str, f64)> = None;
         for f in &c.files {
             let s = ContainsSearcher::compile(f.col.as_parts(), q.as_bytes());
             let truth = memmem_rows(f, &finder);
@@ -277,19 +295,42 @@ fn validate_and_report(c: &Corpus) {
             let pf = s.matching_rows(&f.col.codes, &f.col.code_offsets);
             assert_eq!(dfa, truth, "dfa mismatch: query={q}");
             assert_eq!(pf, truth, "prefiltered mismatch: query={q}");
+            // Stats-compiled searcher (no code stream at compile) is exact too.
+            let ss = ContainsSearcher::compile_with_stats(
+                &f.col.dict_bytes,
+                &f.col.dict_offsets,
+                q.as_bytes(),
+                &f.stats,
+            );
+            assert_eq!(
+                ss.matching_rows(&f.col.codes, &f.col.code_offsets),
+                truth,
+                "stats-compiled mismatch: query={q}"
+            );
             matches += truth.len();
             candidates += s.candidate_rows(&f.col.codes, &f.col.code_offsets).len();
+            stats_candidates += ss.candidate_rows(&f.col.codes, &f.col.code_offsets).len();
             info = info.or_else(|| s.prefilter_info());
+            stats_info = stats_info.or_else(|| ss.prefilter_info());
         }
-        let info = info.map_or_else(
-            || "none (dfa only)".to_string(),
-            |(strategy, rate)| format!("{strategy}, expected per-code hit rate {rate:.5}"),
-        );
+        let fmt_info = |info: Option<(&str, f64)>| {
+            info.map_or_else(
+                || "none (dfa only)".to_string(),
+                |(strategy, rate)| format!("{strategy}, expected per-code hit rate {rate:.5}"),
+            )
+        };
         eprintln!(
             "[contains bench] query \"{q}\": {matches} matches ({:.4}% of rows), \
-             {candidates} prefilter candidates ({:.4}%), prefilter: {info}",
+             {candidates} prefilter candidates ({:.4}%), prefilter: {}",
             100.0 * matches as f64 / rows as f64,
             100.0 * candidates as f64 / rows as f64,
+            fmt_info(info),
+        );
+        eprintln!(
+            "[contains bench]   stats-compiled: {stats_candidates} candidates ({:.4}%), \
+             prefilter: {}",
+            100.0 * stats_candidates as f64 / rows as f64,
+            fmt_info(stats_info),
         );
     }
 }
@@ -374,6 +415,22 @@ fn compile(bencher: Bencher, query: &str) {
             divan::black_box(ContainsSearcher::compile(
                 divan::black_box(f.col.as_parts()),
                 query.as_bytes(),
+            ));
+        }
+    });
+}
+
+/// Compile from stored `CodeStats` — the code stream is never read.
+#[divan::bench(args = QUERIES, sample_count = 5, sample_size = 1)]
+fn compile_stats(bencher: Bencher, query: &str) {
+    let c = corpus();
+    bencher.bench(|| {
+        for f in &c.files {
+            divan::black_box(ContainsSearcher::compile_with_stats(
+                divan::black_box(&f.col.dict_bytes),
+                &f.col.dict_offsets,
+                query.as_bytes(),
+                &f.stats,
             ));
         }
     });

@@ -51,8 +51,8 @@ const FREQ_SAMPLES: usize = 1 << 16;
 /// Compiled prefilter for one pattern over one dictionary.
 pub(crate) struct Prefilter {
     kind: Kind,
-    /// Fraction of sampled codes that were candidates (diagnostic; drives
-    /// nothing at runtime).
+    /// Estimated fraction of stream codes that are candidates, from the
+    /// build-time [`ScoreSource`] (diagnostic; drives nothing at runtime).
     expected_hit_rate: f64,
 }
 
@@ -85,21 +85,47 @@ fn anchor_candidates(pattern: &[u8], dict_bytes: &[u8], dict_offsets: &[u32]) ->
     sets
 }
 
-/// Score each anchor by how often its candidates appear in `codes`, using an
-/// evenly strided sample. Returns (hits, sampled) per anchor.
-fn sample_anchor_hits(sets: &[Vec<u64>], codes: &[u16]) -> Vec<(usize, usize)> {
-    let stride = (codes.len() / FREQ_SAMPLES).max(1);
-    let mut scores = vec![(0usize, 0usize); sets.len()];
-    for &c in codes.iter().step_by(stride) {
-        let (w, b) = (c as usize / 64, c as usize % 64);
-        for (set, score) in sets.iter().zip(scores.iter_mut()) {
-            // Codes are validated against the dictionary before compile, so
-            // `w` is in range.
-            score.0 += (set[w] >> b & 1) as usize;
-            score.1 += 1;
+/// Where anchor-frequency estimates come from at compile time.
+pub(crate) enum ScoreSource<'a> {
+    /// Evenly strided sample of the column's code stream.
+    SampledCodes(&'a [u16]),
+    /// Stored per-token frequency summary; the code stream is never read.
+    Stats(&'a crate::query::CodeStats),
+}
+
+/// Estimated fraction of stream codes hitting each anchor's candidate set.
+fn anchor_hit_rates(sets: &[Vec<u64>], source: &ScoreSource<'_>) -> Vec<f64> {
+    match source {
+        ScoreSource::SampledCodes(codes) => {
+            let stride = (codes.len() / FREQ_SAMPLES).max(1);
+            let mut hits = vec![0usize; sets.len()];
+            let mut sampled = 0usize;
+            for &c in codes.iter().step_by(stride) {
+                let (w, b) = (c as usize / 64, c as usize % 64);
+                for (set, hit) in sets.iter().zip(hits.iter_mut()) {
+                    // Codes are validated against the dictionary before
+                    // compile, so `w` is in range.
+                    *hit += (set[w] >> b & 1) as usize;
+                }
+                sampled += 1;
+            }
+            hits.iter()
+                .map(|&h| h as f64 / sampled.max(1) as f64)
+                .collect()
+        }
+        ScoreSource::Stats(stats) => {
+            let total = stats.approx_total().max(1) as f64;
+            sets.iter()
+                .map(|set| {
+                    let hit: u64 = (0..stats.num_tokens())
+                        .filter(|&c| set[c / 64] >> (c % 64) & 1 == 1)
+                        .map(|c| stats.approx_count(c))
+                        .sum();
+                    hit as f64 / total
+                })
+                .collect()
         }
     }
-    scores
 }
 
 /// Maximal runs of consecutive set bits, as inclusive code intervals.
@@ -124,27 +150,29 @@ fn bitmap_to_intervals(set: &[u64], ntokens: usize) -> Intervals {
 }
 
 impl Prefilter {
-    /// Build the prefilter for `pattern`, choosing the rarest anchor by
-    /// sampling `codes`. Returns `None` when no anchor is selective enough to
-    /// pay for the extra pass (the caller then runs the DFA unfiltered).
+    /// Build the prefilter for `pattern`, choosing the rarest anchor by the
+    /// frequency estimates in `source`. Returns `None` when no anchor is
+    /// selective enough to pay for the extra pass (the caller then runs the
+    /// DFA unfiltered).
     pub(crate) fn build(
         pattern: &[u8],
         dict_bytes: &[u8],
         dict_offsets: &[u32],
-        codes: &[u16],
+        source: &ScoreSource<'_>,
     ) -> Option<Self> {
         let ntokens = dict_offsets.len().saturating_sub(1);
         if pattern.is_empty() || ntokens == 0 {
             return None;
         }
         let sets = anchor_candidates(pattern, dict_bytes, dict_offsets);
-        let scores = sample_anchor_hits(&sets, codes);
+        let rates = anchor_hit_rates(&sets, source);
 
-        let (best, &(hits, sampled)) = scores
-            .iter()
-            .enumerate()
-            .min_by_key(|&(i, &(h, _))| (h, sets[i].iter().map(|w| w.count_ones()).sum::<u32>()))?;
-        let expected_hit_rate = hits as f64 / (sampled.max(1)) as f64;
+        // Argmin by rate, tie-broken toward the smaller candidate set.
+        let (best, &expected_hit_rate) =
+            rates.iter().enumerate().min_by(|&(i, ra), &(j, rb)| {
+                let pop = |k: usize| sets[k].iter().map(|w| w.count_ones()).sum::<u32>();
+                ra.total_cmp(rb).then_with(|| pop(i).cmp(&pop(j)))
+            })?;
 
         // A prefilter that fires on most codes only adds a pass; let the DFA
         // run unassisted. (A row has many codes, so even a small per-code rate
