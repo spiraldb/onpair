@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
-//! Scratch (uncommitted): step-by-step trace of the contains-prefilter
+//! Step-by-step diagnostic trace of the contains-prefilter
 //! compile pipeline for one pattern over one real ClickBench file.
 //! Mirrors the logic in `src/query/prefilter.rs`.
 #![allow(

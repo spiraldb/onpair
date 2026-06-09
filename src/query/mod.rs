@@ -114,6 +114,38 @@ impl ContainsSearcher {
         )
     }
 
+    /// Compile a searcher from the dictionary alone with **no frequency
+    /// information and no deferred work**: the prefilter anchor is chosen by
+    /// a dictionary length prior (`4^-len` per token — shorter tokens
+    /// presumed exponentially more frequent). The cheapest compile and the
+    /// weakest anchor choice; measured on real data its candidate rates run
+    /// 1–2× those of a frequency-informed choice. Prefer
+    /// [`compile`](Self::compile), [`compile_with_stats`](Self::compile_with_stats)
+    /// or [`compile_dict_only`](Self::compile_dict_only) when their inputs
+    /// are available. Results are exact regardless.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if the dictionary fails [`Parts::validate_dictionary`] or if
+    /// `pattern.len() > MAX_PATTERN_LEN`.
+    pub fn compile_heuristic(dict_bytes: &[u8], dict_offsets: &[u32], pattern: &[u8]) -> Self {
+        let parts = Parts {
+            dict_bytes,
+            dict_offsets,
+            bits: 16, // decode metadata only; irrelevant to validation
+            codes: &[],
+        };
+        if let Err(e) = parts.validate_dictionary() {
+            panic!("onpair: {e}");
+        }
+        Self::compile_inner(
+            dict_bytes,
+            dict_offsets,
+            pattern,
+            &ScoreSource::DictPrior(dict_offsets),
+        )
+    }
+
     /// Compile a searcher from the dictionary alone, with **no** frequency
     /// information: anchor choice is deferred to scan time, where each
     /// [`matching_rows`](Self::matching_rows) call samples the code stream it
@@ -354,6 +386,20 @@ mod tests {
                     sd.matching_rows(&col.codes, &col.code_offsets),
                     expect,
                     "dict-only bits={bits} pattern={:?}",
+                    pattern
+                );
+
+                // Heuristic compile (length-prior anchor, no frequency
+                // information) must agree too.
+                let sh = ContainsSearcher::compile_heuristic(
+                    &col.dict_bytes,
+                    &col.dict_offsets,
+                    pattern,
+                );
+                assert_eq!(
+                    sh.matching_rows(&col.codes, &col.code_offsets),
+                    expect,
+                    "heuristic bits={bits} pattern={:?}",
                     pattern
                 );
 

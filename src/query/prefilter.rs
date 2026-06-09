@@ -114,6 +114,10 @@ pub(crate) enum ScoreSource<'a> {
     SampledCodes(&'a [u16]),
     /// Stored per-token frequency summary; the code stream is never read.
     Stats(&'a crate::query::CodeStats),
+    /// No frequency information at all: a dictionary length prior
+    /// (`4^-len`, given `dict_offsets`) standing in for token frequency —
+    /// shorter tokens are presumed exponentially more common.
+    DictPrior(&'a [u32]),
 }
 
 /// Estimated fraction of stream codes hitting each anchor's candidate set.
@@ -166,6 +170,20 @@ fn anchor_hit_rates(sets: &[Vec<u64>], source: &ScoreSource<'_>, max_samples: us
                         .map(|c| stats.approx_count(c))
                         .sum();
                     hit as f64 / total
+                })
+                .collect()
+        }
+        ScoreSource::DictPrior(dict_offsets) => {
+            let ntokens = dict_offsets.len().saturating_sub(1);
+            let weight = |c: usize| 0.25f64.powi((dict_offsets[c + 1] - dict_offsets[c]) as i32);
+            let total: f64 = (0..ntokens).map(weight).sum::<f64>().max(f64::MIN_POSITIVE);
+            sets.iter()
+                .map(|set| {
+                    (0..ntokens)
+                        .filter(|&c| set[c / 64] >> (c % 64) & 1 == 1)
+                        .map(weight)
+                        .sum::<f64>()
+                        / total
                 })
                 .collect()
         }
