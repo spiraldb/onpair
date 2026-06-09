@@ -3,30 +3,53 @@
 
 //! Substring DFA lifted from bytes to dictionary codes.
 //!
-//! A classic KMP matching automaton over the pattern's bytes is precomputed,
-//! then composed with every dictionary token to yield a single transition
-//! table indexed by `(state, code)`. Scanning a row is then one table load per
-//! code — the row's bytes are never materialized, and a match that straddles
-//! token boundaries is found because the automaton state carries the partial
-//! match across codes.
+//! A classic KMP matching automaton over the pattern's bytes is precomputed;
+//! its composition with each dictionary token — the `(state, code)` table the
+//! scan reads — is filled **lazily**, one entry on first touch. A `LIKE`-style
+//! scan compiles a searcher per row group, and behind the prefilter the DFA
+//! only ever visits the (few) candidate rows, so eagerly composing all
+//! `(m + 1) × ntokens` entries (megabytes of token walks) would dominate the
+//! whole query; lazy composition makes compile O(pattern) while the scan pays
+//! one short token walk per *distinct* `(state, code)` pair it actually
+//! reaches. Scanning a row stays one table load per code, and a match that
+//! straddles token boundaries is found because the automaton state carries
+//! the partial match across codes.
+
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Matching automaton over dictionary codes. State `s` means "the longest
 /// prefix of the pattern that is a suffix of the bytes read so far has length
 /// `s`"; the accept state (`s == pattern.len()`) is absorbing.
 pub(crate) struct TokenDfa {
-    /// `(m + 1) * ntokens` transitions, state-major: `table[s * ntokens + c]`.
-    table: Vec<u8>,
+    /// `(m + 1) * 256` byte-level transitions, state-major.
+    delta: Vec<u8>,
+    /// `(m + 1) * ntokens` composed transitions, state-major
+    /// (`table[s * ntokens + c]`), filled on demand; [`UNFILLED`] marks
+    /// untouched entries. Concurrent fills race benignly: every thread
+    /// computes the same value.
+    table: Vec<AtomicU8>,
+    /// Owned copy of the dictionary, for on-demand composition. Keeps the
+    /// searcher free of borrowed lifetimes and usable across code streams.
+    dict_bytes: Vec<u8>,
+    dict_offsets: Vec<u32>,
     ntokens: usize,
     accept: u8,
 }
 
-/// Largest supported pattern length: states are stored as `u8` and one state
-/// per matched prefix length is needed, plus the empty prefix.
-pub const MAX_PATTERN_LEN: usize = u8::MAX as usize;
+/// Sentinel for a not-yet-composed table entry; never a valid state because
+/// states span `0..=pattern.len() <= MAX_PATTERN_LEN < 0xFF`.
+const UNFILLED: u8 = 0xFF;
+
+/// Largest supported pattern length: states are stored as `u8`, one per
+/// matched prefix length plus the empty prefix, and `0xFF` is reserved as the
+/// lazy-fill sentinel.
+pub const MAX_PATTERN_LEN: usize = u8::MAX as usize - 1;
 
 impl TokenDfa {
-    /// Build the `(state, code)` transition table for `pattern` over the
-    /// dictionary described by `dict_bytes` / `dict_offsets`.
+    /// Build the byte automaton for `pattern` over the dictionary described
+    /// by `dict_bytes` / `dict_offsets`; the token-level table fills lazily
+    /// during scans.
     ///
     /// Requires `1 <= pattern.len() <= MAX_PATTERN_LEN` and a validated
     /// dictionary (see [`crate::Parts::validate_dictionary`]).
@@ -54,28 +77,35 @@ impl TokenDfa {
             delta[m * 256 + b] = m as u8;
         }
 
-        // Compose with each token: T[s][c] = delta* (s, token_bytes(c)).
-        let mut table = vec![0u8; (m + 1) * ntokens];
-        for s in 0..=m {
-            let out = &mut table[s * ntokens..(s + 1) * ntokens];
-            for (c, out_c) in out.iter_mut().enumerate() {
-                let tok = &dict_bytes[dict_offsets[c] as usize..dict_offsets[c + 1] as usize];
-                let mut st = s;
-                for &b in tok {
-                    st = delta[st * 256 + b as usize] as usize;
-                    if st == m {
-                        break; // absorbing
-                    }
-                }
-                *out_c = st as u8;
-            }
-        }
+        let table = (0..(m + 1) * ntokens)
+            .map(|_| AtomicU8::new(UNFILLED))
+            .collect();
 
         Self {
+            delta,
             table,
+            dict_bytes: dict_bytes.to_vec(),
+            dict_offsets: dict_offsets.to_vec(),
             ntokens,
             accept: m as u8,
         }
+    }
+
+    /// Compose the byte automaton over token `c`'s bytes starting from state
+    /// `s`. Cold: each `(state, code)` pair pays this at most once.
+    #[cold]
+    fn compose(&self, s: usize, c: usize) -> u8 {
+        let tok =
+            &self.dict_bytes[self.dict_offsets[c] as usize..self.dict_offsets[c + 1] as usize];
+        let m = self.accept as usize;
+        let mut st = s;
+        for &b in tok {
+            st = self.delta[st * 256 + b as usize] as usize;
+            if st == m {
+                break; // absorbing
+            }
+        }
+        st as u8
     }
 
     /// Run the automaton over one row's codes. Returns `true` as soon as the
@@ -87,7 +117,13 @@ impl TokenDfa {
     pub(crate) fn row_matches(&self, codes: &[u16]) -> bool {
         let mut s = 0usize;
         for &c in codes {
-            s = self.table[s * self.ntokens + c as usize] as usize;
+            let idx = s * self.ntokens + c as usize;
+            let mut t = self.table[idx].load(Relaxed);
+            if t == UNFILLED {
+                t = self.compose(s, c as usize);
+                self.table[idx].store(t, Relaxed);
+            }
+            s = t as usize;
             if s == self.accept as usize {
                 return true;
             }

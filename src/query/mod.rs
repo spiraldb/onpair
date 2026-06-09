@@ -55,14 +55,17 @@ impl ContainsSearcher {
     ///
     /// The dictionary drives the automaton; `parts.codes` is only *sampled*
     /// to pick the most selective prefilter anchor, so the searcher remains
-    /// exact for any code stream over the same dictionary.
+    /// exact for any code stream over the same dictionary. Cost is
+    /// `O(dict)` — the code stream is never fully read (a `LIKE` scan
+    /// compiles per row group, so compile is on the scan path).
     ///
     /// ## Panics
     ///
-    /// Panics if `parts` fails [`Parts::validate`] or if
-    /// `pattern.len() > MAX_PATTERN_LEN`.
+    /// Panics if the dictionary fails [`Parts::validate_dictionary`] or if
+    /// `pattern.len() > MAX_PATTERN_LEN`. Codes are not validated here; a
+    /// code out of range for the dictionary panics when sampled or scanned.
     pub fn compile(parts: Parts<'_>, pattern: &[u8]) -> Self {
-        if let Err(e) = parts.validate() {
+        if let Err(e) = parts.validate_dictionary() {
             panic!("onpair: {e}");
         }
         Self::compile_inner(

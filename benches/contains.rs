@@ -740,6 +740,35 @@ fn compile_heuristic(bencher: Bencher, query_arg: &str) {
     bench_compile(bencher, "heuristic", query_arg);
 }
 
+/// What `col LIKE '%pattern%'` actually executes: compile + prefiltered scan
+/// per chunk dictionary, both inside the timed loop.
+fn bench_like_scan(bencher: Bencher, mode: &'static str, query_arg: &str) {
+    let (ds, pattern) = parse_query(query_arg);
+    let d = dataset(ds);
+    bencher
+        .counter(divan::counter::BytesCount::new(d.total_bytes))
+        .bench(|| {
+            let mut n = 0usize;
+            for f in &d.files {
+                let s = compile_mode(mode, divan::black_box(f), pattern.as_bytes());
+                n += s
+                    .matching_rows(divan::black_box(&f.col.codes), &f.col.code_offsets)
+                    .len();
+            }
+            n
+        });
+}
+
+#[divan::bench(args = QUERIES, sample_count = 10, sample_size = 1)]
+fn like_scan_sampled(bencher: Bencher, query_arg: &str) {
+    bench_like_scan(bencher, "sampled", query_arg);
+}
+
+#[divan::bench(args = QUERIES, sample_count = 10, sample_size = 1)]
+fn like_scan_stats(bencher: Bencher, query_arg: &str) {
+    bench_like_scan(bencher, "stats", query_arg);
+}
+
 fn main() {
     let _ = corpus();
     divan::main();

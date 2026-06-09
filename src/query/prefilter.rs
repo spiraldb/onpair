@@ -140,8 +140,8 @@ fn anchor_hit_rates(sets: &[Vec<u64>], source: &ScoreSource<'_>, max_samples: us
                 for &c in block {
                     let (w, b) = (c as usize / 64, c as usize % 64);
                     for (set, hit) in sets.iter().zip(hits.iter_mut()) {
-                        // Codes are validated against the dictionary before
-                        // compile, so `w` is in range.
+                        // A code out of range for the dictionary panics here
+                        // via the slice index (codes are not pre-validated).
                         *hit += (set[w] >> b & 1) as usize;
                     }
                 }
