@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "list-onpair"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "list_onpair"
+path = "src/main.rs"
+
+[dependencies]
+hashbrown = "0.16.1"
+zstd = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
