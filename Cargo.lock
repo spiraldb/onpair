@@ -922,8 +922,10 @@ dependencies = [
  "parquet",
  "rand",
  "rstest",
+ "snap",
  "tpchgen",
  "tpchgen-arrow",
+ "zstd",
 ]
 
 [[package]]
