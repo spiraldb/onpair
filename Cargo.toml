@@ -42,6 +42,8 @@ arrow-schema = "57.1"
 parquet = "57.1"
 tpchgen = "2.0.2"
 tpchgen-arrow = "2.0.2"
+zstd = "0.13"
+snap = "1.1"
 
 [[bench]]
 name = "tpch"
@@ -50,3 +52,6 @@ harness = false
 [[bench]]
 name = "clickbench"
 harness = false
+
+[[example]]
+name = "bench_binaries"
