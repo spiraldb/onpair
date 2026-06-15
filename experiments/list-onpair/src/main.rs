@@ -193,6 +193,73 @@ fn run(ds: &Dataset) {
         "    string dict (shared) = {string_dict} bytes  ({:.0}% of onpair+strdict total)",
         100.0 * string_dict as f64 / (onpair + string_dict) as f64
     );
+    run_sharing_analysis(ds);
+}
+
+/// Train + encode + prune one (sub)column; return its minimal structural size
+/// (codes + token dict + row offsets), excluding the shared string dict.
+fn onpair_structural(flat: &[u32], offsets: &[u32], num_distinct: usize) -> usize {
+    let num_rows = offsets.len() - 1;
+    let base_bits = bits_for(num_distinct);
+    let capacity = (num_distinct.next_power_of_two() * 4).min(1 << 20);
+    let parser = intonpair::train(flat, offsets, num_distinct as u32, capacity, 0.5);
+    let (codes, _) = parser.encode(flat, offsets);
+    let mut used = vec![false; parser.dict.num_tokens()];
+    for &c in &codes {
+        used[c as usize] = true;
+    }
+    let (mut num_tokens, mut dict_elems) = (0usize, 0usize);
+    for (id, &u) in used.iter().enumerate() {
+        if u {
+            dict_elems += parser.dict.token(id as u32).len();
+            num_tokens += 1;
+        }
+    }
+    let code_bits = bits_for(num_tokens);
+    let off_bits = bits_for(dict_elems + 1);
+    packed_bytes(codes.len(), code_bits)
+        + packed_bytes(dict_elems, base_bits)
+        + packed_bytes(num_tokens + 1, off_bits)
+        + packed_bytes(num_rows + 1, bits_for(codes.len() + 1))
+}
+
+/// If a `<name>.runs` sidecar (one row-count per run) exists, compare storing
+/// all runs in one shared-dictionary column vs. compressing each run alone.
+fn run_sharing_analysis(ds: &Dataset) {
+    let sidecar = format!("{}/data/{}.runs", env!("CARGO_MANIFEST_DIR"), ds.name);
+    let Ok(text) = std::fs::read_to_string(&sidecar) else {
+        return;
+    };
+    let run_sizes: Vec<usize> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    if run_sizes.is_empty() {
+        return;
+    }
+    let num_distinct = ds.strings.len();
+
+    let shared = onpair_structural(&ds.flat, &ds.offsets, num_distinct);
+
+    // Per-run independent: each run trains its own dictionary over the same
+    // global frame alphabet, then we sum the structural bytes.
+    let mut per_run = 0usize;
+    let mut row = 0usize;
+    for &rs in &run_sizes {
+        let s = ds.offsets[row] as usize;
+        let e = ds.offsets[row + rs] as usize;
+        let flat = &ds.flat[s..e];
+        let local: Vec<u32> = ds.offsets[row..=row + rs]
+            .iter()
+            .map(|&o| o - ds.offsets[row])
+            .collect();
+        per_run += onpair_structural(flat, &local, num_distinct);
+        row += rs;
+    }
+
+    println!(
+        "\n  runs={}  shared-dict column = {shared} B   per-run independent = {per_run} B   \
+         -> sharing saves {:.1}%",
+        run_sizes.len(),
+        100.0 * (1.0 - shared as f64 / per_run as f64)
+    );
 }
 
 fn verify(ds: &Dataset, parser: &intonpair::Parser, codes: &[u32], code_offsets: &[u32]) {
@@ -207,10 +274,17 @@ fn verify(ds: &Dataset, parser: &intonpair::Parser, codes: &[u32], code_offsets:
 
 fn main() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("data dir")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "lst").unwrap_or(false))
+        .filter(|p| {
+            args.is_empty()
+                || args
+                    .iter()
+                    .any(|a| p.file_stem().map(|s| s == a.as_str()).unwrap_or(false))
+        })
         .collect();
     files.sort();
     if files.is_empty() {

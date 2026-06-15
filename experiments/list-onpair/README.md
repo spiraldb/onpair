@@ -92,6 +92,47 @@ Full ratios vs raw text (including the shared string dict):
 | `graph`  | 1.00× | 2.73× | **2.65×** | 3.9× | 3.8× |
 | `tags`   | 1.00× | 4.69× | **4.33×** | 6.0× | 9.4× |
 
+## Scaling: a store of 1000 perf runs
+
+A single capture undersells OnPair, because its value is *repeated contiguous
+subsequences* and one profile has few. The realistic case is an observability
+store of many profiles. `prep/build_perf_runs.py` models **1000 perf runs** —
+~70% runs of the same "java service" (the *similar* cohort), ~20% `wrk`
+load-generator, ~10% other workloads (the *different* cohort). No frames are
+invented: every stack is a real stack from the real capture, drawn per-run
+(weighted by real sample counts); only the run *population* is constructed.
+
+```bash
+python3 prep/build_perf_runs.py     # -> data/perf_runs.lst (+ .runs sidecar)
+cargo run --release perf_runs
+```
+
+Result — 1000 runs, 203 078 stacks, 5.24 M frames (still 531 distinct frames):
+
+| representation | bytes | ratio vs raw |
+|----------------|------:|-------------:|
+| raw text | 177.5 MB | 1.0× |
+| dict+listview | 7.15 MB | 24.8× |
+| **onpair-int** | **1.02 MB** | **173.3×** |
+| zstd(raw text) | 0.96 MB | 184.7× |
+| zstd(int stream) | 0.49 MB | 360.9× |
+
+* OnPair now saves **85.8%** of the int stream (vs 50.6% at single-run scale):
+  with similar runs repeated, merged tokens grow to **9.16 frames** on average
+  and fold 5.24 M frames into 415 k codes (**12.6× fewer**), code width still
+  10 bits. onpair-int (173×) catches up to `zstd(raw)` (185×) **while keeping
+  O(1) random access**; plain zstd does not.
+* **Share the dictionary across runs.** Storing all 1000 runs in one
+  shared-dictionary column is **48% smaller** than compressing each run
+  independently (1.01 MB vs 1.96 MB): a global dictionary captures cross-run
+  repeated stacks and amortizes the token-dict overhead.
+
+Caveat: because all runs resample one real capture, the frame alphabet stays at
+531. A store of 1000 *genuinely* distinct workloads would have a larger alphabet
+(wider base codes, bigger token dict), so treat 173× as the *similar-cohort*
+regime — which is exactly the common observability case (one service profiled
+repeatedly).
+
 ## Is it good? When, and why not
 
 **It works where the data is genuinely sequential and deep — stack traces.**
