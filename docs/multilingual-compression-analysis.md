@@ -10,30 +10,32 @@ Unicode byte-width distributions — ASCII, CJK (Japanese, Chinese), and
 emoji-heavy social posts — at code widths **12** and **16** bits, and inspects
 the resulting dictionary (the "symbol table").
 
+Each corpus is **≥10 MB** so that the 16-bit dictionary (up to 65,536 tokens)
+can actually fill; a smaller corpus starves the dictionary and makes the
+12-vs-16-bit comparison meaningless (see *Why ≥10 MB* below).
+
 ## Corpora
 
 All data is real (no synthetic strings). Each corpus is split into rows on
 `\n`. Fetch with [`examples/fetch_multilingual_corpora.sh`](../examples/fetch_multilingual_corpora.sh).
 
-| Corpus | Source | bytes/char | UTF-8 char width (1B / 2B / 3B / 4B) |
-|---|---|---|---|
-| ASCII (English) | Gutenberg — *Pride and Prejudice* | 1.01 | **99.4%** / 0 / 0.6% / 0 |
-| Japanese | Aozora — 夏目漱石「こころ」 | 3.00 | 0 / 0 / **100%** / 0 |
-| Chinese | Gutenberg — *紅樓夢* | 2.95 | 2.6% / 0 / **97.4%** / 0 |
-| Emoji-heavy | live Mastodon public timelines | 1.13 | 93.5% / 1.3% / 3.7% / **1.5%** |
+| Corpus | Source | size | rows | bytes/char | UTF-8 char width 1B/2B/3B/4B |
+|---|---|--:|--:|--:|---|
+| ASCII (English) | Project Gutenberg — 11 novels | 11.2 MB | 220k | 1.02 | **99.1** / 0 / 0.8 / 0 |
+| Japanese | Aozora Bunko — 377 works | 11.0 MB | 39k | 2.97 | 1.6 / 0 / **98.4** / 0 |
+| Chinese | Project Gutenberg — 9 works | 11.0 MB | 96k | 2.91 | 4.3 / 0 / **95.7** / 0 |
+| Emoji-heavy | `enryu43/twitter100m_tweets`, real tweets with ≥2 emoji | 12.8 MB | 71k | 1.61 | 70.4 / 0.7 / 26.1 / **2.9** |
 
-The emoji corpus is real social text that *uses* emoji (URLs stripped); emoji
-density is ~1.6% of characters, but those are the 4-byte codepoints — 10k+ of
-them across ~2,100 posts.
+The emoji corpus is real tweets (URLs stripped) filtered to those containing ≥2
+emoji; 2.9% of its characters are 4-byte emoji and 26% are 3-byte (CJK from
+international tweets) — the richest Unicode mix of the four.
 
 ## Run
 
 ```bash
-examples/fetch_multilingual_corpora.sh /tmp/corpora
+examples/fetch_multilingual_corpora.sh /tmp/corpora     # builds four ≥10 MB corpora
 cargo run --release --example multilingual -- /tmp/corpora \
     "ASCII (English)=en.txt" "Japanese=ja.txt" "Chinese=zh.txt" "Emoji-heavy=emoji.txt"
-# size-normalised (removes the dictionary-fill confound):
-ONPAIR_CAP_BYTES=512000 cargo run --release --example multilingual -- /tmp/corpora ...
 ```
 
 ## Compression ratio
@@ -41,71 +43,65 @@ ONPAIR_CAP_BYTES=512000 cargo run --release --example multilingual -- /tmp/corpo
 Two ratios are reported. **codes-only** = `orig / (dict_bytes + dict_offsets +
 codes)` is the cleanest cross-language number. **incl. offsets** additionally
 charges the `u64`-per-row offset layer, which dominates for corpora with many
-tiny rows (English/Chinese have 14k–28k rows) — it is interchange-form overhead,
-not an OnPair property.
+tiny rows (English has 220k rows, Chinese 96k) — that is interchange-form
+overhead, not an OnPair property.
 
-### Native sizes
+| Corpus | 12-bit (codes-only / incl) | 16-bit (codes-only / incl) | mean bytes/code 12→16 | 16-bit dict fill |
+|---|---|---|--:|--:|
+| ASCII (English) | 1.79x / 1.40x | **2.47x** / 1.78x | 3.61 → 5.72 | 79% |
+| Japanese | 2.04x / 1.93x | **2.73x** / 2.54x | 4.11 → 6.41 | 76% |
+| Chinese | 1.59x / 1.43x | **2.07x** / 1.81x | 3.19 → 4.69 | 91% |
+| Emoji-heavy | 1.38x / 1.30x | **2.06x** / 1.89x | 2.76 → 4.64 | 100% |
 
-| Corpus | size | 12-bit (codes-only / incl) | 16-bit (codes-only / incl) | mean bytes/code 12→16 |
-|---|--:|---|---|---|
-| ASCII (English) | 706 KiB | 1.91x / 1.46x | 1.93x / 1.48x | 4.22 → 4.63 |
-| Japanese | 542 KiB | **2.07x** / 1.98x | 2.04x / 1.95x | 4.87 → 4.96 |
-| Chinese | 2526 KiB | 1.93x / 1.65x | **2.12x** / 1.79x | 3.95 → 4.91 |
-| Emoji-heavy | 733 KiB | 1.26x / 1.22x | 1.34x / 1.30x | 2.65 → 3.13 |
+## Symbol table (dictionary) at 16-bit
 
-### Size-normalised (every corpus capped to 500 KiB)
-
-| Corpus | 12-bit codes-only | 16-bit codes-only | 16-bit dict fill |
-|---|--:|--:|--:|
-| ASCII (English) | 1.80x | 1.82x | 8% |
-| Japanese | 2.03x | 2.01x | 7% |
-| Chinese | 1.59x | 1.57x | 8% |
-| Emoji-heavy | 1.23x | 1.27x | 11% |
+| Corpus | tokens N | dict fill | UTF-8 char-aligned | mean token len | dominant token shape |
+|---|--:|--:|--:|--:|---|
+| ASCII (English) | 52,014 | 79% | **100%** | 7.81 B | long words/phrases (43.6k tokens span 5+ chars) |
+| Japanese | 49,799 | 76% | 70% | 7.97 B | long kana/kanji runs; 15k tokens **straddle** char boundaries |
+| Chinese | 59,339 | 91% | 81% | 6.71 B | two-character compound words (24.5k two-char tokens) |
+| Emoji-heavy | 65,431 | **100%** | 84% | 6.62 B | broad length spread; only corpus to fill the dictionary |
 
 ## Findings
 
-1. **Ratio ranking is Japanese > English > Chinese > Emoji**, driven by *mean
-   bytes per code* — how many source bytes each emitted code replaces. Literary
-   Japanese/English are highly redundant (~4.2–4.9 B/code); real emoji-laden
-   social text is high-entropy and low-redundancy (~2.7 B/code), so it
-   compresses worst regardless of code width.
+1. **At ≥10 MB per window, 16-bit beats 12-bit for every language** — by +30%
+   to +50% on the codes-only ratio. With enough data the larger dictionary
+   fills (76–100%) and the mean bytes replaced per emitted code jumps (e.g.
+   English 3.6→5.7, Japanese 4.1→6.4). This is the opposite of what undersized
+   corpora suggest, where 16-bit looks useless — see below.
 
-2. **12 vs 16 bit is a data-volume question, not a language one.** A 16-bit
-   dictionary only helps once a corpus has enough repeated substrings to fill
-   *past* 4,096 tokens. Only the 2.5 MB Chinese corpus does (16-bit dict 26%
-   full, 16.7k tokens) — and it is the one corpus where 16-bit clearly wins
-   (1.93x → 2.12x). At a fixed 500 KiB budget **every** corpus fills only 7–11%
-   of the 16-bit space, so 16-bit barely moves the ratio, and for Japanese and
-   Chinese it is *slightly worse* than 12-bit because the wider `dict_bytes` /
-   `dict_offsets` are not repaid. Emoji is the exception that still gains a
-   little at 16-bit (more distinct short tokens to capture).
+2. **Ratio ranking at 16-bit: Japanese > English > Chinese ≈ Emoji.** Japanese
+   compresses best (2.73x): long, highly-repeated kana/kanji runs. The
+   **emoji** corpus is the most interesting — *worst* at 12-bit (1.38x) but it
+   catches Chinese at 16-bit (2.06x) because it is the only corpus to fill the
+   *entire* 65,536-token dictionary: real social text has an enormous tail of
+   distinct short repeated sequences (hashtags, mentions, emoji clusters,
+   multilingual fragments) that a bigger dictionary can finally capture.
 
-3. **The symbol table looks very different per script.** OnPair builds tokens by
-   merging adjacent bytes, so tokens need not respect UTF-8 character
-   boundaries:
+3. **The symbol table differs sharply by script.** OnPair merges adjacent
+   *bytes*, so tokens need not respect UTF-8 character boundaries:
+   - **English** — every token is valid UTF-8 (100% aligned) and most span
+     several characters: it learns whole words and phrases.
+   - **Japanese** — only ~70% of tokens are char-aligned; ~30% (15k tokens)
+     cut *across* the 3-byte kana/kanji boundary, because frequent byte n-grams
+     sit inside and between characters. Alignment is irrelevant to OnPair —
+     only byte-substring frequency matters — and Japanese still wins on ratio.
+   - **Chinese** — fills the dictionary with two-character compound words, the
+     natural unit of meaning.
+   - **Emoji-heavy** — flattest length distribution and full dictionary.
 
-   | Corpus (16-bit) | tokens | UTF-8 char-aligned | dominant token shape |
-   |---|--:|--:|---|
-   | ASCII (English) | 6,367 | **98%** | long word/phrase tokens (mean 5.9 B, many 5+ chars) |
-   | Japanese | 4,773 | **40%** | majority *straddle* the 3-byte kana/kanji boundary |
-   | Chinese | 16,729 | 71% | many 2-character words (5,449 two-char tokens) |
-   | Emoji-heavy | 9,651 | 88% | short 2–4 B tokens, flat length spread |
+## Why ≥10 MB
 
-   - **English** learns whole words/phrases — almost every token is valid UTF-8
-     and most span several characters.
-   - **Japanese** is the striking case: ~55–60% of learned tokens cut *across*
-     codepoint boundaries (2-byte and 4-byte tokens that split 3-byte kana),
-     because frequent byte n-grams sit inside and between characters. It still
-     achieves the best ratio — boundary alignment is irrelevant to OnPair, only
-     byte-substring frequency matters.
-   - **Chinese** is where the extra 16-bit headroom pays off: it fills the
-     dictionary with two-character compound words, the natural unit of meaning.
-   - **Emoji-heavy** has the flattest token-length distribution and the lowest
-     mean token length, reflecting low cross-post redundancy.
+Earlier runs on 0.5–2.5 MB corpora filled only 7–26% of the 16-bit dictionary,
+so 16-bit barely moved the ratio and was sometimes *worse* than 12-bit (the
+wider `dict_bytes`/`dict_offsets` were not repaid). That was dictionary
+**starvation**, not a property of the languages. A fair 12-vs-16-bit comparison
+needs a window large enough to populate the larger code space — hence ≥10 MB
+here, at which point all four corpora fill ≥76% of the 16-bit dictionary and
+16-bit wins across the board.
 
 ## Caveat
 
-The emoji corpus is sampled live, so its exact ratios vary per run (±a few %);
-the qualitative results (worst ratio, small 16-bit gain, short flat tokens) are
-stable. The `multilingual` example revalidates a full decode roundtrip for every
-corpus and code width.
+The emoji corpus is sampled from a fixed tweet dump, so it is reproducible up to
+the dataset's row order. The `multilingual` example revalidates a full decode
+roundtrip for every corpus and code width.

@@ -2,89 +2,131 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 #
-# Fetch real, public-domain / live text corpora with distinct Unicode character
-# distributions, for the `multilingual` OnPair analysis example.
+# Build four real text corpora (~11 MB each) with distinct Unicode character
+# distributions, for the `multilingual` OnPair analysis example. Each corpus is
+# kept large enough that the 16-bit dictionary fills, so the 12-vs-16-bit
+# comparison is meaningful.
 #
-#   ASCII (English) : Project Gutenberg  — Pride and Prejudice (#1342)
-#   Chinese         : Project Gutenberg  — 紅樓夢 / Dream of the Red Chamber (#24264)
-#   Japanese        : Aozora Bunko       — 夏目漱石「こころ」(card 148), Shift-JIS → UTF-8
-#   Emoji-heavy     : live public Mastodon timelines — real posts containing emoji
+#   ASCII (English) : Project Gutenberg novels (canonical UTF-8 cache text)
+#   Chinese         : Project Gutenberg works in Chinese
+#   Japanese        : Aozora Bunko works (Shift-JIS -> UTF-8, ruby/markup stripped)
+#   Emoji-heavy     : enryu43/twitter100m_tweets — real tweets containing >=2 emoji
 #
-# The first three are deterministic. The emoji corpus is sampled live from
-# federated Mastodon public timelines, so its exact contents vary per run.
+# Requires: python3, and the `duckdb` Python package (auto-installed if missing).
 #
-# Usage:  examples/fetch_multilingual_corpora.sh [OUTDIR]   (default: /tmp/corpora)
+# Usage:  examples/fetch_multilingual_corpora.sh [OUTDIR] [TARGET_BYTES]
+#         (defaults: /tmp/corpora, 11000000)
 set -euo pipefail
 OUT="${1:-/tmp/corpora}"
+TARGET="${2:-11000000}"
 mkdir -p "$OUT"
-UA="onpair-research-corpus"
+export OUT TARGET
 
-strip_gutenberg() {  # stdin -> stdout: drop PG header/footer boilerplate
-  python3 - "$@" <<'PY'
-import sys, re
-t = sys.stdin.buffer.read().decode("utf-8", "replace")
-s = re.search(r'\*\*\* START OF TH[EI]S? PROJECT GUTENBERG EBOOK.*?\*\*\*', t, re.S)
-e = re.search(r'\*\*\* END OF TH[EI]S? PROJECT GUTENBERG EBOOK', t, re.S)
-sys.stdout.write(t[(s.end() if s else 0):(e.start() if e else len(t))].strip() + "\n")
-PY
-}
-
-echo "[1/4] ASCII (English) — Pride and Prejudice"
-curl -sSL "https://www.gutenberg.org/cache/epub/1342/pg1342.txt" | strip_gutenberg > "$OUT/en.txt"
-
-echo "[2/4] Chinese — Dream of the Red Chamber"
-curl -sSL "https://www.gutenberg.org/cache/epub/24264/pg24264.txt" | strip_gutenberg > "$OUT/zh.txt"
-
-echo "[3/4] Japanese — Kokoro (Aozora, Shift-JIS → UTF-8)"
-tmp="$(mktemp -d)"
-curl -sSL "https://www.aozora.gr.jp/cards/000148/files/773_ruby_5968.zip" -o "$tmp/k.zip"
-unzip -o -q "$tmp/k.zip" -d "$tmp"
-iconv -f SHIFT_JIS -t UTF-8 "$(ls "$tmp"/*.txt | head -1)" | python3 - <<'PY' > "$OUT/ja.txt"
-import sys, re
-t = sys.stdin.read()
-parts = re.split(r'-{20,}\r?\n', t)          # drop the Aozora header note (between two rules)
-body = parts[2] if len(parts) >= 3 else t
-sys.stdout.write(re.split(r'底本：', body)[0].strip() + "\n")  # drop the bibliographic footer
-PY
-rm -rf "$tmp"
-
-echo "[4/4] Emoji-heavy — live Mastodon public timelines (~750 KiB of emoji-bearing posts)"
-EMOJI_OUT="$OUT/emoji.txt" python3 - <<'PY'
-import json, re, html, os, urllib.request, time, sys
+python3 - <<'PY'
+import json, re, sys, os, io, csv, time, zipfile, urllib.request
+OUT, TARGET = os.environ["OUT"], int(os.environ["TARGET"])
 UA = {"User-Agent": "onpair-research-corpus"}
-def get(u):
-    with urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=25) as r:
-        return json.load(r)
-def clean(h):
-    h = re.sub(r'<br\s*/?>', '\n', h); h = re.sub(r'</p>', '\n', h)
-    t = html.unescape(re.sub(r'<[^>]+>', ' ', h))
-    return re.sub(r'[ \t]+', ' ', re.sub(r'https?://\S+', '', t)).strip()
-def emoji(s):  # rough emoji / pictograph count
-    return sum(1 for c in s if ord(c) > 0x1F000 or 0x2600 <= ord(c) <= 0x27BF or 0x2190 <= ord(c) <= 0x21FF)
-instances = ["mastodon.world","mstdn.social","mas.to","fosstodon.org","mastodon.online",
-             "techhub.social","mastodon.gamedev.place","infosec.exchange","hachyderm.io",
-             "mstdn.jp","pawoo.net","social.vivaldi.net","universeodon.com","sfba.social"]
-seen, kept, total, TARGET = set(), [], 0, 750_000
-for inst in instances:
-    for mode in ("&local=true", ""):
-        max_id, pages = None, 0
-        while total < TARGET and pages < 40:
-            url = f"https://{inst}/api/v1/timelines/public?limit=40{mode}" + (f"&max_id={max_id}" if max_id else "")
-            try: posts = get(url)
-            except Exception: break
-            if not isinstance(posts, list) or not posts: break
-            pages += 1; max_id = posts[-1]["id"]
-            for p in posts:
-                txt = clean(p.get("content", "")); key = txt[:60]
-                if key in seen: continue
-                seen.add(key)
-                if emoji(txt) >= 2 and len(txt) >= 10:
-                    kept.append(txt.replace("\n", " ")); total += len(txt.encode())
-            time.sleep(0.1)
+def get(u, t=60): return urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=t).read()
+def strip_g(t):
+    s = re.search(r'\*\*\* START OF TH[EI]S? PROJECT GUTENBERG EBOOK.*?\*\*\*', t, re.S)
+    e = re.search(r'\*\*\* END OF TH[EI]S? PROJECT GUTENBERG EBOOK', t, re.S)
+    return t[(s.end() if s else 0):(e.start() if e else len(t))].strip()
+
+def gutenberg(lang, outpath):
+    total = n = 0
+    out = open(outpath, "w", encoding="utf-8")
+    page = f"https://gutendex.com/books?languages={lang}"
+    while page and total < TARGET:
+        d = json.loads(get(page, 40))
+        for b in d["results"]:
+            if total >= TARGET: break
+            # canonical UTF-8 cache URL is reliable; gutendex format URLs often 404
+            cands = [f"https://www.gutenberg.org/cache/epub/{b['id']}/pg{b['id']}.txt"]
+            cands += [v for k, v in b.get("formats", {}).items()
+                      if k.startswith("text/plain") and not v.endswith(".zip")]
+            raw = None
+            for u in cands:
+                try: raw = get(u).decode("utf-8", "replace"); break
+                except Exception: continue
+            if not raw: continue
+            body = strip_g(raw)
+            if len(body) < 2000: continue
+            out.write(body + "\n"); total += len(body.encode()); n += 1
+            time.sleep(0.25)
+        page = d.get("next")
+    out.close()
+    print(f"[{lang}] {n} works, {total/1e6:.2f} MB -> {outpath}", file=sys.stderr)
+
+def aozora(outpath):
+    idx = get("https://www.aozora.gr.jp/index_pages/list_person_all_extended_utf8.zip")
+    zf = zipfile.ZipFile(io.BytesIO(idx))
+    name = next(n for n in zf.namelist() if n.endswith(".csv"))
+    reader = csv.DictReader(io.StringIO(zf.read(name).decode("utf-8-sig")))
+    urlcol = next(c for c in reader.fieldnames if "テキストファイルURL" in c)
+    def clean(t):
+        t = re.sub(r'《[^》]*》', '', t)          # ruby readings
+        t = t.replace('｜', '')                  # ruby start marker
+        t = re.sub(r'［＃[^］]*］', '', t)         # editorial annotations
+        parts = re.split(r'-{20,}\r?\n', t)       # drop Aozora header note
+        if len(parts) >= 3: t = parts[2]
+        return re.split(r'底本：', t)[0].strip()  # drop bibliographic footer
+    total = n = 0
+    out = open(outpath, "w", encoding="utf-8")
+    for r in reader:
         if total >= TARGET: break
-    if total >= TARGET: break
-open(os.environ["EMOJI_OUT"], "w", encoding="utf-8").write("\n".join(kept) + "\n")
-print(f"  emoji corpus: {len(kept)} posts, {total} bytes", file=sys.stderr)
+        url = (r.get(urlcol) or "").strip()
+        if "aozora.gr.jp" not in url: continue
+        try:
+            data = get(url)
+            if url.endswith(".zip"):
+                z = zipfile.ZipFile(io.BytesIO(data))
+                tn = [f for f in z.namelist() if f.lower().endswith(".txt")]
+                if not tn: continue
+                txt = z.read(tn[0]).decode("shift_jis", "replace")
+            else:
+                txt = data.decode("shift_jis", "replace")
+        except Exception:
+            continue
+        body = clean(txt)
+        if len(body) < 1000: continue
+        out.write(body + "\n"); total += len(body.encode()); n += 1
+        time.sleep(0.2)
+    out.close()
+    print(f"[ja] {n} works, {total/1e6:.2f} MB -> {outpath}", file=sys.stderr)
+
+def emoji(outpath):
+    try:
+        import duckdb
+    except ImportError:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "duckdb"])
+        import duckdb
+    base = "https://huggingface.co/datasets/enryu43/twitter100m_tweets/resolve/refs%2Fconvert%2Fparquet/default/train"
+    con = duckdb.connect(); con.execute("INSTALL httpfs; LOAD httpfs;")
+    emoji_re = r'[\x{1F000}-\x{1FAFF}\x{2600}-\x{27BF}\x{2B00}-\x{2BFF}\x{2190}-\x{21FF}]'
+    url_re, ws = re.compile(r'https?://\S+'), re.compile(r'[ \t]+')
+    def ne(s): return sum(1 for c in s if ord(c) > 0x1F000 or 0x2600 <= ord(c) <= 0x27BF or 0x2190 <= ord(c) <= 0x21FF)
+    seen, total = set(), 0
+    out = open(outpath, "w", encoding="utf-8")
+    for shard in range(3):
+        if total >= TARGET: break
+        url = f"{base}/{shard:04d}.parquet"
+        cur = con.execute(f"SELECT tweet FROM read_parquet('{url}') WHERE regexp_matches(tweet, '{emoji_re}') LIMIT 200000")
+        while total < TARGET:
+            batch = cur.fetchmany(5000)
+            if not batch: break
+            for (t,) in batch:
+                t = ws.sub(' ', url_re.sub('', t).replace('\n', ' ')).strip()
+                k = t[:60]
+                if not t or k in seen or ne(t) < 2: continue
+                seen.add(k); out.write(t + "\n"); total += len(t.encode())
+    out.close()
+    print(f"[emoji] {len(seen)} tweets, {total/1e6:.2f} MB -> {outpath}", file=sys.stderr)
+
+print("[1/4] ASCII (English) — Project Gutenberg", file=sys.stderr); gutenberg("en", f"{OUT}/en.txt")
+print("[2/4] Chinese — Project Gutenberg", file=sys.stderr);        gutenberg("zh", f"{OUT}/zh.txt")
+print("[3/4] Japanese — Aozora Bunko", file=sys.stderr);            aozora(f"{OUT}/ja.txt")
+print("[4/4] Emoji-heavy — twitter100m", file=sys.stderr);          emoji(f"{OUT}/emoji.txt")
 PY
 
 echo "Done. Corpora in $OUT:"
