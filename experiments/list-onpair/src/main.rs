@@ -21,6 +21,19 @@ use std::path::PathBuf;
 
 use hashbrown::HashMap;
 
+/// Dictionary capacity (base + merge tokens). Defaults to 4x the alphabet
+/// rounded up, capped at 2^20. Override with DICT_CAP=<n> — needed for tiny
+/// alphabets (e.g. boolean masks) where 4x the alphabet is far too few tokens
+/// for OnPair to capture multi-element patterns.
+fn capacity_for(num_distinct: usize) -> usize {
+    if let Ok(v) = std::env::var("DICT_CAP") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(num_distinct);
+        }
+    }
+    (num_distinct.next_power_of_two() * 4).min(1 << 20)
+}
+
 fn bits_for(n: usize) -> usize {
     if n <= 1 {
         1
@@ -112,7 +125,7 @@ fn run(ds: &Dataset) {
     // ── Integer-OnPair (step 2) ──
     // Capacity: base alphabet + headroom for merges, capped to keep codes
     // narrow. 4x the alphabet (one extra bit) is plenty on these corpora.
-    let capacity = (num_distinct.next_power_of_two() * 4).min(1 << 20);
+    let capacity = capacity_for(num_distinct);
     let parser = intonpair::train(&ds.flat, &ds.offsets, num_distinct as u32, capacity, 0.5);
     let (codes, code_offsets) = parser.encode(&ds.flat, &ds.offsets);
 
@@ -266,7 +279,7 @@ fn run(ds: &Dataset) {
 fn onpair_structural(flat: &[u32], offsets: &[u32], num_distinct: usize) -> usize {
     let num_rows = offsets.len() - 1;
     let base_bits = bits_for(num_distinct);
-    let capacity = (num_distinct.next_power_of_two() * 4).min(1 << 20);
+    let capacity = capacity_for(num_distinct);
     let parser = intonpair::train(flat, offsets, num_distinct as u32, capacity, 0.5);
     let (codes, _) = parser.encode(flat, offsets);
     let mut used = vec![false; parser.dict.num_tokens()];

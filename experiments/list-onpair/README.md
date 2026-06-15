@@ -220,6 +220,45 @@ Findings:
   sharing one dictionary is **39% worse** than per-run — same lesson as the mixed
   profiling corpus, because Java and C/C++ frame namespaces are disjoint.
 
+## The trick on a `list(bool)` column (mp4 decode masks)
+
+A real Vortex file (`*_index_listbool.vortex`, an mp4 index) carries a deeply
+nested boolean column: `col_v0_tracks[].frames_by_video[].closure_local_decode_mask_le`,
+a `list(bool)` of per-frame decode-dependency masks. `vx tree array` shows it is
+**164 KB — 35% of the whole file** — and that Vortex stored the mask bits
+**completely uncompressed** (`vortex.bool`, a raw 148 KB bit buffer + 16 KB
+bitpacked offsets). `vortex-tui/examples/extract_mask.rs` dumps the 5 786 masks
+to `maskbool.lst` (one mask per row, bool elements); run with a larger
+dictionary so OnPair can build multi-bit tokens on the 2-symbol alphabet:
+
+```bash
+DICT_CAP=65536 cargo run --release maskbool
+```
+
+| representation | structural bytes | vs raw |
+|----------------|-----------------:|-------:|
+| listview (≈ what Vortex stores) | 163 349 | 14.5× |
+| listview unique-only (dedup) | 102 031 | 23.2× |
+| onpair | 59 394 | 39.8× |
+| onpair + unique-only | 42 612 | 55.5× |
+| zstd medium (L3) | 19 527 | 121× |
+| zstd high (L19) | 16 459 | 144× |
+
+The OnPair trick **does** transfer to `list(bool)`: 163 KB → 59 KB (**2.75×**),
+or 43 KB (**3.8×**) with whole-mask dedup, while keeping O(1) row access. OnPair
+learns the run-patterns (26 merged tokens, avg 13 bits/token) — essentially
+discovering RLE.
+
+**But the real story is the data shape.** Every one of the 5 786 masks is a pure
+`1^k 0^m` run (100% triangular; popcount 1–272). So a mask is fully described by
+a single integer (its popcount — the length already lives in the list offsets).
+That collapses the 148 KB bit buffer to **5 786 popcounts ≈ 6.5 KB (23×)**, and
+the whole column to **~21.7 KB (7.5×)** — beating OnPair and approaching zstd,
+with full random access. The actionable finding for Vortex: this column should
+hit an RLE / run-end (or constant-run) encoding; today it falls through to raw
+`vortex.bool`. OnPair is a decent general fallback (no special-casing, keeps
+random access) but a run-aware encoding is strictly better here.
+
 ## Whole-stack dedup (when an entire trace equals another)
 
 A cheaper idea than frame-level OnPair: give each **distinct whole stack** one id
