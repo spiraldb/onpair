@@ -149,6 +149,37 @@ fn run(ds: &Dataset) {
     let op_rowoff = packed_bytes(num_rows + 1, bits_for(codes.len() + 1));
     let onpair = op_codes + op_tokdict + op_rowoff;
 
+    // ── Whole-stack dictionary (row-level dedup) ──
+    // Many rows are byte-identical stack traces, so give each *distinct whole
+    // trace* one id: the column becomes one code per row plus a stack table
+    // stored as a ListView of frame ids. This is the "stack table + sample ->
+    // stack id" layout used by real profile stores.
+    let mut stack_ids: HashMap<&[u32], u32> = HashMap::new();
+    let mut uniq_stacks_elems = 0usize;
+    for r in &ds.rows {
+        if stack_ids.insert(r.as_slice(), 0).is_none() {
+            uniq_stacks_elems += r.len();
+        }
+    }
+    let num_uniq_stacks = stack_ids.len();
+    let ws_codes = packed_bytes(num_rows, bits_for(num_uniq_stacks));
+    let ws_table_vals = packed_bytes(uniq_stacks_elems, base_bits);
+    let ws_table_off = packed_bytes(num_uniq_stacks + 1, bits_for(uniq_stacks_elems + 1));
+    let wholestack = ws_codes + ws_table_vals + ws_table_off;
+
+    // Combination: dedup whole stacks, then OnPair the (smaller) stack table.
+    let mut seen: HashMap<&[u32], ()> = HashMap::new();
+    let mut uflat: Vec<u32> = Vec::new();
+    let mut uoff: Vec<u32> = vec![0];
+    for r in &ds.rows {
+        if seen.insert(r.as_slice(), ()).is_none() {
+            uflat.extend_from_slice(r);
+            uoff.push(uflat.len() as u32);
+        }
+    }
+    let ws_onpair_table = onpair_structural(&uflat, &uoff, num_distinct);
+    let wholestack_onpair = ws_codes + ws_onpair_table;
+
     // ── zstd references ──
     let raw_text = std::fs::read(format!(
         "{}/data/{}.lst",
@@ -185,6 +216,8 @@ fn run(ds: &Dataset) {
     };
     println!("  {:28} {raw:8}      {:6.2}x", "raw text", 1.0);
     line("dict+listview (+strdict)", listview, true);
+    line("wholestack-dict (+strdict)", wholestack, true);
+    line("wholestack+onpair (+strdict)", wholestack_onpair, true);
     line("onpair-int    (+strdict)", onpair, true);
     println!("  {:28} {:8}      {:6.2}x", "zstd(raw text)", zstd_raw, raw as f64 / zstd_raw.max(1) as f64);
     println!("  {:28} {:8}      {:6.2}x", "zstd(int stream)", zstd_ints, raw as f64 / zstd_ints.max(1) as f64);
@@ -196,6 +229,13 @@ fn run(ds: &Dataset) {
     println!(
         "    string dict (shared) = {string_dict} bytes  ({:.0}% of onpair+strdict total)",
         100.0 * string_dict as f64 / (onpair + string_dict) as f64
+    );
+    println!(
+        "    wholestack-dict: {num_uniq_stacks}/{num_rows} distinct stacks  structural={wholestack} \
+         (codes={ws_codes} + table={})  onpair {} it by {:.1}%",
+        ws_table_vals + ws_table_off,
+        if onpair < wholestack { "beats" } else { "loses to" },
+        100.0 * (1.0 - onpair.min(wholestack) as f64 / onpair.max(wholestack) as f64),
     );
     run_sharing_analysis(ds);
 }

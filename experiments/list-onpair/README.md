@@ -175,6 +175,27 @@ much the runs' **frame namespaces overlap**: high overlap (one service profiled
 repeatedly) → share; low overlap (a mixed store of different tools/languages) →
 compress per run (or cluster by namespace, then share within a cluster).
 
+## Whole-stack dedup (when an entire trace equals another)
+
+A cheaper idea than frame-level OnPair: give each **distinct whole stack** one id
+and store the column as one code per row plus a stack table (the `stack table +
+sample→stack id` layout real profile stores use). It only helps to the extent
+that *entire* traces repeat.
+
+| corpus | distinct / rows | listview | wholestack-dict | onpair | **wholestack+onpair** |
+|--------|----------------:|---------:|----------------:|-------:|----------------------:|
+| `perf_runs` (resampled) | 710 / 203 078 | 24.8× | **603×** | 173× | **641×** |
+| `perf_corpus` (real, mixed) | 2 773 / 3 508 | 13.2× | 14.9× | 15.5× | **17.1×** |
+
+- When rows repeat heavily (resampled service: only 710 distinct traces),
+  whole-stack dedup alone beats frame-OnPair by ~3.5× — duplication is *row*-level,
+  so dedup the row.
+- When most traces are unique (mixed real profiles: 79% distinct), dedup barely
+  beats plain listview and frame-OnPair still edges it.
+- **Combining them wins in both cases**: dedup removes repeated rows, then OnPair
+  squeezes the shared prefixes out of the (smaller) stack table. This is the
+  representation to ship.
+
 ## Is it good? When, and why not
 
 **It works where the data is genuinely sequential and deep — stack traces.**
