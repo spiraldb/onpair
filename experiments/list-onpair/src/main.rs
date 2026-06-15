@@ -136,6 +136,10 @@ fn run(ds: &Dataset) {
             }
         }
     }
+    if std::env::var("DUMP_DICT").is_ok() {
+        dump_dict(ds, &parser, &codes, num_distinct);
+    }
+
     let codes: Vec<u32> = codes.iter().map(|&c| remap[c as usize]).collect();
     let code_bits = bits_for(num_tokens);
     let off_bits = bits_for(dict_elems + 1);
@@ -260,6 +264,61 @@ fn run_sharing_analysis(ds: &Dataset) {
         run_sizes.len(),
         100.0 * (1.0 - shared as f64 / per_run as f64)
     );
+}
+
+/// Print a human-readable view of the trained dictionary: how it splits into
+/// base vs merged tokens, the merged-length histogram, and the most-used merged
+/// tokens decoded back to their frame strings. `codes` is the pre-prune,
+/// pre-remap code stream so token ids still index `parser.dict` directly.
+fn dump_dict(ds: &Dataset, parser: &intonpair::Parser, codes: &[u32], num_distinct: usize) {
+    let ntok = parser.dict.num_tokens();
+    let mut freq = vec![0u32; ntok];
+    for &c in codes {
+        freq[c as usize] += 1;
+    }
+    // length histogram + usage over *used merged* tokens only.
+    let mut hist: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut merged: Vec<(u32, usize, u32)> = Vec::new(); // (freq, len, id)
+    let (mut used_base, mut used_merged) = (0usize, 0usize);
+    for id in 0..ntok {
+        if freq[id] == 0 {
+            continue;
+        }
+        if id < num_distinct {
+            used_base += 1;
+        } else {
+            used_merged += 1;
+            let len = parser.dict.token(id as u32).len();
+            *hist.entry(len).or_default() += 1;
+            merged.push((freq[id], len, id as u32));
+        }
+    }
+    let decode = |id: u32| -> String {
+        parser
+            .dict
+            .token(id)
+            .iter()
+            .map(|&e| ds.strings[e as usize].as_str())
+            .collect::<Vec<_>>()
+            .join(" ; ")
+    };
+    println!("\n  --- onpair-int dictionary for {} ---", ds.name);
+    println!(
+        "  base tokens (1 frame each): {num_distinct} total, {used_base} used by the encoder",
+    );
+    println!("  merged tokens used: {used_merged}");
+    print!("  merged length histogram (frames -> #tokens):");
+    for (len, n) in &hist {
+        print!(" {len}:{n}");
+    }
+    println!();
+    merged.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    println!("  top merged tokens (uses x length: frames):");
+    for (f, len, id) in merged.iter().take(12) {
+        let s = decode(*id);
+        let s = if s.len() > 140 { format!("{}…", &s[..140]) } else { s };
+        println!("    {f:5} x {len:2}: {s}");
+    }
 }
 
 fn verify(ds: &Dataset, parser: &intonpair::Parser, codes: &[u32], code_offsets: &[u32]) {
