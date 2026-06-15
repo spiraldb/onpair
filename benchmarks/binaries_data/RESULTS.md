@@ -94,6 +94,40 @@ property, not whole-blob ratio, is what OnPair is built for.
    record/block size (smaller blocks trained a better OnPair dictionary here),
    and zstd level (3 → 19 is a real gain; 19 → 22 is not).
 
+## 5. Same program, different ISA: x86-64 vs aarch64
+
+The host is x86-64; its only >5 MiB aarch64 executable is the vendored aarch64
+build of **ripgrep** (`rg-arm64.bin`, 5.0 MiB), which is the *same program* as
+the x86-64 `rg.bin` (5.0 MiB) — a controlled test where the instruction-set
+architecture is the only variable. Raw data: [`results_arm64.csv`](results_arm64.csv).
+
+| codec        | x86-64 `rg` | aarch64 `rg` | Δ      |
+|--------------|------------:|-------------:|-------:|
+| entropy b/B  | 6.078       | 6.358        | +0.28  |
+| onpair-12    | 0.94        | 0.86         | worse  |
+| onpair-16    | 1.10        | 1.03         | worse  |
+| onpair-16-4k | 1.49        | 1.39         | worse  |
+| snappy       | 1.77        | 1.73         | worse  |
+| zstd-3       | 2.85        | 2.66         | worse  |
+| zstd-19      | 3.48        | 3.23         | −7 %   |
+| zstd-22      | 3.48        | 3.23         | −7 %   |
+
+**aarch64 code compresses worse than x86-64 code for the same program, across
+every codec**, and its byte entropy is measurably higher. The cause is the
+instruction encoding:
+
+* **x86-64 is variable-length (1–15 bytes).** Common operations (`push`/`pop`,
+  `mov reg,reg`, short jumps) collapse to 1–2 recurring opcode bytes, and shared
+  prefix/opcode bytes repeat constantly — abundant byte-level redundancy for an
+  LZ matcher.
+* **aarch64 is fixed-width (every instruction is exactly 4 bytes).** Register
+  fields and immediates are bit-packed across the 32-bit word, so each
+  instruction word looks more like a distinct 4-byte value; there are fewer
+  repeated short byte runs, raising entropy and lowering the ratio.
+
+(`.bss` differences don't matter here — it occupies no file bytes; the two files
+are within 0.2 % of the same size.)
+
 ### Bottom line
 
 For compressing whole executable binaries, **block-based zstd is the right

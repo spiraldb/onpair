@@ -1,0 +1,8 @@
+file,orig_bytes,entropy_bits,codec,compressed_bytes,ratio,compress_min_ms,compress_med_ms,compress_mibps,decompress_min_ms,decompress_med_ms,decompress_mibps,roundtrip
+rg-arm64.bin,5248072,6.358,onpair-12,6131218,0.856,199.32,203.82,25.1,4.62,4.71,1083.3,ok
+rg-arm64.bin,5248072,6.358,onpair-16,5122168,1.025,157.48,158.48,31.8,3.92,4.03,1276.6,ok
+rg-arm64.bin,5248072,6.358,onpair-16-4k,3770981,1.392,184.36,185.51,27.1,3.04,3.12,1647.2,ok
+rg-arm64.bin,5248072,6.358,zstd-3,1975330,2.657,26.24,26.42,190.8,6.37,6.46,785.6,ok
+rg-arm64.bin,5248072,6.358,zstd-19,1626311,3.227,1490.37,1501.10,3.4,8.91,9.13,561.9,ok
+rg-arm64.bin,5248072,6.358,zstd-22,1626232,3.227,2293.41,2323.16,2.2,10.93,11.29,457.9,ok
+rg-arm64.bin,5248072,6.358,snappy,3039238,1.727,10.13,10.19,494.1,3.75,3.79,1333.4,ok

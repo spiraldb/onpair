@@ -16,6 +16,11 @@ Five executables spanning four toolchains were copied from the host
 | `cmake.bin`        | `/usr/bin/cmake`                  | C++       |      11.25 |
 | `clang-tidy.bin`   | `/usr/lib/llvm-18/bin/clang-tidy` | C++/LLVM  |      26.08 |
 | `golangci-lint.bin`| `/usr/local/bin/golangci-lint`    | Go        |      36.36 |
+| `rg-arm64.bin`     | vendored ripgrep `arm64-linux/rg` | Rust/ARM64|       5.00 |
+
+`rg-arm64.bin` is the aarch64 build of the same program as `rg.bin`; it is run
+separately (`results_arm64.csv`) for the x86-64-vs-aarch64 comparison in §5 of
+`RESULTS.md`.
 
 ```sh
 cp /usr/bin/rg                      rg.bin

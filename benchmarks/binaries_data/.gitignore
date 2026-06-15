@@ -1,4 +1,4 @@
 # Large staged executables copied from the system for benchmarking.
 # Regenerate with the cp commands in README.md; do not commit.
 *.bin
-results.log
+*.log
