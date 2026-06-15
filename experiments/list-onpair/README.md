@@ -133,6 +133,48 @@ Caveat: because all runs resample one real capture, the frame alphabet stays at
 regime — which is exactly the common observability case (one service profiled
 repeatedly).
 
+## Real heterogeneous corpus (gathered public profiles)
+
+`prep/gather_real_profiles.py` collects **real** folded-stack files shipped as
+test fixtures by public profiling projects (no synthesis): `perf`, dtrace,
+`ghcprof` (Haskell), VS profiler, Intel VTune, macOS `sample`, `xctrace`,
+async-profiler (JVM), and the vertx perf capture — from `jonhoo/inferno`,
+`jlfwong/speedscope`, and `brendangregg/FlameGraph`. After content-dedup this is
+**22 distinct real runs, 3 508 stacks, 61 305 frames, 2 031 distinct frames**,
+all concatenated into one shared column.
+
+```bash
+python3 prep/gather_real_profiles.py    # clones the repos, normalizes fixtures
+cargo run --release perf_corpus
+```
+
+| representation | bytes | ratio vs raw |
+|----------------|------:|-------------:|
+| raw text | 2 147 437 | 1.0× |
+| dict+listview | 163 117 | 13.2× |
+| **onpair-int** | **138 404** | **15.5×** |
+| zstd(raw text) | 31 636 | 67.9× |
+| zstd(int stream) | 11 332 | 189.5× |
+
+OnPair saves **27.1%** of the int stream here — between the single-run (50.6%)
+and the same-service 1000-run (85.8%) cases, because some runs are near-duplicate
+re-profiles (the vertx/dcpu/dtrace groups) but most are different tools entirely.
+
+**The decisive finding: share the dictionary only for *similar* runs.**
+
+| corpus | runs | shared-dict vs per-run |
+|--------|-----:|-----------------------:|
+| same-service resample (`perf_runs`) | 1000 | sharing **saves 48%** ✅ |
+| heterogeneous public profiles (`perf_corpus`) | 22 | sharing is **66% worse** ❌ |
+
+For the heterogeneous corpus a *single* global dictionary must span all 2 031
+frames, so every run — even a 11-frame VTune capture — pays an 11-bit base /
+12-bit code width. Compressed independently, each run uses only its own small
+frame alphabet and gets a much narrower code. The crossover is governed by how
+much the runs' **frame namespaces overlap**: high overlap (one service profiled
+repeatedly) → share; low overlap (a mixed store of different tools/languages) →
+compress per run (or cluster by namespace, then share within a cluster).
+
 ## Is it good? When, and why not
 
 **It works where the data is genuinely sequential and deep — stack traces.**
