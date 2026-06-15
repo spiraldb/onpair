@@ -37,6 +37,10 @@ fn zstd_len(data: &[u8]) -> usize {
     zstd::encode_all(data, 19).expect("zstd").len()
 }
 
+fn zstd_at(data: &[u8], level: i32) -> usize {
+    zstd::encode_all(data, level).expect("zstd").len()
+}
+
 struct Dataset {
     name: String,
     rows: Vec<Vec<u32>>,        // each row: element ids
@@ -237,6 +241,23 @@ fn run(ds: &Dataset) {
         if onpair < wholestack { "beats" } else { "loses to" },
         100.0 * (1.0 - onpair.min(wholestack) as f64 / onpair.max(wholestack) as f64),
     );
+    // ── focused comparison (structural bytes, no shared string dict) ──
+    let zmed = zstd_at(&int_le, 3);
+    let zhigh = zstd_at(&int_le, 19);
+    println!("\n  focused comparison (structural bytes, no string dict):");
+    let cmp = |label: &str, bytes: usize| {
+        println!(
+            "    {label:30} {bytes:9}   {:7.2}x",
+            ds.raw_bytes as f64 / bytes as f64
+        );
+    };
+    cmp("listview (all rows)", listview);
+    cmp("listview unique-only (dedup)", wholestack);
+    cmp("onpair", onpair);
+    cmp("onpair + unique-only", wholestack_onpair);
+    cmp("zstd medium (L3, int stream)", zmed);
+    cmp("zstd high   (L19, int stream)", zhigh);
+
     run_sharing_analysis(ds);
 }
 
