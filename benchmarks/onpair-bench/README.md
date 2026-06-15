@@ -24,7 +24,7 @@ The bench is a uv workspace member of the repo-root `pyproject.toml`. Sync
 once from the repo root, then drive it with `uv run`:
 
 ```bash
-# from /Users/joeisaacs/git/spiraldb/onpair (one-time):
+# from the repo root (one-time):
 uv sync
 
 # drop a corpus in:

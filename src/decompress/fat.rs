@@ -4,11 +4,9 @@
 //! "Fat" token table layout.
 //!
 //! Each token is materialized into a 16-byte-strided row, so a decode load
-//! addresses `data + code * 16` straight from the code — replacing the
-//! `code → entry → dict[offset]` dependent-load chain of the
-//! [`super::DecodeEntry`] layout with a single independent load. Costs
-//! `dict_tokens * 16` bytes of table; whether that pays is a cache-residency
-//! question the [`super::plan`] index decides per host.
+//! addresses `data + code * 16` straight from the code — a single independent
+//! load, with no `code → entry → dict[offset]` indirection. Costs
+//! `dict_tokens * 16` bytes of table, rebuilt once per decode call.
 //!
 //! Loop structure: a 16-byte over-copy fast region ([`super::scalar::copy16`])
 //! plus an exact, length-aware tail.

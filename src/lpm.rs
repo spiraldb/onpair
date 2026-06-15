@@ -266,7 +266,7 @@ impl LongestPrefixMatcher {
     /// prefix's length.
     ///
     /// Precondition: `!data.is_empty()` and the matcher contains every
-    /// single-byte token (always true after [`new`] or [`from_dictionary`]
+    /// single-byte token (always true after [`Self::new`] or [`Self::from_dictionary`]
     /// with a complete dictionary).
     #[inline]
     pub fn find_longest_match(&self, data: &[u8]) -> (Token, usize) {

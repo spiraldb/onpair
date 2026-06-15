@@ -347,7 +347,8 @@ A column is conformant if and only if all of the following hold.
 - Every token length `o_{i+1} - o_i` is in `1 ..= MAX_TOKEN_SIZE`.
 - All 256 single-byte tokens are present (completeness, §3).
 - No two tokens are equal (uniqueness, §3).
-- `dict_bytes_len >= o_N + MAX_TOKEN_SIZE` (the read-padding bound, §3.1).
+- `dict_bytes_len >= o_{N-1} + MAX_TOKEN_SIZE` (the read-padding bound, §3.1;
+  `o_{N-1}` is the offset of the last token).
 - `is_sorted` is `0` or `1`; if `1`, tokens are strictly increasing in
   bytewise-lexicographic order.
 
