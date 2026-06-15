@@ -924,6 +924,7 @@ dependencies = [
  "rstest",
  "tpchgen",
  "tpchgen-arrow",
+ "zstd",
 ]
 
 [[package]]
