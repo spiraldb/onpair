@@ -259,6 +259,27 @@ hit an RLE / run-end (or constant-run) encoding; today it falls through to raw
 `vortex.bool`. OnPair is a decent general fallback (no special-casing, keeps
 random access) but a run-aware encoding is strictly better here.
 
+**Packing bools into bytes helps a lot.** With a 2-symbol alphabet, a 16-element
+OnPair token spans only 16 bits, so a ~200-bit run needs ~13 tokens. Packing
+8 bools into a little-endian `u8` (`prep/pack_mask_bytes.py` → `maskbyte.lst`)
+gives a 9-symbol alphabet (`0,1,3,7,15,31,63,127,255` — the partial bytes of a
+`1^k0^m` run) and lets a token span 16 bytes = 128 bits:
+
+| representation (structural, no strdict) | bool elements | **u8 elements** |
+|-----------------------------------------|--------------:|----------------:|
+| listview (all rows) | 163 349 | 87 100 |
+| listview unique-only (dedup) | 102 031 | 58 379 |
+| onpair | 59 394 | **24 831** |
+| onpair + unique-only | 42 612 | **23 100** |
+| zstd high (L19) | 16 459 | **5 207** |
+
+Byte-packing alone halves every method (dict-encoding 9 byte values to 4 bits is
+0.5 bits/bool vs the raw 1 bit/bool), and byte-OnPair is **2.4× smaller than
+bit-OnPair** (24.8 KB vs 59.4 KB) because each token now covers 8× more bits.
+Even so, the `1^k0^m` structure means zstd (5.2 KB) and a popcount encoding
+(~6.5 KB values) remain the true optimum; OnPair on bytes is the best
+random-access structural option short of a run-aware encoding.
+
 ## Whole-stack dedup (when an entire trace equals another)
 
 A cheaper idea than frame-level OnPair: give each **distinct whole stack** one id
