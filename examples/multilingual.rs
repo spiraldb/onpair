@@ -121,6 +121,7 @@ fn analyze(label: &str, text: &[u8], cap_bytes: Option<usize>) {
     );
     println!("  UTF-8 byte-width mix (over chars): {}", utf8_mix(&bytes));
 
+    let mut codes16: Vec<u16> = Vec::new();
     for &b in BITS {
         let cfg = Config {
             bits: Bits::new(b).expect("9..=16"),
@@ -144,12 +145,15 @@ fn analyze(label: &str, text: &[u8], cap_bytes: Option<usize>) {
         let n_tokens = parts.dict_offsets.len() - 1;
         let m = parts.codes.len();
         let cap = 1usize << b;
+        // Realistic stored size: pack each code to `b` bits instead of plain u16.
+        let codes_packed = (m * b as usize).div_ceil(8);
 
         println!("\n  ── {b}-bit ──");
         println!(
-            "  ratio = {:.3}x  (incl. row offsets)   codes-only ratio = {:.3}x",
-            total as f64 / compressed as f64,
+            "  codes-only ratio = {:.3}x (u16 codes) | {:.3}x (bit-packed {b}b codes) | {:.3}x incl. row offsets",
             total as f64 / (dict_b + dict_off + codes_b) as f64,
+            total as f64 / (dict_b + dict_off + codes_packed) as f64,
+            total as f64 / compressed as f64,
         );
         println!(
             "  size: dict_bytes {} B + dict_offsets {} B + codes {} B + row_offsets {} B = {:.1} KiB",
@@ -164,7 +168,44 @@ fn analyze(label: &str, text: &[u8], cap_bytes: Option<usize>) {
             total as f64 / m.max(1) as f64
         );
         symbol_table_stats(parts.dict_bytes, parts.dict_offsets, n_tokens, cap);
+        if b == 16 {
+            codes16 = parts.codes.to_vec();
+        }
     }
+
+    zstd_compare(total, &bytes, &codes16);
+}
+
+/// General-purpose baseline: zstd at medium (9) and high (19) on the *same*
+/// bytes OnPair sees, plus zstd applied to OnPair's 16-bit code stream (the
+/// "dictionary front-end + entropy back-end" combination).
+fn zstd_compare(total: usize, bytes: &[u8], codes16: &[u16]) {
+    println!("\n  ── zstd (same input bytes) ──");
+    for level in [9, 19] {
+        let t = std::time::Instant::now();
+        let z = zstd::bulk::compress(bytes, level).expect("zstd");
+        let secs = t.elapsed().as_secs_f64();
+        let tag = if level == 9 { "medium" } else { "high" };
+        println!(
+            "  zstd -{level:<2} ({tag}): ratio = {:.3}x  ({:.1} KiB, {:.0} MiB/s)",
+            total as f64 / z.len() as f64,
+            z.len() as f64 / 1024.0,
+            total as f64 / (1024.0 * 1024.0) / secs.max(1e-9),
+        );
+    }
+    // OnPair-16 codes as little-endian bytes, then zstd -19 — a stand-in for
+    // storing the code stream with an entropy back-end.
+    let mut code_bytes = Vec::with_capacity(codes16.len() * 2);
+    for &c in codes16 {
+        code_bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    let z = zstd::bulk::compress(&code_bytes, 19).expect("zstd");
+    println!(
+        "  OnPair-16 codes + zstd -19: codes-only ratio ≈ {:.3}x  (codes {:.1} KiB → {:.1} KiB)",
+        total as f64 / z.len() as f64,
+        code_bytes.len() as f64 / 1024.0,
+        z.len() as f64 / 1024.0,
+    );
 }
 
 /// Distribution of the dictionary ("symbol table").

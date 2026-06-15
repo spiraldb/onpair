@@ -38,6 +38,9 @@ cargo run --release --example multilingual -- /tmp/corpora \
     "ASCII (English)=en.txt" "Japanese=ja.txt" "Chinese=zh.txt" "Emoji-heavy=emoji.txt"
 ```
 
+The example also reports bit-packed code sizes and a zstd `-9`/`-19` baseline on
+the same bytes (see *Comparison to zstd*).
+
 ## Compression ratio
 
 Two ratios are reported. **codes-only** = `orig / (dict_bytes + dict_offsets +
@@ -61,6 +64,44 @@ overhead, not an OnPair property.
 | Japanese | 49,799 | 76% | 70% | 7.97 B | long kana/kanji runs; 15k tokens **straddle** char boundaries |
 | Chinese | 59,339 | 91% | 81% | 6.71 B | two-character compound words (24.5k two-char tokens) |
 | Emoji-heavy | 65,431 | **100%** | 84% | 6.62 B | broad length spread; only corpus to fill the dictionary |
+
+## Comparison to zstd
+
+zstd run on the *identical* bytes, at medium (`-9`) and high (`-19`). The OnPair
+column here is the best config (16-bit; codes bit-packed to 16 b = the plain
+u16 form). The last column applies `zstd -19` to OnPair's 16-bit code stream —
+a dictionary front-end with an entropy back-end.
+
+| Corpus | OnPair-16 | zstd -9 (medium) | zstd -19 (high) | OnPair-16 → zstd -19 |
+|---|--:|--:|--:|--:|
+| ASCII (English) | 2.47x | 3.09x | 3.53x | 3.40x |
+| Japanese | 2.73x | 3.55x | **4.20x** | 3.98x |
+| Chinese | 2.07x | 2.49x | 2.88x | 2.85x |
+| Emoji-heavy | 2.06x | 3.36x | 3.73x | 3.52x |
+
+Throughput (this run): `zstd -9` ≈ 33–40 MiB/s; `zstd -19` ≈ 2 MiB/s (~20× slower
+for ~12–18% more ratio).
+
+**zstd compresses 20–65% smaller than OnPair alone on every corpus** — expected,
+since zstd is a full LZ matcher *plus* an entropy coder (FSE/Huffman), whereas
+OnPair is a dictionary front-end that emits fixed-width codes with **no entropy
+back-end**. The comparison is not apples-to-apples on ratio, because the two
+target different things:
+
+- **OnPair buys random access.** A single row decodes by gathering its own codes
+  through the dictionary, touching no other row; the format also supports
+  compressed-domain equality/prefix search. zstd is block/stream compression —
+  reading one value means inflating the whole frame. That random-access property
+  is OnPair's reason to exist, and it is what the ratio gap pays for.
+- **The layers compose.** `OnPair-16 → zstd -19` reaches 90–99% of `zstd -19`-on-raw
+  (e.g. Japanese 3.98x vs 4.20x, Chinese 2.85x vs 2.88x), so the dictionary stage
+  loses little headroom for a downstream entropy coder. It also shows OnPair's
+  fixed-width code stream is far from incompressible — substantial redundancy
+  remains that zstd's entropy stage captures and OnPair's flat codes do not.
+- **Where OnPair is closest:** high-entropy **Chinese** (OnPair 2.07x vs zstd -9
+  2.49x) — there is less low-entropy structure for zstd's back-end to exploit.
+  **Where it lags most:** **emoji** social text (2.06x vs 3.36x), which is mostly
+  repetitive ASCII that zstd's entropy stage crushes.
 
 ## Findings
 
