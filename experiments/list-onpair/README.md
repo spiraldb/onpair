@@ -175,6 +175,51 @@ much the runs' **frame namespaces overlap**: high overlap (one service profiled
 repeatedly) → share; low overlap (a mixed store of different tools/languages) →
 compress per run (or cluster by namespace, then share within a cluster).
 
+## Crash / exception stack traces (bug-report datasets)
+
+The corpora above are *profiling* stacks. A second, larger family is *crash*
+stack traces from bug-report deduplication research. `prep/convert_crash_traces.py`
+ingests two public sources (streamed, byte-capped at 60 MB/dataset):
+
+* **AERI** (Eclipse) — per-problem JSON, frame = `class.method`
+  ([download.eclipse.org](https://download.eclipse.org/scava/aeri_stacktraces/))
+* **JetBrains EMSE** — Ubuntu(campbell)/Eclipse/NetBeans/Gnome, frame = `function`
+  ([Zenodo 5746044](https://doi.org/10.5281/zenodo.5746044))
+
+```bash
+python3 prep/convert_crash_traces.py    # needs the archives in data/cache
+cargo run --release crash_eclipse crash_netbeans crash_gnome crash_ubuntu crash_aeri crash_corpus
+```
+
+Structural sizes (no string dict), OnPair vs the two baselines:
+
+| dataset | lang | traces | distinct frames | onpair saves vs listview | onpair vs wholestack-dedup |
+|---------|------|-------:|----------------:|-------------------------:|---------------------------:|
+| crash_ubuntu | C/C++ | 14 k | 21 k | 39.1% | **+27.3%** |
+| crash_eclipse | Java | 30 k | 58 k | 42.4% | **+33.8%** |
+| crash_netbeans | Java | 40 k | 30 k | 51.4% | **+18.5%** |
+| crash_gnome | C/C++ | 181 k | 52 k | 44.2% | −1.7% (dedup wins) |
+| crash_aeri | Java | 22 k | 52 k | 55.7% | **+44.8%** |
+
+Findings:
+
+- **OnPair beats whole-stack dedup on crash traces** (the reverse of resampled
+  profiles): bug reports rarely repeat an *entire* trace, but they heavily share
+  call-stack *prefixes* (framework/runtime entry paths), which is exactly what
+  frame-level merging captures. Gnome is the one exception — it has the most
+  exact-duplicate traces (only 28% distinct).
+- **The frame-string dictionary dominates** (55–77% of the OnPair+strdict total).
+  Crash frames are long fully-qualified names with 21 k–58 k distinct values, so
+  the *vocabulary*, not the list structure, is the real cost — unlike profiling
+  data (531–2 031 distinct frames). Compressing the string dictionary matters
+  more than the structural encoding here.
+- **`wholestack+onpair` is again the best non-zstd representation everywhere**
+  (e.g. netbeans 22.5× vs raw, gnome 15.3×), but `zstd(int stream)` still wins on
+  pure ratio (84×–273×) because it entropy-codes the long-tailed code stream.
+- **Heterogeneous combined corpus** (`crash_corpus`, 5 projects as 5 runs):
+  sharing one dictionary is **39% worse** than per-run — same lesson as the mixed
+  profiling corpus, because Java and C/C++ frame namespaces are disjoint.
+
 ## Whole-stack dedup (when an entire trace equals another)
 
 A cheaper idea than frame-level OnPair: give each **distinct whole stack** one id
