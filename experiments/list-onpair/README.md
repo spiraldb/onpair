@@ -280,6 +280,41 @@ Even so, the `1^k0^m` structure means zstd (5.2 KB) and a popcount encoding
 (~6.5 KB values) remain the true optimum; OnPair on bytes is the best
 random-access structural option short of a run-aware encoding.
 
+## Multi-round OnPair (Re-Pair-style)
+
+OnPair is one online BPE pass with a hard `MAX_TOKEN_ELEMS = 16` ceiling, so no
+token spans more than 16 elements. The recursive generalization is **Re-Pair**
+(Larsson–Moffat): iterate pairing until no pair repeats, producing a grammar.
+`multiround()` approximates it by feeding each round's pruned code stream back in
+as the next round's alphabet, so a round-`r` token expands to up to `16^r` base
+elements. Stored cost = final codes + one grammar dictionary per round + row
+offsets (run with `cargo run --release <dataset>`):
+
+| dataset | round 1 | round 2 | round 3 | best | +dedup | zstd L19 |
+|---------|--------:|--------:|--------:|-----:|-------:|---------:|
+| maskbool (bits) | 59 394 | **28 198** | 28 661 | round 2 (**2.1×**) | 42 612 | 16 459 |
+| maskbyte | **26 283** | 26 417 | 28 180 | round 1 (saturated) | 24 761 | 5 207 |
+| perf_runs | 1 009 822 | **723 043** | 724 820 | round 2 (1.4×) | 262 337 | 492 012 |
+| crash_gnome | 3 614 285 | **3 250 787** | 3 497 603 | round 2 (1.1×) | 2 268 705 | 834 250 |
+
+Findings:
+
+- **A second round helps most exactly where round 1 was ceiling-limited.** The
+  bit-level masks halve (59 KB → 28 KB): round 1 tokens cap at 16 bits, round 2
+  merges them to ~256-bit tokens that capture whole runs. On `perf_runs` round 2
+  drops the stream to 203 078 codes = **one code per row** — the grammar learned
+  whole repeated stacks.
+- **The sweet spot is 2 rounds (occasionally 3).** Beyond that the code stream
+  barely shrinks while each round's grammar dictionary accumulates, so the total
+  climbs again — the classic Re-Pair tradeoff (you must store the grammar).
+- **Byte-packing already does what an extra round would.** `maskbyte` saturates
+  at round 1 because a 16-*byte* token is 128 bits — the second round has little
+  left to merge.
+- It confirms the ceiling theory but **does not overtake whole-mask dedup or zstd
+  here**: for the `1^k0^m` masks a run-aware/popcount encoding (~6.5 KB) is still
+  the right answer. Multi-round OnPair is the better *general* structural codec
+  (no special-casing, keeps random access) and a free win on ceiling-bound data.
+
 ## Whole-stack dedup (when an entire trace equals another)
 
 A cheaper idea than frame-level OnPair: give each **distinct whole stack** one id

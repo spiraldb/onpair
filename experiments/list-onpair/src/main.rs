@@ -271,6 +271,8 @@ fn run(ds: &Dataset) {
     cmp("zstd medium (L3, int stream)", zmed);
     cmp("zstd high   (L19, int stream)", zhigh);
 
+    multiround(ds, 6);
+
     run_sharing_analysis(ds);
 }
 
@@ -392,6 +394,90 @@ fn dump_dict(ds: &Dataset, parser: &intonpair::Parser, codes: &[u32], num_distin
         let s = decode(*id);
         let s = if s.len() > 140 { format!("{}…", &s[..140]) } else { s };
         println!("    {f:5} x {len:2}: {s}");
+    }
+}
+
+/// Multi-round OnPair (a practical approximation of Re-Pair): feed each round's
+/// pruned code stream back in as the next round's element alphabet, so a round-r
+/// token expands to up to 16^r base elements — lifting the per-token ceiling.
+///
+/// Stored artifacts for R rounds: the final code stream + one grammar dictionary
+/// per round (token -> previous-level ids) + the row offsets. We prune+renumber
+/// each round so widths stay minimal, and verify each round round-trips.
+fn multiround(ds: &Dataset, max_rounds: usize) {
+    let num_rows = ds.rows.len();
+    let num_distinct = ds.strings.len();
+
+    let mut flat = ds.flat.clone();
+    let mut offsets = ds.offsets.clone();
+    let mut nd = num_distinct; // alphabet size of the current input
+    let mut prev_bits = bits_for(num_distinct); // bits per dict element at this level
+    let mut dict_bytes_total = 0usize;
+    let mut dicts: Vec<(Vec<u32>, Vec<u32>)> = Vec::new(); // (elems, offsets) per round, for verify
+
+    println!("\n  multi-round onpair (Re-Pair-style), structural bytes (no strdict):");
+    println!("    round   codes   tokens   dict+codes+rowoff");
+    let mut best = usize::MAX;
+    for round in 1..=max_rounds {
+        let capacity = capacity_for(nd);
+        let parser = intonpair::train(&flat, &offsets, nd as u32, capacity, 0.5);
+        let (codes, code_offsets) = parser.encode(&flat, &offsets);
+
+        // Prune to used tokens and renumber densely.
+        let ntok_all = parser.dict.num_tokens();
+        let mut used = vec![false; ntok_all];
+        for &c in &codes {
+            used[c as usize] = true;
+        }
+        let mut remap = vec![0u32; ntok_all];
+        let (mut ntokens, mut dict_elems) = (0usize, 0usize);
+        let (mut delems, mut doff) = (Vec::new(), vec![0u32]);
+        for (id, &u) in used.iter().enumerate() {
+            if u {
+                remap[id] = ntokens as u32;
+                let tok = parser.dict.token(id as u32);
+                delems.extend_from_slice(tok); // ids in the *previous* level's space
+                dict_elems += tok.len();
+                doff.push(dict_elems as u32);
+                ntokens += 1;
+            }
+        }
+        let codes: Vec<u32> = codes.iter().map(|&c| remap[c as usize]).collect();
+
+        // Verify this round reconstructs its input stream.
+        let mut decoded = Vec::with_capacity(flat.len());
+        for &c in &codes {
+            let b = doff[c as usize] as usize;
+            let e = doff[c as usize + 1] as usize;
+            decoded.extend_from_slice(&delems[b..e]);
+        }
+        assert_eq!(decoded, flat, "multiround round {round} round-trip failed in {}", ds.name);
+        dicts.push((delems.clone(), doff.clone()));
+
+        // Size: this round's grammar dict (elems at prev_bits) + dict offsets.
+        let dict_bytes = packed_bytes(dict_elems, prev_bits)
+            + packed_bytes(ntokens + 1, bits_for(dict_elems + 1));
+        dict_bytes_total += dict_bytes;
+        let code_bits = bits_for(ntokens);
+        let codes_bytes = packed_bytes(codes.len(), code_bits);
+        let rowoff = packed_bytes(num_rows + 1, bits_for(codes.len() + 1));
+        let total = codes_bytes + dict_bytes_total + rowoff;
+        let mark = if total < best { best = total; " *" } else { "" };
+        println!(
+            "    {round:5}  {:6}  {:6}   {total:9}{mark}",
+            codes.len(),
+            ntokens
+        );
+
+        // Stop once a round stops helping and isn't merging further.
+        if codes.len() == flat.len() {
+            break; // no merges happened
+        }
+        // Set up next round.
+        flat = codes;
+        offsets = code_offsets;
+        nd = ntokens;
+        prev_bits = code_bits;
     }
 }
 
