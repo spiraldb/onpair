@@ -412,12 +412,25 @@ fn multiround(ds: &Dataset, max_rounds: usize) {
     let mut offsets = ds.offsets.clone();
     let mut nd = num_distinct; // alphabet size of the current input
     let mut prev_bits = bits_for(num_distinct); // bits per dict element at this level
+
+    // Per-round record for the tree view.
+    struct Round {
+        codes_len: usize,
+        ntokens: usize,
+        code_bits: usize,
+        dict_elems: usize,
+        elem_bits: usize, // bits per grammar-dict element (previous level width)
+        dict_bytes: usize,
+        codes_bytes: usize,
+        rowoff: usize,
+    }
+    let mut rounds: Vec<Round> = Vec::new();
     let mut dict_bytes_total = 0usize;
-    let mut dicts: Vec<(Vec<u32>, Vec<u32>)> = Vec::new(); // (elems, offsets) per round, for verify
 
     println!("\n  multi-round onpair (Re-Pair-style), structural bytes (no strdict):");
     println!("    round   codes   tokens   dict+codes+rowoff");
     let mut best = usize::MAX;
+    let mut best_round = 1usize;
     for round in 1..=max_rounds {
         let capacity = capacity_for(nd);
         let parser = intonpair::train(&flat, &offsets, nd as u32, capacity, 0.5);
@@ -452,7 +465,6 @@ fn multiround(ds: &Dataset, max_rounds: usize) {
             decoded.extend_from_slice(&delems[b..e]);
         }
         assert_eq!(decoded, flat, "multiround round {round} round-trip failed in {}", ds.name);
-        dicts.push((delems.clone(), doff.clone()));
 
         // Size: this round's grammar dict (elems at prev_bits) + dict offsets.
         let dict_bytes = packed_bytes(dict_elems, prev_bits)
@@ -462,22 +474,68 @@ fn multiround(ds: &Dataset, max_rounds: usize) {
         let codes_bytes = packed_bytes(codes.len(), code_bits);
         let rowoff = packed_bytes(num_rows + 1, bits_for(codes.len() + 1));
         let total = codes_bytes + dict_bytes_total + rowoff;
-        let mark = if total < best { best = total; " *" } else { "" };
-        println!(
-            "    {round:5}  {:6}  {:6}   {total:9}{mark}",
-            codes.len(),
-            ntokens
-        );
+        let mark = if total < best {
+            best = total;
+            best_round = round;
+            " *"
+        } else {
+            ""
+        };
+        println!("    {round:5}  {:6}  {:6}   {total:9}{mark}", codes.len(), ntokens);
+        rounds.push(Round {
+            codes_len: codes.len(),
+            ntokens,
+            code_bits,
+            dict_elems,
+            elem_bits: prev_bits,
+            dict_bytes,
+            codes_bytes,
+            rowoff,
+        });
 
-        // Stop once a round stops helping and isn't merging further.
         if codes.len() == flat.len() {
             break; // no merges happened
         }
-        // Set up next round.
         flat = codes;
         offsets = code_offsets;
         nd = ntokens;
         prev_bits = code_bits;
+    }
+
+    // Array-tree view of the best configuration (the grammar = dicts 1..=best).
+    let r = &rounds[best_round - 1];
+    let raw_bits = packed_bytes(ds.flat.len(), bits_for(num_distinct.max(2)));
+    println!(
+        "\n  array tree — multi-round onpair, best = round {best_round}  ({best} B, {:.2}x vs {raw_bits} B raw bits)",
+        raw_bits as f64 / best as f64
+    );
+    println!(
+        "    onpair-grammar(list, rows={num_rows})                       {best} B (100.0%)",
+    );
+    let pct = |b: usize| 100.0 * b as f64 / best as f64;
+    println!(
+        "    ├─ codes        bitpacked(u{:<2} len={})   {} B ({:.1}%)",
+        r.code_bits, r.codes_len, r.codes_bytes, pct(r.codes_bytes)
+    );
+    println!(
+        "    ├─ row_offsets  bitpacked(len={})            {} B ({:.1}%)",
+        num_rows + 1,
+        r.rowoff,
+        pct(r.rowoff)
+    );
+    let gram: usize = rounds[..best_round].iter().map(|x| x.dict_bytes).sum();
+    println!("    └─ grammar ({best_round} dict layer(s))                  {gram} B ({:.1}%)", pct(gram));
+    for lvl in (1..=best_round).rev() {
+        let d = &rounds[lvl - 1];
+        let target = if lvl == 1 {
+            "base bool".to_string()
+        } else {
+            format!("L{} tokens", lvl - 1)
+        };
+        println!(
+            "       ├─ dict_{lvl}  token→{target:<10}  {} tokens, {} elems (u{}) {} B ({:.1}%)",
+            d.ntokens, d.dict_elems, d.elem_bits, d.dict_bytes, pct(d.dict_bytes)
+        );
     }
 }
 
