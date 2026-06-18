@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use onpair::{Column, Config, DEFAULT_CONFIG, compress, decompress_into};
+use onpair::{Bits, Column, Config, DEFAULT_CONFIG, compress, decode_into};
 
 struct Args {
     input: PathBuf,
@@ -61,46 +61,42 @@ fn build_payload_and_offsets(src: &[u8]) -> (Vec<u8>, Vec<u32>) {
     (payload, offsets)
 }
 
-fn cfg_for(bits: u32) -> Config {
-    Config {
-        bits,
-        seed: Some(42),
-        ..DEFAULT_CONFIG
-    }
+fn cfg_for(bits: u32) -> Result<Config> {
+    let bits = Bits::new(bits as u8).map_err(|_| anyhow!("--bits must be in 9..=16"))?;
+    Ok(Config { bits, seed: Some(42), ..DEFAULT_CONFIG })
 }
 
 fn dict_size(col: &Column<u32>) -> usize {
-    col.dict_offsets.len().saturating_sub(1)
+    col.dict.num_tokens()
 }
 
 fn dict_bytes(col: &Column<u32>) -> usize {
-    col.dict_offsets.last().copied().unwrap_or(0) as usize
+    col.dict.logical_len()
 }
 
 /// Bit-packed size of the code stream — what a `bits`-wide store would use.
 /// The Rust port stores codes as plain `u16`s, so this is smaller than the
 /// in-memory representation. Reported for cross-impl comparability with
-/// onpair_cpp's `StoreView::bytes_used()` (which bit-packs).
-fn codes_bytes(col: &Column<u32>) -> usize {
-    let total_bits = col.codes.len() * col.bits as usize;
+/// onpair_cpp's `StoreView::bytes_used()` (which bit-packs at `bit_width`).
+fn codes_bytes(col: &Column<u32>, bits: u32) -> usize {
+    let total_bits = col.codes.len() * bits as usize;
     total_bits.div_ceil(8)
 }
 
 /// dict + bit-packed codes only — excludes the per-row boundary index
 /// (the "Store" side-table). Matches what onpair_cpp reports after stripping
 /// `StoreView::boundaries` from the view's `bytes_used()`.
-fn compressed_bytes(col: &Column<u32>) -> usize {
-    dict_bytes(col) + col.dict_offsets.len() * std::mem::size_of::<u32>() + codes_bytes(col)
+fn compressed_bytes(col: &Column<u32>, bits: u32) -> usize {
+    dict_bytes(col) + col.dict.offsets.len() * std::mem::size_of::<u32>() + codes_bytes(col, bits)
 }
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let bytes = fs::read(&args.input)
-        .with_context(|| format!("read {}", args.input.display()))?;
+    let bytes = fs::read(&args.input).with_context(|| format!("read {}", args.input.display()))?;
     let input_bytes = bytes.len();
     let (payload, offsets) = build_payload_and_offsets(&bytes);
     let num_rows = offsets.len().saturating_sub(1);
-    let cfg = cfg_for(args.bits);
+    let cfg = cfg_for(args.bits)?;
 
     let mut compress_ns: Vec<u128> = Vec::with_capacity(args.iters as usize);
     for _ in 0..args.warmup {
@@ -114,24 +110,24 @@ fn main() -> Result<()> {
         last = Some(col);
     }
     let col = last.ok_or_else(|| anyhow!("--iters must be >= 1"))?;
-    let parts = col.as_parts();
+    let view = col.view();
     let mut decompress_ns: Vec<u128> = Vec::new();
     if args.decompress {
-        // Size the scratch to the worst-case decoded length (every token is
-        // <= 16 bytes) so `decompress_into`'s O(1) buffer check passes and we
-        // time the decode loop itself, not the exact-length validation pass.
-        let mut scratch: Vec<u8> = Vec::with_capacity(parts.codes.len() * 16);
+        // Worst-case decoded length is `codes.len() * MAX_TOKEN_SIZE`, always
+        // >= the exact decoded length the kernel writes.
+        let mut scratch: Vec<u8> = Vec::with_capacity(view.codes.len() * 16);
         for _ in 0..args.warmup {
-            let len = decompress_into(parts, scratch.spare_capacity_mut());
-            // SAFETY: `len` logical bytes were initialized by the decoder.
+            // SAFETY: column codes are in range, dictionary read-padded, scratch
+            // sized to the worst-case decoded length.
+            let len = unsafe { decode_into(view.codes, view.dict, scratch.spare_capacity_mut()) };
             unsafe { scratch.set_len(len) };
             black_box(scratch.as_slice());
             scratch.clear();
         }
         for _ in 0..args.iters {
             let t0 = Instant::now();
-            let len = decompress_into(parts, scratch.spare_capacity_mut());
-            // SAFETY: `len` logical bytes were initialized by the decoder.
+            // SAFETY: as above.
+            let len = unsafe { decode_into(view.codes, view.dict, scratch.spare_capacity_mut()) };
             unsafe { scratch.set_len(len) };
             black_box(scratch.as_slice());
             scratch.clear();
@@ -140,11 +136,8 @@ fn main() -> Result<()> {
     }
 
     if args.verify {
-        let mut scratch: Vec<u8> = Vec::with_capacity(payload.len());
-        let len = decompress_into(parts, scratch.spare_capacity_mut());
-        // SAFETY: `len` logical bytes were initialized by the decoder.
-        unsafe { scratch.set_len(len) };
-        if len != payload.len() || scratch.as_slice() != payload.as_slice() {
+        let decoded = view.decompress();
+        if decoded.as_slice() != payload.as_slice() {
             eprintln!("verify failed");
             std::process::exit(2);
         }
@@ -157,8 +150,8 @@ fn main() -> Result<()> {
         "input_bytes": input_bytes,
         "dict_size": dict_size(&col),
         "dict_bytes": dict_bytes(&col),
-        "codes_bytes": codes_bytes(&col),
-        "compressed_bytes": compressed_bytes(&col),
+        "codes_bytes": codes_bytes(&col, args.bits),
+        "compressed_bytes": compressed_bytes(&col, args.bits),
         "compress_ns": compress_ns,
         "decompress_ns": decompress_ns,
     });

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use crate::types::BitWidth;
+//! Public training configuration and the crate-internal form it lowers to.
+
+use crate::core::types::BitWidth;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public config.
@@ -13,8 +15,8 @@ use crate::types::BitWidth;
 pub struct Bits(u8);
 
 impl Bits {
-    /// Construct a [`Bits`], returning [`Error::InvalidArg`] unless
-    /// `value` is in `9..=16`.
+    /// Construct a [`Bits`], returning [`Error::InvalidArg`] unless `value` is
+    /// in `9..=16`.
     pub const fn new(value: u8) -> Result<Self, Error> {
         if 9 <= value && value <= 16 {
             Ok(Self(value))
@@ -42,8 +44,8 @@ impl TryFrom<u8> for Bits {
 pub struct Threshold(f64);
 
 impl Threshold {
-    /// Construct a [`Threshold`], returning [`Error::InvalidArg`] unless
-    /// `value` is in `(0.0, 1.0]`.
+    /// Construct a [`Threshold`], returning [`Error::InvalidArg`] unless `value`
+    /// is in `(0.0, 1.0]`.
     pub const fn new(value: f64) -> Result<Self, Error> {
         if value > 0.0 && value <= 1.0 {
             Ok(Self(value))
@@ -77,13 +79,13 @@ pub struct Config {
     pub seed: Option<u64>,
 }
 
-/// Reasonable starting point: 12-bit codes, dynamic threshold sampling 20 %.
+/// Reasonable starting point: 12-bit codes, dynamic threshold sampling 15 %.
 pub const DEFAULT_CONFIG: Config = Config {
     bits: match Bits::new(12) {
         Ok(b) => b,
         Err(_) => unreachable!(),
     },
-    threshold: match Threshold::new(0.2) {
+    threshold: match Threshold::new(0.15) {
         Ok(t) => t,
         Err(_) => unreachable!(),
     },
@@ -134,9 +136,7 @@ pub(crate) struct DynamicThreshold {
 
 impl Default for DynamicThreshold {
     fn default() -> Self {
-        Self {
-            sample_fraction: 0.2,
-        }
+        Self { sample_fraction: 0.15 }
     }
 }
 
@@ -162,11 +162,7 @@ pub(crate) struct TrainingConfig {
 
 impl Default for TrainingConfig {
     fn default() -> Self {
-        Self {
-            bits: 16,
-            threshold: ThresholdSpec::default(),
-            seed: None,
-        }
+        Self { bits: 16, threshold: ThresholdSpec::default(), seed: None }
     }
 }
 

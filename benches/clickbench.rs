@@ -37,7 +37,6 @@ use onpair::Column;
 use onpair::Config;
 use onpair::Threshold;
 use onpair::compress;
-use onpair::decompress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 const BITS_CONFIGS: &[u8] = &[12, 16];
@@ -252,7 +251,7 @@ fn decompress_all(bencher: Bencher, bits: u8) {
     let col = compress_column(bits);
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
-        .bench(|| divan::black_box(decompress(col.as_parts())));
+        .bench(|| divan::black_box(col.view().decompress()));
 }
 
 fn main() {

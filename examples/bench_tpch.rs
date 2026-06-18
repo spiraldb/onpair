@@ -37,7 +37,6 @@ use onpair::Bits;
 use onpair::Config;
 use onpair::Threshold;
 use onpair::compress;
-use onpair::decompress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 const BITS: &[u8] = &[12, 16];
@@ -79,20 +78,19 @@ fn main() {
             compress_secs = compress_secs.min(t.elapsed().as_secs_f64());
         }
 
-        let parts = col.as_parts();
         let mut decompress_secs = f64::MAX;
-        let mut decoded = decompress(parts);
+        let mut decoded = col.view().decompress();
         for _ in 0..iters {
             let t = Instant::now();
-            decoded = decompress(col.as_parts());
+            decoded = col.view().decompress();
             decompress_secs = decompress_secs.min(t.elapsed().as_secs_f64());
         }
 
-        let dict_bytes = parts.dict_bytes.len();
-        let dict_offsets = parts.dict_offsets.len() * 4;
-        let codes = parts.codes.len() * 2;
-        let code_offsets = std::mem::size_of_val(col.code_offsets.as_slice());
-        let compressed = dict_bytes + dict_offsets + codes + code_offsets;
+        let dict_bytes = col.dict.bytes.len();
+        let dict_offsets = col.dict.offsets.len() * 4;
+        let codes = col.codes.len() * 2;
+        let row_offsets = std::mem::size_of_val(col.row_offsets.as_slice());
+        let compressed = dict_bytes + dict_offsets + codes + row_offsets;
         let comp_mib = compressed as f64 / (1024.0 * 1024.0);
 
         println!(
@@ -105,8 +103,8 @@ fn main() {
         );
         println!(
             "  dict tokens = {}, dict bytes = {dict_bytes}, codes = {} ({} bytes)",
-            parts.dict_offsets.len() - 1,
-            parts.codes.len(),
+            col.dict.offsets.len() - 1,
+            col.codes.len(),
             codes
         );
         println!(

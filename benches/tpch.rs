@@ -19,8 +19,7 @@
 //
 // Run with: cargo bench --bench tpch
 //
-// Targets the slim public API
-// (`compress` / `decompress` free fns + `Column::as_parts()`).
+// Targets the slim public API (`compress` + `Column::view().decompress()`).
 
 use std::collections::HashMap;
 use std::env;
@@ -36,7 +35,6 @@ use onpair::Column;
 use onpair::Config;
 use onpair::Threshold;
 use onpair::compress;
-use onpair::decompress;
 use tpchgen::generators::CustomerGenerator;
 use tpchgen::generators::LineItemGenerator;
 use tpchgen::generators::OrderGenerator;
@@ -239,7 +237,7 @@ fn decompress_all(bencher: Bencher, param: (&'static str, u8)) {
     let column = build_column(col, bits);
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
-        .bench(|| divan::black_box(decompress(column.as_parts())));
+        .bench(|| divan::black_box(column.view().decompress()));
 }
 
 fn main() {
@@ -249,12 +247,11 @@ fn main() {
     for &(col, bits) in PARAMS {
         let c = corpus_for(col);
         let column = build_column(col, bits);
-        let parts = column.as_parts();
-        let dict_bytes = parts.dict_bytes.len();
-        let dict_offsets = parts.dict_offsets.len() * 4;
-        let codes = parts.codes.len() * 2;
-        let code_offsets = std::mem::size_of_val(column.code_offsets.as_slice());
-        let compressed = dict_bytes + dict_offsets + codes + code_offsets;
+        let dict_bytes = column.dict.bytes.len();
+        let dict_offsets = column.dict.offsets.len() * 4;
+        let codes = column.codes.len() * 2;
+        let row_offsets = std::mem::size_of_val(column.row_offsets.as_slice());
+        let compressed = dict_bytes + dict_offsets + codes + row_offsets;
         eprintln!(
             "  {col:<16} bits={bits}: ratio = {:.3}x  (raw {:.2} MiB → {:.2} MiB)",
             c.total_bytes as f64 / compressed as f64,

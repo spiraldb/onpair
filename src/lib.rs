@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
+#![cfg(target_endian = "little")]
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -14,65 +15,64 @@
     clippy::unwrap_used
 )]
 
-//! OnPair: short-strings compression for fast random access.
+//! OnPair: dictionary-based short-string compression for fast random access.
 //!
 //! Rust port of the algorithm described in
-//! [arXiv:2508.02280](https://arxiv.org/abs/2508.02280).
+//! [arXiv:2508.02280](https://arxiv.org/abs/2508.02280). OnPair replaces
+//! recurring substrings ("tokens") with fixed-width integer codes into a
+//! dictionary; decoding is a gather-copy, so individual rows decode in
+//! isolation at no extra cost.
 //!
-//! ```ignore
-//! use onpair::{compress, decompress_into, DEFAULT_CONFIG};
+//! # Layout
+//! A compressed [`Column`] is a [`Dictionary`] (token bytes + offsets), a code
+//! stream (one [`Token`] per emitted token), and a row layer (offsets into the
+//! code stream). Borrow it as a [`ColumnView`] — or build a view directly from
+//! buffers deserialized from storage — and decode with the [`decode_into`]
+//! kernel or a reusable [`FatTable`].
 //!
-//! let col = compress(&bytes, &offsets, DEFAULT_CONFIG)?;
-//! let mut decoded = Vec::with_capacity(bytes.len());
-//! let len = decompress_into(col.as_parts(), decoded.spare_capacity_mut());
-//! unsafe { decoded.set_len(len) };
+//! # Examples
+//! ```
+//! use onpair::{Column, DEFAULT_CONFIG};
+//!
+//! // Compress an Arrow (bytes, offsets) value pair.
+//! let bytes = b"catdogcat";
+//! let offsets: [u32; 4] = [0, 3, 6, 9];
+//! let col = Column::compress(bytes, &offsets, DEFAULT_CONFIG).unwrap();
+//!
+//! // Bulk decode, or random-access a single row.
+//! assert_eq!(col.view().decompress(), b"catdogcat");
+//! assert_eq!(col.view().decompress_row(1), b"dog");
 //! ```
 //!
-//! The trained encoder is also available directly:
-//!
-//! ```ignore
-//! use onpair::{Parser, DEFAULT_CONFIG};
-//!
-//! let parser = Parser::train(&sample_bytes, &sample_offsets, DEFAULT_CONFIG)?;
-//! let col_a = parser.parse(&corpus_a_bytes, &corpus_a_offsets)?;
-//! let col_b = parser.parse(&corpus_b_bytes, &corpus_b_offsets)?;
-//! ```
+//! The trained encoder is also available directly via [`Parser`], to reuse one
+//! dictionary across several corpora.
 
 mod column;
-mod config;
-mod decompress;
-mod dict;
-mod hash;
-mod lpm;
-mod offset;
-mod parser;
-mod trainer;
-mod types;
+mod core;
+mod decoding;
+mod encoding;
+mod search;
 
 #[cfg(test)]
 mod test_corpus;
 
-pub use column::Column;
-pub use column::Parts;
-pub use config::Bits;
-pub use config::Config;
-pub use config::DEFAULT_CONFIG;
-pub use config::Error;
-pub use config::Threshold;
-pub use decompress::InvalidParts;
-pub use decompress::decompress;
-pub use decompress::decompress_into;
-pub use decompress::decompress_into_unchecked;
-pub use decompress::decompressed_len;
-pub use dict::Dictionary;
-pub use offset::Offset;
-pub use parser::Parser;
-pub use types::MAX_TOKEN_SIZE;
+pub use crate::column::{Column, ColumnView};
+pub use crate::core::dictionary::{Dictionary, DictionaryView};
+pub use crate::core::offset::Offset;
+pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
+pub use crate::decoding::{FatTable, decode_into, decode_to_vec, decoded_len};
+pub use crate::encoding::config::{Bits, Config, DEFAULT_CONFIG, Error, Threshold};
+pub use crate::encoding::parser::Parser;
 
-/// Compress `bytes` / `offsets` end-to-end. Equivalent to
-/// `Parser::train(..)?.parse(..)`, but validates the offsets once instead of
-/// in both the train and parse steps.
+/// Compress an Arrow `(bytes, offsets)` value pair end-to-end. Equivalent to
+/// `Parser::train(..)?.parse(..)`, but validates the offsets once instead of in
+/// both the train and parse steps. `offsets` has `n + 1` entries.
+///
+/// # Errors
+/// [`Error::InvalidArg`] if `offsets` is empty or its last entry exceeds
+/// `bytes.len()`.
 pub fn compress<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<Column<O>, Error> {
-    parser::validate_offsets(bytes, offsets)?;
-    Ok(Parser::train_unchecked(bytes, offsets, cfg).parse_unchecked(bytes, offsets))
+    encoding::parser::validate_offsets(bytes, offsets)?;
+    let parser = Parser::train_unchecked(bytes, offsets, cfg);
+    Ok(parser.parse_unchecked(bytes, offsets))
 }
