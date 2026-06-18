@@ -32,34 +32,40 @@ pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
     dict.decoded_len(codes)
 }
 
-/// Decode `codes` against `dict` into `out`, returning the number of bytes
-/// written (`== decoded_len(codes, dict)`).
-///
-/// All but the final [`MAX_TOKEN_SIZE`] tokens are written with a fixed 16-byte
-/// over-store (the fast path); the tail tokens are copied at their true length,
-/// so the last byte written lands exactly at `decoded_len`. This lets `out` be
-/// sized to the exact decoded length, with no trailing slack.
+/// Decode `codes` against `dict` into `out`, returning bytes written
+/// (`== decoded_len(codes, dict)`). `out` need only be the exact decoded length.
 ///
 /// # Safety
-/// The caller must guarantee all of:
 /// - every `code` is `< dict.num_tokens()`;
 /// - `dict` upholds [`DictionaryView::token_ptr`]'s 16-byte-readable contract
-///   (for a compact view: read-padded);
+///   (a compact view must be read-padded);
 /// - `out.len() >= decoded_len(codes, dict)`.
 pub unsafe fn decode_into<V: DictionaryView>(codes: &[Token], dict: V, out: &mut [MaybeUninit<u8>]) -> usize {
     let dst = out.as_mut_ptr().cast::<u8>();
+
+    // Exact-copy tail = the trailing tokens spanning the last < MAX_TOKEN_SIZE bytes;
+    // the fast 16-byte over-store needs that much room ahead. Counting bytes, not a
+    // fixed 16 codes, keeps short strings on the fast path — better for random access.
+    let mut split = codes.len();
+    let mut tail_bytes = 0usize;
+    for &code in codes.iter().rev() {
+        // SAFETY: code in range (caller contract).
+        let len = unsafe { dict.token_len_unchecked(code) };
+        if tail_bytes + len >= MAX_TOKEN_SIZE {
+            break;
+        }
+        tail_bytes += len;
+        split -= 1;
+    }
+
     let mut w = 0usize;
-    // The fast path over-stores [`MAX_TOKEN_SIZE`] bytes per token; that stays in
-    // bounds only while at least `MAX_TOKEN_SIZE` tokens still follow, since they
-    // span >= `MAX_TOKEN_SIZE` bytes and absorb the over-store. The final
-    // <= `MAX_TOKEN_SIZE` tokens are copied at their true length instead.
-    let (fast, tail) = codes.split_at(codes.len().saturating_sub(MAX_TOKEN_SIZE));
-    for &code in fast {
+    for &code in &codes[..split] {
         // SAFETY: code in range ⇒ token_ptr/token_len_unchecked are valid and the
-        // pointer is readable for 16 bytes; >= MAX_TOKEN_SIZE tokens remain ⇒
-        // w + 16 <= decoded_len <= out.len(). `len` is read right after `ptr` so
-        // the compact path folds its shared `offsets[code]` load; the wide copy
-        // does not depend on `len`, so it is not serialized behind that load.
+        // pointer is readable for 16 bytes; the split guarantees >= 16 output
+        // bytes remain from `w`, so the over-store stays within `decoded_len <=
+        // out.len()`. `len` is read right after `ptr` so the compact path folds
+        // its shared `offsets[code]` load; the wide copy does not depend on `len`,
+        // so it is not serialized behind that load.
         unsafe {
             let src = dict.token_ptr(code);
             let len = dict.token_len_unchecked(code);
@@ -67,7 +73,7 @@ pub unsafe fn decode_into<V: DictionaryView>(codes: &[Token], dict: V, out: &mut
             w += len;
         }
     }
-    for &code in tail {
+    for &code in &codes[split..] {
         // SAFETY: code in range; the exact-length copy reads `len <= MAX_TOKEN_SIZE`
         // bytes and writes within `[w, decoded_len) ⊆ out`.
         unsafe {
