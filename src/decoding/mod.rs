@@ -4,14 +4,15 @@
 //! Token decode.
 //!
 //! Decoding is a gather-copy: each code names a dictionary token; the output is
-//! those tokens concatenated. Two kernels share the same vocabulary — both take
-//! a `&[Token]` and decode it into a caller buffer:
+//! those tokens concatenated. The kernels are generic over the dictionary
+//! representation ([`DictionaryView`]):
 //!
-//! * [`decode_into`] — direct; reads the dictionary offsets per code (two
-//!   dependent loads). No precomputation; best for random access / one-shot.
-//! * [`FatTable`] — materializes a `num_tokens × MAX_TOKEN_SIZE` byte-strided
-//!   copy of the dictionary once, after which a decode is a single
-//!   `table[code]` load. Best for bulk decode or repeated random access.
+//! * [`CompactDictionaryView`](crate::core::dictionary::CompactDictionaryView) —
+//!   a `code → offset → bytes` lookup (two dependent loads). Best for random
+//!   access / one-shot; no precomputation.
+//! * [`WideDictionaryView`](crate::core::dictionary::WideDictionaryView) —
+//!   a load-free `data + code*MAX_TOKEN_SIZE` address. Built once (via
+//!   `to_wide`), then best for bulk decode or repeated random access.
 //!
 //! To decode one row pass that row's code slice
 //! ([`ColumnView::row_codes`](crate::ColumnView::row_codes)); to bulk-decode
@@ -22,20 +23,17 @@ use std::mem::MaybeUninit;
 use crate::core::dictionary::DictionaryView;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 
-mod fat;
-mod scalar;
-
-pub use fat::FatTable;
+mod copy;
 
 /// Exact decoded byte length of `codes` against `dict` (the sum of token
 /// lengths).
 #[inline]
-pub fn decoded_len(codes: &[Token], dict: DictionaryView<'_>) -> usize {
-    codes.iter().map(|&c| dict.token_len(c)).sum()
+pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
+    dict.decoded_len(codes)
 }
 
 /// Decode `codes` against `dict` into `out`, returning the number of bytes
-/// written (`== decoded_len(codes, dict)`). Direct path; no table build.
+/// written (`== decoded_len(codes, dict)`).
 ///
 /// All but the final [`MAX_TOKEN_SIZE`] tokens are written with a fixed 16-byte
 /// over-store (the fast path); the tail tokens are copied at their true length,
@@ -45,12 +43,10 @@ pub fn decoded_len(codes: &[Token], dict: DictionaryView<'_>) -> usize {
 /// # Safety
 /// The caller must guarantee all of:
 /// - every `code` is `< dict.num_tokens()`;
-/// - `dict` is read-padded (the fast path reads [`MAX_TOKEN_SIZE`] bytes per
-///   token);
+/// - `dict` upholds [`DictionaryView::token_ptr`]'s 16-byte-readable contract
+///   (for a compact view: read-padded);
 /// - `out.len() >= decoded_len(codes, dict)`.
-pub unsafe fn decode_into(codes: &[Token], dict: DictionaryView<'_>, out: &mut [MaybeUninit<u8>]) -> usize {
-    let bytes = dict.bytes.as_ptr();
-    let offsets = dict.offsets.as_ptr();
+pub unsafe fn decode_into<V: DictionaryView>(codes: &[Token], dict: V, out: &mut [MaybeUninit<u8>]) -> usize {
     let dst = out.as_mut_ptr().cast::<u8>();
     let mut w = 0usize;
     // The fast path over-stores [`MAX_TOKEN_SIZE`] bytes per token; that stays in
@@ -59,41 +55,39 @@ pub unsafe fn decode_into(codes: &[Token], dict: DictionaryView<'_>, out: &mut [
     // <= `MAX_TOKEN_SIZE` tokens are copied at their true length instead.
     let (fast, tail) = codes.split_at(codes.len().saturating_sub(MAX_TOKEN_SIZE));
     for &code in fast {
-        let c = code as usize;
-        // SAFETY: c < num_tokens ⇒ offsets[c] and offsets[c + 1] are in bounds
-        // and the token starts within `bytes`; read-padding ⇒ 16 readable bytes
-        // there; >= MAX_TOKEN_SIZE tokens remain ⇒ w + 16 <= decoded_len <= out.len().
+        // SAFETY: code in range ⇒ token_ptr/token_len_unchecked are valid and the
+        // pointer is readable for 16 bytes; >= MAX_TOKEN_SIZE tokens remain ⇒
+        // w + 16 <= decoded_len <= out.len(). `len` is read right after `ptr` so
+        // the compact path folds its shared `offsets[code]` load; the wide copy
+        // does not depend on `len`, so it is not serialized behind that load.
         unsafe {
-            let off = *offsets.add(c) as usize;
-            let len = (*offsets.add(c + 1) as usize) - off;
-            scalar::copy16(bytes.add(off), dst.add(w));
+            let src = dict.token_ptr(code);
+            let len = dict.token_len_unchecked(code);
+            copy::copy16(src, dst.add(w));
             w += len;
         }
     }
     for &code in tail {
-        let c = code as usize;
-        // SAFETY: c < num_tokens ⇒ offsets[c] and offsets[c + 1] are in bounds;
-        // the exact-length copy reads `len <= MAX_TOKEN_SIZE` bytes (no read-padding
-        // needed) and writes within `[w, decoded_len) ⊆ out`.
+        // SAFETY: code in range; the exact-length copy reads `len <= MAX_TOKEN_SIZE`
+        // bytes and writes within `[w, decoded_len) ⊆ out`.
         unsafe {
-            let off = *offsets.add(c) as usize;
-            let len = (*offsets.add(c + 1) as usize) - off;
-            scalar::copy_token_bytes(bytes.add(off), dst.add(w), len);
+            let src = dict.token_ptr(code);
+            let len = dict.token_len_unchecked(code);
+            copy::copy_token_bytes(src, dst.add(w), len);
             w += len;
         }
     }
     w
 }
 
-/// Decode `codes` against `dict` into a freshly allocated `Vec` (direct path),
-/// sized exactly.
+/// Decode `codes` against `dict` into a freshly allocated `Vec`, sized exactly.
 ///
 /// Safe convenience: it assumes `dict` and `codes` uphold their invariants
 /// (true for any [`ColumnView`](crate::ColumnView) obtained from a
 /// [`Column`](crate::Column)). Feeding it a hand-built, malformed dictionary or
 /// out-of-range code is undefined behavior.
-pub fn decode_to_vec(codes: &[Token], dict: DictionaryView<'_>) -> Vec<u8> {
-    let n = decoded_len(codes, dict);
+pub fn decode_to_vec<V: DictionaryView>(codes: &[Token], dict: V) -> Vec<u8> {
+    let n = dict.decoded_len(codes);
     let mut out = Vec::with_capacity(n);
     // SAFETY: buffer sized to the exact decoded length; trust assumption as above.
     let w = unsafe { decode_into(codes, dict, out.spare_capacity_mut()) };
@@ -105,8 +99,9 @@ pub fn decode_to_vec(codes: &[Token], dict: DictionaryView<'_>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::dictionary::{CompactDictionaryView, Dictionary};
 
-    /// Build a read-padded dictionary `(bytes, offsets)` from tokens.
+    /// Build read-padded compact `(bytes, offsets)` from tokens.
     fn padded(tokens: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
         let mut bytes = Vec::new();
         let mut offsets = vec![0u32];
@@ -122,26 +117,19 @@ mod tests {
         codes.iter().flat_map(|&c| tokens[c as usize].iter().copied()).collect()
     }
 
-    /// Decode through both kernels and compare. Cheap enough to run under Miri,
-    /// which then proves the `unsafe` over-copy has no UB.
+    /// Decode through both representations and compare. Cheap enough to run under
+    /// Miri, which then proves the `unsafe` over-copy has no UB.
     fn check(tokens: &[&[u8]], codes: &[Token]) {
         let (bytes, offsets) = padded(tokens);
-        let dict = DictionaryView { bytes: &bytes, offsets: &offsets };
+        let view = CompactDictionaryView { bytes: &bytes, offsets: &offsets };
         let want = expected(tokens, codes);
 
-        assert_eq!(decoded_len(codes, dict), want.len());
-        assert_eq!(decode_to_vec(codes, dict), want, "direct kernel");
+        assert_eq!(decoded_len(codes, view), want.len());
+        assert_eq!(decode_to_vec(codes, view), want, "compact");
 
-        // SAFETY: padded dict, in-range codes.
-        let table = unsafe { FatTable::build(dict) };
-        let mut out = Vec::<u8>::with_capacity(want.len());
-        // SAFETY: buffer sized to the exact decoded length; codes in range.
-        let w = unsafe { table.decode_into(codes, out.spare_capacity_mut()) };
-        unsafe { out.set_len(w) };
-        assert_eq!(out, want, "fat table");
-
-        assert_eq!(table.decoded_len(codes), want.len());
-        assert_eq!(table.decode_to_vec(codes), want, "fat table to_vec");
+        let wide = view.to_wide();
+        assert_eq!(decoded_len(codes, wide.as_view()), want.len());
+        assert_eq!(decode_to_vec(codes, wide.as_view()), want, "wide");
     }
 
     #[test]

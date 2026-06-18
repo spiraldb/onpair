@@ -7,18 +7,18 @@
 //! The code stream is plain [`Token`] data — there is no separate wrapper type.
 //! A bulk-only consumer ignores `row_offsets`; the decode kernels never read it.
 
-use crate::core::dictionary::{Dictionary, DictionaryView};
+use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, Dictionary, WideDictionary};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-use crate::decoding::{self, FatTable};
+use crate::decoding;
 
 /// Owned compressed column, produced by [`Column::compress`] /
 /// [`Parser::parse`](crate::Parser::parse). Self-contained: it carries its own
 /// dictionary, so it decodes without reference to the training corpus.
 #[derive(Debug, Clone)]
 pub struct Column<O: Offset> {
-    /// Decode-side dictionary, read-padded.
-    pub dict: Dictionary,
+    /// Token dictionary, read-padded.
+    pub dict: CompactDictionary,
     /// Code stream: one [`Token`] per emitted token, in row-concatenated order.
     /// Every code is `< dict.num_tokens()`.
     pub codes: Vec<Token>,
@@ -67,8 +67,8 @@ impl<O: Offset> Column<O> {
 /// or built directly from buffers deserialized from storage.
 #[derive(Copy, Clone, Debug)]
 pub struct ColumnView<'a, O: Offset> {
-    /// The decode-side dictionary.
-    pub dict: DictionaryView<'a>,
+    /// The token dictionary.
+    pub dict: CompactDictionaryView<'a>,
     /// The code stream (see [`Column::codes`]).
     pub codes: &'a [Token],
     /// The row layer (see [`Column::row_offsets`]).
@@ -96,23 +96,23 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         decoding::decoded_len(self.codes, self.dict)
     }
 
-    /// Build a reusable [`FatTable`] for this column's dictionary. Amortize it
-    /// across many [`FatTable::decode_into`] calls when doing repeated random
-    /// access; for a single bulk decode prefer [`Self::decompress`].
+    /// Build a reusable [`WideDictionary`] for this column's dictionary. Amortize
+    /// it across many decodes (`decode_into`/`decode_to_vec` over its view) when
+    /// doing repeated random access; for a single bulk decode prefer
+    /// [`Self::decompress`].
     #[inline]
-    pub fn fat_table(&self) -> FatTable {
-        // SAFETY: a column's dictionary upholds the read-padding invariant.
-        unsafe { FatTable::build(self.dict) }
+    pub fn wide_dict(&self) -> WideDictionary {
+        self.dict.to_wide()
     }
 
-    /// Decode the whole column into a fresh `Vec` (bulk path, via a fat table).
+    /// Decode the whole column into a fresh `Vec` (bulk path, via the wide form).
     pub fn decompress(&self) -> Vec<u8> {
-        // A column upholds the table's invariants: every code is in range.
-        self.fat_table().decode_to_vec(self.codes)
+        // A column upholds the invariants: every code is in range.
+        decoding::decode_to_vec(self.codes, self.wide_dict().as_view())
     }
 
-    /// Decode row `k` into a fresh `Vec` (random-access path, direct kernel — no
-    /// table build). Precondition: `k < num_rows()`.
+    /// Decode row `k` into a fresh `Vec` (random-access path, compact dictionary —
+    /// no wide-table build). Precondition: `k < num_rows()`.
     pub fn decompress_row(&self, k: usize) -> Vec<u8> {
         decoding::decode_to_vec(self.row_codes(k), self.dict)
     }

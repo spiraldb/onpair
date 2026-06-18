@@ -24,11 +24,11 @@
 //! isolation at no extra cost.
 //!
 //! # Layout
-//! A compressed [`Column`] is a [`Dictionary`] (token bytes + offsets), a code
-//! stream (one [`Token`] per emitted token), and a row layer (offsets into the
-//! code stream). Borrow it as a [`ColumnView`] — or build a view directly from
-//! buffers deserialized from storage — and decode with the [`decode_into`]
-//! kernel or a reusable [`FatTable`].
+//! A compressed [`Column`] is a [`CompactDictionary`] (token bytes + offsets), a
+//! code stream (one [`Token`] per emitted token), and a row layer (offsets into
+//! the code stream). Borrow it as a [`ColumnView`] — or build a view directly
+//! from buffers deserialized from storage — and decode with [`decode_into`] over
+//! the compact dictionary or a reusable [`WideDictionary`].
 //!
 //! # Examples
 //! ```
@@ -57,10 +57,13 @@ mod search;
 mod test_corpus;
 
 pub use crate::column::{Column, ColumnView};
-pub use crate::core::dictionary::{Dictionary, DictionaryView};
+pub use crate::core::dictionary::{
+    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, WideDictionary,
+    WideDictionaryView,
+};
 pub use crate::core::offset::Offset;
 pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
-pub use crate::decoding::{FatTable, decode_into, decode_to_vec, decoded_len};
+pub use crate::decoding::{decode_into, decode_to_vec, decoded_len};
 pub use crate::encoding::config::{Bits, Config, DEFAULT_CONFIG, Error, Threshold};
 pub use crate::encoding::parser::Parser;
 

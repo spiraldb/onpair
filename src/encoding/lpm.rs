@@ -18,7 +18,7 @@
 //! single hash probe on the 8-byte prefix to reach the long bucket, then falls
 //! through to the short map probing lengths `min(max_len, 8)..1`.
 
-use crate::core::dictionary::DictionaryView;
+use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::encoding::hash::{Map, map, map_with_capacity};
 
@@ -182,7 +182,7 @@ impl LongestPrefixMatcher {
     /// Build a matcher from a complete dictionary: token at index `i` receives
     /// id `i`. The caller guarantees the dictionary contains every single-byte
     /// token so [`find_longest_match`](Self::find_longest_match) stays total.
-    pub(crate) fn from_dictionary(dict: DictionaryView<'_>) -> Self {
+    pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
         let n = dict.num_tokens();
         let mut me = Self {
             short_map: map_with_capacity(n.min(BUCKET_PREFIX_LEN * 256)),
@@ -291,7 +291,7 @@ impl LongestPrefixMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::dictionary::Dictionary;
+    use crate::core::dictionary::{CompactDictionary, Dictionary};
 
     fn insert_str(lpm: &mut LongestPrefixMatcher, s: &str) -> Token {
         lpm.insert(s.as_bytes())
@@ -301,8 +301,8 @@ mod tests {
         lpm.find_longest_match(s.as_bytes())
     }
 
-    fn make_test_dictionary(extra: &[&str]) -> Dictionary {
-        let mut d = Dictionary::default();
+    fn make_test_dictionary(extra: &[&str]) -> CompactDictionary {
+        let mut d = CompactDictionary::default();
         d.offsets.push(0);
         for i in 0u16..=255 {
             d.bytes.push(i as u8);

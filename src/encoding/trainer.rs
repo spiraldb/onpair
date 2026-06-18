@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Dictionary training: discover merge tokens by a frequency-threshold scan,
+//! CompactDictionary training: discover merge tokens by a frequency-threshold scan,
 //! then sort the dictionary lexicographically.
 //!
 //! The first 256 tokens are always the single-byte values `0x00..=0xFF`
 //! (completeness); subsequent tokens are pair merges discovered during the
 //! scan. The result is sorted by token byte sequence with ids reassigned to
-//! match — see the [dictionary invariants](crate::Dictionary).
+//! match — see the [dictionary invariants](crate::CompactDictionary).
 
 use hashbrown::HashMap;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
-use crate::core::dictionary::Dictionary;
+use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView};
 use crate::core::offset::Offset;
 use crate::core::types::{MAX_TOKEN_SIZE, Token, max_dict_size};
 use crate::encoding::config::{ThresholdSpec, TrainingConfig};
@@ -25,7 +25,7 @@ use crate::encoding::lpm::LongestPrefixMatcher;
 /// yet read-padded — the parser pads it when it builds a column.
 #[derive(Debug, Clone)]
 pub(crate) struct TrainResult {
-    pub(crate) dict: Dictionary,
+    pub(crate) dict: CompactDictionary,
     pub(crate) lpm: LongestPrefixMatcher,
 }
 
@@ -123,7 +123,7 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
     let n = offsets.len() - 1;
     let dict_capacity = max_dict_size(cfg.bits);
 
-    let mut dict = Dictionary {
+    let mut dict = CompactDictionary {
         bytes: Vec::with_capacity(dict_capacity * MAX_TOKEN_SIZE),
         offsets: Vec::with_capacity(dict_capacity + 1),
     };
@@ -252,19 +252,20 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
 /// Sort the dictionary's tokens into ascending bytewise-lexicographic order,
 /// reassigning ids, and rebuild the matcher to match.
 fn sort_dictionary(result: &mut TrainResult) {
-    let n = result.dict.num_tokens();
+    let view = result.dict.as_view();
+    let n = view.num_tokens();
 
     let mut perm: Vec<Token> = (0..n).map(|i| i as Token).collect();
-    perm.sort_by(|&a, &b| result.dict.token(a).cmp(result.dict.token(b)));
+    perm.sort_by(|&a, &b| view.token(a).cmp(view.token(b)));
 
-    let mut sorted = Dictionary {
-        bytes: Vec::with_capacity(result.dict.bytes.len()),
+    let mut sorted = CompactDictionary {
+        bytes: Vec::with_capacity(view.bytes.len()),
         offsets: Vec::with_capacity(n + 1),
     };
     sorted.offsets.push(0);
 
     for &old_id in &perm {
-        sorted.bytes.extend_from_slice(result.dict.token(old_id));
+        sorted.bytes.extend_from_slice(view.token(old_id));
         sorted.offsets.push(sorted.bytes.len() as u32);
     }
 
@@ -279,6 +280,7 @@ fn sort_dictionary(result: &mut TrainResult) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::core::dictionary::CompactDictionaryView;
     use crate::encoding::config::{DynamicThreshold, FixedThreshold};
     use crate::test_corpus::{
         alternating_strings as make_alternating_strings, binary_strings as make_binary_strings,
@@ -293,7 +295,7 @@ pub(crate) mod tests {
         train(&raw.data, &raw.offsets, cfg)
     }
 
-    fn check_base_tokens(d: &Dictionary) {
+    fn check_base_tokens(d: CompactDictionaryView<'_>) {
         assert!(d.num_tokens() >= 256);
         let mut found = [false; 256];
         for i in 0..d.num_tokens() {
@@ -307,27 +309,27 @@ pub(crate) mod tests {
         }
     }
 
-    fn is_lex_sorted(d: &Dictionary) -> bool {
+    fn is_lex_sorted(d: CompactDictionaryView<'_>) -> bool {
         (1..d.num_tokens()).all(|i| d.token((i - 1) as Token) <= d.token(i as Token))
     }
 
     #[test]
     fn base_tokens_always_single_bytes() {
         let result = train_strings(&make_user_strings(50), &TrainingConfig::default());
-        check_base_tokens(&result.dict);
+        check_base_tokens(result.dict.as_view());
     }
 
     #[test]
     fn base_tokens_on_empty_input() {
         let result = train(&[], &[0u32], &TrainingConfig::default());
-        check_base_tokens(&result.dict);
+        check_base_tokens(result.dict.as_view());
         assert_eq!(result.dict.num_tokens(), 256);
     }
 
     #[test]
     fn base_tokens_on_single_empty_string() {
         let result = train(&[], &[0u32, 0], &TrainingConfig::default());
-        check_base_tokens(&result.dict);
+        check_base_tokens(result.dict.as_view());
         assert_eq!(result.dict.num_tokens(), 256);
     }
 
@@ -370,7 +372,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let result = train_strings(&corpus, &cfg);
-        let found = (0..result.dict.num_tokens()).any(|i| result.dict.token(i as Token) == b"ab");
+        let view = result.dict.as_view();
+        let found = (0..view.num_tokens()).any(|i| view.token(i as Token) == b"ab");
         assert!(found, "merged token \"ab\" not found in dictionary");
     }
 
@@ -387,15 +390,16 @@ pub(crate) mod tests {
     #[test]
     fn dictionary_is_always_sorted() {
         let result = train_strings(&make_user_strings(100), &TrainingConfig::default());
-        assert!(is_lex_sorted(&result.dict));
+        assert!(is_lex_sorted(result.dict.as_view()));
     }
 
     #[test]
     fn lpm_remaps_correctly() {
         let result = train_strings(&make_user_strings(30), &TrainingConfig::default());
-        let n = result.dict.num_tokens();
+        let view = result.dict.as_view();
+        let n = view.num_tokens();
         for id in 0..n {
-            let bytes = result.dict.token(id as Token);
+            let bytes = view.token(id as Token);
             let (tok, len) = result.lpm.find_longest_match(bytes);
             assert_eq!(tok, id as Token, "id mismatch for token {id}");
             assert_eq!(len, bytes.len(), "length mismatch for token {id}");
@@ -405,8 +409,9 @@ pub(crate) mod tests {
     #[test]
     fn no_token_exceeds_max_token_size() {
         let result = train_strings(&make_random_strings(100, 50, 99), &TrainingConfig::default());
-        for i in 0..result.dict.num_tokens() {
-            assert!(result.dict.token(i as Token).len() <= MAX_TOKEN_SIZE, "token {i} too large");
+        let view = result.dict.as_view();
+        for i in 0..view.num_tokens() {
+            assert!(view.token(i as Token).len() <= MAX_TOKEN_SIZE, "token {i} too large");
         }
     }
 
@@ -425,8 +430,9 @@ pub(crate) mod tests {
         ];
         for (name, c) in &corpora {
             let result = train_strings(c, &cfg);
-            for i in 0..result.dict.num_tokens() {
-                assert!(!result.dict.token(i as Token).is_empty(), "corpus={name} token {i} empty");
+            let view = result.dict.as_view();
+            for i in 0..view.num_tokens() {
+                assert!(!view.token(i as Token).is_empty(), "corpus={name} token {i} empty");
             }
         }
     }
@@ -459,16 +465,17 @@ pub(crate) mod tests {
             seed: Some(42),
             ..Default::default()
         };
-        assert!(is_lex_sorted(&train_strings(&make_user_strings(100), &cfg).dict));
+        assert!(is_lex_sorted(train_strings(&make_user_strings(100), &cfg).dict.as_view()));
     }
 
     #[test]
     fn no_duplicate_tokens_in_dictionary() {
         let result = train_strings(&make_user_strings(100), &TrainingConfig::default());
-        let n = result.dict.num_tokens();
+        let view = result.dict.as_view();
+        let n = view.num_tokens();
         for i in 1..n {
             assert!(
-                result.dict.token((i - 1) as Token) != result.dict.token(i as Token),
+                view.token((i - 1) as Token) != view.token(i as Token),
                 "duplicate token at {} and {}",
                 i - 1,
                 i
@@ -485,7 +492,7 @@ pub(crate) mod tests {
         };
         let result = train_strings(&make_homogeneous_strings(50, 16, b'a'), &cfg);
         assert!(result.dict.num_tokens() > 256);
-        check_base_tokens(&result.dict);
+        check_base_tokens(result.dict.as_view());
     }
 
     #[test]
@@ -497,7 +504,7 @@ pub(crate) mod tests {
         };
         let result = train_strings(&make_alternating_strings(50, 16), &cfg);
         assert!(result.dict.num_tokens() > 256);
-        check_base_tokens(&result.dict);
+        check_base_tokens(result.dict.as_view());
     }
 
     #[test]
@@ -508,8 +515,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let result = train_strings(&make_mixed_length_strings(200, 64, 7), &cfg);
-        check_base_tokens(&result.dict);
-        assert!(is_lex_sorted(&result.dict));
+        check_base_tokens(result.dict.as_view());
+        assert!(is_lex_sorted(result.dict.as_view()));
         assert!(result.dict.num_tokens() <= max_dict_size(cfg.bits));
     }
 
@@ -519,8 +526,8 @@ pub(crate) mod tests {
         for b in 9u8..=16 {
             let cfg = TrainingConfig { bits: b, seed: Some(42), ..Default::default() };
             let result = train_strings(&corpus, &cfg);
-            check_base_tokens(&result.dict);
-            assert!(is_lex_sorted(&result.dict), "not sorted for bits={b}");
+            check_base_tokens(result.dict.as_view());
+            assert!(is_lex_sorted(result.dict.as_view()), "not sorted for bits={b}");
             assert!(result.dict.num_tokens() <= max_dict_size(b), "overflow for bits={b}");
         }
     }

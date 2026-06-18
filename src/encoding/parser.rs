@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The trained encoder: pairs a [`Dictionary`] with a [`LongestPrefixMatcher`]
+//! The trained encoder: pairs a [`CompactDictionary`] with a [`LongestPrefixMatcher`]
 //! that drives encoding. Build with [`Parser::train`]; encode with
 //! [`Parser::parse`].
 
 use crate::column::Column;
-use crate::core::dictionary::Dictionary;
+use crate::core::dictionary::CompactDictionary;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::encoding::config::{Config, Error, TrainingConfig};
 use crate::encoding::lpm::LongestPrefixMatcher;
 use crate::encoding::trainer::{TrainResult, train};
 
-/// A trained encoder. Holds the decode-side [`Dictionary`] (cloned into each
-/// [`Column`] so columns are self-contained) and a crate-private longest-prefix
-/// matcher.
+/// A trained encoder. Holds the [`CompactDictionary`] (cloned into each
+/// [`Column`] so columns are self-contained) and a crate-private, encode-side
+/// longest-prefix matcher built from it.
 #[derive(Debug, Clone)]
 pub struct Parser {
     /// The trained dictionary: sorted and read-padded.
-    pub dict: Dictionary,
+    pub dict: CompactDictionary,
     pub(crate) lpm: LongestPrefixMatcher,
 }
 
@@ -110,7 +110,7 @@ pub(crate) fn validate_offsets<O: Offset>(bytes: &[u8], offsets: &[O]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::dictionary::Dictionary;
+    use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView};
     use crate::core::types::BitWidth;
     use crate::encoding::config::{FixedThreshold, ThresholdSpec, TrainingConfig};
     use crate::encoding::trainer::train;
@@ -121,8 +121,8 @@ mod tests {
         random_ascii_strings as make_random_strings, user_strings as make_user_strings,
     };
 
-    fn make_base_dict() -> Dictionary {
-        let mut d = Dictionary::default();
+    fn make_base_dict() -> CompactDictionary {
+        let mut d = CompactDictionary::default();
         d.offsets.push(0);
         for i in 0u16..=255 {
             d.bytes.push(i as u8);
@@ -132,7 +132,7 @@ mod tests {
     }
 
     /// Decode the whole flat code stream against `dict`.
-    fn decode_all(codes: &[Token], dict: &Dictionary) -> Vec<u8> {
+    fn decode_all(codes: &[Token], dict: CompactDictionaryView<'_>) -> Vec<u8> {
         let mut out = Vec::new();
         for &c in codes {
             out.extend_from_slice(dict.token(c));
@@ -141,7 +141,7 @@ mod tests {
     }
 
     /// Decode the codes for row `idx` against `dict`.
-    fn decode_row(codes: &[Token], row_offsets: &[u32], dict: &Dictionary, idx: usize) -> Vec<u8> {
+    fn decode_row(codes: &[Token], row_offsets: &[u32], dict: CompactDictionaryView<'_>, idx: usize) -> Vec<u8> {
         let begin = row_offsets[idx] as usize;
         let end = row_offsets[idx + 1] as usize;
         let mut out = Vec::new();
@@ -163,7 +163,7 @@ mod tests {
         };
         let TrainResult { dict, lpm } = train(&raw.data, &raw.offsets, &cfg);
         let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        decode_all(&codes, &dict) == raw.data
+        decode_all(&codes, dict.as_view()) == raw.data
     }
 
     const WIDTHS: &[BitWidth] = &[9, 10, 11, 12, 13, 14, 15, 16];
@@ -199,7 +199,7 @@ mod tests {
             assert!(w[1] >= w[0], "row_offsets must be monotonic");
         }
         for (i, s) in strings.iter().enumerate() {
-            assert_eq!(decode_row(&codes, &row_offsets, &d, i), *s);
+            assert_eq!(decode_row(&codes, &row_offsets, d.as_view(), i), *s);
         }
     }
 
@@ -209,7 +209,7 @@ mod tests {
         let d = make_base_dict();
         let raw = make_raw(&["Hello, World!"]);
         let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        assert_eq!(decode_all(&codes, &d), b"Hello, World!");
+        assert_eq!(decode_all(&codes, d.as_view()), b"Hello, World!");
     }
 
     #[test]

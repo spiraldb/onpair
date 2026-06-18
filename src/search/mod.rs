@@ -8,7 +8,7 @@
 //! types already satisfy the contract such operations need:
 //!
 //! * The dictionary is **sorted, complete, and unique**
-//!   ([`Dictionary`](crate::Dictionary) invariants): sortedness enables binary
+//!   ([`CompactDictionary`](crate::CompactDictionary) invariants): sortedness enables binary
 //!   search and prefix-range lookup; completeness makes any query string
 //!   encodable into codes; uniqueness makes distinct code sequences denote
 //!   distinct strings (required for compressed-domain equality).
@@ -17,4 +17,4 @@
 //!   [`ColumnView::row_codes`](crate::ColumnView::row_codes).
 //!
 //! When search lands, `ColumnView` grows `contains` / `starts_with` / `equals`
-//! and `DictionaryView` grows `prefix_range`, all on top of these guarantees.
+//! and `CompactDictionaryView` grows `prefix_range`, all on top of these guarantees.
