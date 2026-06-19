@@ -13,6 +13,20 @@
 //! recover the compact form with [`WideDictionaryView::to_compact`]. Both
 //! representations implement [`DictionaryView`] (via their views), so the decode
 //! kernels treat them uniformly.
+//!
+//! # Invariants
+//! Upheld by [`CompactDictionaryView::to_wide`] and by any consumer that
+//! constructs one from deserialized buffers; a precondition of every accessor and
+//! of decoding. The logical invariants match the compact form's — only the
+//! physical sizing clause differs (and the wide form needs no read-padding).
+//! - `lens.len() == num_tokens` and `data.len() == num_tokens * MAX_TOKEN_SIZE`.
+//! - **Bounded lengths** — every `lens[id]` is in `1..=MAX_TOKEN_SIZE`, so every
+//!   token is non-empty; row `id`'s first `lens[id]` bytes are token `id`, and the
+//!   rest of the row is unused.
+//! - **Sorted** — tokens are in strictly ascending bytewise-lexicographic order.
+//! - **Complete** — all 256 single-byte tokens are present, so any byte string
+//!   is encodable.
+//! - **Unique** — no two tokens are equal.
 
 use super::{CompactDictionary, Dictionary, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
@@ -20,16 +34,13 @@ use crate::core::types::{MAX_TOKEN_SIZE, Token};
 /// Owned wide dictionary: `num_tokens` rows of [`MAX_TOKEN_SIZE`] bytes plus
 /// per-token lengths.
 ///
-/// Fields are public (like [`CompactDictionary`]) so a consumer can construct one
-/// from buffers deserialized from storage. Invariants, a precondition of
-/// decoding: `data.len() == num_tokens * MAX_TOKEN_SIZE`, `lens.len() == num_tokens`,
-/// each `lens[id]` in `1..=MAX_TOKEN_SIZE`, and row `id`'s first `lens[id]` bytes
-/// are token `id`.
+/// Fields are public (like [`CompactDictionary`]) — a consumer may construct one
+/// directly from buffers it deserialized from storage — and must satisfy the
+/// invariants described in this module's documentation.
 #[derive(Default, Debug, Clone)]
 pub struct WideDictionary {
-    /// `num_tokens * MAX_TOKEN_SIZE` bytes. The widest decode access is the
-    /// 16-byte over-store of the last row, which ends exactly at the buffer end
-    /// (load width == row stride) — no trailing padding needed.
+    /// `num_tokens * MAX_TOKEN_SIZE` row-major token bytes; row `id` holds token
+    /// `id`, zero-padded to the row width.
     pub data: Vec<u8>,
     /// `num_tokens` true token lengths.
     pub lens: Vec<u8>,
@@ -60,6 +71,10 @@ impl Dictionary for WideDictionary {
 }
 
 /// Borrowed, `Copy` view over a wide dictionary's buffers.
+///
+/// Borrows the raw slices rather than an owned [`WideDictionary`], so a consumer
+/// can build a view directly from buffers deserialized from storage. The slices
+/// must satisfy the same invariants (see this module's documentation).
 #[derive(Copy, Clone, Debug)]
 pub struct WideDictionaryView<'a> {
     /// `num_tokens * MAX_TOKEN_SIZE` row-major token bytes.
