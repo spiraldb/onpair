@@ -85,7 +85,10 @@ impl Dictionary for CompactDictionary {
     type View<'a> = CompactDictionaryView<'a>;
     #[inline]
     fn as_view(&self) -> CompactDictionaryView<'_> {
-        CompactDictionaryView { bytes: &self.bytes, offsets: &self.offsets }
+        CompactDictionaryView {
+            bytes: &self.bytes,
+            offsets: &self.offsets,
+        }
     }
 }
 
@@ -103,12 +106,6 @@ pub struct CompactDictionaryView<'a> {
 }
 
 impl<'a> CompactDictionaryView<'a> {
-    /// Number of tokens.
-    #[inline]
-    pub fn num_tokens(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
-    }
-
     /// Minimum bits per code needed to address this dictionary,
     /// `ceil(log2(num_tokens))`. See [`CompactDictionary::code_bits`].
     #[inline]
@@ -142,6 +139,11 @@ impl<'a> CompactDictionaryView<'a> {
 
 impl DictionaryView for CompactDictionaryView<'_> {
     #[inline]
+    fn num_tokens(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    #[inline]
     fn token(&self, id: Token) -> &[u8] {
         let begin = self.offsets[id as usize] as usize;
         let end = self.offsets[id as usize + 1] as usize;
@@ -154,25 +156,33 @@ impl DictionaryView for CompactDictionaryView<'_> {
     }
 
     #[inline]
-    fn decoded_len(&self, codes: &[Token]) -> usize {
-        codes
-            .iter()
-            .map(|&id| (self.offsets[id as usize + 1] - self.offsets[id as usize]) as usize)
-            .sum()
-    }
-
-    #[inline]
     unsafe fn token_ptr(&self, id: Token) -> *const u8 {
         // SAFETY: id < num_tokens ⇒ offsets[id] is in bounds; the read-padding
         // invariant guarantees MAX_TOKEN_SIZE readable bytes at the offset.
-        unsafe { self.bytes.as_ptr().add(*self.offsets.get_unchecked(id as usize) as usize) }
+        unsafe {
+            self.bytes
+                .as_ptr()
+                .add(*self.offsets.get_unchecked(id as usize) as usize)
+        }
     }
 
     #[inline]
     unsafe fn token_len_unchecked(&self, id: Token) -> usize {
         // SAFETY: id < num_tokens ⇒ offsets[id] and offsets[id + 1] are in bounds.
         unsafe {
-            (*self.offsets.get_unchecked(id as usize + 1) - *self.offsets.get_unchecked(id as usize)) as usize
+            (*self.offsets.get_unchecked(id as usize + 1)
+                - *self.offsets.get_unchecked(id as usize)) as usize
+        }
+    }
+
+    #[inline]
+    unsafe fn byte_unchecked(&self, id: Token, k: usize) -> u8 {
+        // SAFETY: id < num_tokens ⇒ offsets[id] is in bounds; k < token_len(id) ⇒
+        // offsets[id] + k < offsets[id + 1] <= bytes.len(), so the byte is token id's.
+        unsafe {
+            *self
+                .bytes
+                .get_unchecked(*self.offsets.get_unchecked(id as usize) as usize + k)
         }
     }
 }
@@ -189,7 +199,10 @@ mod tests {
     use super::*;
 
     fn dict(offsets: Vec<u32>, bytes: &[u8]) -> CompactDictionary {
-        CompactDictionary { bytes: bytes.to_vec(), offsets }
+        CompactDictionary {
+            bytes: bytes.to_vec(),
+            offsets,
+        }
     }
 
     /// A read-padded compact dictionary built from tokens.
@@ -275,7 +288,10 @@ mod tests {
         assert_eq!(wide.num_tokens(), tokens.len());
         for (id, tok) in tokens.iter().enumerate() {
             assert_eq!(wide.lens[id] as usize, tok.len());
-            assert_eq!(&wide.data[id * MAX_TOKEN_SIZE..id * MAX_TOKEN_SIZE + tok.len()], *tok);
+            assert_eq!(
+                &wide.data[id * MAX_TOKEN_SIZE..id * MAX_TOKEN_SIZE + tok.len()],
+                *tok
+            );
         }
     }
 
@@ -285,6 +301,9 @@ mod tests {
         let d = padded(tokens);
         let back = d.to_wide().to_compact();
         assert_eq!(back.offsets, d.offsets);
-        assert_eq!(&back.bytes[..back.logical_len()], &d.bytes[..d.logical_len()]);
+        assert_eq!(
+            &back.bytes[..back.logical_len()],
+            &d.bytes[..d.logical_len()]
+        );
     }
 }

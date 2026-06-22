@@ -27,7 +27,8 @@ pub(crate) unsafe fn copy16(src: *const u8, dst: *mut u8) {
     // SAFETY: caller guarantees 16 readable/writable bytes. A 16-byte value copy
     // lowers to a single 128-bit `movups` (x86) / `str q` (AArch64).
     unsafe {
-        dst.cast::<[u8; 16]>().write_unaligned(src.cast::<[u8; 16]>().read_unaligned());
+        dst.cast::<[u8; 16]>()
+            .write_unaligned(src.cast::<[u8; 16]>().read_unaligned());
     }
 }
 
@@ -38,8 +39,7 @@ pub(crate) unsafe fn copy16(src: *const u8, dst: *mut u8) {
 /// never outside `[dst, dst + len)`, so no source or destination padding is
 /// required.
 ///
-/// ## Safety
-///
+/// # Safety
 /// `src` and `dst` must be valid for `len` bytes.
 #[inline(always)]
 pub(crate) unsafe fn copy_token_bytes(src: *const u8, dst: *mut u8, len: usize) {

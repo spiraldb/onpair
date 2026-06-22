@@ -29,7 +29,7 @@ mod copy;
 /// lengths).
 #[inline]
 pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
-    dict.decoded_len(codes)
+    codes.iter().map(|&c| dict.token_len(c)).sum()
 }
 
 /// Decode `codes` against `dict` into `out`, returning bytes written
@@ -40,7 +40,11 @@ pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
 /// - `dict` upholds [`DictionaryView::token_ptr`]'s 16-byte-readable contract
 ///   (a compact view must be read-padded);
 /// - `out.len() >= decoded_len(codes, dict)`.
-pub unsafe fn decode_into<V: DictionaryView>(codes: &[Token], dict: V, out: &mut [MaybeUninit<u8>]) -> usize {
+pub unsafe fn decode_into<V: DictionaryView>(
+    codes: &[Token],
+    dict: V,
+    out: &mut [MaybeUninit<u8>],
+) -> usize {
     let dst = out.as_mut_ptr().cast::<u8>();
 
     // Exact-copy tail = the trailing tokens spanning the last < MAX_TOKEN_SIZE bytes;
@@ -93,7 +97,7 @@ pub unsafe fn decode_into<V: DictionaryView>(codes: &[Token], dict: V, out: &mut
 /// [`Column`](crate::Column)). Feeding it a hand-built, malformed dictionary or
 /// out-of-range code is undefined behavior.
 pub fn decode_to_vec<V: DictionaryView>(codes: &[Token], dict: V) -> Vec<u8> {
-    let n = dict.decoded_len(codes);
+    let n = decoded_len(codes, dict);
     let mut out = Vec::with_capacity(n);
     // SAFETY: buffer sized to the exact decoded length; trust assumption as above.
     let w = unsafe { decode_into(codes, dict, out.spare_capacity_mut()) };
@@ -120,14 +124,20 @@ mod tests {
     }
 
     fn expected(tokens: &[&[u8]], codes: &[Token]) -> Vec<u8> {
-        codes.iter().flat_map(|&c| tokens[c as usize].iter().copied()).collect()
+        codes
+            .iter()
+            .flat_map(|&c| tokens[c as usize].iter().copied())
+            .collect()
     }
 
     /// Decode through both representations and compare. Cheap enough to run under
     /// Miri, which then proves the `unsafe` over-copy has no UB.
     fn check(tokens: &[&[u8]], codes: &[Token]) {
         let (bytes, offsets) = padded(tokens);
-        let view = CompactDictionaryView { bytes: &bytes, offsets: &offsets };
+        let view = CompactDictionaryView {
+            bytes: &bytes,
+            offsets: &offsets,
+        };
         let want = expected(tokens, codes);
 
         assert_eq!(decoded_len(codes, view), want.len());
@@ -171,7 +181,14 @@ mod tests {
         // Tokens spanning every `copy_token_bytes` size bucket (1, 2|3, 4..=7,
         // 8..=15, 16); > MAX_TOKEN_SIZE codes cycle through them so each bucket
         // lands in the exact-copy tail. Miri then vets the overlapping writes.
-        let t = [vec![b'a'; 1], vec![b'b'; 3], vec![b'c'; 5], vec![b'd'; 11], vec![b'e'; 15], vec![b'f'; 16]];
+        let t = [
+            vec![b'a'; 1],
+            vec![b'b'; 3],
+            vec![b'c'; 5],
+            vec![b'd'; 11],
+            vec![b'e'; 15],
+            vec![b'f'; 16],
+        ];
         let tokens: Vec<&[u8]> = t.iter().map(Vec::as_slice).collect();
         let codes: Vec<Token> = (0..40).map(|i| (i % t.len()) as Token).collect();
         check(&tokens, &codes);

@@ -42,16 +42,15 @@ pub trait Dictionary {
 /// A borrowed dictionary's token-read interface, abstracted over the layout
 /// ([`CompactDictionaryView`] or [`WideDictionaryView`]).
 pub trait DictionaryView: Copy {
+    /// Number of tokens in the dictionary. The valid token ids are
+    /// `0..num_tokens()`.
+    fn num_tokens(&self) -> usize;
+
     /// Bytes of token `id`. Bounds-checked; panics if `id` is out of range.
     fn token(&self, id: Token) -> &[u8];
 
     /// Byte length of token `id`. Bounds-checked; panics if `id` is out of range.
     fn token_len(&self, id: Token) -> usize;
-
-    /// Total byte length of the tokens `codes` name (the sum of their lengths).
-    /// Bounds-checked — panics on an out-of-range code. Sizes the output buffer
-    /// for [`decode_to_vec`](crate::decode_to_vec).
-    fn decoded_len(&self, codes: &[Token]) -> usize;
 
     /// Raw pointer to token `id`'s bytes.
     ///
@@ -68,4 +67,14 @@ pub trait DictionaryView: Copy {
     /// # Safety
     /// `id` is a valid code (less than the number of tokens).
     unsafe fn token_len_unchecked(&self, id: Token) -> usize;
+
+    /// Byte `k` of token `id` — the unchecked counterpart of `token(id)[k]`. The
+    /// sorted-dictionary search hot loop reads one byte per binary-search step;
+    /// this skips the slice construction and two bounds checks `token(id)[k]`
+    /// incurs.
+    ///
+    /// # Safety
+    /// `id` is a valid code (less than the number of tokens) and
+    /// `k < token_len(id)`.
+    unsafe fn byte_unchecked(&self, id: Token, k: usize) -> u8;
 }

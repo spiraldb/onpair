@@ -9,13 +9,15 @@
 //! with no `code → offset → bytes` indirection, so a decode is one independent
 //! load.
 //!
-//! Build it from the compact form with [`CompactDictionaryView::to_wide`];
+//! Build it from the compact form with
+//! [`CompactDictionaryView::to_wide`](super::CompactDictionaryView::to_wide);
 //! recover the compact form with [`WideDictionaryView::to_compact`]. Both
 //! representations implement [`DictionaryView`] (via their views), so the decode
 //! kernels treat them uniformly.
 //!
 //! # Invariants
-//! Upheld by [`CompactDictionaryView::to_wide`] and by any consumer that
+//! Upheld by [`CompactDictionaryView::to_wide`](super::CompactDictionaryView::to_wide)
+//! and by any consumer that
 //! constructs one from deserialized buffers; a precondition of every accessor and
 //! of decoding. The logical invariants match the compact form's — only the
 //! physical sizing clause differs (and the wide form needs no read-padding).
@@ -66,7 +68,10 @@ impl Dictionary for WideDictionary {
     type View<'a> = WideDictionaryView<'a>;
     #[inline]
     fn as_view(&self) -> WideDictionaryView<'_> {
-        WideDictionaryView { data: &self.data, lens: &self.lens }
+        WideDictionaryView {
+            data: &self.data,
+            lens: &self.lens,
+        }
     }
 }
 
@@ -84,12 +89,6 @@ pub struct WideDictionaryView<'a> {
 }
 
 impl<'a> WideDictionaryView<'a> {
-    /// Number of tokens.
-    #[inline]
-    pub fn num_tokens(&self) -> usize {
-        self.lens.len()
-    }
-
     /// Rebuild the [`CompactDictionary`] form (read-padded, decodable).
     ///
     /// Safe: copies only `lens[id]` exact bytes per row, never over-reads.
@@ -112,6 +111,11 @@ impl<'a> WideDictionaryView<'a> {
 
 impl DictionaryView for WideDictionaryView<'_> {
     #[inline]
+    fn num_tokens(&self) -> usize {
+        self.lens.len()
+    }
+
+    #[inline]
     fn token(&self, id: Token) -> &[u8] {
         let row = id as usize * MAX_TOKEN_SIZE;
         &self.data[row..row + self.lens[id as usize] as usize]
@@ -120,11 +124,6 @@ impl DictionaryView for WideDictionaryView<'_> {
     #[inline]
     fn token_len(&self, id: Token) -> usize {
         self.lens[id as usize] as usize
-    }
-
-    #[inline]
-    fn decoded_len(&self, codes: &[Token]) -> usize {
-        codes.iter().map(|&id| self.lens[id as usize] as usize).sum()
     }
 
     #[inline]
@@ -138,6 +137,13 @@ impl DictionaryView for WideDictionaryView<'_> {
     unsafe fn token_len_unchecked(&self, id: Token) -> usize {
         // SAFETY: id < num_tokens ⇒ lens[id] is in bounds.
         unsafe { *self.lens.get_unchecked(id as usize) as usize }
+    }
+
+    #[inline]
+    unsafe fn byte_unchecked(&self, id: Token, k: usize) -> u8 {
+        // SAFETY: id < num_tokens and k < token_len(id) <= MAX_TOKEN_SIZE ⇒
+        // id * MAX_TOKEN_SIZE + k lies within row id's own bytes in `data`.
+        unsafe { *self.data.get_unchecked(id as usize * MAX_TOKEN_SIZE + k) }
     }
 }
 
@@ -167,11 +173,21 @@ mod tests {
     #[test]
     fn to_compact_round_trips_all_length_buckets() {
         // Token lengths spanning every copy bucket: 1, 3, 5, 11, 15, 16.
-        let t = [vec![b'a'; 1], vec![b'b'; 3], vec![b'c'; 5], vec![b'd'; 11], vec![b'e'; 15], vec![b'f'; 16]];
+        let t = [
+            vec![b'a'; 1],
+            vec![b'b'; 3],
+            vec![b'c'; 5],
+            vec![b'd'; 11],
+            vec![b'e'; 15],
+            vec![b'f'; 16],
+        ];
         let tokens: Vec<&[u8]> = t.iter().map(Vec::as_slice).collect();
         let compact = padded_compact(&tokens);
         let back = compact.to_wide().to_compact();
         assert_eq!(back.offsets, compact.offsets);
-        assert_eq!(&back.bytes[..back.logical_len()], &compact.bytes[..compact.logical_len()]);
+        assert_eq!(
+            &back.bytes[..back.logical_len()],
+            &compact.bytes[..compact.logical_len()]
+        );
     }
 }
