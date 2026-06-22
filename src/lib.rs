@@ -51,7 +51,7 @@ mod column;
 mod core;
 mod decoding;
 mod encoding;
-mod search;
+pub mod search;
 
 #[cfg(test)]
 mod test_corpus;
