@@ -88,20 +88,34 @@ impl DynamicThresholdController {
         let delta_e = self.entries_created - self.entries_at_check;
         let delta_b = self.bytes_scanned - self.bytes_at_check;
 
-        let recent_rate = if delta_b > 0 { delta_e as f64 / delta_b as f64 } else { 1e9 };
+        let recent_rate = if delta_b > 0 {
+            delta_e as f64 / delta_b as f64
+        } else {
+            1e9
+        };
 
-        let e_rem =
-            if self.capacity > self.entries_created { self.capacity - self.entries_created } else { 1 };
-        let b_rem =
-            if self.scan_budget > self.bytes_scanned { self.scan_budget - self.bytes_scanned } else { 1 };
+        let e_rem = if self.capacity > self.entries_created {
+            self.capacity - self.entries_created
+        } else {
+            1
+        };
+        let b_rem = if self.scan_budget > self.bytes_scanned {
+            self.scan_budget - self.bytes_scanned
+        } else {
+            1
+        };
 
         let target_rate = e_rem as f64 / b_rem as f64;
-        let ratio = if target_rate > 0.0 { recent_rate / target_rate } else { 1e9 };
+        let ratio = if target_rate > 0.0 {
+            recent_rate / target_rate
+        } else {
+            1e9
+        };
 
         if ratio > 2.0 && self.threshold < 255 {
             self.threshold += 1;
-        } else if ratio < 0.5 {
-            self.threshold = if self.threshold > 2 { self.threshold - 1 } else { 2 };
+        } else if ratio < 0.5 && self.threshold > 2 {
+            self.threshold -= 1;
         }
 
         self.entries_at_check = self.entries_created;
@@ -217,7 +231,8 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
                     let pair_start = pos - prev_len;
                     let pair_end = pos + curr_len;
                     let new_id = lpm.insert(&str_bytes[pair_start..pair_end]);
-                    dict.bytes.extend_from_slice(&str_bytes[pair_start..pair_end]);
+                    dict.bytes
+                        .extend_from_slice(&str_bytes[pair_start..pair_end]);
                     dict.offsets.push(dict.bytes.len() as u32);
 
                     if lpm.size() == dict_capacity {
@@ -380,7 +395,10 @@ pub(crate) mod tests {
     #[test]
     fn same_seed_produces_identical_dictionaries() {
         let corpus = make_random_strings(100, 40, 12345);
-        let cfg = TrainingConfig { seed: Some(42), ..Default::default() };
+        let cfg = TrainingConfig {
+            seed: Some(42),
+            ..Default::default()
+        };
         let r1 = train_strings(&corpus, &cfg);
         let r2 = train_strings(&corpus, &cfg);
         assert_eq!(r1.dict.bytes, r2.dict.bytes);
@@ -408,10 +426,16 @@ pub(crate) mod tests {
 
     #[test]
     fn no_token_exceeds_max_token_size() {
-        let result = train_strings(&make_random_strings(100, 50, 99), &TrainingConfig::default());
+        let result = train_strings(
+            &make_random_strings(100, 50, 99),
+            &TrainingConfig::default(),
+        );
         let view = result.dict.as_view();
         for i in 0..view.num_tokens() {
-            assert!(view.token(i as Token).len() <= MAX_TOKEN_SIZE, "token {i} too large");
+            assert!(
+                view.token(i as Token).len() <= MAX_TOKEN_SIZE,
+                "token {i} too large"
+            );
         }
     }
 
@@ -424,7 +448,13 @@ pub(crate) mod tests {
         };
         let corpora: Vec<(&str, Vec<Vec<u8>>)> = vec![
             ("random", make_random_strings(100, 50, 77)),
-            ("user", make_user_strings(50).into_iter().map(String::into_bytes).collect()),
+            (
+                "user",
+                make_user_strings(50)
+                    .into_iter()
+                    .map(String::into_bytes)
+                    .collect(),
+            ),
             ("binary", make_binary_strings(50, 30, 13)),
             ("fixed_len", make_fixed_length_strings(20, MAX_TOKEN_SIZE)),
         ];
@@ -432,7 +462,10 @@ pub(crate) mod tests {
             let result = train_strings(c, &cfg);
             let view = result.dict.as_view();
             for i in 0..view.num_tokens() {
-                assert!(!view.token(i as Token).is_empty(), "corpus={name} token {i} empty");
+                assert!(
+                    !view.token(i as Token).is_empty(),
+                    "corpus={name} token {i} empty"
+                );
             }
         }
     }
@@ -440,18 +473,27 @@ pub(crate) mod tests {
     #[test]
     fn dynamic_threshold_produces_merged_tokens() {
         let cfg = TrainingConfig {
-            threshold: ThresholdSpec::Dynamic(DynamicThreshold { sample_fraction: 0.5 }),
+            threshold: ThresholdSpec::Dynamic(DynamicThreshold {
+                sample_fraction: 0.5,
+            }),
             seed: Some(42),
             ..Default::default()
         };
-        assert!(train_strings(&make_user_strings(200), &cfg).dict.num_tokens() > 256);
+        assert!(
+            train_strings(&make_user_strings(200), &cfg)
+                .dict
+                .num_tokens()
+                > 256
+        );
     }
 
     #[test]
     fn dynamic_threshold_does_not_exceed_capacity() {
         let cfg = TrainingConfig {
             bits: 12,
-            threshold: ThresholdSpec::Dynamic(DynamicThreshold { sample_fraction: 1.0 }),
+            threshold: ThresholdSpec::Dynamic(DynamicThreshold {
+                sample_fraction: 1.0,
+            }),
             seed: Some(42),
         };
         let result = train_strings(&make_user_strings(500), &cfg);
@@ -461,11 +503,15 @@ pub(crate) mod tests {
     #[test]
     fn dynamic_threshold_dictionary_is_sorted() {
         let cfg = TrainingConfig {
-            threshold: ThresholdSpec::Dynamic(DynamicThreshold { sample_fraction: 0.3 }),
+            threshold: ThresholdSpec::Dynamic(DynamicThreshold {
+                sample_fraction: 0.3,
+            }),
             seed: Some(42),
             ..Default::default()
         };
-        assert!(is_lex_sorted(train_strings(&make_user_strings(100), &cfg).dict.as_view()));
+        assert!(is_lex_sorted(
+            train_strings(&make_user_strings(100), &cfg).dict.as_view()
+        ));
     }
 
     #[test]
@@ -524,11 +570,21 @@ pub(crate) mod tests {
     fn all_bit_widths_produce_valid_dictionary() {
         let corpus = make_user_strings(50);
         for b in 9u8..=16 {
-            let cfg = TrainingConfig { bits: b, seed: Some(42), ..Default::default() };
+            let cfg = TrainingConfig {
+                bits: b,
+                seed: Some(42),
+                ..Default::default()
+            };
             let result = train_strings(&corpus, &cfg);
             check_base_tokens(result.dict.as_view());
-            assert!(is_lex_sorted(result.dict.as_view()), "not sorted for bits={b}");
-            assert!(result.dict.num_tokens() <= max_dict_size(b), "overflow for bits={b}");
+            assert!(
+                is_lex_sorted(result.dict.as_view()),
+                "not sorted for bits={b}"
+            );
+            assert!(
+                result.dict.num_tokens() <= max_dict_size(b),
+                "overflow for bits={b}"
+            );
         }
     }
 }
