@@ -15,7 +15,15 @@ use crate::core::types::Token;
 /// Whether `codes` equals the query's code sequence `query`.
 #[inline]
 pub fn equals(codes: &[Token], query: &[Token]) -> bool {
-    codes == query
+    if codes.len() != query.len() {
+        return false;
+    }
+    for (a, b) in codes.iter().zip(query) {
+        if a != b {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
