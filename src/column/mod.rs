@@ -10,6 +10,8 @@
 //! ([`ColumnView::rows_equal_to`] and friends), by contrast, read the row layer
 //! to delimit rows and match against their codes without decoding.
 
+use std::mem::MaybeUninit;
+
 use crate::core::dictionary::{
     CompactDictionary, CompactDictionaryView, Dictionary, WideDictionary,
 };
@@ -90,6 +92,13 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         decoding::decoded_len(self.codes, self.dict)
     }
 
+    /// Exact decoded byte length of row `k` — sizes the buffer for
+    /// [`decompress_row_into`](Self::decompress_row_into). Precondition: `k < num_rows()`.
+    #[inline]
+    pub fn row_decoded_len(&self, k: usize) -> usize {
+        decoding::decoded_len(self.row_codes(k), self.dict)
+    }
+
     /// Build a reusable [`WideDictionary`] for this column's dictionary. Amortize
     /// it across many decodes (`decode_into`/`decode_to_vec` over its view) when
     /// doing repeated random access; for a single bulk decode prefer
@@ -105,10 +114,32 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         decoding::decode_to_vec(self.codes, self.wide_dict().as_view())
     }
 
+    /// Decode the whole column into `out` (bulk path, via the wide form),
+    /// returning the bytes written — no allocation.
+    ///
+    /// # Safety
+    /// `out` must be at least [`decoded_len`](Self::decoded_len) bytes long.
+    pub unsafe fn decompress_into(&self, out: &mut [MaybeUninit<u8>]) -> usize {
+        // SAFETY: a view from a `Column` keeps every code in range and the dict
+        // read-padded; the caller guarantees `out` is long enough.
+        unsafe { decoding::decode_into(self.codes, self.wide_dict().as_view(), out) }
+    }
+
     /// Decode row `k` into a fresh `Vec` (random-access path, compact dictionary —
     /// no wide-table build). Precondition: `k < num_rows()`.
     pub fn decompress_row(&self, k: usize) -> Vec<u8> {
         decoding::decode_to_vec(self.row_codes(k), self.dict)
+    }
+
+    /// Decode row `k` into `out` (random-access path, compact dictionary),
+    /// returning the bytes written — no allocation, so one buffer can be reused
+    /// across rows. Precondition: `k < num_rows()`.
+    ///
+    /// # Safety
+    /// `out` must be at least [`row_decoded_len(k)`](Self::row_decoded_len) bytes long.
+    pub unsafe fn decompress_row_into(&self, k: usize, out: &mut [MaybeUninit<u8>]) -> usize {
+        // SAFETY: invariants upheld by the view; the caller guarantees `out` is long enough.
+        unsafe { decoding::decode_into(self.row_codes(k), self.dict, out) }
     }
 
     /// Ascending indices of the rows equal to `needle`. The needle is
@@ -166,6 +197,37 @@ mod tests {
         assert_eq!(view.num_rows(), rows.len());
         for (k, row) in rows.iter().enumerate() {
             assert_eq!(view.decompress_row(k), *row, "row {k}");
+        }
+    }
+
+    /// Decoding into a caller buffer must agree with the `Vec`-returning path,
+    /// for both the whole column and per row, with one buffer reused across rows.
+    #[test]
+    fn decompress_into_matches_vec_path() {
+        let rows: &[&[u8]] = &[b"alpha", b"", b"beta beta", b"gamma", b"alpha"];
+        let (bytes, offsets) = pack(rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+
+        // Whole column into an exactly-sized buffer.
+        let mut buf = vec![std::mem::MaybeUninit::uninit(); view.decoded_len()];
+        // SAFETY: `buf` is sized to the exact decoded length.
+        let n = unsafe { view.decompress_into(&mut buf) };
+        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
+        assert_eq!(got, view.decompress().as_slice());
+
+        // Per row, reusing a single buffer sized to the widest row.
+        let widest = (0..view.num_rows())
+            .map(|k| view.row_decoded_len(k))
+            .max()
+            .unwrap();
+        let mut scratch = vec![std::mem::MaybeUninit::uninit(); widest];
+        for (k, row) in rows.iter().enumerate() {
+            // SAFETY: `scratch` is sized to the widest row, so it holds row `k`.
+            let n = unsafe { view.decompress_row_into(k, &mut scratch) };
+            let got = unsafe { std::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), n) };
+            assert_eq!(n, view.row_decoded_len(k), "row {k} length");
+            assert_eq!(got, *row, "row {k} bytes");
         }
     }
 
