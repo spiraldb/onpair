@@ -136,7 +136,9 @@ pub(crate) struct DynamicThreshold {
 
 impl Default for DynamicThreshold {
     fn default() -> Self {
-        Self { sample_fraction: 0.15 }
+        Self {
+            sample_fraction: 0.15,
+        }
     }
 }
 
@@ -162,7 +164,11 @@ pub(crate) struct TrainingConfig {
 
 impl Default for TrainingConfig {
     fn default() -> Self {
-        Self { bits: 16, threshold: ThresholdSpec::default(), seed: None }
+        Self {
+            bits: 16,
+            threshold: ThresholdSpec::default(),
+            seed: None,
+        }
     }
 }
 

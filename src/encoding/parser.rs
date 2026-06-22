@@ -63,7 +63,11 @@ impl Parser {
         let (codes, row_offsets) = encode_strings(bytes, offsets, &self.lpm);
         // `self.dict` is already read-padded, so the cloned column dictionary is
         // too.
-        Column { dict: self.dict.clone(), codes, row_offsets }
+        Column {
+            dict: self.dict.clone(),
+            codes,
+            row_offsets,
+        }
     }
 }
 
@@ -97,7 +101,9 @@ pub(crate) fn encode_strings<O: Offset>(
 /// (maximum) offset must fit and be `<= bytes.len()`. `O(1)` in release.
 pub(crate) fn validate_offsets<O: Offset>(bytes: &[u8], offsets: &[O]) -> Result<(), Error> {
     debug_assert!(
-        offsets.windows(2).all(|w| w[0].to_usize() <= w[1].to_usize()),
+        offsets
+            .windows(2)
+            .all(|w| w[0].to_usize() <= w[1].to_usize()),
         "offsets must be monotonic non-decreasing",
     );
     let last = offsets.last().ok_or(Error::InvalidArg)?;
@@ -110,7 +116,9 @@ pub(crate) fn validate_offsets<O: Offset>(bytes: &[u8], offsets: &[O]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView};
+    use crate::core::dictionary::{
+        CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView,
+    };
     use crate::core::types::BitWidth;
     use crate::encoding::config::{FixedThreshold, ThresholdSpec, TrainingConfig};
     use crate::encoding::trainer::train;
@@ -141,7 +149,12 @@ mod tests {
     }
 
     /// Decode the codes for row `idx` against `dict`.
-    fn decode_row(codes: &[Token], row_offsets: &[u32], dict: CompactDictionaryView<'_>, idx: usize) -> Vec<u8> {
+    fn decode_row(
+        codes: &[Token],
+        row_offsets: &[u32],
+        dict: CompactDictionaryView<'_>,
+        idx: usize,
+    ) -> Vec<u8> {
         let begin = row_offsets[idx] as usize;
         let end = row_offsets[idx + 1] as usize;
         let mut out = Vec::new();
@@ -222,7 +235,10 @@ mod tests {
         };
         let TrainResult { dict: _, lpm } = train(&raw.data, &raw.offsets, &cfg);
         let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
-        assert!(codes.len() < raw.data.len(), "parser did not use multi-byte tokens");
+        assert!(
+            codes.len() < raw.data.len(),
+            "parser did not use multi-byte tokens"
+        );
     }
 
     #[test]
@@ -256,7 +272,11 @@ mod tests {
     #[test]
     fn roundtrip_homogeneous_strings() {
         for &bits in WIDTHS {
-            assert!(roundtrip_all(&make_homogeneous_strings(30, 40, b'a'), bits, 42));
+            assert!(roundtrip_all(
+                &make_homogeneous_strings(30, 40, b'a'),
+                bits,
+                42
+            ));
         }
     }
 
@@ -270,7 +290,11 @@ mod tests {
     #[test]
     fn roundtrip_mixed_length_strings() {
         for &bits in WIDTHS {
-            assert!(roundtrip_all(&make_mixed_length_strings(80, 100, 31415), bits, 42));
+            assert!(roundtrip_all(
+                &make_mixed_length_strings(80, 100, 31415),
+                bits,
+                42
+            ));
         }
     }
 }

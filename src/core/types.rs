@@ -77,7 +77,10 @@ pub(crate) const fn max_dict_size(bits: BitWidth) -> usize {
 /// `#[inline]`d — it runs once per column (to size the code stream), never in a
 /// hot loop.
 pub(crate) const fn code_bits_for(num_tokens: usize) -> BitWidth {
-    debug_assert!(num_tokens >= 1, "log2(0) is undefined; num_tokens must be >= 1");
+    debug_assert!(
+        num_tokens >= 1,
+        "log2(0) is undefined; num_tokens must be >= 1"
+    );
     if num_tokens <= 1 {
         1
     } else {

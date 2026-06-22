@@ -46,7 +46,11 @@ fn load_le_u64(data: &[u8], len: usize) -> u64 {
 /// Mask of the low `len * 8` bits in a `u64`.
 #[inline]
 fn mask_u64(len: usize) -> u64 {
-    if len >= 8 { u64::MAX } else { (1u64 << (len * 8)) - 1 }
+    if len >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (len * 8)) - 1
+    }
 }
 
 /// One long-token entry within a bucket: the suffix bytes after the shared
@@ -111,7 +115,10 @@ fn search_trie(pool: &[TrieNode], root: u32, suf: &[u8]) -> Option<(Token, usize
 
 #[inline]
 fn trie_find_child(pool: &[TrieNode], node: u32, byte: u8) -> Option<u32> {
-    pool[node as usize].children.iter().find_map(|&(b, idx)| (b == byte).then_some(idx))
+    pool[node as usize]
+        .children
+        .iter()
+        .find_map(|&(b, idx)| (b == byte).then_some(idx))
 }
 
 fn trie_alloc(pool: &mut Vec<TrieNode>) -> u32 {
@@ -224,10 +231,17 @@ impl LongestPrefixMatcher {
         let suffix = load_le_u64(&data[BUCKET_PREFIX_LEN..], slen);
         // Split borrows: `pool` and `long_map` are disjoint fields.
         let pool = &mut self.pool;
-        let bucket = self.long_map.entry(prefix).or_insert_with(|| Bucket::Linear(Vec::new()));
+        let bucket = self
+            .long_map
+            .entry(prefix)
+            .or_insert_with(|| Bucket::Linear(Vec::new()));
         match bucket {
             Bucket::Linear(entries) => {
-                entries.push(LongEntry { suffix, slen: slen as u8, token: id });
+                entries.push(LongEntry {
+                    suffix,
+                    slen: slen as u8,
+                    token: id,
+                });
                 // Keep descending-by-length order so the first match wins.
                 entries.sort_by(|a, b| b.slen.cmp(&a.slen));
                 if entries.len() > PROMOTE_THRESHOLD {
@@ -475,7 +489,10 @@ mod tests {
     #[test]
     fn from_dict_size_matches_extra_tokens() {
         let d = make_test_dictionary(&["ab", "abcde"]);
-        assert_eq!(LongestPrefixMatcher::from_dictionary(d.as_view()).size(), 258);
+        assert_eq!(
+            LongestPrefixMatcher::from_dictionary(d.as_view()).size(),
+            258
+        );
     }
 
     #[test]
