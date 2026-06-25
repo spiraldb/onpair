@@ -9,6 +9,7 @@ on:
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 jobs:
   build:
@@ -43,17 +44,16 @@ jobs:
         env:
           RUSTFLAGS: "-C target-feature=+avx2"
         run: |
-          cargo codspeed build --profile bench -m instrumentation
+          cargo codspeed build --profile bench -m simulation
 
-      - name: Run benchmarks - Instrumentation
-        uses: CodSpeedHQ/action@281164b0f014a4e7badd2c02cecad9b595b70537 # v4
+      - name: Run benchmarks - Simulation
+        uses: CodSpeedHQ/action@3194d9a39c4d46684cb44bf7207fc56626aad8fd # v4.15.1
         with:
           run: cargo codspeed run
-          token: ${{ secrets.CODSPEED_TOKEN }}
-          mode: instrumentation
+          mode: simulation
 
   bench-codspeed-walltime:
-    name: Benchmark with Codspeed
+    name: Benchmark with Codspeed (Walltime)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -72,9 +72,8 @@ jobs:
         run: |
           cargo codspeed build --profile bench -m walltime
 
-      - name: Run benchmarks - Wall time
-        uses: CodSpeedHQ/action@281164b0f014a4e7badd2c02cecad9b595b70537 # v4
+      - name: Run benchmarks - Walltime
+        uses: CodSpeedHQ/action@3194d9a39c4d46684cb44bf7207fc56626aad8fd # v4.15.1
         with:
           run: cargo codspeed run
-          token: ${{ secrets.CODSPEED_TOKEN }}
           mode: walltime
