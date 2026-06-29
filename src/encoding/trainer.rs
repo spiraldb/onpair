@@ -13,9 +13,9 @@ use hashbrown::HashMap;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
-use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView};
+use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
 use crate::core::offset::Offset;
-use crate::core::types::{MAX_TOKEN_SIZE, Token, max_dict_size};
+use crate::core::types::{MAX_TOKEN_SIZE, max_dict_size};
 use crate::encoding::config::{ThresholdSpec, TrainingConfig};
 use crate::encoding::hash::FxBuildHasher;
 use crate::encoding::lpm::LongestPrefixMatcher;
@@ -137,14 +137,15 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
     let n = offsets.len() - 1;
     let dict_capacity = max_dict_size(cfg.bits);
 
-    let mut dict = CompactDictionary {
-        bytes: Vec::with_capacity(dict_capacity * MAX_TOKEN_SIZE),
-        offsets: Vec::with_capacity(dict_capacity + 1),
-    };
-    dict.offsets.push(0);
+    // Accumulate into local buffers, then seal once into a trusted dictionary at
+    // the end — a move, no copy. The dictionary is never viewed mid-build (the
+    // matcher, not the dictionary, drives matching).
+    let mut dict_bytes: Vec<u8> = Vec::with_capacity(dict_capacity * MAX_TOKEN_SIZE);
+    let mut dict_offsets: Vec<u32> = Vec::with_capacity(dict_capacity + 1);
+    dict_offsets.push(0);
     for i in 0u16..=255 {
-        dict.bytes.push(i as u8);
-        dict.offsets.push(dict.bytes.len() as u32);
+        dict_bytes.push(i as u8);
+        dict_offsets.push(dict_bytes.len() as u32);
     }
     let mut lpm = LongestPrefixMatcher::new();
 
@@ -231,9 +232,8 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
                     let pair_start = pos - prev_len;
                     let pair_end = pos + curr_len;
                     let new_id = lpm.insert(&str_bytes[pair_start..pair_end]);
-                    dict.bytes
-                        .extend_from_slice(&str_bytes[pair_start..pair_end]);
-                    dict.offsets.push(dict.bytes.len() as u32);
+                    dict_bytes.extend_from_slice(&str_bytes[pair_start..pair_end]);
+                    dict_offsets.push(dict_bytes.len() as u32);
 
                     if lpm.size() == dict_capacity {
                         full_dictionary = true;
@@ -259,33 +259,35 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
         }
     }
 
-    let mut result = TrainResult { dict, lpm };
-    sort_dictionary(&mut result);
-    result
+    // Sort the tokens into final order, pad, and seal exactly once: the only
+    // `CompactDictionary` that exists is sorted and read-padded by construction.
+    // The merge-loop matcher used unsorted ids, so rebuild it from the sealed dict.
+    let (mut bytes, offsets) = sort_tokens(&dict_bytes, &dict_offsets);
+    pad_raw(&mut bytes, &offsets);
+    let dict = CompactDictionary::from_raw(bytes, offsets);
+    let lpm = LongestPrefixMatcher::from_dictionary(dict.as_view());
+    TrainResult { dict, lpm }
 }
 
-/// Sort the dictionary's tokens into ascending bytewise-lexicographic order,
-/// reassigning ids, and rebuild the matcher to match.
-fn sort_dictionary(result: &mut TrainResult) {
-    let view = result.dict.as_view();
-    let n = view.num_tokens();
+/// Sort the tokens into ascending bytewise-lexicographic order, returning fresh
+/// `(bytes, offsets)` with ids reassigned to sorted position. Reads tokens
+/// straight from the raw buffers; the result is unpadded — the caller pads before
+/// sealing.
+fn sort_tokens(bytes: &[u8], offsets: &[u32]) -> (Vec<u8>, Vec<u32>) {
+    let n = offsets.len() - 1;
+    let token = |id: usize| -> &[u8] { &bytes[offsets[id] as usize..offsets[id + 1] as usize] };
 
-    let mut perm: Vec<Token> = (0..n).map(|i| i as Token).collect();
-    perm.sort_by(|&a, &b| view.token(a).cmp(view.token(b)));
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.sort_by(|&a, &b| token(a).cmp(token(b)));
 
-    let mut sorted = CompactDictionary {
-        bytes: Vec::with_capacity(view.bytes.len()),
-        offsets: Vec::with_capacity(n + 1),
-    };
-    sorted.offsets.push(0);
-
-    for &old_id in &perm {
-        sorted.bytes.extend_from_slice(view.token(old_id));
-        sorted.offsets.push(sorted.bytes.len() as u32);
+    let mut out_bytes: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut out_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+    out_offsets.push(0);
+    for &old in &perm {
+        out_bytes.extend_from_slice(token(old));
+        out_offsets.push(out_bytes.len() as u32);
     }
-
-    result.dict = sorted;
-    result.lpm = LongestPrefixMatcher::from_dictionary(result.dict.as_view());
+    (out_bytes, out_offsets)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -295,7 +297,8 @@ fn sort_dictionary(result: &mut TrainResult) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::core::dictionary::CompactDictionaryView;
+    use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
+    use crate::core::types::Token;
     use crate::encoding::config::{DynamicThreshold, FixedThreshold};
     use crate::test_corpus::{
         alternating_strings as make_alternating_strings, binary_strings as make_binary_strings,
@@ -401,8 +404,8 @@ pub(crate) mod tests {
         };
         let r1 = train_strings(&corpus, &cfg);
         let r2 = train_strings(&corpus, &cfg);
-        assert_eq!(r1.dict.bytes, r2.dict.bytes);
-        assert_eq!(r1.dict.offsets, r2.dict.offsets);
+        assert_eq!(r1.dict.bytes(), r2.dict.bytes());
+        assert_eq!(r1.dict.offsets(), r2.dict.offsets());
     }
 
     #[test]

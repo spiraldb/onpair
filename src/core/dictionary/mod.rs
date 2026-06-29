@@ -13,16 +13,34 @@
 //!
 //! Both borrowed views implement [`DictionaryView`], the layout-agnostic
 //! token-read interface; the owned forms implement [`Dictionary`], which lends
-//! the matching view. Convert between representations with
-//! [`CompactDictionaryView::to_wide`] and [`WideDictionaryView::to_compact`].
+//! the matching view. The compact form is the serialized one; accelerate decoding
+//! by materializing the wide form with [`CompactDictionaryView::to_wide`].
+//!
+//! # Trust
+//! The four trusted types above are crate-private in their fields and implement a
+//! **sealed** [`DictionaryView`], so external code cannot forge one. Raw
+//! deserialized buffers live in the untrusted [`UntrustedDictionary`] /
+//! [`UntrustedDictionaryView`] ([`untrusted`]), which cross into the trusted forms
+//! only through `validate` (checked) or `trust_unchecked` (the `unsafe` backdoor).
 
 mod compact;
+mod untrusted;
 mod wide;
 
+pub(crate) use compact::pad_raw;
 pub use compact::{CompactDictionary, CompactDictionaryView};
+pub use untrusted::{UntrustedDictionary, UntrustedDictionaryView};
 pub use wide::{WideDictionary, WideDictionaryView};
 
 use crate::core::types::Token;
+
+/// Sealing for [`DictionaryView`] — implemented only by the crate's trusted view
+/// types, so `DictionaryView` cannot be implemented downstream.
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::CompactDictionaryView<'_> {}
+    impl Sealed for super::WideDictionaryView<'_> {}
+}
 
 /// An owned dictionary that can lend its borrowed [`DictionaryView`].
 ///
@@ -39,9 +57,14 @@ pub trait Dictionary {
     fn as_view(&self) -> Self::View<'_>;
 }
 
-/// A borrowed dictionary's token-read interface, abstracted over the layout
-/// ([`CompactDictionaryView`] or [`WideDictionaryView`]).
-pub trait DictionaryView: Copy {
+/// A borrowed **trusted** dictionary's token-read interface, abstracted over the
+/// layout ([`CompactDictionaryView`] or [`WideDictionaryView`]).
+///
+/// **Sealed:** implemented only by this crate's trusted view types, so a value of
+/// `V: DictionaryView` is by construction a validated dictionary — the unchecked
+/// accessors below rely on that. Untrusted buffers reach a view through
+/// [`UntrustedDictionaryView::validate`], not by implementing this trait.
+pub trait DictionaryView: Copy + sealed::Sealed {
     /// Number of tokens in the dictionary. The valid token ids are
     /// `0..num_tokens()`.
     fn num_tokens(&self) -> usize;
@@ -67,14 +90,4 @@ pub trait DictionaryView: Copy {
     /// # Safety
     /// `id` is a valid code (less than the number of tokens).
     unsafe fn token_len_unchecked(&self, id: Token) -> usize;
-
-    /// Byte `k` of token `id` — the unchecked counterpart of `token(id)[k]`. The
-    /// sorted-dictionary search hot loop reads one byte per binary-search step;
-    /// this skips the slice construction and two bounds checks `token(id)[k]`
-    /// incurs.
-    ///
-    /// # Safety
-    /// `id` is a valid code (less than the number of tokens) and
-    /// `k < token_len(id)`.
-    unsafe fn byte_unchecked(&self, id: Token, k: usize) -> u8;
 }

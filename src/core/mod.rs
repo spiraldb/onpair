@@ -12,3 +12,4 @@
 pub(crate) mod dictionary;
 pub(crate) mod offset;
 pub(crate) mod types;
+pub(crate) mod validate;

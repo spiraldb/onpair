@@ -316,17 +316,17 @@ mod tests {
     }
 
     fn make_test_dictionary(extra: &[&str]) -> CompactDictionary {
-        let mut d = CompactDictionary::default();
-        d.offsets.push(0);
+        let mut bytes = Vec::new();
+        let mut offsets = vec![0u32];
         for i in 0u16..=255 {
-            d.bytes.push(i as u8);
-            d.offsets.push(d.bytes.len() as u32);
+            bytes.push(i as u8);
+            offsets.push(bytes.len() as u32);
         }
         for &s in extra {
-            d.bytes.extend_from_slice(s.as_bytes());
-            d.offsets.push(d.bytes.len() as u32);
+            bytes.extend_from_slice(s.as_bytes());
+            offsets.push(bytes.len() as u32);
         }
-        d
+        CompactDictionary::from_raw(bytes, offsets)
     }
 
     // ── Construction ─────────────────────────────────────────────────────────

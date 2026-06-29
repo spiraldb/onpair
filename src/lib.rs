@@ -27,21 +27,31 @@
 //! A compressed [`Column`] is a [`CompactDictionary`] (token bytes + offsets), a
 //! code stream (one [`Token`] per emitted token), and a row layer (offsets into
 //! the code stream). Borrow it as a [`ColumnView`] — or build a view directly
-//! from buffers deserialized from storage — and decode with [`decode_into`] over
-//! the compact dictionary or a reusable [`WideDictionary`].
+//! from buffers deserialized from storage — and decode into a caller-owned buffer
+//! with [`ColumnView::decompress_into`] (or [`decode_into`] over a reusable
+//! [`WideDictionary`]). The caller owns buffer sizing: size it from
+//! [`ColumnView::decoded_len`] (plus [`DECODE_PADDING`]).
 //!
 //! # Examples
 //! ```
-//! use onpair::{Column, DEFAULT_CONFIG};
+//! use onpair::{Column, DECODE_PADDING, DEFAULT_CONFIG};
+//! use std::mem::MaybeUninit;
 //!
 //! // Compress an Arrow (bytes, offsets) value pair.
 //! let bytes = b"catdogcat";
 //! let offsets: [u32; 4] = [0, 3, 6, 9];
 //! let col = Column::compress(bytes, &offsets, DEFAULT_CONFIG).unwrap();
 //!
-//! // Bulk decode, or random-access a single row.
-//! assert_eq!(col.view().decompress(), b"catdogcat");
+//! // Random-access a single row (safe, no full decode).
 //! assert_eq!(col.view().decompress_row(1), b"dog");
+//!
+//! // Bulk-decode into a caller buffer, sized from the decoded length.
+//! let view = col.view();
+//! let mut buf = vec![MaybeUninit::uninit(); view.decoded_len() + DECODE_PADDING];
+//! // SAFETY: `col` is freshly compressed (valid by construction) and `buf` is sized.
+//! let n = unsafe { view.decompress_into(&mut buf) };
+//! let out = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
+//! assert_eq!(out, b"catdogcat");
 //! ```
 //!
 //! The trained encoder is also available directly via [`Parser`], to reuse one
@@ -58,12 +68,13 @@ mod test_corpus;
 
 pub use crate::column::{Column, ColumnView};
 pub use crate::core::dictionary::{
-    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, WideDictionary,
-    WideDictionaryView,
+    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, UntrustedDictionary,
+    UntrustedDictionaryView, WideDictionary, WideDictionaryView,
 };
 pub use crate::core::offset::Offset;
 pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
-pub use crate::decoding::{decode_into, decode_to_vec, decoded_len};
+pub use crate::core::validate::InvalidColumn;
+pub use crate::decoding::{DECODE_PADDING, decode_into, decoded_len};
 pub use crate::encoding::config::{Bits, Config, DEFAULT_CONFIG, Error, Threshold};
 pub use crate::encoding::parser::Parser;
 

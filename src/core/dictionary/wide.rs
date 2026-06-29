@@ -10,17 +10,19 @@
 //! load.
 //!
 //! Build it from the compact form with
-//! [`CompactDictionaryView::to_wide`](super::CompactDictionaryView::to_wide);
-//! recover the compact form with [`WideDictionaryView::to_compact`]. Both
-//! representations implement [`DictionaryView`] (via their views), so the decode
-//! kernels treat them uniformly.
+//! [`CompactDictionaryView::to_wide`](super::CompactDictionaryView::to_wide). The
+//! compact form is the serialized one; the wide form exists only to accelerate
+//! decoding, so the conversion is one-way. Both representations implement
+//! [`DictionaryView`] (via their views), so the decode kernels treat them
+//! uniformly.
 //!
 //! # Invariants
-//! Upheld by [`CompactDictionaryView::to_wide`](super::CompactDictionaryView::to_wide)
-//! and by any consumer that
-//! constructs one from deserialized buffers; a precondition of every accessor and
-//! of decoding. The logical invariants match the compact form's — only the
-//! physical sizing clause differs (and the wide form needs no read-padding).
+//! Upheld by [`CompactDictionaryView::to_wide`](super::CompactDictionaryView::to_wide),
+//! the wide form's only producer: it is built from a **trusted** compact
+//! dictionary and is therefore valid by construction. It is never deserialized
+//! (only the compact form is), so there is no untrusted wide type. The logical
+//! invariants match the compact form's — only the physical sizing clause differs
+//! (the wide form needs no read-padding).
 //! - `lens.len() == num_tokens` and `data.len() == num_tokens * MAX_TOKEN_SIZE`.
 //! - **Bounded lengths** — every `lens[id]` is in `1..=MAX_TOKEN_SIZE`, so every
 //!   token is non-empty; row `id`'s first `lens[id]` bytes are token `id`, and the
@@ -30,22 +32,23 @@
 //!   is encodable.
 //! - **Unique** — no two tokens are equal.
 
-use super::{CompactDictionary, Dictionary, DictionaryView};
+use super::{Dictionary, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 
 /// Owned wide dictionary: `num_tokens` rows of [`MAX_TOKEN_SIZE`] bytes plus
 /// per-token lengths.
 ///
-/// Fields are public (like [`CompactDictionary`]) — a consumer may construct one
-/// directly from buffers it deserialized from storage — and must satisfy the
-/// invariants described in this module's documentation.
+/// **Trusted** and crate-private, like [`CompactDictionary`](super::CompactDictionary): the only way to get
+/// one is [`CompactDictionaryView::to_wide`](super::CompactDictionaryView::to_wide)
+/// from a trusted compact dictionary, so it is valid by construction. There is no
+/// untrusted wide type — the wide form is never deserialized.
 #[derive(Default, Debug, Clone)]
 pub struct WideDictionary {
     /// `num_tokens * MAX_TOKEN_SIZE` row-major token bytes; row `id` holds token
     /// `id`, zero-padded to the row width.
-    pub data: Vec<u8>,
+    data: Vec<u8>,
     /// `num_tokens` true token lengths.
-    pub lens: Vec<u8>,
+    lens: Vec<u8>,
 }
 
 impl WideDictionary {
@@ -55,12 +58,12 @@ impl WideDictionary {
         self.lens.len()
     }
 
-    /// Rebuild the [`CompactDictionary`] form (see
-    /// [`WideDictionaryView::to_compact`]). Borrow as a view first with
-    /// [`Dictionary::as_view`].
+    /// Seal row-major `data` and `lens` into a wide dictionary. The single
+    /// construction door, called by [`CompactDictionaryView::to_wide`](super::CompactDictionaryView::to_wide),
+    /// which guarantees the invariants.
     #[inline]
-    pub fn to_compact(&self) -> CompactDictionary {
-        self.as_view().to_compact()
+    pub(crate) fn from_raw(data: Vec<u8>, lens: Vec<u8>) -> Self {
+        Self { data, lens }
     }
 }
 
@@ -75,38 +78,16 @@ impl Dictionary for WideDictionary {
     }
 }
 
-/// Borrowed, `Copy` view over a wide dictionary's buffers.
+/// Borrowed, `Copy`, **trusted** view over a wide dictionary's buffers.
 ///
-/// Borrows the raw slices rather than an owned [`WideDictionary`], so a consumer
-/// can build a view directly from buffers deserialized from storage. The slices
-/// must satisfy the same invariants (see this module's documentation).
+/// Private fields: obtained only from a trusted [`WideDictionary`] via
+/// [`Dictionary::as_view`].
 #[derive(Copy, Clone, Debug)]
 pub struct WideDictionaryView<'a> {
     /// `num_tokens * MAX_TOKEN_SIZE` row-major token bytes.
-    pub data: &'a [u8],
+    data: &'a [u8],
     /// `num_tokens` true token lengths.
-    pub lens: &'a [u8],
-}
-
-impl<'a> WideDictionaryView<'a> {
-    /// Rebuild the [`CompactDictionary`] form (read-padded, decodable).
-    ///
-    /// Safe: copies only `lens[id]` exact bytes per row, never over-reads.
-    pub fn to_compact(&self) -> CompactDictionary {
-        let n = self.num_tokens();
-        let mut bytes = Vec::new();
-        let mut offsets = Vec::with_capacity(n + 1);
-        offsets.push(0u32);
-        for id in 0..n {
-            let len = self.lens[id] as usize;
-            let row = id * MAX_TOKEN_SIZE;
-            bytes.extend_from_slice(&self.data[row..row + len]);
-            offsets.push(bytes.len() as u32);
-        }
-        let mut d = CompactDictionary { bytes, offsets };
-        d.pad_for_decoder(); // restore the read-padding invariant
-        d
-    }
+    lens: &'a [u8],
 }
 
 impl DictionaryView for WideDictionaryView<'_> {
@@ -138,18 +119,12 @@ impl DictionaryView for WideDictionaryView<'_> {
         // SAFETY: id < num_tokens ⇒ lens[id] is in bounds.
         unsafe { *self.lens.get_unchecked(id as usize) as usize }
     }
-
-    #[inline]
-    unsafe fn byte_unchecked(&self, id: Token, k: usize) -> u8 {
-        // SAFETY: id < num_tokens and k < token_len(id) <= MAX_TOKEN_SIZE ⇒
-        // id * MAX_TOKEN_SIZE + k lies within row id's own bytes in `data`.
-        unsafe { *self.data.get_unchecked(id as usize * MAX_TOKEN_SIZE + k) }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::dictionary::{CompactDictionary, pad_raw};
 
     fn padded_compact(tokens: &[&[u8]]) -> CompactDictionary {
         let mut bytes = Vec::new();
@@ -158,9 +133,8 @@ mod tests {
             bytes.extend_from_slice(t);
             offsets.push(bytes.len() as u32);
         }
-        let mut d = CompactDictionary { bytes, offsets };
-        d.pad_for_decoder();
-        d
+        pad_raw(&mut bytes, &offsets);
+        CompactDictionary::from_raw(bytes, offsets)
     }
 
     #[test]
@@ -171,23 +145,17 @@ mod tests {
     }
 
     #[test]
-    fn to_compact_round_trips_all_length_buckets() {
-        // Token lengths spanning every copy bucket: 1, 3, 5, 11, 15, 16.
-        let t = [
-            vec![b'a'; 1],
-            vec![b'b'; 3],
-            vec![b'c'; 5],
-            vec![b'd'; 11],
-            vec![b'e'; 15],
-            vec![b'f'; 16],
-        ];
-        let tokens: Vec<&[u8]> = t.iter().map(Vec::as_slice).collect();
-        let compact = padded_compact(&tokens);
-        let back = compact.to_wide().to_compact();
-        assert_eq!(back.offsets, compact.offsets);
-        assert_eq!(
-            &back.bytes[..back.logical_len()],
-            &compact.bytes[..compact.logical_len()]
-        );
+    fn to_wide_rows_and_lens_match_tokens() {
+        // `to_wide` lays each token in its own zero-padded MAX_TOKEN_SIZE row.
+        let tokens: &[&[u8]] = &[b"a", b"bc", b"def", b"ghij"];
+        let wide = padded_compact(tokens).to_wide();
+        assert_eq!(wide.num_tokens(), tokens.len());
+        for (id, tok) in tokens.iter().enumerate() {
+            assert_eq!(wide.lens[id] as usize, tok.len());
+            assert_eq!(
+                &wide.data[id * MAX_TOKEN_SIZE..id * MAX_TOKEN_SIZE + tok.len()],
+                *tok
+            );
+        }
     }
 }

@@ -40,8 +40,9 @@ impl Parser {
     /// non-decreasing offsets, last `<= bytes.len()`).
     pub(crate) fn train_unchecked<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Self {
         let internal_cfg: TrainingConfig = cfg.into();
-        let TrainResult { mut dict, lpm } = train(bytes, offsets, &internal_cfg);
-        dict.pad_for_decoder();
+        let TrainResult { dict, lpm } = train(bytes, offsets, &internal_cfg);
+        // `train` returns a dictionary that is sorted and read-padded by
+        // construction — nothing left to do here.
         Self { dict, lpm }
     }
 
@@ -130,13 +131,13 @@ mod tests {
     };
 
     fn make_base_dict() -> CompactDictionary {
-        let mut d = CompactDictionary::default();
-        d.offsets.push(0);
+        let mut bytes = Vec::new();
+        let mut offsets = vec![0u32];
         for i in 0u16..=255 {
-            d.bytes.push(i as u8);
-            d.offsets.push(d.bytes.len() as u32);
+            bytes.push(i as u8);
+            offsets.push(bytes.len() as u32);
         }
-        d
+        CompactDictionary::from_raw(bytes, offsets)
     }
 
     /// Decode the whole flat code stream against `dict`.

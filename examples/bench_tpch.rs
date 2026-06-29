@@ -31,10 +31,13 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use std::mem::MaybeUninit;
+
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use onpair::Bits;
 use onpair::Config;
+use onpair::DECODE_PADDING;
 use onpair::Threshold;
 use onpair::compress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -79,15 +82,21 @@ fn main() {
         }
 
         let mut decompress_secs = f64::MAX;
-        let mut decoded = col.view().decompress();
+        // Caller-owned output buffer, sized from the column's decoded length.
+        let mut buf = vec![MaybeUninit::uninit(); col.view().decoded_len() + DECODE_PADDING];
+        let mut decoded_len = 0usize;
         for _ in 0..iters {
             let t = Instant::now();
-            decoded = col.view().decompress();
+            // SAFETY: freshly-compressed (trusted) column; `buf` is sized to
+            // `decoded_len() + DECODE_PADDING`.
+            decoded_len = unsafe { col.view().decompress_into(&mut buf) };
             decompress_secs = decompress_secs.min(t.elapsed().as_secs_f64());
         }
+        // SAFETY: the decoder initialized exactly `decoded_len` leading bytes.
+        let decoded = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), decoded_len) };
 
-        let dict_bytes = col.dict.bytes.len();
-        let dict_offsets = col.dict.offsets.len() * 4;
+        let dict_bytes = col.dict.bytes().len();
+        let dict_offsets = col.dict.offsets().len() * 4;
         let codes = col.codes.len() * 2;
         let row_offsets = std::mem::size_of_val(col.row_offsets.as_slice());
         let compressed = dict_bytes + dict_offsets + codes + row_offsets;
@@ -103,7 +112,7 @@ fn main() {
         );
         println!(
             "  dict tokens = {}, dict bytes = {dict_bytes}, codes = {} ({} bytes)",
-            col.dict.offsets.len() - 1,
+            col.dict.offsets().len() - 1,
             col.codes.len(),
             codes
         );
@@ -112,7 +121,7 @@ fn main() {
             mib / comp_mib
         );
 
-        let roundtrip_ok = decoded == bytes;
+        let roundtrip_ok = decoded == bytes.as_slice();
         println!(
             "  roundtrip: {} (decoded={:.2} MiB)",
             if roundtrip_ok { "PASS" } else { "FAIL" },

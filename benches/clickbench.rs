@@ -29,12 +29,15 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use std::mem::MaybeUninit;
+
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use divan::Bencher;
 use onpair::Bits;
 use onpair::Column;
 use onpair::Config;
+use onpair::DECODE_PADDING;
 use onpair::Threshold;
 use onpair::compress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -249,9 +252,15 @@ fn train_and_compress(bencher: Bencher, bits: u8) {
 fn decompress_all(bencher: Bencher, bits: u8) {
     let c = corpus();
     let col = compress_column(bits);
+    let cap = col.view().decoded_len() + DECODE_PADDING;
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
-        .bench(|| divan::black_box(col.view().decompress()));
+        .bench(|| {
+            let mut buf = vec![MaybeUninit::uninit(); cap];
+            // SAFETY: trusted column; `buf` is sized to decoded_len() + DECODE_PADDING.
+            let n = unsafe { col.view().decompress_into(&mut buf) };
+            divan::black_box(&buf[..n]);
+        });
 }
 
 fn main() {

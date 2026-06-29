@@ -16,24 +16,44 @@
 //!   is encodable.
 //! - **Unique** — no two tokens are equal.
 //! - **Read-padded** — `bytes` is readable for [`MAX_TOKEN_SIZE`] bytes past the
-//!   highest token offset (call [`CompactDictionary::pad_for_decoder`] once after
-//!   filling). `offsets.last()` is the logical length; `bytes.len()` may exceed
-//!   it by the padding.
+//!   highest token offset (applied by [`pad_raw`] at construction).
+//!   `offsets.last()` is the logical length; `bytes.len()` may exceed it by the
+//!   padding.
 
 use super::{Dictionary, DictionaryView, WideDictionary};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, code_bits_for};
 
-/// Owned compact dictionary.
+/// Append `MAX_TOKEN_SIZE - len(last token)` zero bytes to `bytes` so the decoder's
+/// fixed-width read from any token offset stays in bounds — the read-padding
+/// invariant. Applied once, on the raw buffers, just before sealing a
+/// [`CompactDictionary`]. Idempotent: a no-op once the padding is present or when
+/// the last token is already `MAX_TOKEN_SIZE` wide.
+pub(crate) fn pad_raw(bytes: &mut Vec<u8>, offsets: &[u32]) {
+    if offsets.len() < 2 {
+        return;
+    }
+    let last_token_start = offsets[offsets.len() - 2] as usize;
+    let required = last_token_start + MAX_TOKEN_SIZE;
+    if bytes.len() < required {
+        bytes.resize(required, 0);
+    }
+}
+
+/// Owned compact dictionary — **trusted**: holding one is a proof that its
+/// buffers satisfy the invariants in this module's documentation.
 ///
-/// Fields are public — this is a data type a consumer may construct directly
-/// from buffers it deserialized from storage — and must satisfy the invariants
-/// described in this module's documentation.
+/// The fields are private, so a value can only be obtained through a door that
+/// establishes that proof: the trainer, or
+/// [`UntrustedDictionary::validate`](crate::UntrustedDictionary::validate) /
+/// [`trust_unchecked`](crate::UntrustedDictionary::trust_unchecked) applied to
+/// deserialized buffers. Read the buffers back with [`bytes`](Self::bytes) /
+/// [`offsets`](Self::offsets) (e.g. to serialize).
 #[derive(Default, Debug, Clone)]
 pub struct CompactDictionary {
     /// Concatenated token bytes, followed by read-padding.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
     /// `num_tokens + 1` offsets delimiting the tokens within `bytes`.
-    pub offsets: Vec<u32>,
+    offsets: Vec<u32>,
 }
 
 impl CompactDictionary {
@@ -41,6 +61,27 @@ impl CompactDictionary {
     #[inline]
     pub fn num_tokens(&self) -> usize {
         self.offsets.len().saturating_sub(1)
+    }
+
+    /// The token bytes, including trailing read-padding (the serialized
+    /// `dict_bytes`; see `docs/interchange-format.md`).
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The `num_tokens + 1` token offsets (the serialized `dict_offsets`).
+    #[inline]
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    /// Seal raw buffers into a trusted dictionary. The crate-internal trust mint:
+    /// the caller (trainer, or the [`validate`](crate::UntrustedDictionary::validate)
+    /// door) guarantees the invariants.
+    #[inline]
+    pub(crate) fn from_raw(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
+        Self { bytes, offsets }
     }
 
     /// Logical byte length — token bytes only, excluding read-padding.
@@ -55,21 +96,6 @@ impl CompactDictionary {
     #[inline]
     pub fn code_bits(&self) -> u8 {
         code_bits_for(self.num_tokens())
-    }
-
-    /// Append `MAX_TOKEN_SIZE - len(last token)` zero bytes so the decoder's
-    /// fixed-width read from any token offset stays in bounds. Idempotent: a
-    /// no-op once the padding is present or when the last token is already
-    /// `MAX_TOKEN_SIZE` wide.
-    pub fn pad_for_decoder(&mut self) {
-        if self.offsets.len() < 2 {
-            return;
-        }
-        let last_token_start = self.offsets[self.offsets.len() - 2] as usize;
-        let required = last_token_start + MAX_TOKEN_SIZE;
-        if self.bytes.len() < required {
-            self.bytes.resize(required, 0);
-        }
     }
 
     /// Materialize the [`WideDictionary`] form (see
@@ -92,20 +118,27 @@ impl Dictionary for CompactDictionary {
     }
 }
 
-/// Borrowed, `Copy` view over a compact dictionary's buffers.
+/// Borrowed, `Copy`, **trusted** view over a compact dictionary's buffers.
 ///
-/// Borrows the raw slices rather than an owned [`CompactDictionary`], so a
-/// consumer can build a view directly from buffers deserialized from storage.
-/// The slices must satisfy the same invariants (see this module's documentation).
+/// Like [`CompactDictionary`] its fields are private: a value can only be obtained
+/// from a trusted owned dictionary ([`Dictionary::as_view`]) or by validating an
+/// [`UntrustedDictionaryView`](crate::UntrustedDictionaryView).
 #[derive(Copy, Clone, Debug)]
 pub struct CompactDictionaryView<'a> {
     /// Read-padded token bytes.
-    pub bytes: &'a [u8],
+    bytes: &'a [u8],
     /// `num_tokens + 1` offsets into `bytes`.
-    pub offsets: &'a [u32],
+    offsets: &'a [u32],
 }
 
 impl<'a> CompactDictionaryView<'a> {
+    /// Seal raw borrowed buffers into a trusted view (crate-internal trust mint;
+    /// the caller guarantees the invariants).
+    #[inline]
+    pub(crate) fn from_raw(bytes: &'a [u8], offsets: &'a [u32]) -> Self {
+        Self { bytes, offsets }
+    }
+
     /// Minimum bits per code needed to address this dictionary,
     /// `ceil(log2(num_tokens))`. See [`CompactDictionary::code_bits`].
     #[inline]
@@ -113,13 +146,24 @@ impl<'a> CompactDictionaryView<'a> {
         code_bits_for(self.num_tokens())
     }
 
-    /// Materialize the [`WideDictionary`] form.
+    /// Materialize the [`WideDictionary`] form: every token laid out in its own
+    /// fixed [`MAX_TOKEN_SIZE`]-byte row, so a decode reaches a token at
+    /// `code * MAX_TOKEN_SIZE` with no `code → offset → bytes` indirection. Worth
+    /// building once to amortize over a bulk or repeated decode; see
+    /// [`WideDictionary`] for the space/speed trade-off.
     ///
-    /// A conformant dictionary is read-padded, so the fixed 16-byte copy from
-    /// each token offset is in bounds (only `lens[id]` bytes of each row are the
-    /// token's own; the rest is overwritten by neighbours or padding and never
-    /// read by decode). The copy is bounds-checked, so a non-padded (malformed)
-    /// view panics rather than risking UB.
+    /// The source is a **trusted** [`CompactDictionaryView`], so this never
+    /// validates and never fails — the wide form is valid by construction. Two
+    /// trusted invariants carry the build:
+    ///
+    /// * read-padding lets each row be filled with one fixed 16-byte copy from the
+    ///   token's offset — an over-read past the token into neighbouring or padding
+    ///   bytes (harmless: decode only ever reads a row's first `lens[id]` bytes),
+    ///   kept in bounds by the padding;
+    /// * the `≤ MAX_TOKEN_SIZE` length bound makes `lens[id] = len as u8` exact,
+    ///   not a silent truncation.
+    ///
+    /// `O(num_tokens)`, dominated by the row copy.
     pub fn to_wide(&self) -> WideDictionary {
         let n = self.num_tokens();
         let mut data = vec![0u8; n * MAX_TOKEN_SIZE];
@@ -129,11 +173,9 @@ impl<'a> CompactDictionaryView<'a> {
             let len = self.offsets[id + 1] as usize - off;
             lens[id] = len as u8;
             let row = id * MAX_TOKEN_SIZE;
-            // Read-padding ⇒ 16 bytes readable from every token offset; lowers
-            // to a single SIMD move plus a (well-predicted) bounds check.
             data[row..row + MAX_TOKEN_SIZE].copy_from_slice(&self.bytes[off..off + MAX_TOKEN_SIZE]);
         }
-        WideDictionary { data, lens }
+        WideDictionary::from_raw(data, lens)
     }
 }
 
@@ -174,17 +216,6 @@ impl DictionaryView for CompactDictionaryView<'_> {
                 - *self.offsets.get_unchecked(id as usize)) as usize
         }
     }
-
-    #[inline]
-    unsafe fn byte_unchecked(&self, id: Token, k: usize) -> u8 {
-        // SAFETY: id < num_tokens ⇒ offsets[id] is in bounds; k < token_len(id) ⇒
-        // offsets[id] + k < offsets[id + 1] <= bytes.len(), so the byte is token id's.
-        unsafe {
-            *self
-                .bytes
-                .get_unchecked(*self.offsets.get_unchecked(id as usize) as usize + k)
-        }
-    }
 }
 
 impl<'a> From<&'a CompactDictionary> for CompactDictionaryView<'a> {
@@ -199,23 +230,7 @@ mod tests {
     use super::*;
 
     fn dict(offsets: Vec<u32>, bytes: &[u8]) -> CompactDictionary {
-        CompactDictionary {
-            bytes: bytes.to_vec(),
-            offsets,
-        }
-    }
-
-    /// A read-padded compact dictionary built from tokens.
-    fn padded(tokens: &[&[u8]]) -> CompactDictionary {
-        let mut bytes = Vec::new();
-        let mut offsets = vec![0u32];
-        for t in tokens {
-            bytes.extend_from_slice(t);
-            offsets.push(bytes.len() as u32);
-        }
-        let mut d = CompactDictionary { bytes, offsets };
-        d.pad_for_decoder();
-        d
+        CompactDictionary::from_raw(bytes.to_vec(), offsets)
     }
 
     #[test]
@@ -247,63 +262,36 @@ mod tests {
     }
 
     #[test]
-    fn pad_for_decoder_extends_to_max_token_read() {
-        // Last token "bc" is 2 bytes, so padding = MAX_TOKEN_SIZE - 2.
-        let mut d = dict(vec![0, 1, 3], b"abc");
-        d.pad_for_decoder();
-        assert_eq!(d.logical_len(), 3);
-        assert_eq!(d.bytes.len(), 1 + MAX_TOKEN_SIZE); // offset(last)=1, +16
+    fn pad_raw_extends_to_max_token_read() {
+        // Last token "bc" is 2 bytes; padding fills to offset(last) + MAX_TOKEN_SIZE.
+        let mut bytes = b"abc".to_vec();
+        pad_raw(&mut bytes, &[0, 1, 3]);
+        assert_eq!(bytes.len(), 1 + MAX_TOKEN_SIZE); // offset(last)=1, +16
     }
 
     #[test]
-    fn pad_for_decoder_is_idempotent() {
-        let mut d = dict(vec![0, 1, 3], b"abc");
-        d.pad_for_decoder();
-        let len = d.bytes.len();
-        d.pad_for_decoder();
-        assert_eq!(d.bytes.len(), len);
+    fn pad_raw_is_idempotent() {
+        let mut bytes = b"abc".to_vec();
+        let offsets = [0u32, 1, 3];
+        pad_raw(&mut bytes, &offsets);
+        let len = bytes.len();
+        pad_raw(&mut bytes, &offsets);
+        assert_eq!(bytes.len(), len);
     }
 
     #[test]
-    fn pad_for_decoder_tops_up_insufficient_trailing_bytes() {
+    fn pad_raw_tops_up_insufficient_trailing_bytes() {
         // bytes already exceed logical_len (3) but lack room for a full
         // MAX_TOKEN_SIZE read from the last token's start (offset 1).
-        let mut d = dict(vec![0, 1, 3], &[b'a', b'b', b'c', 0]);
-        d.pad_for_decoder();
-        assert_eq!(d.bytes.len(), 1 + MAX_TOKEN_SIZE);
+        let mut bytes = vec![b'a', b'b', b'c', 0];
+        pad_raw(&mut bytes, &[0, 1, 3]);
+        assert_eq!(bytes.len(), 1 + MAX_TOKEN_SIZE);
     }
 
     #[test]
-    fn pad_for_decoder_noop_for_full_width_last_token() {
-        let mut d = dict(vec![0, MAX_TOKEN_SIZE as u32], &[b'z'; MAX_TOKEN_SIZE]);
-        d.pad_for_decoder();
-        assert_eq!(d.bytes.len(), MAX_TOKEN_SIZE);
-    }
-
-    #[test]
-    fn to_wide_rows_and_lens_match_tokens() {
-        let tokens: &[&[u8]] = &[b"a", b"bc", b"def", b"ghij"];
-        let d = padded(tokens);
-        let wide = d.to_wide();
-        assert_eq!(wide.num_tokens(), tokens.len());
-        for (id, tok) in tokens.iter().enumerate() {
-            assert_eq!(wide.lens[id] as usize, tok.len());
-            assert_eq!(
-                &wide.data[id * MAX_TOKEN_SIZE..id * MAX_TOKEN_SIZE + tok.len()],
-                *tok
-            );
-        }
-    }
-
-    #[test]
-    fn to_wide_then_to_compact_round_trips_logical_content() {
-        let tokens: &[&[u8]] = &[b"a", b"bc", b"def", b"ghij", &[b'z'; MAX_TOKEN_SIZE]];
-        let d = padded(tokens);
-        let back = d.to_wide().to_compact();
-        assert_eq!(back.offsets, d.offsets);
-        assert_eq!(
-            &back.bytes[..back.logical_len()],
-            &d.bytes[..d.logical_len()]
-        );
+    fn pad_raw_noop_for_full_width_last_token() {
+        let mut bytes = vec![b'z'; MAX_TOKEN_SIZE];
+        pad_raw(&mut bytes, &[0, MAX_TOKEN_SIZE as u32]);
+        assert_eq!(bytes.len(), MAX_TOKEN_SIZE);
     }
 }

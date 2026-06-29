@@ -27,15 +27,8 @@ pub(super) fn narrow<V: DictionaryView>(
     k: usize,
     target: u8,
 ) -> TokenRange {
-    // Unchecked reads in the binary-search hot loop (this elides the per-step
-    // bounds checks `token(t)[k]` would emit).
-    //
-    // SAFETY (both closures): every id passed (`lo`, `hi`, `mid`) stays within
-    // `[range.begin, range.last]`, which callers keep `⊆ [0, num_tokens)`, so it
-    // is a valid code. `byte_at` is only reached after the `tlen(t) <= k` guard
-    // is false (the `||` / `&&` short-circuits), so `k < tlen(t)`.
-    let tlen = |t: Token| -> usize { unsafe { dict.token_len_unchecked(t) } };
-    let byte_at = |t: Token| -> u8 { unsafe { dict.byte_unchecked(t, k) } };
+    let tlen = |t: Token| -> usize { dict.token_len(t) };
+    let byte_at = |t: Token| -> u8 { dict.token(t)[k] };
 
     // Lower bound: first token in range with byte[k] >= target.
     let (mut lo, mut hi) = (range.begin, range.last);
@@ -100,7 +93,7 @@ pub fn prefix_range<V: DictionaryView>(dict: V, needle: &[u8]) -> TokenRange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, Dictionary};
+    use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
 
     /// A sorted, read-padded compact dictionary of all 256 single bytes plus the
     /// given multi-byte tokens, returned alongside the id-ordered token list.
@@ -118,8 +111,8 @@ mod tests {
             bytes.extend_from_slice(t);
             offsets.push(bytes.len() as u32);
         }
-        let mut dict = CompactDictionary { bytes, offsets };
-        dict.pad_for_decoder();
+        pad_raw(&mut bytes, &offsets);
+        let dict = CompactDictionary::from_raw(bytes, offsets);
         (dict, toks)
     }
 

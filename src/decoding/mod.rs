@@ -4,72 +4,81 @@
 //! Token decode.
 //!
 //! Decoding is a gather-copy: each code names a dictionary token; the output is
-//! those tokens concatenated. The kernels are generic over the dictionary
-//! representation ([`DictionaryView`]):
-//!
-//! * [`CompactDictionaryView`](crate::core::dictionary::CompactDictionaryView) —
-//!   a `code → offset → bytes` lookup (two dependent loads). Best for random
-//!   access / one-shot; no precomputation.
-//! * [`WideDictionaryView`](crate::core::dictionary::WideDictionaryView) —
-//!   a load-free `data + code*MAX_TOKEN_SIZE` address. Built once (via
-//!   `to_wide`), then best for bulk decode or repeated random access.
-//!
-//! To decode one row pass that row's code slice
-//! ([`ColumnView::row_codes`](crate::ColumnView::row_codes)); to bulk-decode
-//! pass the whole stream.
+//! those tokens concatenated. [`decode_into`] copies a fixed 16 bytes per token
+//! (one `copy16` store) whatever the token's true length — no per-token length
+//! branch. The cost is two paddings to keep that over-read in bounds: the
+//! dictionary's read-padding backs the source over-read, and the output buffer's
+//! [`DECODE_PADDING`] backs the destination over-store. It is generic over the
+//! dictionary representation ([`DictionaryView`]) — a load-free
+//! [`WideDictionaryView`](crate::core::dictionary::WideDictionaryView) or a
+//! [`CompactDictionaryView`](crate::core::dictionary::CompactDictionaryView).
+//! Codes are bounds-checked in the loop; [`ColumnView`](crate::ColumnView) wraps
+//! it as the buffer-sized [`decompress_into`](crate::ColumnView::decompress_into).
 
 use std::mem::MaybeUninit;
 
 use crate::core::dictionary::DictionaryView;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
+use crate::core::validate::{InvalidColumn, panic_malformed};
 
 mod copy;
 
+/// Trailing bytes a [`decode_into`] output buffer needs **beyond** the decoded
+/// length. The decoder over-stores a fixed [`MAX_TOKEN_SIZE`]-byte chunk for the
+/// final token — up to `MAX_TOKEN_SIZE - 1` bytes past the logical end — so an
+/// output buffer is sized as `decoded_len + DECODE_PADDING`.
+pub const DECODE_PADDING: usize = MAX_TOKEN_SIZE;
+
 /// Exact decoded byte length of `codes` against `dict` (the sum of token
-/// lengths).
+/// lengths) — sizes a decode buffer.
+///
+/// Bounds-checks each code, so a malformed code stream panics with
+/// [`InvalidColumn::CodeOutOfRange`] rather than reading out of bounds. The sum
+/// is only meaningful for a structurally valid dictionary.
 #[inline]
 pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
-    codes.iter().map(|&c| dict.token_len(c)).sum()
+    let n = dict.num_tokens();
+    let mut sum = 0usize;
+    for &c in codes {
+        if (c as usize) >= n {
+            panic_malformed(InvalidColumn::CodeOutOfRange);
+        }
+        // SAFETY: c < num_tokens.
+        let len = unsafe { dict.token_len_unchecked(c) };
+        sum = sum
+            .checked_add(len)
+            .unwrap_or_else(|| panic_malformed(InvalidColumn::DecodedLenOverflow));
+    }
+    sum
 }
 
-/// Decode `codes` against `dict` into `out`, returning bytes written
-/// (`== decoded_len(codes, dict)`). `out` need only be the exact decoded length.
+/// Decode `codes` against an **already-validated** `dict` into `out`, returning
+/// the bytes written. It over-reads a fixed 16 bytes per token, trusting the
+/// dictionary's offsets/lengths (validated up front). Each code is bounds-checked
+/// in the loop (a near-free, predicted-not-taken branch); an out-of-range code
+/// panics with [`InvalidColumn::CodeOutOfRange`].
+///
+/// `dict`'s validity is a *type* invariant — only a trusted [`DictionaryView`]
+/// (sealed; obtained through `validate`/`to_wide`) can be passed — so it is not a
+/// precondition here.
 ///
 /// # Safety
-/// - every `code` is `< dict.num_tokens()`;
-/// - `dict` upholds [`DictionaryView::token_ptr`]'s 16-byte-readable contract
-///   (a compact view must be read-padded);
-/// - `out.len() >= decoded_len(codes, dict)`.
+/// `out.len() >= decoded_len(codes, dict) + DECODE_PADDING`.
 pub unsafe fn decode_into<V: DictionaryView>(
     codes: &[Token],
     dict: V,
     out: &mut [MaybeUninit<u8>],
 ) -> usize {
+    let ntok = dict.num_tokens();
     let dst = out.as_mut_ptr().cast::<u8>();
-
-    // Exact-copy tail = the trailing tokens spanning the last < MAX_TOKEN_SIZE bytes;
-    // the fast 16-byte over-store needs that much room ahead. Counting bytes, not a
-    // fixed 16 codes, keeps short strings on the fast path — better for random access.
-    let mut split = codes.len();
-    let mut tail_bytes = 0usize;
-    for &code in codes.iter().rev() {
-        // SAFETY: code in range (caller contract).
-        let len = unsafe { dict.token_len_unchecked(code) };
-        if tail_bytes + len >= MAX_TOKEN_SIZE {
-            break;
-        }
-        tail_bytes += len;
-        split -= 1;
-    }
-
     let mut w = 0usize;
-    for &code in &codes[..split] {
-        // SAFETY: code in range ⇒ token_ptr/token_len_unchecked are valid and the
-        // pointer is readable for 16 bytes; the split guarantees >= 16 output
-        // bytes remain from `w`, so the over-store stays within `decoded_len <=
-        // out.len()`. `len` is read right after `ptr` so the compact path folds
-        // its shared `offsets[code]` load; the wide copy does not depend on `len`,
-        // so it is not serialized behind that load.
+    for &code in codes {
+        if code as usize >= ntok {
+            panic_malformed(InvalidColumn::CodeOutOfRange);
+        }
+        // SAFETY: code in range ⇒ token_ptr is readable for 16 bytes (the dict is
+        // read-padded); the trailing DECODE_PADDING keeps the last token's
+        // over-store within `out`.
         unsafe {
             let src = dict.token_ptr(code);
             let len = dict.token_len_unchecked(code);
@@ -77,33 +86,7 @@ pub unsafe fn decode_into<V: DictionaryView>(
             w += len;
         }
     }
-    for &code in &codes[split..] {
-        // SAFETY: code in range; the exact-length copy reads `len <= MAX_TOKEN_SIZE`
-        // bytes and writes within `[w, decoded_len) ⊆ out`.
-        unsafe {
-            let src = dict.token_ptr(code);
-            let len = dict.token_len_unchecked(code);
-            copy::copy_token_bytes(src, dst.add(w), len);
-            w += len;
-        }
-    }
     w
-}
-
-/// Decode `codes` against `dict` into a freshly allocated `Vec`, sized exactly.
-///
-/// Safe convenience: it assumes `dict` and `codes` uphold their invariants
-/// (true for any [`ColumnView`](crate::ColumnView) obtained from a
-/// [`Column`](crate::Column)). Feeding it a hand-built, malformed dictionary or
-/// out-of-range code is undefined behavior.
-pub fn decode_to_vec<V: DictionaryView>(codes: &[Token], dict: V) -> Vec<u8> {
-    let n = decoded_len(codes, dict);
-    let mut out = Vec::with_capacity(n);
-    // SAFETY: buffer sized to the exact decoded length; trust assumption as above.
-    let w = unsafe { decode_into(codes, dict, out.spare_capacity_mut()) };
-    // SAFETY: the kernel initialized exactly `w` leading bytes.
-    unsafe { out.set_len(w) };
-    out
 }
 
 #[cfg(test)]
@@ -130,35 +113,39 @@ mod tests {
             .collect()
     }
 
+    /// Decode into a padded buffer and return the initialized bytes.
+    fn vec_decode<V: DictionaryView>(codes: &[Token], dict: V) -> Vec<u8> {
+        let n = decoded_len(codes, dict);
+        let mut out = Vec::with_capacity(n + DECODE_PADDING);
+        // SAFETY: read-padded dict, in-range codes, buffer + DECODE_PADDING.
+        let w = unsafe { decode_into(codes, dict, out.spare_capacity_mut()) };
+        unsafe { out.set_len(w) };
+        out
+    }
+
     /// Decode through both representations and compare. Cheap enough to run under
-    /// Miri, which then proves the `unsafe` over-copy has no UB.
+    /// Miri, which then proves the over-copy has no UB.
     fn check(tokens: &[&[u8]], codes: &[Token]) {
         let (bytes, offsets) = padded(tokens);
-        let view = CompactDictionaryView {
-            bytes: &bytes,
-            offsets: &offsets,
-        };
+        let view = CompactDictionaryView::from_raw(&bytes, &offsets);
         let want = expected(tokens, codes);
 
         assert_eq!(decoded_len(codes, view), want.len());
-        assert_eq!(decode_to_vec(codes, view), want, "compact");
+        assert_eq!(vec_decode(codes, view), want, "compact");
 
         let wide = view.to_wide();
-        assert_eq!(decoded_len(codes, wide.as_view()), want.len());
-        assert_eq!(decode_to_vec(codes, wide.as_view()), want, "wide");
+        assert_eq!(vec_decode(codes, wide.as_view()), want, "wide");
     }
 
     #[test]
     fn decodes_mixed_length_tokens() {
         let tokens: &[&[u8]] = &[b"a", b"bc", b"def", b"ghij"];
-        // 40 codes (> MAX_TOKEN_SIZE) so the over-copy region is exercised.
         let codes: Vec<Token> = (0..40).map(|i| (i % 4) as Token).collect();
         check(tokens, &codes);
     }
 
     #[test]
     fn decodes_full_width_last_token() {
-        // A full-width last token: the wide read ends exactly at the logical end.
         let full = vec![b'z'; MAX_TOKEN_SIZE];
         let tokens: &[&[u8]] = &[b"x", &full];
         let codes: Vec<Token> = (0..40).map(|i| (i % 2) as Token).collect();
@@ -167,20 +154,16 @@ mod tests {
 
     #[test]
     fn decodes_short_final_token() {
-        // > MAX_TOKEN_SIZE codes ending in a 1-byte token: the fast/exact split
-        // must route the short tail through the exact copy so nothing over-stores
-        // past the exact-sized buffer (Miri checks the bound).
+        // Ends in a 1-byte token: the last over-store must land in the
+        // DECODE_PADDING room. Miri checks the bound.
         let tokens: &[&[u8]] = &[b"a", b"bcde"];
         let mut codes: Vec<Token> = (0..40).map(|i| (i % 2) as Token).collect();
-        *codes.last_mut().unwrap() = 0; // final token is the 1-byte "a"
+        *codes.last_mut().unwrap() = 0;
         check(tokens, &codes);
     }
 
     #[test]
     fn decodes_all_tail_length_buckets() {
-        // Tokens spanning every `copy_token_bytes` size bucket (1, 2|3, 4..=7,
-        // 8..=15, 16); > MAX_TOKEN_SIZE codes cycle through them so each bucket
-        // lands in the exact-copy tail. Miri then vets the overlapping writes.
         let t = [
             vec![b'a'; 1],
             vec![b'b'; 3],
@@ -196,8 +179,7 @@ mod tests {
 
     #[test]
     fn decodes_empty_code_stream() {
-        let tokens: &[&[u8]] = &[b"a", b"b"];
-        check(tokens, &[]);
+        check(&[b"a", b"b"], &[]);
     }
 
     #[test]
@@ -205,5 +187,23 @@ mod tests {
         let tokens: &[&[u8]] = &[b"hello", b"world"];
         check(tokens, &[0]);
         check(tokens, &[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "code index out of range")]
+    fn decode_into_panics_on_out_of_range_code() {
+        let (bytes, offsets) = padded(&[b"a", b"b"]);
+        let view = CompactDictionaryView::from_raw(&bytes, &offsets);
+        let mut out = vec![MaybeUninit::uninit(); 64];
+        // SAFETY: read-padded dict + generous buffer; the bad code must panic.
+        unsafe { decode_into(&[0, 5], view, &mut out) };
+    }
+
+    #[test]
+    #[should_panic(expected = "code index out of range")]
+    fn decoded_len_panics_on_out_of_range_code() {
+        let (bytes, offsets) = padded(&[b"a", b"b"]);
+        let view = CompactDictionaryView::from_raw(&bytes, &offsets);
+        let _ = decoded_len(&[0, 5], view);
     }
 }

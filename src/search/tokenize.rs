@@ -64,10 +64,22 @@ pub fn tokenize<V: DictionaryView>(text: &[u8], dict: V) -> Vec<Token> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, Dictionary};
-    use crate::decode_to_vec;
+    use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
     use crate::test_corpus::{binary_strings, make_raw, random_ascii_strings, user_strings};
-    use crate::{DEFAULT_CONFIG, Parser};
+    use crate::{DECODE_PADDING, DEFAULT_CONFIG, MAX_TOKEN_SIZE, Parser, decode_into, decoded_len};
+
+    /// Decode `codes` against `dict` into a fresh `Vec` (test helper; the crate
+    /// exposes only the into-buffer decoder).
+    fn decode_to_vec<V: DictionaryView>(codes: &[Token], dict: V) -> Vec<u8> {
+        let n = decoded_len(codes, dict);
+        let mut out = Vec::with_capacity(n + DECODE_PADDING);
+        // SAFETY: a built/padded test dict is read-padded, codes are in range, and
+        // the buffer carries DECODE_PADDING headroom.
+        let w = unsafe { decode_into(codes, dict, out.spare_capacity_mut()) };
+        // SAFETY: the decoder initialized exactly `w` leading bytes.
+        unsafe { out.set_len(w) };
+        out
+    }
 
     /// A sorted, complete (all 256 single bytes), read-padded compact dictionary
     /// built from the given `extra` multi-byte tokens. Returns it alongside the
@@ -86,8 +98,8 @@ mod tests {
             bytes.extend_from_slice(t);
             offsets.push(bytes.len() as u32);
         }
-        let mut dict = CompactDictionary { bytes, offsets };
-        dict.pad_for_decoder();
+        pad_raw(&mut bytes, &offsets);
+        let dict = CompactDictionary::from_raw(bytes, offsets);
         (dict, toks)
     }
 

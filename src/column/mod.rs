@@ -13,10 +13,11 @@
 use std::mem::MaybeUninit;
 
 use crate::core::dictionary::{
-    CompactDictionary, CompactDictionaryView, Dictionary, WideDictionary,
+    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, WideDictionary,
 };
 use crate::core::offset::Offset;
 use crate::core::types::Token;
+use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
 use crate::search::{ContainsTable, PrefixQuery, contains, equals, starts_with, tokenize};
 
@@ -79,67 +80,133 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     }
 
     /// The codes for row `k`. Precondition: `k < num_rows()`.
+    ///
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if this view's row layer is
+    /// malformed (`row_offsets[k] > row_offsets[k + 1]`, or past the code stream)
+    /// — never UB. The bound check is the same one slicing would do anyway, so it
+    /// only swaps the panic message; the access itself is unchecked.
     #[inline]
     pub fn row_codes(&self, k: usize) -> &'a [Token] {
         let a = self.row_offsets[k].to_usize();
         let b = self.row_offsets[k + 1].to_usize();
-        &self.codes[a..b]
+        if b < a || b > self.codes.len() {
+            panic_malformed(InvalidColumn::BadRowOffsets);
+        }
+        // SAFETY: just checked `a <= b <= codes.len()`.
+        unsafe { self.codes.get_unchecked(a..b) }
     }
 
-    /// Exact decoded byte length of the whole column.
+    /// Exact decoded byte length of the whole column — sizes a
+    /// [`decompress_into`](Self::decompress_into) buffer (plus
+    /// [`DECODE_PADDING`](crate::DECODE_PADDING)). `O(codes)`; an out-of-range code
+    /// panics with [`InvalidColumn::CodeOutOfRange`].
     #[inline]
     pub fn decoded_len(&self) -> usize {
         decoding::decoded_len(self.codes, self.dict)
     }
 
-    /// Exact decoded byte length of row `k` — sizes the buffer for
-    /// [`decompress_row_into`](Self::decompress_row_into). Precondition: `k < num_rows()`.
+    /// Exact decoded byte length of row `k` — sizes a buffer for a
+    /// [`decode_into`](crate::decode_into) over [`row_codes`](Self::row_codes).
+    /// Precondition: `k < num_rows()`.
     #[inline]
     pub fn row_decoded_len(&self, k: usize) -> usize {
         decoding::decoded_len(self.row_codes(k), self.dict)
     }
 
-    /// Build a reusable [`WideDictionary`] for this column's dictionary. Amortize
-    /// it across many decodes (`decode_into`/`decode_to_vec` over its view) when
-    /// doing repeated random access; for a single bulk decode prefer
-    /// [`Self::decompress`].
+    /// Build a reusable [`WideDictionary`] for this column's dictionary (validates
+    /// it; panics if malformed). Amortize it across many decodes
+    /// ([`decode_into`](crate::decode_into) over its view) when doing repeated
+    /// access after one validation; for a single bulk decode
+    /// [`decompress_into`](Self::decompress_into) over the compact dictionary is
+    /// usually enough.
     #[inline]
     pub fn wide_dict(&self) -> WideDictionary {
         self.dict.to_wide()
     }
 
-    /// Decode the whole column into a fresh `Vec` (bulk path, via the wide form).
-    pub fn decompress(&self) -> Vec<u8> {
-        // A column upholds the invariants: every code is in range.
-        decoding::decode_to_vec(self.codes, self.wide_dict().as_view())
+    /// Check this view's column-level invariants: every code in range and
+    /// well-formed row offsets. `O(codes)`. The dictionary is already **trusted**
+    /// by its type ([`CompactDictionaryView`] can only be obtained validated), so
+    /// it is not re-checked here.
+    ///
+    /// This is a recoverable **pre-flight**, not a fast-path gate. The decode
+    /// kernels ([`decode_into`](crate::decode_into) and [`row_codes`](Self::row_codes))
+    /// bounds-check every code and row offset regardless, so they are sound — and
+    /// panic, never UB — on any view. `validate` unlocks no unchecked path; it
+    /// merely surfaces, as a `Result` up front, the same violations a later decode
+    /// would otherwise hit as a panic. After `Ok`, a decode into an adequately-sized
+    /// buffer will not panic.
+    ///
+    /// A view from a [`Column`] always passes; this is for views assembled from a
+    /// validated dictionary plus deserialized code/row buffers. Safety only — not
+    /// the correctness properties (sorted/complete/unique).
+    pub fn validate(&self) -> Result<(), InvalidColumn> {
+        let n = self.dict.num_tokens();
+        if self.codes.iter().any(|&c| (c as usize) >= n) {
+            return Err(InvalidColumn::CodeOutOfRange);
+        }
+        let mut prev = 0usize;
+        for &r in self.row_offsets {
+            let r = r.to_usize();
+            if r < prev {
+                return Err(InvalidColumn::BadRowOffsets);
+            }
+            prev = r;
+        }
+        if prev > self.codes.len() {
+            return Err(InvalidColumn::BadRowOffsets);
+        }
+        Ok(())
     }
 
-    /// Decode the whole column into `out` (bulk path, via the wide form),
-    /// returning the bytes written — no allocation.
+    /// Decode the whole column into `out`, returning the bytes written. Expands the
+    /// dictionary to its load-free [`WideDictionary`] form once — the fast layout
+    /// for a bulk decode, reached directly per code with no offset indirection —
+    /// then over-reads a fixed 16 bytes per token via
+    /// [`decode_into`](crate::decode_into). The caller owns buffer sizing: size
+    /// `out` from [`decoded_len`](Self::decoded_len) plus
+    /// [`DECODE_PADDING`](crate::DECODE_PADDING).
+    ///
+    /// For repeated decodes, build a [`wide_dict`](Self::wide_dict) once and decode
+    /// over its view with [`decode_into`](crate::decode_into), so the wide form is
+    /// not rebuilt on every call.
+    ///
+    /// # Panics
+    /// With [`InvalidColumn`] on a malformed view — a bad dictionary (caught while
+    /// building the wide form) or an out-of-range code. Never UB.
     ///
     /// # Safety
-    /// `out` must be at least [`decoded_len`](Self::decoded_len) bytes long.
+    /// `out.len() >= self.decoded_len() + DECODE_PADDING`. The dictionary's
+    /// validity is established by the wide expansion, so it is *not* a precondition.
+    #[inline]
     pub unsafe fn decompress_into(&self, out: &mut [MaybeUninit<u8>]) -> usize {
-        // SAFETY: a view from a `Column` keeps every code in range and the dict
-        // read-padded; the caller guarantees `out` is long enough.
-        unsafe { decoding::decode_into(self.codes, self.wide_dict().as_view(), out) }
+        // Expand to the load-free wide form (fast for a bulk decode); its copy
+        // bounds-checks the dictionary bytes via safe slicing, so a malformed one
+        // panics rather than risks UB.
+        let wide = self.dict.to_wide();
+        // SAFETY: the wide form is read-padded by construction (`n` exact 16-byte
+        // rows); the only caller precondition is the buffer size.
+        unsafe { decoding::decode_into(self.codes, wide.as_view(), out) }
     }
 
     /// Decode row `k` into a fresh `Vec` (random-access path, compact dictionary —
     /// no wide-table build). Precondition: `k < num_rows()`.
-    pub fn decompress_row(&self, k: usize) -> Vec<u8> {
-        decoding::decode_to_vec(self.row_codes(k), self.dict)
-    }
-
-    /// Decode row `k` into `out` (random-access path, compact dictionary),
-    /// returning the bytes written — no allocation, so one buffer can be reused
-    /// across rows. Precondition: `k < num_rows()`.
     ///
-    /// # Safety
-    /// `out` must be at least [`row_decoded_len(k)`](Self::row_decoded_len) bytes long.
-    pub unsafe fn decompress_row_into(&self, k: usize, out: &mut [MaybeUninit<u8>]) -> usize {
-        // SAFETY: invariants upheld by the view; the caller guarantees `out` is long enough.
-        unsafe { decoding::decode_into(self.row_codes(k), self.dict, out) }
+    /// Bounds-checked per token (`O(row)`, no `O(num_tokens)` validation), so it is
+    /// safe on any view and panics (never UB) on a malformed column. This is the
+    /// simple safe path for random access; for bulk decode use
+    /// [`decompress_into`](Self::decompress_into).
+    pub fn decompress_row(&self, k: usize) -> Vec<u8> {
+        let codes = self.row_codes(k);
+        let n = self.dict.num_tokens();
+        let mut out = Vec::new();
+        for &c in codes {
+            if (c as usize) >= n {
+                panic_malformed(InvalidColumn::CodeOutOfRange);
+            }
+            out.extend_from_slice(self.dict.token(c));
+        }
+        out
     }
 
     /// Ascending indices of the rows equal to `needle`. The needle is
@@ -174,7 +241,9 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Bits, Config, DEFAULT_CONFIG, compress};
+    use crate::{
+        Bits, ColumnView, Config, DECODE_PADDING, DEFAULT_CONFIG, InvalidColumn, compress,
+    };
 
     fn pack(rows: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
         let mut bytes = Vec::new();
@@ -186,6 +255,17 @@ mod tests {
         (bytes, offsets)
     }
 
+    /// Decode the whole column into a fresh `Vec` through the caller-buffer API,
+    /// sizing from `decoded_len` (test helper; the crate exposes only into-buffer
+    /// decode).
+    fn decode_all(view: ColumnView<'_, u32>) -> Vec<u8> {
+        let mut buf = vec![std::mem::MaybeUninit::uninit(); view.decoded_len() + DECODE_PADDING];
+        // SAFETY: view from a trusted column; buffer carries DECODE_PADDING headroom.
+        let w = unsafe { view.decompress_into(&mut buf) };
+        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) };
+        got.to_vec()
+    }
+
     #[test]
     fn roundtrip_bulk_and_per_row() {
         let rows: &[&[u8]] = &[b"alpha", b"", b"beta beta", b"gamma"];
@@ -193,42 +273,33 @@ mod tests {
         let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
         let view = col.view();
 
-        assert_eq!(view.decompress(), bytes);
+        assert_eq!(view.decoded_len(), bytes.len());
+        assert_eq!(decode_all(view), bytes);
         assert_eq!(view.num_rows(), rows.len());
         for (k, row) in rows.iter().enumerate() {
             assert_eq!(view.decompress_row(k), *row, "row {k}");
         }
     }
 
-    /// Decoding into a caller buffer must agree with the `Vec`-returning path,
-    /// for both the whole column and per row, with one buffer reused across rows.
+    /// Decoding over the wide form (what `decompress_into` builds) and directly
+    /// over the compact dictionary agree, and both reproduce the input.
     #[test]
-    fn decompress_into_matches_vec_path() {
+    fn compact_and_wide_decode_agree() {
+        use crate::decode_into;
         let rows: &[&[u8]] = &[b"alpha", b"", b"beta beta", b"gamma", b"alpha"];
         let (bytes, offsets) = pack(rows);
         let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
         let view = col.view();
 
-        // Whole column into an exactly-sized buffer.
-        let mut buf = vec![std::mem::MaybeUninit::uninit(); view.decoded_len()];
-        // SAFETY: `buf` is sized to the exact decoded length.
-        let n = unsafe { view.decompress_into(&mut buf) };
-        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
-        assert_eq!(got, view.decompress().as_slice());
+        // Wide path: `decompress_into` expands to the wide form internally.
+        assert_eq!(decode_all(view), bytes);
 
-        // Per row, reusing a single buffer sized to the widest row.
-        let widest = (0..view.num_rows())
-            .map(|k| view.row_decoded_len(k))
-            .max()
-            .unwrap();
-        let mut scratch = vec![std::mem::MaybeUninit::uninit(); widest];
-        for (k, row) in rows.iter().enumerate() {
-            // SAFETY: `scratch` is sized to the widest row, so it holds row `k`.
-            let n = unsafe { view.decompress_row_into(k, &mut scratch) };
-            let got = unsafe { std::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), n) };
-            assert_eq!(n, view.row_decoded_len(k), "row {k} length");
-            assert_eq!(got, *row, "row {k} bytes");
-        }
+        // Compact path: decode the same codes directly over the compact view.
+        let mut buf = vec![std::mem::MaybeUninit::uninit(); view.decoded_len() + DECODE_PADDING];
+        // SAFETY: read-padded compact dict (from a Column); buffer carries headroom.
+        let w = unsafe { decode_into(view.codes, view.dict, &mut buf) };
+        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) };
+        assert_eq!(got, bytes.as_slice());
     }
 
     #[test]
@@ -246,7 +317,7 @@ mod tests {
                 ..DEFAULT_CONFIG
             };
             let col = compress(&bytes, &offsets, cfg).unwrap();
-            assert_eq!(col.view().decompress(), bytes, "bits={bits}");
+            assert_eq!(decode_all(col.view()), bytes, "bits={bits}");
         }
     }
 
@@ -260,6 +331,60 @@ mod tests {
         let col = compress(&bytes, &offsets, cfg).unwrap();
         // Minimal packing width never exceeds the configured capacity.
         assert!(col.dict.code_bits() <= 12);
+    }
+
+    #[test]
+    fn validate_classifies_column_corruption() {
+        let (bytes, offsets) = pack(&[b"alpha", b"beta", b"alpha"]);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        assert_eq!(view.validate(), Ok(()));
+
+        // A code past the dictionary.
+        let bad_codes = vec![u16::MAX];
+        let ro = vec![0u32, 1];
+        let bad = ColumnView {
+            dict: view.dict,
+            codes: &bad_codes,
+            row_offsets: &ro,
+        };
+        assert_eq!(bad.validate(), Err(InvalidColumn::CodeOutOfRange));
+
+        // Row offsets that decrease.
+        let ro = vec![0u32, 2, 1];
+        let bad = ColumnView {
+            dict: view.dict,
+            codes: view.codes,
+            row_offsets: &ro,
+        };
+        assert_eq!(bad.validate(), Err(InvalidColumn::BadRowOffsets));
+
+        // A row offset past the code stream.
+        let ro = vec![0u32, (view.codes.len() + 1) as u32];
+        let bad = ColumnView {
+            dict: view.dict,
+            codes: view.codes,
+            row_offsets: &ro,
+        };
+        assert_eq!(bad.validate(), Err(InvalidColumn::BadRowOffsets));
+    }
+
+    /// A malformed row layer surfaces as a typed `BadRowOffsets` panic through the
+    /// safe row accessor, not a generic slice-index panic.
+    #[test]
+    #[should_panic(expected = "row offsets must be non-decreasing")]
+    fn row_codes_panics_typed_on_bad_row_offsets() {
+        let (bytes, offsets) = pack(&[b"alpha", b"beta"]);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        // Row 0 spans codes[0..len+1]: past the code stream.
+        let ro = vec![0u32, (view.codes.len() + 1) as u32];
+        let bad = ColumnView {
+            dict: view.dict,
+            codes: view.codes,
+            row_offsets: &ro,
+        };
+        let _ = bad.row_codes(0);
     }
 
     #[test]
