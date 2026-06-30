@@ -11,10 +11,10 @@
 //!
 //! * **Recoverable** — the `validate` family returns a `Result` for buffers a
 //!   consumer deserialized from storage. Two distinct roles:
-//!   * [`UntrustedDictionary::validate`](crate::UntrustedDictionary::validate) is
-//!     the *trust boundary*: it seals raw `(bytes, offsets)` into a trusted
-//!     dictionary, which is what lets the decoder read tokens unchecked. Validate
-//!     once, then decode on the fast (unchecked) path.
+//!   * [`CompactDictionary::validate`](crate::CompactDictionary::validate) is the
+//!     *trust boundary*: it seals raw `(bytes, offsets)` into a trusted dictionary,
+//!     which is what lets the decoder read tokens unchecked. Validate once, then
+//!     decode on the fast (unchecked) path.
 //!   * [`ColumnView::validate`](crate::ColumnView::validate) is a *pre-flight*, not
 //!     a fast-path gate: the decode kernels bounds-check every code and row offset
 //!     regardless, so it unlocks nothing faster. It just reports the same
@@ -29,7 +29,7 @@
 /// A violation found while validating compressed buffers.
 ///
 /// Two kinds. **Safety** violations would let an unchecked decoder read or write
-/// out of bounds — these are exactly the obligations an `unsafe trust_unchecked`
+/// out of bounds — these are exactly the obligations an `unsafe new_unchecked`
 /// caller must uphold to avoid UB. **Conformance** violations decode safely but
 /// make search / tokenize give *wrong answers*. The `validate` family checks both,
 /// so a trusted dictionary is fully conformant — indistinguishable from a

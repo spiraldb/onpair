@@ -22,6 +22,7 @@
 
 use super::{Dictionary, DictionaryView, WideDictionary};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, code_bits_for};
+use crate::core::validate::InvalidColumn;
 
 /// Append `MAX_TOKEN_SIZE - len(last token)` zero bytes to `bytes` so the decoder's
 /// fixed-width read from any token offset stays in bounds — the read-padding
@@ -39,14 +40,64 @@ pub(crate) fn pad_raw(bytes: &mut Vec<u8>, offsets: &[u32]) {
     }
 }
 
+/// Validate raw compact `(bytes, offsets)` against the [`CompactDictionary`]
+/// invariants: both safety (no out-of-bounds decode) and conformance (correct
+/// search / tokenize). `O(total token bytes)` — the token bytes are read once.
+///
+/// Two passes: the first checks the offset-only safety invariants and proves every
+/// token's bytes are in bounds; the second reads those bytes to check sortedness
+/// and alphabet completeness.
+fn validate_compact(bytes: &[u8], offsets: &[u32]) -> Result<(), InvalidColumn> {
+    // Pass 1 — safety: strictly-increasing offsets (so the length subtraction can't
+    // underflow and no token is empty), bounded length, and the trailing
+    // read-padding. `s` of the final window is the highest token offset, so a
+    // single padding bound covers every token's fixed-width over-read. After this,
+    // every `bytes[offsets[i]..offsets[i + 1]]` slice is in bounds.
+    let mut last_offset = 0usize;
+    for w in offsets.windows(2) {
+        let (s, e) = (w[0], w[1]);
+        if e < s {
+            return Err(InvalidColumn::NonDecreasingOffsets);
+        }
+        if e == s {
+            return Err(InvalidColumn::EmptyToken);
+        }
+        if (e - s) as usize > MAX_TOKEN_SIZE {
+            return Err(InvalidColumn::TokenTooLarge);
+        }
+        last_offset = s as usize;
+    }
+    if offsets.len() >= 2 && last_offset + MAX_TOKEN_SIZE > bytes.len() {
+        return Err(InvalidColumn::MissingPadding);
+    }
+
+    // Pass 2 — conformance: tokens strictly ascending (hence sorted and unique) and
+    // the 256 single-byte tokens all present. Indexing `bytes` is sound after pass 1.
+    let mut seen = [false; 256];
+    let mut prev: &[u8] = &[];
+    for w in offsets.windows(2) {
+        let token = &bytes[w[0] as usize..w[1] as usize];
+        if prev >= token {
+            return Err(InvalidColumn::UnsortedTokens);
+        }
+        if token.len() == 1 {
+            seen[token[0] as usize] = true;
+        }
+        prev = token;
+    }
+    if seen.iter().any(|&present| !present) {
+        return Err(InvalidColumn::IncompleteAlphabet);
+    }
+    Ok(())
+}
+
 /// Owned compact dictionary — **trusted**: holding one is a proof that its
 /// buffers satisfy the invariants in this module's documentation.
 ///
 /// The fields are private, so a value can only be obtained through a door that
-/// establishes that proof: the trainer, or
-/// [`UntrustedDictionary::validate`](crate::UntrustedDictionary::validate) /
-/// [`trust_unchecked`](crate::UntrustedDictionary::trust_unchecked) applied to
-/// deserialized buffers. Read the buffers back with [`bytes`](Self::bytes) /
+/// establishes that proof: the trainer, or [`validate`](Self::validate) (checked) /
+/// [`new_unchecked`](Self::new_unchecked) (`unsafe`) applied to deserialized
+/// buffers. Read the buffers back with [`bytes`](Self::bytes) /
 /// [`offsets`](Self::offsets) (e.g. to serialize).
 #[derive(Default, Debug, Clone)]
 pub struct CompactDictionary {
@@ -77,11 +128,45 @@ impl CompactDictionary {
     }
 
     /// Seal raw buffers into a trusted dictionary. The crate-internal trust mint:
-    /// the caller (trainer, or the [`validate`](crate::UntrustedDictionary::validate)
-    /// door) guarantees the invariants.
+    /// the caller (trainer, or the [`validate`](Self::validate) door) guarantees the
+    /// invariants.
     #[inline]
     pub(crate) fn from_raw(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
         Self { bytes, offsets }
+    }
+
+    /// Validate raw `(bytes, offsets)` deserialized from storage into a trusted
+    /// dictionary (moved, no copy) — the checked door across the trust boundary. On
+    /// success it is fully conformant: safe to decode *and* correct to
+    /// search / tokenize, indistinguishable from a trainer-built dictionary.
+    ///
+    /// # Errors
+    /// [`InvalidColumn`] for a safety violation (decreasing offsets, an over-long
+    /// token, missing read-padding) or a conformance violation (an empty token,
+    /// unsorted/duplicate tokens, or an incomplete single-byte alphabet). Does not
+    /// pad — a conformant serialized dictionary already carries the read-padding.
+    pub fn validate(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<Self, InvalidColumn> {
+        validate_compact(&bytes, &offsets)?;
+        Ok(Self::from_raw(bytes, offsets))
+    }
+
+    /// Seal raw `(bytes, offsets)` into a trusted dictionary **without** checking —
+    /// the `unsafe` door across the trust boundary, for buffers the caller already
+    /// knows are conformant (e.g. its own validated-on-write format).
+    ///
+    /// # Safety
+    /// Every invariant in this module's docs is a precondition; the result must be
+    /// indistinguishable from a [`validate`](Self::validate)d one. They split by how
+    /// a violation bites, but both tiers are required:
+    /// * **Read-safety** (violating these is UB — an unchecked decoder reads or
+    ///   writes out of bounds): `offsets[0] == 0`, `offsets.len() == num_tokens + 1`,
+    ///   non-decreasing offsets, every token `<= MAX_TOKEN_SIZE`, and read-padded
+    ///   (`offsets.last() + MAX_TOKEN_SIZE <= bytes.len()`).
+    /// * **Conformance** (violating these is not UB, but search / tokenize then give
+    ///   wrong answers): strictly-increasing offsets, tokens sorted and unique, and
+    ///   the 256-symbol alphabet complete.
+    pub unsafe fn new_unchecked(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
+        Self::from_raw(bytes, offsets)
     }
 
     /// Logical byte length — token bytes only, excluding read-padding.
@@ -121,8 +206,8 @@ impl Dictionary for CompactDictionary {
 /// Borrowed, `Copy`, **trusted** view over a compact dictionary's buffers.
 ///
 /// Like [`CompactDictionary`] its fields are private: a value can only be obtained
-/// from a trusted owned dictionary ([`Dictionary::as_view`]) or by validating an
-/// [`UntrustedDictionaryView`](crate::UntrustedDictionaryView).
+/// from a trusted owned dictionary ([`Dictionary::as_view`]) or by validating raw
+/// borrowed buffers with [`validate`](Self::validate) / [`new_unchecked`](Self::new_unchecked).
 #[derive(Copy, Clone, Debug)]
 pub struct CompactDictionaryView<'a> {
     /// Read-padded token bytes.
@@ -137,6 +222,25 @@ impl<'a> CompactDictionaryView<'a> {
     #[inline]
     pub(crate) fn from_raw(bytes: &'a [u8], offsets: &'a [u32]) -> Self {
         Self { bytes, offsets }
+    }
+
+    /// Validate raw borrowed `(bytes, offsets)` into a trusted view over the same
+    /// slices (no copy) — the checked door across the trust boundary. The borrowed
+    /// bytes must already be read-padded (a borrow cannot be extended).
+    ///
+    /// # Errors
+    /// As [`CompactDictionary::validate`].
+    pub fn validate(bytes: &'a [u8], offsets: &'a [u32]) -> Result<Self, InvalidColumn> {
+        validate_compact(bytes, offsets)?;
+        Ok(Self::from_raw(bytes, offsets))
+    }
+
+    /// Seal raw borrowed `(bytes, offsets)` into a trusted view without checking.
+    ///
+    /// # Safety
+    /// As [`CompactDictionary::new_unchecked`].
+    pub unsafe fn new_unchecked(bytes: &'a [u8], offsets: &'a [u32]) -> Self {
+        Self::from_raw(bytes, offsets)
     }
 
     /// Minimum bits per code needed to address this dictionary,
@@ -188,7 +292,11 @@ impl<'a> CompactDictionaryView<'a> {
             // bytes at `off`; `src` (borrowed dictionary) and the freshly-allocated
             // `dst` are distinct allocations, so the copy cannot overlap.
             unsafe {
-                std::ptr::copy_nonoverlapping(src.add(off), dst.add(id * MAX_TOKEN_SIZE), MAX_TOKEN_SIZE);
+                std::ptr::copy_nonoverlapping(
+                    src.add(off),
+                    dst.add(id * MAX_TOKEN_SIZE),
+                    MAX_TOKEN_SIZE,
+                );
             }
         }
         WideDictionary::from_raw(data, lens)
@@ -309,5 +417,107 @@ mod tests {
         let mut bytes = vec![b'z'; MAX_TOKEN_SIZE];
         pad_raw(&mut bytes, &[0, MAX_TOKEN_SIZE as u32]);
         assert_eq!(bytes.len(), MAX_TOKEN_SIZE);
+    }
+
+    /// Read-padded `(bytes, offsets)` from an explicit token list — the caller
+    /// controls exactly which conformance property is under test.
+    fn padded(tokens: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
+        let mut bytes = Vec::new();
+        let mut offsets = vec![0u32];
+        for t in tokens {
+            bytes.extend_from_slice(t);
+            offsets.push(bytes.len() as u32);
+        }
+        bytes.resize(bytes.len() + MAX_TOKEN_SIZE, 0); // worst-case read padding
+        (bytes, offsets)
+    }
+
+    /// A conformant dictionary: all 256 single-byte tokens plus `extra`, sorted and
+    /// deduped (so strictly increasing, sorted, unique, complete, and padded).
+    fn conformant(extra: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
+        let mut toks: Vec<Vec<u8>> = (0u16..256).map(|b| vec![b as u8]).collect();
+        for &t in extra {
+            toks.push(t.to_vec());
+        }
+        toks.sort();
+        toks.dedup();
+        let refs: Vec<&[u8]> = toks.iter().map(Vec::as_slice).collect();
+        padded(&refs)
+    }
+
+    /// Map to `Result<(), _>` so we can compare (`CompactDictionary` isn't `Eq`).
+    fn check(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<(), InvalidColumn> {
+        CompactDictionary::validate(bytes, offsets).map(|_| ())
+    }
+
+    #[test]
+    fn validate_accepts_conformant() {
+        let (bytes, offsets) = conformant(&[b"bc", b"def"]);
+        assert_eq!(check(bytes, offsets), Ok(()));
+    }
+
+    #[test]
+    fn validate_classifies_safety_corruption() {
+        // Decreasing offsets (would underflow the length subtraction).
+        let mut bytes = b"ab".to_vec();
+        bytes.resize(2 + MAX_TOKEN_SIZE, 0);
+        assert_eq!(
+            check(bytes, vec![0, 2, 1]),
+            Err(InvalidColumn::NonDecreasingOffsets)
+        );
+
+        // Zero-length token (`e == s`).
+        assert_eq!(
+            check(vec![0u8; MAX_TOKEN_SIZE], vec![0, 0]),
+            Err(InvalidColumn::EmptyToken)
+        );
+
+        // Token longer than MAX_TOKEN_SIZE.
+        assert_eq!(
+            check(vec![b'x'; 20 + MAX_TOKEN_SIZE], vec![0, 20]),
+            Err(InvalidColumn::TokenTooLarge)
+        );
+
+        // Missing the trailing read-padding.
+        assert_eq!(
+            check(b"abc".to_vec(), vec![0, 1, 3]),
+            Err(InvalidColumn::MissingPadding)
+        );
+    }
+
+    #[test]
+    fn validate_classifies_conformance_corruption() {
+        // Safe + padded but out of order (also how a duplicate would surface).
+        let (bytes, offsets) = padded(&[&[1u8], &[0u8]]);
+        assert_eq!(check(bytes, offsets), Err(InvalidColumn::UnsortedTokens));
+
+        // Sorted + safe but missing all but three single-byte tokens.
+        let (bytes, offsets) = padded(&[&[0u8], &[1u8], &[2u8]]);
+        assert_eq!(
+            check(bytes, offsets),
+            Err(InvalidColumn::IncompleteAlphabet)
+        );
+    }
+
+    #[test]
+    fn new_unchecked_matches_validate() {
+        let (bytes, offsets) = conformant(&[b"bc"]);
+        let checked = CompactDictionary::validate(bytes.clone(), offsets.clone()).unwrap();
+        // SAFETY: `conformant` produces a conformant dictionary.
+        let trusted = unsafe { CompactDictionary::new_unchecked(bytes, offsets) };
+        assert_eq!(checked.bytes(), trusted.bytes());
+        assert_eq!(checked.offsets(), trusted.offsets());
+    }
+
+    #[test]
+    fn view_validate_yields_usable_view() {
+        let (bytes, offsets) = conformant(&[b"bc"]);
+        let view = CompactDictionaryView::validate(&bytes, &offsets).unwrap();
+        assert_eq!(view.num_tokens(), 257); // 256 single bytes + "bc"
+        assert_eq!(view.token(0), &[0u8]); // byte 0 sorts first
+
+        // A non-conformant borrow is rejected.
+        let raw: &[u8] = b"abc";
+        assert!(CompactDictionaryView::validate(raw, &[0, 1, 3]).is_err());
     }
 }

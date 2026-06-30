@@ -68,8 +68,8 @@ mod test_corpus;
 
 pub use crate::column::{Column, ColumnView};
 pub use crate::core::dictionary::{
-    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, UntrustedDictionary,
-    UntrustedDictionaryView, WideDictionary, WideDictionaryView,
+    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, WideDictionary,
+    WideDictionaryView,
 };
 pub use crate::core::offset::Offset;
 pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};

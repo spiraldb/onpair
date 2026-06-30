@@ -19,17 +19,16 @@
 //! # Trust
 //! The four trusted types above are crate-private in their fields and implement a
 //! **sealed** [`DictionaryView`], so external code cannot forge one. Raw
-//! deserialized buffers live in the untrusted [`UntrustedDictionary`] /
-//! [`UntrustedDictionaryView`] ([`untrusted`]), which cross into the trusted forms
-//! only through `validate` (checked) or `trust_unchecked` (the `unsafe` backdoor).
+//! deserialized buffers cross into the trusted forms only through the
+//! [`validate`](CompactDictionary::validate) (checked) and
+//! [`new_unchecked`](CompactDictionary::new_unchecked) (`unsafe` backdoor)
+//! constructors on the compact types.
 
 mod compact;
-mod untrusted;
 mod wide;
 
 pub(crate) use compact::pad_raw;
 pub use compact::{CompactDictionary, CompactDictionaryView};
-pub use untrusted::{UntrustedDictionary, UntrustedDictionaryView};
 pub use wide::{WideDictionary, WideDictionaryView};
 
 use crate::core::types::Token;
@@ -63,7 +62,7 @@ pub trait Dictionary {
 /// **Sealed:** implemented only by this crate's trusted view types, so a value of
 /// `V: DictionaryView` is by construction a validated dictionary — the unchecked
 /// accessors below rely on that. Untrusted buffers reach a view through
-/// [`UntrustedDictionaryView::validate`], not by implementing this trait.
+/// [`CompactDictionaryView::validate`], not by implementing this trait.
 pub trait DictionaryView: Copy + sealed::Sealed {
     /// Number of tokens in the dictionary. The valid token ids are
     /// `0..num_tokens()`.
