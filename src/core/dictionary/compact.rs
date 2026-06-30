@@ -98,7 +98,8 @@ fn validate_compact(bytes: &[u8], offsets: &[u32]) -> Result<(), InvalidColumn> 
 /// establishes that proof: the trainer, or [`validate`](Self::validate) (checked) /
 /// [`new_unchecked`](Self::new_unchecked) (`unsafe`) applied to deserialized
 /// buffers. Read the buffers back with [`bytes`](Self::bytes) /
-/// [`offsets`](Self::offsets) (e.g. to serialize).
+/// [`offsets`](Self::offsets), or move them out with [`into_raw`](Self::into_raw)
+/// (e.g. to serialize).
 #[derive(Default, Debug, Clone)]
 pub struct CompactDictionary {
     /// Concatenated token bytes, followed by read-padding.
@@ -125,6 +126,23 @@ impl CompactDictionary {
     #[inline]
     pub fn offsets(&self) -> &[u32] {
         &self.offsets
+    }
+
+    /// Consume the dictionary, returning its owned buffers `(dict_bytes,
+    /// dict_offsets)` without copying — the inverse of [`validate`](Self::validate) /
+    /// [`new_unchecked`](Self::new_unchecked). Use it to hand the read-padded token
+    /// bytes and the `num_tokens + 1` offsets to another owner (e.g. to serialize)
+    /// without the copy that [`bytes`](Self::bytes) / [`offsets`](Self::offsets)
+    /// would force.
+    ///
+    /// This consumes `self`: the dictionary no longer exists afterward. It does not
+    /// alter the buffers — `dict_bytes` keeps its trailing read-padding
+    /// (`dict_bytes.len()` may exceed `dict_offsets.last()`), so the pair is still
+    /// conformant and rebuilds into a trusted dictionary via
+    /// [`validate`](Self::validate) (checked) or [`new_unchecked`](Self::new_unchecked).
+    #[inline]
+    pub fn into_raw(self) -> (Vec<u8>, Vec<u32>) {
+        (self.bytes, self.offsets)
     }
 
     /// Seal raw buffers into a trusted dictionary. The crate-internal trust mint:
@@ -507,6 +525,22 @@ mod tests {
         let trusted = unsafe { CompactDictionary::new_unchecked(bytes, offsets) };
         assert_eq!(checked.bytes(), trusted.bytes());
         assert_eq!(checked.offsets(), trusted.offsets());
+    }
+
+    #[test]
+    fn into_raw_returns_buffers_and_round_trips() {
+        let (bytes, offsets) = conformant(&[b"bc", b"def"]);
+        let num_tokens = offsets.len() - 1;
+        let dict = CompactDictionary::validate(bytes.clone(), offsets.clone()).unwrap();
+
+        // The owned buffers come back byte-for-byte, read-padding included.
+        let (raw_bytes, raw_offsets) = dict.into_raw();
+        assert_eq!(raw_bytes, bytes);
+        assert_eq!(raw_offsets, offsets);
+
+        // ...and rebuild into an equivalent trusted dictionary.
+        let rebuilt = CompactDictionary::validate(raw_bytes, raw_offsets).unwrap();
+        assert_eq!(rebuilt.num_tokens(), num_tokens);
     }
 
     #[test]
