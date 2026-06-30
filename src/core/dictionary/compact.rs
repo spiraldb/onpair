@@ -168,12 +168,28 @@ impl<'a> CompactDictionaryView<'a> {
         let n = self.num_tokens();
         let mut data = vec![0u8; n * MAX_TOKEN_SIZE];
         let mut lens = vec![0u8; n];
+        let src = self.bytes.as_ptr();
+        let dst = data.as_mut_ptr();
         for id in 0..n {
-            let off = self.offsets[id] as usize;
-            let len = self.offsets[id + 1] as usize - off;
-            lens[id] = len as u8;
-            let row = id * MAX_TOKEN_SIZE;
-            data[row..row + MAX_TOKEN_SIZE].copy_from_slice(&self.bytes[off..off + MAX_TOKEN_SIZE]);
+            // SAFETY: a trusted view has `offsets.len() == n + 1`, so `id` and
+            // `id + 1` index it in bounds. Offsets are strictly increasing with
+            // every token length in `1..=MAX_TOKEN_SIZE`, so `end - off` neither
+            // wraps nor overflows the `u8` length.
+            let (off, end) = unsafe {
+                (
+                    *self.offsets.get_unchecked(id) as usize,
+                    *self.offsets.get_unchecked(id + 1) as usize,
+                )
+            };
+            // SAFETY: `id < n == lens.len()`.
+            unsafe { *lens.get_unchecked_mut(id) = (end - off) as u8 };
+            // SAFETY: dst — `(id + 1) * MAX_TOKEN_SIZE <= n * MAX_TOKEN_SIZE == data.len()`.
+            // src — the read-padding invariant guarantees `MAX_TOKEN_SIZE` readable
+            // bytes at `off`; `src` (borrowed dictionary) and the freshly-allocated
+            // `dst` are distinct allocations, so the copy cannot overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(off), dst.add(id * MAX_TOKEN_SIZE), MAX_TOKEN_SIZE);
+            }
         }
         WideDictionary::from_raw(data, lens)
     }
