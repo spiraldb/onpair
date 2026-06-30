@@ -345,6 +345,15 @@ mod tests {
         needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// Decode row `k` to bytes via the into-buffer API, for the oracle.
+    fn decode_row(view: crate::ColumnView<'_, u32>, k: usize) -> Vec<u8> {
+        let mut buf =
+            vec![std::mem::MaybeUninit::uninit(); view.row_decoded_len(k) + crate::DECODE_PADDING];
+        // SAFETY: buffer sized for row `k`; view from a trusted column.
+        let w = unsafe { view.decompress_row_into(k, &mut buf) };
+        unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) }.to_vec()
+    }
+
     /// Driving `contains` over every row must agree with a brute-force
     /// decode-and-substring oracle. The table is built from both the compact and
     /// the wide dictionary to confirm construction is representation-agnostic.
@@ -354,7 +363,7 @@ mod tests {
         let wide = view.wide_dict();
         for &pat in patterns {
             let want: Vec<usize> = (0..view.num_rows())
-                .filter(|&k| byte_contains(&view.decompress_row(k), pat))
+                .filter(|&k| byte_contains(&decode_row(view, k), pat))
                 .collect();
 
             for table in [

@@ -27,10 +27,12 @@
 //! A compressed [`Column`] is a [`CompactDictionary`] (token bytes + offsets), a
 //! code stream (one [`Token`] per emitted token), and a row layer (offsets into
 //! the code stream). Borrow it as a [`ColumnView`] — or build a view directly
-//! from buffers deserialized from storage — and decode into a caller-owned buffer
-//! with [`ColumnView::decompress_into`] (or [`decode_into`] over a reusable
-//! [`WideDictionary`]). The caller owns buffer sizing: size it from
-//! [`ColumnView::decoded_len`] (plus [`DECODE_PADDING`]).
+//! from buffers deserialized from storage — and decode into a caller-owned buffer:
+//! the whole column with [`ColumnView::decompress_into`], one row with
+//! [`ColumnView::decompress_row_into`], or [`decode_into`] over a reusable
+//! [`WideDictionary`]. The caller owns buffer sizing: size it from
+//! [`ColumnView::decoded_len`] or [`ColumnView::row_decoded_len`] (plus
+//! [`DECODE_PADDING`]).
 //!
 //! # Examples
 //! ```
@@ -41,12 +43,16 @@
 //! let bytes = b"catdogcat";
 //! let offsets: [u32; 4] = [0, 3, 6, 9];
 //! let col = Column::compress(bytes, &offsets, DEFAULT_CONFIG).unwrap();
-//!
-//! // Random-access a single row (safe, no full decode).
-//! assert_eq!(col.view().decompress_row(1), b"dog");
-//!
-//! // Bulk-decode into a caller buffer, sized from the decoded length.
 //! let view = col.view();
+//!
+//! // Random-access a single row into a caller buffer — no full decode, no
+//! // wide-table build. Size it from the row's decoded length plus DECODE_PADDING.
+//! let mut row = vec![MaybeUninit::uninit(); view.row_decoded_len(1) + DECODE_PADDING];
+//! // SAFETY: `col` is valid by construction and `row` is sized as required.
+//! let n = unsafe { view.decompress_row_into(1, &mut row) };
+//! assert_eq!(unsafe { std::slice::from_raw_parts(row.as_ptr().cast::<u8>(), n) }, b"dog");
+//!
+//! // Bulk-decode the whole column into a caller buffer, sized from the decoded length.
 //! let mut buf = vec![MaybeUninit::uninit(); view.decoded_len() + DECODE_PADDING];
 //! // SAFETY: `col` is freshly compressed (valid by construction) and `buf` is sized.
 //! let n = unsafe { view.decompress_into(&mut buf) };

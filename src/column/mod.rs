@@ -189,24 +189,28 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         unsafe { decoding::decode_into(self.codes, wide.as_view(), out) }
     }
 
-    /// Decode row `k` into a fresh `Vec` (random-access path, compact dictionary —
-    /// no wide-table build). Precondition: `k < num_rows()`.
+    /// Decode row `k` into `out`, returning the bytes written — the random-access
+    /// analog of [`decompress_into`](Self::decompress_into). Same fixed 16-byte
+    /// over-copy per token, but decoded directly over the compact dictionary with
+    /// no wide-table build (the wide form would cost `O(num_tokens)` to materialize,
+    /// dwarfing a single short row). The caller owns buffer sizing and reuse — size
+    /// `out` from [`row_decoded_len`](Self::row_decoded_len) plus
+    /// [`DECODE_PADDING`](crate::DECODE_PADDING), and reuse it across rows to avoid
+    /// per-row allocation. Precondition: `k < num_rows()`.
     ///
-    /// Bounds-checked per token (`O(row)`, no `O(num_tokens)` validation), so it is
-    /// safe on any view and panics (never UB) on a malformed column. This is the
-    /// simple safe path for random access; for bulk decode use
-    /// [`decompress_into`](Self::decompress_into).
-    pub fn decompress_row(&self, k: usize) -> Vec<u8> {
-        let codes = self.row_codes(k);
-        let n = self.dict.num_tokens();
-        let mut out = Vec::new();
-        for &c in codes {
-            if (c as usize) >= n {
-                panic_malformed(InvalidColumn::CodeOutOfRange);
-            }
-            out.extend_from_slice(self.dict.token(c));
-        }
-        out
+    /// Each code is bounds-checked in the loop; an out-of-range code panics with
+    /// [`InvalidColumn::CodeOutOfRange`] (never UB).
+    ///
+    /// # Safety
+    /// `out.len() >= self.row_decoded_len(k) + DECODE_PADDING`. The dictionary's
+    /// validity is a type invariant of [`CompactDictionaryView`], so it is not a
+    /// precondition.
+    #[inline]
+    pub unsafe fn decompress_row_into(&self, k: usize, out: &mut [MaybeUninit<u8>]) -> usize {
+        // SAFETY: `self.dict` is trusted and read-padded, so each token's fixed
+        // 16-byte over-read stays in bounds; the caller guarantees `out` holds the
+        // row's decoded length plus DECODE_PADDING for the final over-store.
+        unsafe { decoding::decode_into(self.row_codes(k), self.dict, out) }
     }
 
     /// Ascending indices of the rows equal to `needle`. The needle is
@@ -266,6 +270,17 @@ mod tests {
         got.to_vec()
     }
 
+    /// Decode a single row into a fresh `Vec` through the into-buffer API — the
+    /// per-row counterpart of `decode_all`.
+    fn decode_row(view: ColumnView<'_, u32>, k: usize) -> Vec<u8> {
+        let mut buf =
+            vec![std::mem::MaybeUninit::uninit(); view.row_decoded_len(k) + DECODE_PADDING];
+        // SAFETY: buffer sized for row `k`; view from a trusted column.
+        let w = unsafe { view.decompress_row_into(k, &mut buf) };
+        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) };
+        got.to_vec()
+    }
+
     #[test]
     fn roundtrip_bulk_and_per_row() {
         let rows: &[&[u8]] = &[b"alpha", b"", b"beta beta", b"gamma"];
@@ -277,7 +292,7 @@ mod tests {
         assert_eq!(decode_all(view), bytes);
         assert_eq!(view.num_rows(), rows.len());
         for (k, row) in rows.iter().enumerate() {
-            assert_eq!(view.decompress_row(k), *row, "row {k}");
+            assert_eq!(decode_row(view, k), *row, "row {k}");
         }
     }
 
@@ -443,12 +458,12 @@ mod tests {
         ];
         for &needle in needles {
             let eq: Vec<usize> = (0..view.num_rows())
-                .filter(|&k| view.decompress_row(k).as_slice() == needle)
+                .filter(|&k| decode_row(view, k).as_slice() == needle)
                 .collect();
             assert_eq!(view.rows_equal_to(needle), eq, "equals {needle:?}");
 
             let pre: Vec<usize> = (0..view.num_rows())
-                .filter(|&k| view.decompress_row(k).starts_with(needle))
+                .filter(|&k| decode_row(view, k).starts_with(needle))
                 .collect();
             assert_eq!(
                 view.rows_starting_with(needle),
@@ -458,7 +473,7 @@ mod tests {
 
             let con: Vec<usize> = (0..view.num_rows())
                 .filter(|&k| {
-                    let r = view.decompress_row(k);
+                    let r = decode_row(view, k);
                     needle.is_empty() || r.windows(needle.len()).any(|w| w == needle)
                 })
                 .collect();
