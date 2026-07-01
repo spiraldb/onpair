@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add compressed-domain equality, prefix, and substring search APIs.
+
+### Changed
+
+- Refactor the public API around modules, `Column`/`ColumnView`, and validated dictionary types.
+- Bump the crate to 0.1.0 for the breaking public API changes.
+
 ## [0.0.4](https://github.com/spiraldb/onpair/compare/v0.0.3...v0.0.4) - 2026-05-29
 
 ### Added
