@@ -21,7 +21,7 @@
 //!   padding.
 
 use super::{Dictionary, DictionaryView, WideDictionary};
-use crate::core::types::{MAX_TOKEN_SIZE, Token, code_bits_for};
+use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::core::validate::InvalidColumn;
 
 /// Append `MAX_TOKEN_SIZE - len(last token)` zero bytes to `bytes` so the decoder's
@@ -89,6 +89,20 @@ fn validate_compact(bytes: &[u8], offsets: &[u32]) -> Result<(), InvalidColumn> 
         return Err(InvalidColumn::IncompleteAlphabet);
     }
     Ok(())
+}
+
+/// Minimum code width needed to address `num_tokens` distinct tokens:
+/// `ceil(log2(num_tokens))`.
+fn code_bits_for(num_tokens: usize) -> u8 {
+    debug_assert!(
+        num_tokens >= 1,
+        "log2(0) is undefined; num_tokens must be >= 1"
+    );
+    if num_tokens <= 1 {
+        1
+    } else {
+        ((num_tokens as u32 - 1).ilog2() + 1) as u8
+    }
 }
 
 /// Owned compact dictionary — **trusted**: holding one is a proof that its
@@ -401,6 +415,7 @@ mod tests {
         assert_eq!(dict(vec![0; 258], b"").code_bits(), 9); // 257 tokens -> 9 bits
         assert_eq!(dict(vec![0; 513], b"").code_bits(), 9); // 512 tokens -> 9 bits
         assert_eq!(dict(vec![0; 514], b"").code_bits(), 10); // 513 tokens -> 10 bits
+        assert_eq!(dict(vec![0; 65_537], b"").code_bits(), 16); // 65536 tokens -> 16 bits
     }
 
     #[test]

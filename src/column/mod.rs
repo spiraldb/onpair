@@ -246,7 +246,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Bits, ColumnView, Config, DECODE_PADDING, DEFAULT_CONFIG, InvalidColumn, compress,
+        ColumnView, Config, DECODE_PADDING, DEFAULT_CONFIG, InvalidColumn, MaxDictBits, compress,
     };
 
     fn pack(rows: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
@@ -328,7 +328,7 @@ mod tests {
         }
         for bits in 9..=16u8 {
             let cfg = Config {
-                bits: Bits::new(bits).unwrap(),
+                max_dict_bits: MaxDictBits::new(bits).unwrap(),
                 ..DEFAULT_CONFIG
             };
             let col = compress(&bytes, &offsets, cfg).unwrap();
@@ -340,7 +340,7 @@ mod tests {
     fn code_bits_is_within_capacity() {
         let (bytes, offsets) = pack(&[b"hello world", b"hello there", b"world peace"]);
         let cfg = Config {
-            bits: Bits::new(12).unwrap(),
+            max_dict_bits: MaxDictBits::new(12).unwrap(),
             ..DEFAULT_CONFIG
         };
         let col = compress(&bytes, &offsets, cfg).unwrap();

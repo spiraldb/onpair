@@ -35,9 +35,9 @@ use std::mem::MaybeUninit;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
-use onpair::Bits;
 use onpair::Config;
 use onpair::DECODE_PADDING;
+use onpair::MaxDictBits;
 use onpair::Threshold;
 use onpair::compress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -68,7 +68,7 @@ fn main() {
     for &bits in BITS {
         println!("\n=== bits = {bits} ===");
         let cfg = Config {
-            bits: Bits::new(bits).expect("BITS entries are in 9..=16"),
+            max_dict_bits: MaxDictBits::new(bits).expect("BITS entries are in 9..=16"),
             threshold,
             seed: Some(42),
         };

@@ -120,7 +120,6 @@ mod tests {
     use crate::core::dictionary::{
         CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView,
     };
-    use crate::core::types::BitWidth;
     use crate::encoding::config::{FixedThreshold, ThresholdSpec, TrainingConfig};
     use crate::encoding::trainer::train;
     use crate::test_corpus::{
@@ -165,13 +164,13 @@ mod tests {
         out
     }
 
-    fn roundtrip_all<S: AsRef<[u8]>>(strings: &[S], bits: BitWidth, seed: u64) -> bool {
+    fn roundtrip_all<S: AsRef<[u8]>>(strings: &[S], max_dict_bits: u8, seed: u64) -> bool {
         if strings.is_empty() {
             return true;
         }
         let raw = make_raw(strings);
         let cfg = TrainingConfig {
-            bits,
+            max_dict_bits,
             threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
             seed: Some(seed),
         };
@@ -180,7 +179,7 @@ mod tests {
         decode_all(&codes, dict.as_view()) == raw.data
     }
 
-    const WIDTHS: &[BitWidth] = &[9, 10, 11, 12, 13, 14, 15, 16];
+    const WIDTHS: &[u8] = &[9, 10, 11, 12, 13, 14, 15, 16];
 
     #[test]
     fn zero_strings_produces_no_codes() {
@@ -230,7 +229,7 @@ mod tests {
     fn trained_lpm_produces_multi_byte_tokens() {
         let raw = make_raw(&make_homogeneous_strings(50, 40, b'a'));
         let cfg = TrainingConfig {
-            bits: 16,
+            max_dict_bits: 16,
             threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
             seed: Some(42),
         };

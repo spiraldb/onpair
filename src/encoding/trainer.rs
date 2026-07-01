@@ -15,7 +15,7 @@ use rand::seq::SliceRandom;
 
 use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
 use crate::core::offset::Offset;
-use crate::core::types::{MAX_TOKEN_SIZE, max_dict_size};
+use crate::core::types::MAX_TOKEN_SIZE;
 use crate::encoding::config::{ThresholdSpec, TrainingConfig};
 use crate::encoding::hash::FxBuildHasher;
 use crate::encoding::lpm::LongestPrefixMatcher;
@@ -27,6 +27,15 @@ use crate::encoding::lpm::LongestPrefixMatcher;
 pub(crate) struct TrainResult {
     pub(crate) dict: CompactDictionary,
     pub(crate) lpm: LongestPrefixMatcher,
+}
+
+/// Largest dictionary size for a training budget: `2^max_dict_bits`.
+///
+/// `max_dict_bits` is validated as `9..=16` at the public boundary by
+/// [`crate::MaxDictBits`].
+#[inline]
+const fn max_dict_size(max_dict_bits: u8) -> usize {
+    1usize << max_dict_bits
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,11 +140,11 @@ impl DynamicThresholdController {
 /// Discover merge tokens via frequency-threshold scanning, then sort the
 /// dictionary lexicographically. `offsets` has length `n + 1`; string `i`
 /// occupies `data[offsets[i]..offsets[i + 1]]`. The caller guarantees offsets
-/// fit in `usize` and `cfg.bits` is in `9..=16`.
+/// fit in `usize` and `cfg.max_dict_bits` is in `9..=16`.
 pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig) -> TrainResult {
     debug_assert!(!offsets.is_empty());
     let n = offsets.len() - 1;
-    let dict_capacity = max_dict_size(cfg.bits);
+    let dict_capacity = max_dict_size(cfg.max_dict_bits);
 
     // Accumulate into local buffers, then seal once into a trusted dictionary at
     // the end — a move, no copy. The dictionary is never viewed mid-build (the
@@ -354,12 +363,12 @@ pub(crate) mod tests {
     #[test]
     fn dictionary_size_does_not_exceed_capacity() {
         let cfg = TrainingConfig {
-            bits: 12,
+            max_dict_bits: 12,
             threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
             seed: Some(42),
         };
         let result = train_strings(&make_user_strings(500), &cfg);
-        assert!(result.dict.num_tokens() <= max_dict_size(cfg.bits));
+        assert!(result.dict.num_tokens() <= max_dict_size(cfg.max_dict_bits));
     }
 
     #[test]
@@ -493,14 +502,14 @@ pub(crate) mod tests {
     #[test]
     fn dynamic_threshold_does_not_exceed_capacity() {
         let cfg = TrainingConfig {
-            bits: 12,
+            max_dict_bits: 12,
             threshold: ThresholdSpec::Dynamic(DynamicThreshold {
                 sample_fraction: 1.0,
             }),
             seed: Some(42),
         };
         let result = train_strings(&make_user_strings(500), &cfg);
-        assert!(result.dict.num_tokens() <= max_dict_size(cfg.bits));
+        assert!(result.dict.num_tokens() <= max_dict_size(cfg.max_dict_bits));
     }
 
     #[test]
@@ -566,7 +575,7 @@ pub(crate) mod tests {
         let result = train_strings(&make_mixed_length_strings(200, 64, 7), &cfg);
         check_base_tokens(result.dict.as_view());
         assert!(is_lex_sorted(result.dict.as_view()));
-        assert!(result.dict.num_tokens() <= max_dict_size(cfg.bits));
+        assert!(result.dict.num_tokens() <= max_dict_size(cfg.max_dict_bits));
     }
 
     #[test]
@@ -574,7 +583,7 @@ pub(crate) mod tests {
         let corpus = make_user_strings(50);
         for b in 9u8..=16 {
             let cfg = TrainingConfig {
-                bits: b,
+                max_dict_bits: b,
                 seed: Some(42),
                 ..Default::default()
             };

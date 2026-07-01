@@ -32,10 +32,10 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_schema::Schema;
 use divan::Bencher;
-use onpair::Bits;
 use onpair::Column;
 use onpair::Config;
 use onpair::DECODE_PADDING;
+use onpair::MaxDictBits;
 use onpair::Threshold;
 use onpair::compress;
 use tpchgen::generators::CustomerGenerator;
@@ -201,7 +201,7 @@ where
 fn build_column(col: &'static str, bits: u8) -> Column<u64> {
     let c = corpus_for(col);
     let cfg = Config {
-        bits: Bits::new(bits).unwrap(),
+        max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.2).unwrap(),
         seed: Some(42),
     };
@@ -217,7 +217,7 @@ fn train_and_compress(bencher: Bencher, param: (&'static str, u8)) {
     let (col, bits) = param;
     let c = corpus_for(col);
     let cfg = Config {
-        bits: Bits::new(bits).unwrap(),
+        max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.2).unwrap(),
         seed: Some(42),
     };

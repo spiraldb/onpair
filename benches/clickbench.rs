@@ -34,10 +34,10 @@ use std::mem::MaybeUninit;
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use divan::Bencher;
-use onpair::Bits;
 use onpair::Column;
 use onpair::Config;
 use onpair::DECODE_PADDING;
+use onpair::MaxDictBits;
 use onpair::Threshold;
 use onpair::compress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -217,7 +217,7 @@ fn synthetic_clickbench_urls(n: usize) -> Vec<Vec<u8>> {
 fn compress_column(bits: u8) -> Column<u64> {
     let c = corpus();
     let cfg = Config {
-        bits: Bits::new(bits).unwrap(),
+        max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.5).unwrap(),
         seed: Some(42),
     };
@@ -235,7 +235,7 @@ fn train_and_compress(bencher: Bencher, bits: u8) {
         .counter(divan::counter::BytesCount::new(c.total_bytes))
         .bench(|| {
             let cfg = Config {
-                bits: Bits::new(bits).unwrap(),
+                max_dict_bits: MaxDictBits::new(bits).unwrap(),
                 threshold: Threshold::new(0.5).unwrap(),
                 seed: Some(42),
             };

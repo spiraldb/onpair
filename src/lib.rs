@@ -83,7 +83,7 @@ pub use crate::core::validate::InvalidColumn;
 pub use crate::decoding::{
     DECODE_PADDING, OutputTooSmall, decode_into, decoded_len, try_decode_into,
 };
-pub use crate::encoding::config::{Bits, Config, DEFAULT_CONFIG, Error, Threshold};
+pub use crate::encoding::config::{Config, DEFAULT_CONFIG, Error, MaxDictBits, Threshold};
 pub use crate::encoding::parser::Parser;
 
 /// Compress an Arrow `(bytes, offsets)` value pair end-to-end. Equivalent to

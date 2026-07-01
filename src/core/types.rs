@@ -9,11 +9,6 @@
 //! most `2^16` tokens, so a fixed-width `u16` addresses every code regardless of
 //! dictionary size.
 
-/// Number of bits per code at training time; the dictionary capacity is
-/// `2^bits`. Legal range `9..=16`, validated at the public boundary by
-/// [`crate::Bits`].
-pub(crate) type BitWidth = u8;
-
 /// Identifies a dictionary token: a token id, equivalently a *code* in a
 /// column's code stream. Named `Token` for simplicity.
 pub type Token = u16;
@@ -65,51 +60,9 @@ impl TokenRange {
     }
 }
 
-/// Largest dictionary (token count) for a code width: `2^bits`, with `bits` in
-/// `9..=16`. Used by the trainer to size the dictionary.
-#[inline]
-pub(crate) const fn max_dict_size(bits: BitWidth) -> usize {
-    1usize << bits
-}
-
-/// Minimum code width (bits per code) needed to address `num_tokens` distinct
-/// tokens: `ceil(log2(num_tokens))`. The inverse of [`max_dict_size`]. Not
-/// `#[inline]`d — it runs once per column (to size the code stream), never in a
-/// hot loop.
-pub(crate) const fn code_bits_for(num_tokens: usize) -> BitWidth {
-    debug_assert!(
-        num_tokens >= 1,
-        "log2(0) is undefined; num_tokens must be >= 1"
-    );
-    if num_tokens <= 1 {
-        1
-    } else {
-        ((num_tokens as u32 - 1).ilog2() + 1) as BitWidth
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn max_dict_size_12_is_4096() {
-        assert_eq!(max_dict_size(12), 4096);
-    }
-
-    #[test]
-    fn max_dict_size_16_is_65536() {
-        assert_eq!(max_dict_size(16), 65536);
-    }
-
-    #[test]
-    fn code_bits_for_is_ceil_log2_num_tokens() {
-        assert_eq!(code_bits_for(256), 8); // 256 tokens -> 8 bits
-        assert_eq!(code_bits_for(257), 9);
-        assert_eq!(code_bits_for(512), 9);
-        assert_eq!(code_bits_for(513), 10);
-        assert_eq!(code_bits_for(65536), 16);
-    }
 
     #[test]
     fn max_token_size_is_16() {
