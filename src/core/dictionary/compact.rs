@@ -93,7 +93,11 @@ fn validate_compact(bytes: &[u8], offsets: &[u32]) -> Result<(), InvalidColumn> 
 
 /// Minimum code width needed to address `num_tokens` distinct tokens:
 /// `ceil(log2(num_tokens))`.
-fn code_bits_for(num_tokens: usize) -> u8 {
+///
+/// This is the runtime width of OnPair token codes for a dictionary with
+/// `num_tokens` entries. It is independent from the training-time
+/// [`MaxDictBits`](crate::MaxDictBits) budget.
+pub fn code_bits_for_num_tokens(num_tokens: usize) -> u8 {
     debug_assert!(
         num_tokens >= 1,
         "log2(0) is undefined; num_tokens must be >= 1"
@@ -212,7 +216,7 @@ impl CompactDictionary {
     /// each code in this many bits. `8..=16` for a conformant dictionary.
     #[inline]
     pub fn code_bits(&self) -> u8 {
-        code_bits_for(self.num_tokens())
+        code_bits_for_num_tokens(self.num_tokens())
     }
 
     /// Materialize the [`WideDictionary`] form (see
@@ -279,7 +283,7 @@ impl<'a> CompactDictionaryView<'a> {
     /// `ceil(log2(num_tokens))`. See [`CompactDictionary::code_bits`].
     #[inline]
     pub fn code_bits(&self) -> u8 {
-        code_bits_for(self.num_tokens())
+        code_bits_for_num_tokens(self.num_tokens())
     }
 
     /// Materialize the [`WideDictionary`] form: every token laid out in its own

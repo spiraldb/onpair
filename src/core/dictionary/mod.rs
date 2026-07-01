@@ -28,7 +28,7 @@ mod compact;
 mod wide;
 
 pub(crate) use compact::pad_raw;
-pub use compact::{CompactDictionary, CompactDictionaryView};
+pub use compact::{CompactDictionary, CompactDictionaryView, code_bits_for_num_tokens};
 pub use wide::{WideDictionary, WideDictionaryView};
 
 use crate::core::types::Token;

@@ -58,6 +58,14 @@ impl<O: Offset> Column<O> {
             row_offsets: &self.row_offsets,
         }
     }
+
+    /// Consume the column and return its owned `(dictionary, codes, row_offsets)`
+    /// without copying. This is useful for embedders that want OnPair to own
+    /// training and parsing, but store the resulting buffers in their own layout.
+    #[inline]
+    pub fn into_raw(self) -> (CompactDictionary, Vec<Token>, Vec<O>) {
+        (self.dict, self.codes, self.row_offsets)
+    }
 }
 
 /// Borrowed, `Copy` view over a compressed column — obtained from a [`Column`]

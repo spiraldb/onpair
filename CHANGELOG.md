@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add compressed-domain equality, prefix, and substring search APIs.
+- Add `Column::into_raw` and `code_bits_for_num_tokens` for embedders that
+  store OnPair buffers in their own layout.
 
 ### Changed
 

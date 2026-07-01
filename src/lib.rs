@@ -75,7 +75,7 @@ mod test_corpus;
 pub use crate::column::{Column, ColumnView};
 pub use crate::core::dictionary::{
     CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, WideDictionary,
-    WideDictionaryView,
+    WideDictionaryView, code_bits_for_num_tokens,
 };
 pub use crate::core::offset::Offset;
 pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
