@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use crate::types::BitWidth;
+//! Public training configuration and the crate-internal form it lowers to.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public config.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Code width: the maximum dictionary size is `2^bits`. Validated to `9..=16`
-/// at construction, so a [`Bits`] always holds an in-range value.
+/// Training-time upper bound on the dictionary: at most `2^bits` tokens.
+///
+/// This is a compression budget, not stored column metadata. After compression,
+/// consumers that bit-pack codes should derive the runtime code width from the
+/// dictionary with [`CompactDictionary::code_bits`](crate::CompactDictionary::code_bits).
+/// Validated to `9..=16` at construction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Bits(u8);
+pub struct MaxDictBits(u8);
 
-impl Bits {
-    /// Construct a [`Bits`], returning [`Error::InvalidArg`] unless
+impl MaxDictBits {
+    /// Construct a [`MaxDictBits`], returning [`Error::InvalidArg`] unless
     /// `value` is in `9..=16`.
     pub const fn new(value: u8) -> Result<Self, Error> {
         if 9 <= value && value <= 16 {
@@ -23,13 +27,13 @@ impl Bits {
         }
     }
 
-    /// The validated code width, in `9..=16`.
+    /// The validated dictionary-budget width, in `9..=16`.
     pub const fn value(self) -> u8 {
         self.0
     }
 }
 
-impl TryFrom<u8> for Bits {
+impl TryFrom<u8> for MaxDictBits {
     type Error = Error;
     fn try_from(value: u8) -> Result<Self, Error> {
         Self::new(value)
@@ -42,8 +46,8 @@ impl TryFrom<u8> for Bits {
 pub struct Threshold(f64);
 
 impl Threshold {
-    /// Construct a [`Threshold`], returning [`Error::InvalidArg`] unless
-    /// `value` is in `(0.0, 1.0]`.
+    /// Construct a [`Threshold`], returning [`Error::InvalidArg`] unless `value`
+    /// is in `(0.0, 1.0]`.
     pub const fn new(value: f64) -> Result<Self, Error> {
         if value > 0.0 && value <= 1.0 {
             Ok(Self(value))
@@ -69,21 +73,22 @@ impl TryFrom<f64> for Threshold {
 /// point.
 #[derive(Copy, Clone, Debug)]
 pub struct Config {
-    /// Code width; see [`Bits`].
-    pub bits: Bits,
+    /// Dictionary-size budget; see [`MaxDictBits`].
+    pub max_dict_bits: MaxDictBits,
     /// Dynamic-threshold sample fraction; see [`Threshold`].
     pub threshold: Threshold,
     /// RNG seed for sampling; `None` means non-deterministic.
     pub seed: Option<u64>,
 }
 
-/// Reasonable starting point: 12-bit codes, dynamic threshold sampling 20 %.
+/// Reasonable starting point: dictionary capped at 4 096 tokens, dynamic
+/// threshold sampling 15 %.
 pub const DEFAULT_CONFIG: Config = Config {
-    bits: match Bits::new(12) {
+    max_dict_bits: match MaxDictBits::new(12) {
         Ok(b) => b,
         Err(_) => unreachable!(),
     },
-    threshold: match Threshold::new(0.2) {
+    threshold: match Threshold::new(0.15) {
         Ok(t) => t,
         Err(_) => unreachable!(),
     },
@@ -135,7 +140,7 @@ pub(crate) struct DynamicThreshold {
 impl Default for DynamicThreshold {
     fn default() -> Self {
         Self {
-            sample_fraction: 0.2,
+            sample_fraction: 0.15,
         }
     }
 }
@@ -155,7 +160,7 @@ impl Default for ThresholdSpec {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TrainingConfig {
-    pub(crate) bits: BitWidth,
+    pub(crate) max_dict_bits: u8,
     pub(crate) threshold: ThresholdSpec,
     pub(crate) seed: Option<u64>,
 }
@@ -163,7 +168,7 @@ pub(crate) struct TrainingConfig {
 impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
-            bits: 16,
+            max_dict_bits: 16,
             threshold: ThresholdSpec::default(),
             seed: None,
         }
@@ -173,7 +178,7 @@ impl Default for TrainingConfig {
 impl From<Config> for TrainingConfig {
     fn from(c: Config) -> Self {
         Self {
-            bits: c.bits.value(),
+            max_dict_bits: c.max_dict_bits.value(),
             threshold: ThresholdSpec::Dynamic(DynamicThreshold {
                 sample_fraction: c.threshold.value(),
             }),

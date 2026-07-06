@@ -31,13 +31,15 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use std::mem::MaybeUninit;
+
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
-use onpair::Bits;
 use onpair::Config;
+use onpair::DECODE_PADDING;
+use onpair::MaxDictBits;
 use onpair::Threshold;
 use onpair::compress;
-use onpair::decompress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 const BITS: &[u8] = &[12, 16];
@@ -66,7 +68,7 @@ fn main() {
     for &bits in BITS {
         println!("\n=== bits = {bits} ===");
         let cfg = Config {
-            bits: Bits::new(bits).expect("BITS entries are in 9..=16"),
+            max_dict_bits: MaxDictBits::new(bits).expect("BITS entries are in 9..=16"),
             threshold,
             seed: Some(42),
         };
@@ -79,20 +81,25 @@ fn main() {
             compress_secs = compress_secs.min(t.elapsed().as_secs_f64());
         }
 
-        let parts = col.as_parts();
         let mut decompress_secs = f64::MAX;
-        let mut decoded = decompress(parts);
+        // Caller-owned output buffer, sized from the column's decoded length.
+        let mut buf = vec![MaybeUninit::uninit(); col.view().decoded_len() + DECODE_PADDING];
+        let mut decoded_len = 0usize;
         for _ in 0..iters {
             let t = Instant::now();
-            decoded = decompress(col.as_parts());
+            // SAFETY: freshly-compressed (trusted) column; `buf` is sized to
+            // `decoded_len() + DECODE_PADDING`.
+            decoded_len = unsafe { col.view().decompress_into(&mut buf) };
             decompress_secs = decompress_secs.min(t.elapsed().as_secs_f64());
         }
+        // SAFETY: the decoder initialized exactly `decoded_len` leading bytes.
+        let decoded = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), decoded_len) };
 
-        let dict_bytes = parts.dict_bytes.len();
-        let dict_offsets = parts.dict_offsets.len() * 4;
-        let codes = parts.codes.len() * 2;
-        let code_offsets = std::mem::size_of_val(col.code_offsets.as_slice());
-        let compressed = dict_bytes + dict_offsets + codes + code_offsets;
+        let dict_bytes = col.dict.bytes().len();
+        let dict_offsets = col.dict.offsets().len() * 4;
+        let codes = col.codes.len() * 2;
+        let row_offsets = std::mem::size_of_val(col.row_offsets.as_slice());
+        let compressed = dict_bytes + dict_offsets + codes + row_offsets;
         let comp_mib = compressed as f64 / (1024.0 * 1024.0);
 
         println!(
@@ -105,8 +112,8 @@ fn main() {
         );
         println!(
             "  dict tokens = {}, dict bytes = {dict_bytes}, codes = {} ({} bytes)",
-            parts.dict_offsets.len() - 1,
-            parts.codes.len(),
+            col.dict.offsets().len() - 1,
+            col.codes.len(),
             codes
         );
         println!(
@@ -114,7 +121,7 @@ fn main() {
             mib / comp_mib
         );
 
-        let roundtrip_ok = decoded == bytes;
+        let roundtrip_ok = decoded == bytes.as_slice();
         println!(
             "  roundtrip: {} (decoded={:.2} MiB)",
             if roundtrip_ok { "PASS" } else { "FAIL" },

@@ -19,24 +19,25 @@
 //
 // Run with: cargo bench --bench tpch
 //
-// Targets the slim public API
-// (`compress` / `decompress` free fns + `Column::as_parts()`).
+// Targets the slim public API (`compress` + `ColumnView::decompress_into`).
 
 use std::collections::HashMap;
 use std::env;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+use std::mem::MaybeUninit;
+
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_schema::Schema;
 use divan::Bencher;
-use onpair::Bits;
 use onpair::Column;
 use onpair::Config;
+use onpair::DECODE_PADDING;
+use onpair::MaxDictBits;
 use onpair::Threshold;
 use onpair::compress;
-use onpair::decompress;
 use tpchgen::generators::CustomerGenerator;
 use tpchgen::generators::LineItemGenerator;
 use tpchgen::generators::OrderGenerator;
@@ -200,7 +201,7 @@ where
 fn build_column(col: &'static str, bits: u8) -> Column<u64> {
     let c = corpus_for(col);
     let cfg = Config {
-        bits: Bits::new(bits).unwrap(),
+        max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.2).unwrap(),
         seed: Some(42),
     };
@@ -216,7 +217,7 @@ fn train_and_compress(bencher: Bencher, param: (&'static str, u8)) {
     let (col, bits) = param;
     let c = corpus_for(col);
     let cfg = Config {
-        bits: Bits::new(bits).unwrap(),
+        max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.2).unwrap(),
         seed: Some(42),
     };
@@ -237,9 +238,15 @@ fn decompress_all(bencher: Bencher, param: (&'static str, u8)) {
     let (col, bits) = param;
     let c = corpus_for(col);
     let column = build_column(col, bits);
+    let cap = column.view().decoded_len() + DECODE_PADDING;
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
-        .bench(|| divan::black_box(decompress(column.as_parts())));
+        .bench(|| {
+            let mut buf = vec![MaybeUninit::uninit(); cap];
+            // SAFETY: trusted column; `buf` is sized to decoded_len() + DECODE_PADDING.
+            let n = unsafe { column.view().decompress_into(&mut buf) };
+            divan::black_box(&buf[..n]);
+        });
 }
 
 fn main() {
@@ -249,12 +256,11 @@ fn main() {
     for &(col, bits) in PARAMS {
         let c = corpus_for(col);
         let column = build_column(col, bits);
-        let parts = column.as_parts();
-        let dict_bytes = parts.dict_bytes.len();
-        let dict_offsets = parts.dict_offsets.len() * 4;
-        let codes = parts.codes.len() * 2;
-        let code_offsets = std::mem::size_of_val(column.code_offsets.as_slice());
-        let compressed = dict_bytes + dict_offsets + codes + code_offsets;
+        let dict_bytes = column.dict.bytes().len();
+        let dict_offsets = column.dict.offsets().len() * 4;
+        let codes = column.codes.len() * 2;
+        let row_offsets = std::mem::size_of_val(column.row_offsets.as_slice());
+        let compressed = dict_bytes + dict_offsets + codes + row_offsets;
         eprintln!(
             "  {col:<16} bits={bits}: ratio = {:.3}x  (raw {:.2} MiB → {:.2} MiB)",
             c.total_bytes as f64 / compressed as f64,
