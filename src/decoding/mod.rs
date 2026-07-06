@@ -94,7 +94,7 @@ pub unsafe fn decode_into<V: DictionaryView>(
 /// checked decode needs no [`DECODE_PADDING`] slack — see [`try_decode_into`]).
 ///
 /// This is a *buffer-capacity* outcome, deliberately distinct from
-/// [`InvalidColumn`](crate::InvalidColumn): a too-small caller buffer is not a
+/// [`InvalidColumn`]: a too-small caller buffer is not a
 /// malformation of the compressed data, so it does not belong to the validation
 /// vocabulary. An out-of-range code *is* a malformation and is handled like the
 /// other decoders — a panic, recoverable up front via
