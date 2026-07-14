@@ -16,10 +16,13 @@ use crate::core::dictionary::{
     CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, WideDictionary,
 };
 use crate::core::offset::Offset;
-use crate::core::types::Token;
+use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
-use crate::search::{ContainsTable, PrefixQuery, contains, equals, starts_with, tokenize};
+use crate::search::{
+    ContainsPrefilter, ContainsTable, PrefixQuery, contains, equals, prefilter_candidates,
+    starts_with, tokenize,
+};
 
 /// Owned compressed column, produced by [`Column::compress`] /
 /// [`Parser::parse`](crate::Parser::parse). Self-contained: it carries its own
@@ -35,6 +38,15 @@ pub struct Column<O: Offset> {
     /// is `codes[row_offsets[k]..row_offsets[k + 1]]`. `row_offsets[0] == 0`,
     /// non-decreasing, and `row_offsets[R] == codes.len()`.
     pub row_offsets: Vec<O>,
+    /// Prefix sums of per-token term frequency over `codes`:
+    /// `cum_token_freq[i] = Σ_{id < i} (occurrences of token id in codes)`, so
+    /// `cum_token_freq.len() == dict.num_tokens() + 1`, `cum_token_freq[0] == 0`,
+    /// and the last entry is `codes.len()`. This is the selectivity signal the
+    /// substring prefilter ([`ContainsPrefilter`](crate::search::ContainsPrefilter))
+    /// consumes — a point's frequency is `cum_token_freq[t + 1] − cum_token_freq[t]`
+    /// and a range's is `cum_token_freq[hi + 1] − cum_token_freq[lo]`. Computed once
+    /// at compression time and stored, so no per-query pass over `codes` is needed.
+    pub cum_token_freq: Vec<u64>,
 }
 
 impl<O: Offset> Column<O> {
@@ -56,15 +68,17 @@ impl<O: Offset> Column<O> {
             dict: self.dict.as_view(),
             codes: &self.codes,
             row_offsets: &self.row_offsets,
+            cum_token_freq: &self.cum_token_freq,
         }
     }
 
-    /// Consume the column and return its owned `(dictionary, codes, row_offsets)`
-    /// without copying. This is useful for embedders that want OnPair to own
-    /// training and parsing, but store the resulting buffers in their own layout.
+    /// Consume the column and return its owned
+    /// `(dictionary, codes, row_offsets, cum_token_freq)` without copying. Useful
+    /// for embedders that want OnPair to own training and parsing, but store the
+    /// resulting buffers in their own layout.
     #[inline]
-    pub fn into_raw(self) -> (CompactDictionary, Vec<Token>, Vec<O>) {
-        (self.dict, self.codes, self.row_offsets)
+    pub fn into_raw(self) -> (CompactDictionary, Vec<Token>, Vec<O>, Vec<u64>) {
+        (self.dict, self.codes, self.row_offsets, self.cum_token_freq)
     }
 }
 
@@ -78,6 +92,9 @@ pub struct ColumnView<'a, O: Offset> {
     pub codes: &'a [Token],
     /// The row layer (see [`Column::row_offsets`]).
     pub row_offsets: &'a [O],
+    /// Prefix-sum per-token frequencies, the substring prefilter's selectivity
+    /// signal (the `cum_token_freq` field of [`Column`]).
+    pub cum_token_freq: &'a [u64],
 }
 
 impl<'a, O: Offset> ColumnView<'a, O> {
@@ -243,6 +260,83 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         self.select(|codes| contains(codes, &table))
     }
 
+    /// Ascending indices of the rows containing `pattern` — identical to
+    /// [`rows_containing`](Self::rows_containing), but a SIMD
+    /// [`ContainsPrefilter`](crate::search::ContainsPrefilter) rejects most rows
+    /// before the token-KMP verify, so it is faster at low selectivity. Panics if
+    /// `pattern` exceeds 255 bytes.
+    ///
+    /// This assembles the "prefilter, then verify" recipe for convenience: the
+    /// prefilter collects a sound superset, then each survivor is verified in the
+    /// compressed domain with the token-KMP [`contains`](crate::search::contains).
+    /// See [`rows_containing_prefiltered_memmem`](Self::rows_containing_prefiltered_memmem)
+    /// for the same prefilter with a decode-and-`memmem` verify instead.
+    pub fn rows_containing_prefiltered(&self, pattern: &[u8]) -> Vec<usize> {
+        if pattern.is_empty() {
+            return (0..self.num_rows()).collect();
+        }
+        // Build the verifier first, so an over-long pattern fails fast (like
+        // `rows_containing`) before any cover-compile work.
+        let table = ContainsTable::new(pattern, self.dict);
+        let mut cand = self.prefilter_rows(pattern);
+        cand.retain(|&r| contains(self.row_codes(r), &table));
+        cand
+    }
+
+    /// Ascending indices of the rows containing `pattern` — the same prefilter as
+    /// [`rows_containing_prefiltered`](Self::rows_containing_prefiltered), but each
+    /// surviving row is verified by **decoding it and running `memmem`** over the
+    /// bytes, rather than stepping the token-KMP automaton over its codes. The two
+    /// return identical results; which verify wins depends on the corpus (decode +
+    /// SIMD `memmem` vs. compressed-domain KMP).
+    ///
+    /// Unlike [`rows_containing_prefiltered`](Self::rows_containing_prefiltered),
+    /// this has **no 255-byte limit** — the token-KMP [`ContainsTable`] caps the
+    /// pattern at 255 bytes, but `memmem` and the prefilter cover do not.
+    pub fn rows_containing_prefiltered_memmem(&self, pattern: &[u8]) -> Vec<usize> {
+        if pattern.is_empty() {
+            return (0..self.num_rows()).collect();
+        }
+        let finder = memchr::memmem::Finder::new(pattern);
+        let mut cand = self.prefilter_rows(pattern);
+
+        // Size one reusable decode buffer to the largest candidate row's worst
+        // case: each of its codes expands to at most `MAX_TOKEN_SIZE` bytes, plus
+        // the decoder's fixed over-store. A row's code count is O(1) from
+        // `row_offsets`, so this replaces the per-row `row_decoded_len` (an O(row)
+        // sum over token lengths) — which would double the verify's per-row cost —
+        // with a single up-front sizing pass.
+        let row_codes =
+            |r: usize| self.row_offsets[r + 1].to_usize() - self.row_offsets[r].to_usize();
+        let cap = cand
+            .iter()
+            .map(|&r| row_codes(r))
+            .max()
+            .map_or(0, |mx| MAX_TOKEN_SIZE * mx + crate::DECODE_PADDING);
+        let mut buf = vec![MaybeUninit::uninit(); cap];
+
+        cand.retain(|&r| {
+            // SAFETY: `cap` bounds every candidate's decoded length + DECODE_PADDING
+            // (≤ MAX_TOKEN_SIZE per code); the view comes from a trusted column.
+            let w = unsafe { self.decompress_row_into(r, &mut buf) };
+            // SAFETY: `decompress_row_into` initialized the first `w` bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) };
+            finder.find(bytes).is_some()
+        });
+        cand
+    }
+
+    /// The prefilter's **sound superset** of the rows containing `pattern`
+    /// (ascending) — candidates for either verify path to confirm. Reads the
+    /// column's stored `cum_token_freq`, so no per-query pass over `codes`.
+    /// Precondition: `pattern` is non-empty (the callers special-case `%%`).
+    fn prefilter_rows(&self, pattern: &[u8]) -> Vec<usize> {
+        let pf = ContainsPrefilter::new(pattern, self.dict, self.cum_token_freq);
+        let mut cand = Vec::new();
+        prefilter_candidates(self.codes, self.row_offsets, &pf, &mut cand);
+        cand
+    }
+
     /// Ascending indices of the rows whose codes satisfy `pred`.
     fn select(&self, pred: impl Fn(&[Token]) -> bool) -> Vec<usize> {
         (0..self.num_rows())
@@ -370,6 +464,7 @@ mod tests {
             dict: view.dict,
             codes: &bad_codes,
             row_offsets: &ro,
+            cum_token_freq: view.cum_token_freq,
         };
         assert_eq!(bad.validate(), Err(InvalidColumn::CodeOutOfRange));
 
@@ -379,6 +474,7 @@ mod tests {
             dict: view.dict,
             codes: view.codes,
             row_offsets: &ro,
+            cum_token_freq: view.cum_token_freq,
         };
         assert_eq!(bad.validate(), Err(InvalidColumn::BadRowOffsets));
 
@@ -388,6 +484,7 @@ mod tests {
             dict: view.dict,
             codes: view.codes,
             row_offsets: &ro,
+            cum_token_freq: view.cum_token_freq,
         };
         assert_eq!(bad.validate(), Err(InvalidColumn::BadRowOffsets));
     }
@@ -406,6 +503,7 @@ mod tests {
             dict: view.dict,
             codes: view.codes,
             row_offsets: &ro,
+            cum_token_freq: view.cum_token_freq,
         };
         let _ = bad.row_codes(0);
     }

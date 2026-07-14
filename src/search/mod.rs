@@ -29,16 +29,22 @@
 //!   [`PrefixQuery`].
 //! * [`contains`](contains()) — rows containing a pattern, via a precomputed
 //!   token-level KMP [`ContainsTable`].
+//! * [`prefilter_candidates`] — a sound *superset* of the rows containing a
+//!   pattern, collected by a SIMD [`ContainsPrefilter`] scan over the code
+//!   stream. The caller verifies the survivors with any exact check
+//!   ([`contains`](contains()), decode-and-`memmem`, …) for the precise answer.
 //! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
 
 mod contains;
 mod equals;
 mod lookup;
+mod prefilter;
 mod prefix;
 mod tokenize;
 
 pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
+pub use prefilter::{ContainsPrefilter, prefilter_candidates};
 pub use prefix::{PrefixQuery, starts_with};
 pub use tokenize::tokenize;
