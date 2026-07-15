@@ -166,7 +166,8 @@ Invariants:
   non-empty.
 - Each token length `o_{i+1} - o_i` lies in `1 ..= MAX_TOKEN_SIZE`.
 - `o_N == L`, the logical byte length of the dictionary.
-- Element count is `N + 1`, with `N >= 256` (completeness, §3).
+- Element count is `N + 1`, with `256 <= N <= 2^16` (completeness and the
+  `u16` code address space, §3).
 
 **Width.** Dictionary offsets are `u32`. The largest offset `o_N <= N ·
 MAX_TOKEN_SIZE` and `N <= 2^16`, so `o_N` always fits in 32 bits; `u32` covers

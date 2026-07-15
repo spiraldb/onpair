@@ -15,6 +15,8 @@
 //! - **Complete** — all 256 single-byte tokens are present, so any byte string
 //!   is encodable.
 //! - **Unique** — no two tokens are equal.
+//! - **Addressable** — at most `2^16` tokens, so every token id fits in
+//!   [`Token`].
 //! - **Read-padded** — `bytes` is readable for [`MAX_TOKEN_SIZE`] bytes past the
 //!   highest token offset (applied by [`pad_raw`] at construction).
 //!   `offsets.last()` is the logical length; `bytes.len()` may exceed it by the
@@ -23,6 +25,9 @@
 use super::{Dictionary, DictionaryView, WideDictionary};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::core::validate::InvalidColumn;
+
+/// Maximum number of dictionary entries addressable by a [`Token`].
+const MAX_NUM_TOKENS: usize = Token::MAX as usize + 1;
 
 /// Append `MAX_TOKEN_SIZE - len(last token)` zero bytes to `bytes` so the decoder's
 /// fixed-width read from any token offset stays in bounds — the read-padding
@@ -48,6 +53,10 @@ pub(crate) fn pad_raw(bytes: &mut Vec<u8>, offsets: &[u32]) {
 /// token's bytes are in bounds; the second reads those bytes to check sortedness
 /// and alphabet completeness.
 fn validate_compact(bytes: &[u8], offsets: &[u32]) -> Result<(), InvalidColumn> {
+    if offsets.len().saturating_sub(1) > MAX_NUM_TOKENS {
+        return Err(InvalidColumn::CodeOutOfRange);
+    }
+
     // Pass 1 — safety: strictly-increasing offsets (so the length subtraction can't
     // underflow and no token is empty), bounded length, and the trailing
     // read-padding. `s` of the final window is the highest token offset, so a
@@ -177,10 +186,11 @@ impl CompactDictionary {
     /// search / tokenize, indistinguishable from a trainer-built dictionary.
     ///
     /// # Errors
-    /// [`InvalidColumn`] for a safety violation (decreasing offsets, an over-long
-    /// token, missing read-padding) or a conformance violation (an empty token,
-    /// unsorted/duplicate tokens, or an incomplete single-byte alphabet). Does not
-    /// pad — a conformant serialized dictionary already carries the read-padding.
+    /// [`InvalidColumn`] for an addressability violation (too many tokens), a safety
+    /// violation (decreasing offsets, an over-long token, missing read-padding), or
+    /// a conformance violation (an empty token, unsorted/duplicate tokens, or an
+    /// incomplete single-byte alphabet). Does not pad — a conformant serialized
+    /// dictionary already carries the read-padding.
     pub fn validate(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<Self, InvalidColumn> {
         validate_compact(&bytes, &offsets)?;
         Ok(Self::from_raw(bytes, offsets))
@@ -199,8 +209,8 @@ impl CompactDictionary {
     ///   non-decreasing offsets, every token `<= MAX_TOKEN_SIZE`, and read-padded
     ///   (`offsets.last() + MAX_TOKEN_SIZE <= bytes.len()`).
     /// * **Conformance** (violating these is not UB, but search / tokenize then give
-    ///   wrong answers): strictly-increasing offsets, tokens sorted and unique, and
-    ///   the 256-symbol alphabet complete.
+    ///   wrong answers): no more than `2^16` tokens, strictly-increasing offsets,
+    ///   tokens sorted and unique, and the 256-symbol alphabet complete.
     pub unsafe fn new_unchecked(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
         Self::from_raw(bytes, offsets)
     }
@@ -482,6 +492,18 @@ mod tests {
         padded(&refs)
     }
 
+    /// A conformant dictionary with exactly `num_tokens` entries. Multi-byte
+    /// entries are generated as unique two-byte sequences, then sorted together
+    /// with the complete single-byte alphabet.
+    fn conformant_with_num_tokens(num_tokens: usize) -> (Vec<u8>, Vec<u32>) {
+        assert!((256..=256 + u16::MAX as usize + 1).contains(&num_tokens));
+        let mut toks: Vec<Vec<u8>> = (0u16..256).map(|b| vec![b as u8]).collect();
+        toks.extend((0..num_tokens - 256).map(|value| (value as u16).to_be_bytes().to_vec()));
+        toks.sort();
+        let refs: Vec<&[u8]> = toks.iter().map(Vec::as_slice).collect();
+        padded(&refs)
+    }
+
     /// Map to `Result<(), _>` so we can compare (`CompactDictionary` isn't `Eq`).
     fn check(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<(), InvalidColumn> {
         CompactDictionary::validate(bytes, offsets).map(|_| ())
@@ -491,6 +513,15 @@ mod tests {
     fn validate_accepts_conformant() {
         let (bytes, offsets) = conformant(&[b"bc", b"def"]);
         assert_eq!(check(bytes, offsets), Ok(()));
+    }
+
+    #[test]
+    fn validate_enforces_token_address_space() {
+        let (bytes, offsets) = conformant_with_num_tokens(MAX_NUM_TOKENS);
+        assert_eq!(check(bytes, offsets), Ok(()));
+
+        let (bytes, offsets) = conformant_with_num_tokens(MAX_NUM_TOKENS + 1);
+        assert_eq!(check(bytes, offsets), Err(InvalidColumn::CodeOutOfRange));
     }
 
     #[test]
