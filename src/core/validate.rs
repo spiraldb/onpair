@@ -30,13 +30,13 @@
 ///
 /// Two kinds. **Safety** violations would let an unchecked decoder read or write
 /// out of bounds — these are exactly the obligations an `unsafe new_unchecked`
-/// caller must uphold to avoid UB. **Conformance** violations decode safely but
-/// make search / tokenize give *wrong answers*. The `validate` family checks both,
-/// so a trusted dictionary is fully conformant — indistinguishable from a
-/// trainer-built one.
+/// caller must uphold to avoid UB. **Conformance** violations, including a
+/// dictionary too large for the code address space, decode safely but make search /
+/// tokenize give *wrong answers*. The `validate` family checks both, so a trusted
+/// dictionary is fully conformant — indistinguishable from a trainer-built one.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum InvalidColumn {
-    // ── Safety: an unchecked decoder would otherwise access memory out of bounds ──
+    // ── Safety / addressability ──────────────────────────────────────────────
     /// Dictionary offsets decrease (`offsets[i] > offsets[i + 1]`), which would
     /// underflow the unchecked token-length subtraction.
     NonDecreasingOffsets,
@@ -45,7 +45,9 @@ pub enum InvalidColumn {
     /// A token offset has fewer than [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE)
     /// readable bytes after it, so the decoder's fixed-width read runs off the end.
     MissingPadding,
-    /// A code does not index the dictionary (`code >= num_tokens`).
+    /// The dictionary has more than `2^16` entries, or a code does not index the
+    /// dictionary (`code >= num_tokens`). In either case, the `u16` token/code
+    /// type cannot address the requested entry.
     CodeOutOfRange,
     /// Row offsets are not non-decreasing, or the last exceeds the code count.
     BadRowOffsets,
