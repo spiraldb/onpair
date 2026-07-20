@@ -26,6 +26,51 @@ use super::{Dictionary, DictionaryView, WideDictionary};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::core::validate::InvalidColumn;
 
+/// Storage for a compact dictionary's serialized buffers.
+///
+/// Implementations must keep the returned slices immutable and valid for as
+/// long as the storage value is alive. The trait exposes borrowed slices so a
+/// storage-backed [`CompactDictionary`] can lend the same zero-copy view as
+/// the default owned representation.
+pub trait DictionaryStorage<D> {
+    /// The concatenated, read-padded token bytes.
+    fn bytes(&self) -> &[u8];
+
+    /// The `num_tokens + 1` offsets delimiting the token bytes.
+    fn offsets(&self) -> &[D];
+}
+
+/// The default owned storage used by [`CompactDictionary`].
+#[derive(Debug, Clone)]
+pub struct OwnedDictionaryStorage {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl OwnedDictionaryStorage {
+    /// Build owned dictionary storage from its serialized buffers.
+    pub fn new(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
+        Self { bytes, offsets }
+    }
+
+    /// Consume the storage and return its serialized buffers without copying.
+    pub fn into_raw(self) -> (Vec<u8>, Vec<u32>) {
+        (self.bytes, self.offsets)
+    }
+}
+
+impl DictionaryStorage<u32> for OwnedDictionaryStorage {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[inline]
+    fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+}
+
 /// Maximum number of dictionary entries addressable by a [`Token`].
 const MAX_NUM_TOKENS: usize = Token::MAX as usize + 1;
 
@@ -127,98 +172,59 @@ pub fn code_bits_for_num_tokens(num_tokens: usize) -> u8 {
 /// buffers. Read the buffers back with [`bytes`](Self::bytes) /
 /// [`offsets`](Self::offsets), or move them out with [`into_raw`](Self::into_raw)
 /// (e.g. to serialize).
-#[derive(Default, Debug, Clone)]
-pub struct CompactDictionary {
-    /// Concatenated token bytes, followed by read-padding.
-    bytes: Vec<u8>,
-    /// `num_tokens + 1` offsets delimiting the tokens within `bytes`.
-    offsets: Vec<u32>,
+#[derive(Debug, Clone)]
+pub struct CompactDictionary<S = OwnedDictionaryStorage> {
+    /// The storage whose buffers have been sealed as a trusted dictionary.
+    storage: S,
 }
 
-impl CompactDictionary {
+impl Default for CompactDictionary<OwnedDictionaryStorage> {
+    fn default() -> Self {
+        Self {
+            storage: OwnedDictionaryStorage::new(Vec::new(), Vec::new()),
+        }
+    }
+}
+
+impl<S> CompactDictionary<S>
+where
+    S: DictionaryStorage<u32>,
+{
     /// Number of tokens.
     #[inline]
     pub fn num_tokens(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
+        self.storage.offsets().len().saturating_sub(1)
     }
 
     /// The token bytes, including trailing read-padding (the serialized
     /// `dict_bytes`; see `docs/interchange-format.md`).
     #[inline]
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.storage.bytes()
     }
 
     /// The `num_tokens + 1` token offsets (the serialized `dict_offsets`).
     #[inline]
     pub fn offsets(&self) -> &[u32] {
-        &self.offsets
+        self.storage.offsets()
     }
 
-    /// Consume the dictionary, returning its owned buffers `(dict_bytes,
-    /// dict_offsets)` without copying — the inverse of [`validate`](Self::validate) /
-    /// [`new_unchecked`](Self::new_unchecked). Use it to hand the read-padded token
-    /// bytes and the `num_tokens + 1` offsets to another owner (e.g. to serialize)
-    /// without the copy that [`bytes`](Self::bytes) / [`offsets`](Self::offsets)
-    /// would force.
-    ///
-    /// This consumes `self`: the dictionary no longer exists afterward. It does not
-    /// alter the buffers — `dict_bytes` keeps its trailing read-padding
-    /// (`dict_bytes.len()` may exceed `dict_offsets.last()`), so the pair is still
-    /// conformant and rebuilds into a trusted dictionary via
-    /// [`validate`](Self::validate) (checked) or [`new_unchecked`](Self::new_unchecked).
+    /// Borrow the storage backing this trusted dictionary.
     #[inline]
-    pub fn into_raw(self) -> (Vec<u8>, Vec<u32>) {
-        (self.bytes, self.offsets)
+    pub fn storage(&self) -> &S {
+        &self.storage
     }
 
-    /// Seal raw buffers into a trusted dictionary. The crate-internal trust mint:
-    /// the caller (trainer, or the [`validate`](Self::validate) door) guarantees the
-    /// invariants.
+    /// Consume the dictionary and return its backing storage without copying.
     #[inline]
-    pub(crate) fn from_raw(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
-        Self { bytes, offsets }
-    }
-
-    /// Validate raw `(bytes, offsets)` deserialized from storage into a trusted
-    /// dictionary (moved, no copy) — the checked door across the trust boundary. On
-    /// success it is fully conformant: safe to decode *and* correct to
-    /// search / tokenize, indistinguishable from a trainer-built dictionary.
-    ///
-    /// # Errors
-    /// [`InvalidColumn`] for an addressability violation (too many tokens), a safety
-    /// violation (decreasing offsets, an over-long token, missing read-padding), or
-    /// a conformance violation (an empty token, unsorted/duplicate tokens, or an
-    /// incomplete single-byte alphabet). Does not pad — a conformant serialized
-    /// dictionary already carries the read-padding.
-    pub fn validate(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<Self, InvalidColumn> {
-        validate_compact(&bytes, &offsets)?;
-        Ok(Self::from_raw(bytes, offsets))
-    }
-
-    /// Seal raw `(bytes, offsets)` into a trusted dictionary **without** checking —
-    /// the `unsafe` door across the trust boundary, for buffers the caller already
-    /// knows are conformant (e.g. its own validated-on-write format).
-    ///
-    /// # Safety
-    /// Every invariant in this module's docs is a precondition; the result must be
-    /// indistinguishable from a [`validate`](Self::validate)d one. They split by how
-    /// a violation bites, but both tiers are required:
-    /// * **Read-safety** (violating these is UB — an unchecked decoder reads or
-    ///   writes out of bounds): `offsets[0] == 0`, `offsets.len() == num_tokens + 1`,
-    ///   non-decreasing offsets, every token `<= MAX_TOKEN_SIZE`, and read-padded
-    ///   (`offsets.last() + MAX_TOKEN_SIZE <= bytes.len()`).
-    /// * **Conformance** (violating these is not UB, but search / tokenize then give
-    ///   wrong answers): no more than `2^16` tokens, strictly-increasing offsets,
-    ///   tokens sorted and unique, and the 256-symbol alphabet complete.
-    pub unsafe fn new_unchecked(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
-        Self::from_raw(bytes, offsets)
+    pub fn into_storage(self) -> S {
+        self.storage
     }
 
     /// Logical byte length — token bytes only, excluding read-padding.
     #[inline]
     pub fn logical_len(&self) -> usize {
-        self.offsets.last().copied().unwrap_or(0) as usize
+        self.storage.offsets().last().copied().unwrap_or(0) as usize
     }
 
     /// Minimum bits per code needed to address this dictionary,
@@ -236,15 +242,71 @@ impl CompactDictionary {
     pub fn to_wide(&self) -> WideDictionary {
         self.as_view().to_wide()
     }
+
+    /// Validate storage into a trusted dictionary without copying either
+    /// serialized buffer.
+    pub fn validate_storage(storage: S) -> Result<Self, InvalidColumn> {
+        validate_compact(storage.bytes(), storage.offsets())?;
+        Ok(Self { storage })
+    }
+
+    /// Seal storage into a trusted dictionary without checking.
+    ///
+    /// # Safety
+    /// `storage` must satisfy every invariant documented for
+    /// [`CompactDictionary`]. In particular, it must be safe for the unchecked
+    /// decoder and fully conformant for search and tokenization.
+    pub unsafe fn new_unchecked_storage(storage: S) -> Self {
+        Self { storage }
+    }
 }
 
-impl Dictionary for CompactDictionary {
-    type View<'a> = CompactDictionaryView<'a>;
+impl CompactDictionary<OwnedDictionaryStorage> {
+    /// Consume the dictionary, returning its owned buffers without copying.
+    #[inline]
+    pub fn into_raw(self) -> (Vec<u8>, Vec<u32>) {
+        self.storage.into_raw()
+    }
+
+    /// Seal raw buffers into a trusted dictionary. The crate-internal trust mint:
+    /// the caller (trainer, or the [`validate`](Self::validate) door) guarantees
+    /// the invariants.
+    #[inline]
+    pub(crate) fn from_raw(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
+        Self {
+            storage: OwnedDictionaryStorage::new(bytes, offsets),
+        }
+    }
+
+    /// Validate raw `(bytes, offsets)` into a trusted dictionary without copying.
+    pub fn validate(bytes: Vec<u8>, offsets: Vec<u32>) -> Result<Self, InvalidColumn> {
+        Self::validate_storage(OwnedDictionaryStorage::new(bytes, offsets))
+    }
+
+    /// Seal raw buffers into a trusted dictionary without checking.
+    ///
+    /// # Safety
+    /// Every invariant documented for [`CompactDictionary`] is a precondition.
+    pub unsafe fn new_unchecked(bytes: Vec<u8>, offsets: Vec<u32>) -> Self {
+        // SAFETY: the caller provides the same full-invariant guarantee required
+        // by `new_unchecked_storage`.
+        unsafe { Self::new_unchecked_storage(OwnedDictionaryStorage::new(bytes, offsets)) }
+    }
+}
+
+impl<S> Dictionary for CompactDictionary<S>
+where
+    S: DictionaryStorage<u32>,
+{
+    type View<'a>
+        = CompactDictionaryView<'a>
+    where
+        S: 'a;
     #[inline]
     fn as_view(&self) -> CompactDictionaryView<'_> {
         CompactDictionaryView {
-            bytes: &self.bytes,
-            offsets: &self.offsets,
+            bytes: self.storage.bytes(),
+            offsets: self.storage.offsets(),
         }
     }
 }
@@ -398,6 +460,23 @@ impl<'a> From<&'a CompactDictionary> for CompactDictionaryView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[derive(Clone, Debug)]
+    struct SharedStorage {
+        bytes: Arc<[u8]>,
+        offsets: Arc<[u32]>,
+    }
+
+    impl DictionaryStorage<u32> for SharedStorage {
+        fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+
+        fn offsets(&self) -> &[u32] {
+            &self.offsets
+        }
+    }
 
     fn dict(offsets: Vec<u32>, bytes: &[u8]) -> CompactDictionary {
         CompactDictionary::from_raw(bytes.to_vec(), offsets)
@@ -421,6 +500,26 @@ mod tests {
         assert_eq!(v.token(1), b"bc");
         assert_eq!(v.token(2), b"def");
         assert_eq!(v.token_len(2), 3);
+    }
+
+    #[test]
+    fn storage_backed_dictionary_does_not_copy_buffers() {
+        let (bytes, offsets) = conformant(&[b"bc", b"def"]);
+        let bytes: Arc<[u8]> = bytes.into();
+        let offsets: Arc<[u32]> = offsets.into();
+        let storage = SharedStorage {
+            bytes: bytes.clone(),
+            offsets: offsets.clone(),
+        };
+
+        let dictionary = CompactDictionary::<SharedStorage>::validate_storage(storage).unwrap();
+        assert_eq!(dictionary.bytes().as_ptr(), bytes.as_ptr());
+        assert_eq!(dictionary.offsets().as_ptr(), offsets.as_ptr());
+        assert_eq!(dictionary.as_view().token(0), &[0]);
+
+        let storage = dictionary.into_storage();
+        assert!(Arc::ptr_eq(&storage.bytes, &bytes));
+        assert!(Arc::ptr_eq(&storage.offsets, &offsets));
     }
 
     #[test]
