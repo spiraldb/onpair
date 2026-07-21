@@ -28,10 +28,18 @@ use crate::core::validate::InvalidColumn;
 
 /// Storage for a compact dictionary's serialized buffers.
 ///
-/// Implementations must keep the returned slices immutable and valid for as
-/// long as the storage value is alive. The trait exposes borrowed slices so a
-/// storage-backed [`CompactDictionary`] can lend the same zero-copy view as
-/// the default owned representation.
+/// Implementations must keep the returned slices immutable and stable for as
+/// long as the storage value is alive. In particular, repeated calls must
+/// refer to the same logical buffers, and an implementation must not expose a
+/// mutable alias that can change either buffer while the storage is alive.
+///
+/// This is what lets a validated [`CompactDictionary`] retain `S` and lend the
+/// same zero-copy view as the default owned representation. The storage itself
+/// is only a raw buffer carrier; [`CompactDictionary::validate_storage`] is the
+/// safe boundary that additionally establishes the dictionary invariants.
+/// Validation does not freeze, copy, or snapshot the buffers. Violating this
+/// contract after validation can cause undefined behavior in the unchecked
+/// decoder, even if validation initially succeeds.
 pub trait DictionaryStorage<D> {
     /// The concatenated, read-padded token bytes.
     fn bytes(&self) -> &[u8];
@@ -84,7 +92,9 @@ pub(crate) fn pad_raw(bytes: &mut Vec<u8>, offsets: &[u32]) {
         return;
     }
     let last_token_start = offsets[offsets.len() - 2] as usize;
-    let required = last_token_start + MAX_TOKEN_SIZE;
+    let required = last_token_start
+        .checked_add(MAX_TOKEN_SIZE)
+        .expect("dictionary padding length must fit in usize");
     if bytes.len() < required {
         bytes.resize(required, 0);
     }
@@ -100,6 +110,9 @@ pub(crate) fn pad_raw(bytes: &mut Vec<u8>, offsets: &[u32]) {
 fn validate_compact(bytes: &[u8], offsets: &[u32]) -> Result<(), InvalidColumn> {
     if offsets.len().saturating_sub(1) > MAX_NUM_TOKENS {
         return Err(InvalidColumn::CodeOutOfRange);
+    }
+    if offsets.first().copied() != Some(0) {
+        return Err(InvalidColumn::FirstOffsetNotZero);
     }
 
     // Pass 1 — safety: strictly-increasing offsets (so the length subtraction can't
@@ -121,8 +134,13 @@ fn validate_compact(bytes: &[u8], offsets: &[u32]) -> Result<(), InvalidColumn> 
         }
         last_offset = s as usize;
     }
-    if offsets.len() >= 2 && last_offset + MAX_TOKEN_SIZE > bytes.len() {
-        return Err(InvalidColumn::MissingPadding);
+    if offsets.len() >= 2 {
+        let Some(last_read_end) = last_offset.checked_add(MAX_TOKEN_SIZE) else {
+            return Err(InvalidColumn::MissingPadding);
+        };
+        if last_read_end > bytes.len() {
+            return Err(InvalidColumn::MissingPadding);
+        }
     }
 
     // Pass 2 — conformance: tokens strictly ascending (hence sorted and unique) and
@@ -176,14 +194,6 @@ pub fn code_bits_for_num_tokens(num_tokens: usize) -> u8 {
 pub struct CompactDictionary<S = OwnedDictionaryStorage> {
     /// The storage whose buffers have been sealed as a trusted dictionary.
     storage: S,
-}
-
-impl Default for CompactDictionary<OwnedDictionaryStorage> {
-    fn default() -> Self {
-        Self {
-            storage: OwnedDictionaryStorage::new(Vec::new(), Vec::new()),
-        }
-    }
 }
 
 impl<S> CompactDictionary<S>
@@ -483,11 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn num_tokens_zero_when_offsets_empty() {
-        assert_eq!(CompactDictionary::default().num_tokens(), 0);
-    }
-
-    #[test]
     fn num_tokens_is_offsets_len_minus_one() {
         assert_eq!(dict(vec![0, 3, 5, 8], b"").num_tokens(), 3);
     }
@@ -625,6 +630,12 @@ mod tests {
 
     #[test]
     fn validate_classifies_safety_corruption() {
+        // The first offset must point at the beginning of the byte buffer.
+        assert_eq!(
+            check(vec![0u8; MAX_TOKEN_SIZE + 1], vec![1, 2]),
+            Err(InvalidColumn::FirstOffsetNotZero)
+        );
+
         // Decreasing offsets (would underflow the length subtraction).
         let mut bytes = b"ab".to_vec();
         bytes.resize(2 + MAX_TOKEN_SIZE, 0);

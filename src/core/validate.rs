@@ -37,6 +37,8 @@
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum InvalidColumn {
     // ── Safety / addressability ──────────────────────────────────────────────
+    /// The first dictionary offset is not zero.
+    FirstOffsetNotZero,
     /// Dictionary offsets decrease (`offsets[i] > offsets[i + 1]`), which would
     /// underflow the unchecked token-length subtraction.
     NonDecreasingOffsets,
@@ -68,6 +70,7 @@ pub enum InvalidColumn {
 impl std::fmt::Display for InvalidColumn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::FirstOffsetNotZero => "dictionary offsets must start at zero",
             Self::NonDecreasingOffsets => "dictionary offsets must be non-decreasing",
             Self::TokenTooLarge => "dictionary token exceeds MAX_TOKEN_SIZE",
             Self::MissingPadding => "dictionary bytes lack the required trailing decoder padding",
