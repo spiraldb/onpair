@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.1.1...HEAD)
+
+### Added
+
+- Make `CompactDictionary` storage-backed, allowing validated dictionary bytes
+  and offsets to be borrowed or shared without copying.
+- Separate dictionary safety validation from correctness validation, allowing
+  bounded decoding and tokenization checks without requiring full semantic
+  validation.
+
+## [0.1.1](https://github.com/spiraldb/onpair/compare/v0.1.0...v0.1.1) - 2026-07-15
+
+### Fixed
+
+- Reject compact dictionaries containing more than 65,536 tokens, which cannot
+  be addressed by the `u16` token type.
+- Add regression coverage for the 65,536-token boundary and document the
+  dictionary size limit in the invariants and interchange format.
+
 ## [0.1.0](https://github.com/spiraldb/onpair/compare/v0.0.4...v0.1.0) - 2026-07-06
 
 ### Added
