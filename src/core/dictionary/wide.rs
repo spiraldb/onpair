@@ -142,7 +142,7 @@ impl WideDictionary {
         }
 
         if bad_decreasing != 0 {
-            return Err(InvalidColumn::NonDecreasingOffsets);
+            return Err(InvalidColumn::DecreasingOffsets);
         }
         if bad_empty != 0 {
             return Err(InvalidColumn::EmptyToken);
@@ -358,7 +358,7 @@ mod tests {
             ),
             (
                 OwnedDictionaryStorage::new(vec![0; MAX_TOKEN_SIZE + 2], vec![0, 2, 1]),
-                InvalidColumn::NonDecreasingOffsets,
+                InvalidColumn::DecreasingOffsets,
             ),
             (
                 OwnedDictionaryStorage::new(vec![0; MAX_TOKEN_SIZE + 17], vec![0, 17]),

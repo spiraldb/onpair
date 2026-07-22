@@ -172,7 +172,7 @@ fn validate_safety(bytes: &[u8], offsets: &[u32]) -> Result<(), InvalidColumn> {
     }
 
     if bad_decreasing != 0 {
-        return Err(InvalidColumn::NonDecreasingOffsets);
+        return Err(InvalidColumn::DecreasingOffsets);
     }
     if bad_empty != 0 {
         // Empty tokens are not safe for the search tokenizer because they would
@@ -810,7 +810,7 @@ mod tests {
         bytes.resize(2 + MAX_TOKEN_SIZE, 0);
         assert_eq!(
             check(bytes, vec![0, 2, 1]),
-            Err(InvalidColumn::NonDecreasingOffsets)
+            Err(InvalidColumn::DecreasingOffsets)
         );
 
         // Zero-length token (`e == s`).
@@ -892,7 +892,7 @@ mod tests {
             (
                 vec![0u8; MAX_TOKEN_SIZE + 2],
                 vec![0, 2, 1],
-                InvalidColumn::NonDecreasingOffsets,
+                InvalidColumn::DecreasingOffsets,
             ),
             (
                 vec![0u8; MAX_TOKEN_SIZE],

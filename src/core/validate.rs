@@ -46,7 +46,7 @@ pub enum InvalidColumn {
     FirstOffsetNotZero,
     /// Dictionary offsets decrease (`offsets[i] > offsets[i + 1]`), which would
     /// underflow the unchecked token-length subtraction.
-    NonDecreasingOffsets,
+    DecreasingOffsets,
     /// A dictionary token is longer than [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE).
     TokenTooLarge,
     /// A token offset has fewer than [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE)
@@ -78,7 +78,7 @@ impl std::fmt::Display for InvalidColumn {
         f.write_str(match self {
             Self::EmptyDictionary => "dictionary must contain at least one token",
             Self::FirstOffsetNotZero => "dictionary offsets must start at zero",
-            Self::NonDecreasingOffsets => "dictionary offsets must be strictly increasing",
+            Self::DecreasingOffsets => "dictionary offsets must be strictly increasing",
             Self::TokenTooLarge => "dictionary token exceeds MAX_TOKEN_SIZE",
             Self::MissingPadding => "dictionary bytes lack the required trailing decoder padding",
             Self::CodeOutOfRange => "code index out of range for dictionary",
