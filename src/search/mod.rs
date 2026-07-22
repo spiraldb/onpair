@@ -4,7 +4,11 @@
 //! Compressed-domain search: equality, prefix, and substring queries answered
 //! directly over the code stream, without decoding rows back to bytes.
 //!
-//! The dictionary's invariants are what make this sound:
+//! These operations require a conformant dictionary — one that is sorted,
+//! complete, and unique. A dictionary produced by the trainer or passed through
+//! `validate` satisfies this precondition. [`crate::DictionaryView`]
+//! only guarantees structurally safe access; it does not establish these semantic
+//! properties:
 //!
 //! * **Sorted** — tokens are in bytewise-lexicographic order, so a needle can be
 //!   tokenized ([`tokenize`](tokenize())) and prefix-ranged ([`prefix_range`]) by
