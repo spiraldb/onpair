@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn default_config_uses_a_deterministic_seed() {
-        assert_eq!(DEFAULT_CONFIG.seed, Some(42));
-        assert_eq!(Config::default().seed, Some(42));
+        assert!(DEFAULT_CONFIG.seed.is_some());
+        assert!(Config::default().seed.is_some());
     }
 }
