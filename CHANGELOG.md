@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded decoding and tokenization checks without requiring full semantic
   validation.
 
+### Removed
+
+- Remove the obsolete cross-implementation benchmark harness and standalone
+  TPC-H example, retaining the Rust benchmarks under `benches/`.
+
+### Fixed
+
+- Ensure the Rust setup action installs the pinned toolchain without referring to a nonexistent cache step.
+
 ## [0.1.1](https://github.com/spiraldb/onpair/compare/v0.1.0...v0.1.1) - 2026-07-15
 
 ### Fixed
