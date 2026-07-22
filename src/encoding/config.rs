@@ -82,7 +82,7 @@ pub struct Config {
 }
 
 /// Reasonable starting point: dictionary capped at 4 096 tokens, dynamic
-/// threshold sampling 15 %, and deterministic sampling with seed 42.
+/// threshold sampling 15 %, and deterministic sampling with a fixed seed.
 pub const DEFAULT_CONFIG: Config = Config {
     max_dict_bits: match MaxDictBits::new(12) {
         Ok(b) => b,
