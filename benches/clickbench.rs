@@ -15,8 +15,7 @@
 //   1. env var `ONPAIR_BENCH_PARQUET` — path to a parquet file
 //      (e.g. ClickBench `hits.parquet`). Optionally set
 //      `ONPAIR_BENCH_COLUMN` to pick a specific UTF-8 column; otherwise
-//      we pick the first BYTE_ARRAY / Utf8 / Utf8View column with the
-//      largest total byte volume.
+//      we pick the first Utf8 / LargeUtf8 / Utf8View column in the schema.
 //   2. `/tmp/userdata1.parquet` if present (small real-world parquet,
 //      good for smoke runs).
 //   3. A synthetic ClickBench-shaped URL corpus (100 000 rows of

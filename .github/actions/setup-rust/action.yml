@@ -1,5 +1,5 @@
 name: "Setup Rust"
-description: "Toolchain setup and Initial compilation"
+description: "Toolchain setup and cache configuration"
 
 inputs:
   targets:
@@ -15,13 +15,11 @@ runs:
       run: echo "version=$(cat rust-toolchain.toml | grep channel | awk -F'\"' '{print $2}')" >> $GITHUB_OUTPUT
 
     - name: Rust Toolchain
-      id: rust-toolchain
       uses: dtolnay/rust-toolchain@master
-      if: steps.rustup-cache.outputs.cache-hit != 'true'
       with:
         toolchain: "${{ steps.rust-version.outputs.version }}"
         targets: "${{inputs.targets || ''}}"
-        components: clippy, rustfmt
+        components: rust-src, clippy, rustfmt
 
     - name: Rust Dependency Cache
       uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
