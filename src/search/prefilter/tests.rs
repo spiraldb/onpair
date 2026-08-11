@@ -419,7 +419,7 @@ fn mismatched_index_is_rejected_without_modifying_output() {
 #[test]
 fn cover_probes_the_maximal_runs_of_its_membership() {
     let table = vec![true, true, false, true, false, false, true, true, true];
-    let pf = ProbeCover::from_membership(table.clone());
+    let pf = ProbeCover::from_membership(table.clone(), Some);
 
     assert_eq!(pf.points, vec![3]);
     assert_eq!(
@@ -430,7 +430,137 @@ fn cover_probes_the_maximal_runs_of_its_membership() {
         ]
     );
     assert_eq!(pf.table, table);
-    assert_eq!(ProbeCover::from_membership(vec![false; 4]).points, vec![]);
+    assert_eq!(
+        ProbeCover::from_membership(vec![false; 4], Some).points,
+        vec![]
+    );
+}
+
+/// What a run gives up, it gives up in both shapes: the lists are what the
+/// kernels compare against and the table is what the scalar tail looks up, so an
+/// id dropped from one has to leave the other.
+#[test]
+fn cover_narrows_and_drops_the_runs_it_is_told_to() {
+    // Runs 0..=1, 3..=3, 6..=9, 11..=12.
+    let table = vec![
+        true, true, false, true, false, false, true, true, true, true, false, true, true,
+    ];
+    let pf = ProbeCover::from_membership(table, |run| match run.begin {
+        0 => None,                                   // dropped whole
+        6 => Some(TokenRange { begin: 7, last: 8 }), // trimmed both ends
+        11 => Some(TokenRange {
+            begin: 12,
+            last: 12,
+        }), // a range becomes a point
+        _ => Some(run),
+    });
+
+    assert_eq!(pf.points, vec![3, 12]);
+    assert_eq!(pf.ranges, vec![TokenRange { begin: 7, last: 8 }]);
+    assert_eq!(
+        pf.table,
+        vec![
+            false, false, false, true, false, false, false, true, true, false, false, false, true,
+        ]
+    );
+    assert!(!ProbeCover::from_membership(vec![true; 4], Some).is_empty());
+    assert!(ProbeCover::from_membership(vec![true; 4], |_| None).is_empty());
+}
+
+/// A token the code stream never uses is held by no row, so probing for it can
+/// only cost comparisons. The cut selects such tokens readily — they are free by
+/// its objective — so the planner has to take them back out.
+#[test]
+fn unused_tokens_are_kept_out_of_the_cover() {
+    let col = compress_rows(&[
+        b"https://example.com/search?q=onpair",
+        b"https://example.com/index.html",
+        b"https://example.org/search?q=compression",
+        b"https://example.org/cart/checkout",
+    ]);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+    for pattern in [
+        b"search?q=".as_slice(),
+        b"example.org".as_slice(),
+        b"/cart/checkout".as_slice(),
+        b"ex".as_slice(),
+    ] {
+        let pf = plan(view.dict, pattern, &frequencies);
+
+        let used = |id: Token| frequencies.frequency(id) != 0;
+
+        // A point is one id: an unused one would be a comparison that can never
+        // fire. A range is one comparison however long it is, so only its ends
+        // are worth trimming — an interior unused id rides along for free.
+        for &id in &pf.points {
+            assert!(used(id), "point probe {id} never occurs");
+        }
+        for range in &pf.ranges {
+            assert!(used(range.begin), "range {range:?} starts unused");
+            assert!(used(range.last), "range {range:?} ends unused");
+        }
+    }
+}
+
+/// Pruning must not change which rows are admitted — the whole argument for it
+/// is that it cannot.
+#[test]
+fn pruning_does_not_change_the_candidates() {
+    let rows: Vec<&[u8]> = vec![
+        b"alpha beta gamma",
+        b"beta gamma delta",
+        b"gamma delta epsilon",
+        b"delta epsilon alpha",
+        b"epsilon alpha beta",
+    ];
+    let col = compress_rows(&rows);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+    for pattern in [
+        b"beta".as_slice(),
+        b"gamma delta".as_slice(),
+        b"a b".as_slice(),
+        b"epsilon alpha".as_slice(),
+    ] {
+        let got = candidates(view, view.dict, &frequencies, pattern);
+        for (k, row) in rows.iter().enumerate() {
+            if byte_contains(row, pattern) {
+                assert!(got.contains(&k), "{pattern:?} lost row {k}");
+            }
+        }
+    }
+}
+
+/// When every id a pattern's cover would name is absent from the code stream, no
+/// row can match. That is exact, not an approximation, and it needs no scan —
+/// so it is answered even where there is no SIMD kernel to refuse with.
+#[test]
+fn a_fully_unused_cover_admits_no_rows() {
+    let col = compress_rows(&[b"alpha", b"beta", b"gamma"]);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+    // 0xff is in the dictionary — all 256 single-byte tokens always are — but
+    // occurs nowhere in these rows, so the cover for it prunes to nothing.
+    let pf = plan(view.dict, b"\xff", &frequencies);
+    assert!(pf.points.is_empty() && pf.ranges.is_empty());
+
+    let mut out = Vec::new();
+    assert_eq!(
+        prefilter_candidates(
+            view.codes,
+            view.row_offsets,
+            b"\xff",
+            view.dict,
+            &frequencies,
+            &mut out,
+        ),
+        Ok(())
+    );
+    assert!(out.is_empty());
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -475,7 +605,7 @@ fn each_hit_row_is_appended_once_in_order() {
         row_offsets.push(codes.len() as u32);
     }
 
-    let pf = ProbeCover::from_membership(vec![false, true]);
+    let pf = ProbeCover::from_membership(vec![false, true], Some);
     let mut out = Vec::new();
     super::scan::scan(&codes, &row_offsets, &pf, &mut out).unwrap();
     assert_eq!(out, vec![1, 4]);

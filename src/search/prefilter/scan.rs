@@ -36,6 +36,14 @@ pub(super) fn scan<O: Offset>(
     pf: &ProbeCover,
     out: &mut Vec<usize>,
 ) -> Result<(), PrefilterError> {
+    // Nothing to compare against, so nothing can match. Answered here rather
+    // than by a kernel, both because scanning for no probes is wasted work and
+    // because the answer is exact on any target — a cover this narrow must not be
+    // turned away for want of SIMD.
+    if pf.is_empty() {
+        return Ok(());
+    }
+
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     if pf.cmp_cost() > SIMD_CAP {
         return Err(PrefilterError::ProbeCoverTooWide);
