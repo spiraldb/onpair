@@ -34,7 +34,8 @@
 //! * `graph` — pattern to alignment DAG: every layout of the pattern across
 //!   token boundaries, as one graph whose cuts are exactly the sound covers.
 //! * `mincut` — the cheapest such cut, by max-flow over the split DAG.
-//! * `plan` — the two of them end to end: pattern in, cover out.
+//! * `plan` — the two of them end to end: pattern in, cover out, minus the ids
+//!   the code stream never uses.
 //! * `cover` — the cover itself, in both the shapes the scan wants.
 //! * `scan` — the vector kernels, and the refusal that keeps a wide cover off a
 //!   slow path.
@@ -97,6 +98,10 @@ impl std::error::Error for PrefilterError {}
 /// has no SIMD implementation, the probe cover is too expensive for SIMD, or the
 /// index shape does not match the inputs, it returns an error without modifying
 /// `out`.
+///
+/// A pattern whose cover names only tokens absent from `codes` is the exception:
+/// no row can match, so it appends nothing and succeeds on any target, SIMD or
+/// not.
 ///
 /// # Precondition
 /// `dict` is conformant: **sorted** (strict bytewise-lexicographic order) and
