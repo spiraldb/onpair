@@ -907,6 +907,7 @@ dependencies = [
  "arrow-schema",
  "codspeed-divan-compat",
  "hashbrown 0.16.1",
+ "memchr",
  "parquet",
  "rand",
  "rstest",

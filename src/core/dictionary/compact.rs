@@ -531,6 +531,18 @@ impl<'a> CompactDictionaryView<'a> {
     }
 }
 
+impl super::internal::ViewInternal for CompactDictionaryView<'_> {
+    /// Storing the tokens back to back *is* this layout's definition, so the
+    /// property holds by construction. The one care needed is to stop at the
+    /// logical length, leaving out the trailing read-padding — the only bytes here
+    /// that belong to no token.
+    #[inline]
+    fn token_payload(&self) -> Option<(&[u8], &[u32])> {
+        let logical = self.offsets.last().copied().unwrap_or(0) as usize;
+        Some((&self.bytes[..logical], self.offsets))
+    }
+}
+
 impl DictionaryView for CompactDictionaryView<'_> {
     #[inline]
     fn num_tokens(&self) -> usize {

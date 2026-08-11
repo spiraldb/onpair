@@ -17,7 +17,10 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
-use crate::search::{ContainsTable, PrefixQuery, contains, equals, starts_with, tokenize};
+use crate::search::{
+    BytesVerifier, ContainsTable, PrefilterError, PrefixQuery, TokenFrequencyIndex, contains,
+    equals, prefilter_candidates, starts_with, tokenize,
+};
 
 /// Owned compressed column, produced by [`Column::compress`] /
 /// [`Parser::parse`](crate::Parser::parse). Self-contained: it carries its own
@@ -188,6 +191,94 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     pub fn rows_containing(&self, pattern: &[u8]) -> Vec<usize> {
         let table = ContainsTable::new(pattern, self.dict);
         self.select(|codes| contains(codes, &table))
+    }
+
+    /// Ascending indices of the rows containing `pattern`, narrowed by the SIMD
+    /// prefilter and verified in the compressed domain.
+    ///
+    /// [`prefilter_candidates`](crate::search::prefilter_candidates) collects a
+    /// sound superset of the rows from the code stream, and each survivor then
+    /// takes the same [`ContainsTable`] walk
+    /// [`rows_containing`](Self::rows_containing) applies to every row — paid on
+    /// the candidates only. Worth it exactly when the pattern is selective; a
+    /// pattern most rows match is more cheaply answered by `rows_containing`
+    /// directly.
+    ///
+    /// `frequencies` must have been built for this view's code stream and
+    /// dictionary ([`build_token_frequency_index`](crate::search::build_token_frequency_index)),
+    /// and is reusable across every query against this column.
+    ///
+    /// # Errors
+    /// Whatever the prefilter refused with, unchanged. It does not fall back to a
+    /// full scan on its own: a [`PrefilterError`] means this column and pattern
+    /// are not a case prefiltering helps, and choosing what to do instead —
+    /// usually [`rows_containing`](Self::rows_containing) — is the caller's.
+    ///
+    /// # Panics
+    /// If `pattern` is longer than 255 bytes, the state width of
+    /// [`ContainsTable`]. The check happens before the prefilter runs, so it does
+    /// not depend on whether the prefilter would have refused; for longer
+    /// patterns use
+    /// [`rows_containing_prefiltered_memmem`](Self::rows_containing_prefiltered_memmem).
+    pub fn rows_containing_prefiltered(
+        &self,
+        pattern: &[u8],
+        frequencies: &TokenFrequencyIndex,
+    ) -> Result<Vec<usize>, PrefilterError> {
+        let table = ContainsTable::new(pattern, self.dict);
+        let mut rows = Vec::new();
+        self.prefilter_into(pattern, frequencies, &mut rows)?;
+        rows.retain(|&k| contains(self.row_codes(k), &table));
+        Ok(rows)
+    }
+
+    /// Ascending indices of the rows containing `pattern`, narrowed by the SIMD
+    /// prefilter and verified by decoding each candidate and searching its bytes.
+    ///
+    /// The same prefilter as
+    /// [`rows_containing_prefiltered`](Self::rows_containing_prefiltered) with the
+    /// other verifier behind it — see [`BytesVerifier`] for why decoding the
+    /// survivors beats walking their codes, and note that this one has no
+    /// pattern-length limit.
+    ///
+    /// One decode buffer serves every candidate. It is discarded when this returns,
+    /// so a caller issuing many queries against one column should drive
+    /// [`prefilter_candidates`](crate::search::prefilter_candidates) and a kept
+    /// [`BytesVerifier`] directly and reuse both buffers.
+    ///
+    /// # Errors
+    /// As [`rows_containing_prefiltered`](Self::rows_containing_prefiltered): the
+    /// prefilter's refusal, unchanged.
+    pub fn rows_containing_prefiltered_memmem(
+        &self,
+        pattern: &[u8],
+        frequencies: &TokenFrequencyIndex,
+    ) -> Result<Vec<usize>, PrefilterError> {
+        let mut rows = Vec::new();
+        self.prefilter_into(pattern, frequencies, &mut rows)?;
+        // The empty pattern occurs at offset 0 of every row, so the prefilter's
+        // answer is already exact and decoding the column would only confirm it.
+        if !pattern.is_empty() {
+            BytesVerifier::new(pattern).retain(*self, &mut rows);
+        }
+        Ok(rows)
+    }
+
+    /// The prefilter half both `rows_containing_prefiltered*` methods share.
+    fn prefilter_into(
+        &self,
+        pattern: &[u8],
+        frequencies: &TokenFrequencyIndex,
+        out: &mut Vec<usize>,
+    ) -> Result<(), PrefilterError> {
+        prefilter_candidates(
+            self.codes,
+            self.row_offsets,
+            pattern,
+            self.dict,
+            frequencies,
+            out,
+        )
     }
 
     /// Ascending indices of the rows whose codes satisfy `pred`.
@@ -395,6 +486,68 @@ mod tests {
                 })
                 .collect();
             assert_eq!(view.rows_containing(needle), con, "contains {needle:?}");
+        }
+    }
+
+    /// Both prefiltered paths are optimizations of `rows_containing` and nothing
+    /// else: same rows, same order. A refusal is a legitimate answer — the
+    /// prefilter declines rather than degrading — but it has to be the same
+    /// decision for both, since they share the plan and differ only in how they
+    /// verify.
+    #[test]
+    fn prefiltered_search_agrees_with_rows_containing() {
+        use crate::DictionaryView;
+        use crate::search::build_token_frequency_index;
+        use crate::test_corpus::user_strings;
+        let corpus: Vec<Vec<u8>> = user_strings(60)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+        let (bytes, offsets) = pack(&rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+        let needles: &[&[u8]] = &[
+            b"",
+            b"h",
+            b"https",
+            b"https://www.example.com/",
+            b"example",
+            b".com",
+            b"://",
+            b"zzz",
+        ];
+        for &needle in needles {
+            let want = view.rows_containing(needle);
+            let kmp = view.rows_containing_prefiltered(needle, &freqs);
+            let mem = view.rows_containing_prefiltered_memmem(needle, &freqs);
+            assert_eq!(kmp.is_ok(), mem.is_ok(), "split refusal for {needle:?}");
+            if let (Ok(kmp), Ok(mem)) = (kmp, mem) {
+                assert_eq!(kmp, want, "prefiltered kmp {needle:?}");
+                assert_eq!(mem, want, "prefiltered memmem {needle:?}");
+            }
+        }
+    }
+
+    /// `ContainsTable` caps the pattern at 255 bytes and the decoded-domain
+    /// verifier does not, which is the whole reason both methods exist.
+    #[test]
+    fn prefiltered_memmem_takes_patterns_the_kmp_table_rejects() {
+        use crate::DictionaryView;
+        use crate::search::build_token_frequency_index;
+        let long = vec![b'q'; 400];
+        let mut hit = long.clone();
+        hit.extend_from_slice(b"tail");
+        let rows: &[&[u8]] = &[b"short", hit.as_slice(), b"qqq"];
+        let (bytes, offsets) = pack(rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+        if let Ok(got) = view.rows_containing_prefiltered_memmem(&long, &freqs) {
+            assert_eq!(got, vec![1]);
         }
     }
 }
