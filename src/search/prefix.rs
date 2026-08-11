@@ -100,7 +100,7 @@ mod tests {
     fn check(rows: &[&[u8]], prefixes: &[&[u8]]) {
         let col = compress_rows(rows);
         let view = col.view();
-        let wide = view.wide_dict();
+        let wide = view.dict.to_wide();
         for &prefix in prefixes {
             let want: Vec<usize> = (0..view.num_rows())
                 .filter(|&k| decode_row(view, k).starts_with(prefix))

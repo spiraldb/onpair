@@ -23,10 +23,13 @@ use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 /// than it saves.
 ///
 /// # Precondition
-/// `dict` is **sorted** (strict bytewise-lexicographic order) and **complete**
-/// (all 256 single-byte tokens present) — guaranteed for any dictionary trained
-/// by [`Parser::train`](crate::Parser::train). Completeness makes every byte
-/// encodable, so the loop always consumes at least one byte and terminates.
+/// `dict` is conformant: **sorted** (strict bytewise-lexicographic order) and
+/// **complete** (all 256 single-byte tokens present). These properties are
+/// guaranteed for any dictionary trained by [`Parser::train`](crate::Parser::train)
+/// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
+/// Completeness makes every byte encodable, so the loop always consumes at least
+/// one byte and terminates. See [`crate::search`] for the general search
+/// precondition.
 pub fn tokenize<V: DictionaryView>(text: &[u8], dict: V) -> Vec<Token> {
     let mut tokens = Vec::with_capacity(text.len());
 

@@ -82,7 +82,7 @@ pub struct Config {
 }
 
 /// Reasonable starting point: dictionary capped at 4 096 tokens, dynamic
-/// threshold sampling 15 %.
+/// threshold sampling 15 %, and deterministic sampling with a fixed seed.
 pub const DEFAULT_CONFIG: Config = Config {
     max_dict_bits: match MaxDictBits::new(12) {
         Ok(b) => b,
@@ -92,7 +92,7 @@ pub const DEFAULT_CONFIG: Config = Config {
         Ok(t) => t,
         Err(_) => unreachable!(),
     },
-    seed: None,
+    seed: Some(42),
 };
 
 impl Default for Config {
@@ -184,5 +184,16 @@ impl From<Config> for TrainingConfig {
             }),
             seed: c.seed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_uses_a_deterministic_seed() {
+        assert!(DEFAULT_CONFIG.seed.is_some());
+        assert!(Config::default().seed.is_some());
     }
 }

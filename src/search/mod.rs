@@ -4,7 +4,11 @@
 //! Compressed-domain search: equality, prefix, and substring queries answered
 //! directly over the code stream, without decoding rows back to bytes.
 //!
-//! The dictionary's invariants are what make this sound:
+//! These operations require a conformant dictionary — one that is sorted,
+//! complete, and unique. A dictionary produced by the trainer or passed through
+//! `validate` satisfies this precondition. [`crate::DictionaryView`]
+//! only guarantees structurally safe access; it does not establish these semantic
+//! properties:
 //!
 //! * **Sorted** — tokens are in bytewise-lexicographic order, so a needle can be
 //!   tokenized ([`tokenize`](tokenize())) and prefix-ranged ([`prefix_range`]) by
@@ -29,10 +33,14 @@
 //!   [`PrefixQuery`].
 //! * [`contains`](contains()) — rows containing a pattern, via a precomputed
 //!   token-level KMP [`ContainsTable`].
+//! * [`build_token_frequency_index`] — build the reusable selectivity index for
+//!   a code stream.
 //! * [`prefilter_candidates`] — a sound *superset* of the rows containing a
-//!   pattern, collected by a SIMD [`ContainsPrefilter`] scan over the code
-//!   stream. The caller verifies the survivors with any exact check
-//!   ([`contains`](contains()), decode-and-`memmem`, …) for the precise answer.
+//!   pattern, collected by a SIMD scan over the code stream. The caller verifies
+//!   the survivors with [`contains`] or another exact check.
+//! * [`BytesVerifier`] — that exact check in the decoded domain: decode a
+//!   candidate row into a reused buffer and `memmem` it. The faster of the two
+//!   verifies, and the one without a pattern-length cap.
 //! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
 
 mod contains;
@@ -41,10 +49,15 @@ mod lookup;
 mod prefilter;
 mod prefix;
 mod tokenize;
+mod verify;
 
 pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
-pub use prefilter::{ContainsPrefilter, prefilter_candidates};
+pub use prefilter::{
+    PrefilterError, TokenFrequencyIndex, TokenFrequencyIndexError, build_token_frequency_index,
+    prefilter_candidates,
+};
 pub use prefix::{PrefixQuery, starts_with};
 pub use tokenize::tokenize;
+pub use verify::BytesVerifier;

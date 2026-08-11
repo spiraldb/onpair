@@ -360,7 +360,7 @@ mod tests {
     fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
         let col = compress_rows(rows);
         let view = col.view();
-        let wide = view.wide_dict();
+        let wide = view.dict.to_wide();
         for &pat in patterns {
             let want: Vec<usize> = (0..view.num_rows())
                 .filter(|&k| byte_contains(&decode_row(view, k), pat))

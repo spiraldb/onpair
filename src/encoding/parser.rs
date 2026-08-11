@@ -62,25 +62,12 @@ impl Parser {
     /// guarantees as [`Parser::train_unchecked`].
     pub(crate) fn parse_unchecked<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Column<O> {
         let (codes, row_offsets) = encode_strings(bytes, offsets, &self.lpm);
-        // Prefix sums of per-token term frequency over the code stream — the
-        // selectivity signal the substring prefilter consumes (see
-        // `ContainsPrefilter::new`). Counted once here and stored on the column
-        // alongside `codes`, so no query rebuilds it.
-        let num_tokens = self.dict.num_tokens();
-        let mut cum_token_freq = vec![0u64; num_tokens + 1];
-        for &c in &codes {
-            cum_token_freq[c as usize + 1] += 1;
-        }
-        for t in 0..num_tokens {
-            cum_token_freq[t + 1] += cum_token_freq[t];
-        }
         // `self.dict` is already read-padded, so the cloned column dictionary is
         // too.
         Column {
             dict: self.dict.clone(),
             codes,
             row_offsets,
-            cum_token_freq,
         }
     }
 }
