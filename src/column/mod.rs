@@ -12,16 +12,14 @@
 
 use std::mem::MaybeUninit;
 
-use crate::core::dictionary::{
-    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, WideDictionary,
-};
+use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, Dictionary};
 use crate::core::offset::Offset;
-use crate::core::types::{MAX_TOKEN_SIZE, Token};
+use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
 use crate::search::{
-    ContainsPrefilter, ContainsTable, PrefixQuery, contains, equals, prefilter_candidates,
-    starts_with, tokenize,
+    BytesVerifier, ContainsTable, PrefilterError, PrefixQuery, TokenFrequencyIndex, contains,
+    equals, prefilter_candidates, starts_with, tokenize,
 };
 
 /// Owned compressed column, produced by [`Column::compress`] /
@@ -38,15 +36,6 @@ pub struct Column<O: Offset> {
     /// is `codes[row_offsets[k]..row_offsets[k + 1]]`. `row_offsets[0] == 0`,
     /// non-decreasing, and `row_offsets[R] == codes.len()`.
     pub row_offsets: Vec<O>,
-    /// Prefix sums of per-token term frequency over `codes`:
-    /// `cum_token_freq[i] = Σ_{id < i} (occurrences of token id in codes)`, so
-    /// `cum_token_freq.len() == dict.num_tokens() + 1`, `cum_token_freq[0] == 0`,
-    /// and the last entry is `codes.len()`. This is the selectivity signal the
-    /// substring prefilter ([`ContainsPrefilter`](crate::search::ContainsPrefilter))
-    /// consumes — a point's frequency is `cum_token_freq[t + 1] − cum_token_freq[t]`
-    /// and a range's is `cum_token_freq[hi + 1] − cum_token_freq[lo]`. Computed once
-    /// at compression time and stored, so no per-query pass over `codes` is needed.
-    pub cum_token_freq: Vec<u64>,
 }
 
 impl<O: Offset> Column<O> {
@@ -68,17 +57,15 @@ impl<O: Offset> Column<O> {
             dict: self.dict.as_view(),
             codes: &self.codes,
             row_offsets: &self.row_offsets,
-            cum_token_freq: &self.cum_token_freq,
         }
     }
 
-    /// Consume the column and return its owned
-    /// `(dictionary, codes, row_offsets, cum_token_freq)` without copying. Useful
-    /// for embedders that want OnPair to own training and parsing, but store the
-    /// resulting buffers in their own layout.
+    /// Consume the column and return its owned `(dictionary, codes, row_offsets)`
+    /// without copying. This is useful for embedders that want OnPair to own
+    /// training and parsing, but store the resulting buffers in their own layout.
     #[inline]
-    pub fn into_raw(self) -> (CompactDictionary, Vec<Token>, Vec<O>, Vec<u64>) {
-        (self.dict, self.codes, self.row_offsets, self.cum_token_freq)
+    pub fn into_raw(self) -> (CompactDictionary, Vec<Token>, Vec<O>) {
+        (self.dict, self.codes, self.row_offsets)
     }
 }
 
@@ -92,9 +79,6 @@ pub struct ColumnView<'a, O: Offset> {
     pub codes: &'a [Token],
     /// The row layer (see [`Column::row_offsets`]).
     pub row_offsets: &'a [O],
-    /// Prefix-sum per-token frequencies, the substring prefilter's selectivity
-    /// signal (the `cum_token_freq` field of [`Column`]).
-    pub cum_token_freq: &'a [u64],
 }
 
 impl<'a, O: Offset> ColumnView<'a, O> {
@@ -138,76 +122,27 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         decoding::decoded_len(self.row_codes(k), self.dict)
     }
 
-    /// Build a reusable [`WideDictionary`] for this column's dictionary (validates
-    /// it; panics if malformed). Amortize it across many decodes
-    /// ([`decode_into`](crate::decode_into) over its view) when doing repeated
-    /// access after one validation; for a single bulk decode
-    /// [`decompress_into`](Self::decompress_into) over the compact dictionary is
-    /// usually enough.
-    #[inline]
-    pub fn wide_dict(&self) -> WideDictionary {
-        self.dict.to_wide()
-    }
-
-    /// Check this view's column-level invariants: every code in range and
-    /// well-formed row offsets. `O(codes)`. The dictionary is already **trusted**
-    /// by its type ([`CompactDictionaryView`] can only be obtained validated), so
-    /// it is not re-checked here.
-    ///
-    /// This is a recoverable **pre-flight**, not a fast-path gate. The decode
-    /// kernels ([`decode_into`](crate::decode_into) and [`row_codes`](Self::row_codes))
-    /// bounds-check every code and row offset regardless, so they are sound — and
-    /// panic, never UB — on any view. `validate` unlocks no unchecked path; it
-    /// merely surfaces, as a `Result` up front, the same violations a later decode
-    /// would otherwise hit as a panic. After `Ok`, a decode into an adequately-sized
-    /// buffer will not panic.
-    ///
-    /// A view from a [`Column`] always passes; this is for views assembled from a
-    /// validated dictionary plus deserialized code/row buffers. Safety only — not
-    /// the correctness properties (sorted/complete/unique).
-    pub fn validate(&self) -> Result<(), InvalidColumn> {
-        let n = self.dict.num_tokens();
-        if self.codes.iter().any(|&c| (c as usize) >= n) {
-            return Err(InvalidColumn::CodeOutOfRange);
-        }
-        let mut prev = 0usize;
-        for &r in self.row_offsets {
-            let r = r.to_usize();
-            if r < prev {
-                return Err(InvalidColumn::BadRowOffsets);
-            }
-            prev = r;
-        }
-        if prev > self.codes.len() {
-            return Err(InvalidColumn::BadRowOffsets);
-        }
-        Ok(())
-    }
-
     /// Decode the whole column into `out`, returning the bytes written. Expands the
-    /// dictionary to its load-free [`WideDictionary`] form once — the fast layout
+    /// dictionary to its load-free `WideDictionary` form once — the fast layout
     /// for a bulk decode, reached directly per code with no offset indirection —
     /// then over-reads a fixed 16 bytes per token via
     /// [`decode_into`](crate::decode_into). The caller owns buffer sizing: size
     /// `out` from [`decoded_len`](Self::decoded_len) plus
     /// [`DECODE_PADDING`](crate::DECODE_PADDING).
     ///
-    /// For repeated decodes, build a [`wide_dict`](Self::wide_dict) once and decode
-    /// over its view with [`decode_into`](crate::decode_into), so the wide form is
-    /// not rebuilt on every call.
+    /// For repeated decodes, retain the materialized wide form and decode over its
+    /// view with [`decode_into`](crate::decode_into), so the wide form is not
+    /// rebuilt on every call.
     ///
     /// # Panics
-    /// With [`InvalidColumn`] on a malformed view — a bad dictionary (caught while
-    /// building the wide form) or an out-of-range code. Never UB.
+    /// With [`InvalidColumn::CodeOutOfRange`] on an out-of-range code.
     ///
     /// # Safety
-    /// `out.len() >= self.decoded_len() + DECODE_PADDING`. The dictionary's
-    /// validity is established by the wide expansion, so it is *not* a precondition.
+    /// `out.len() >= self.decoded_len() + DECODE_PADDING`.
     #[inline]
     pub unsafe fn decompress_into(&self, out: &mut [MaybeUninit<u8>]) -> usize {
-        // Expand to the load-free wide form (fast for a bulk decode); its copy
-        // bounds-checks the dictionary bytes via safe slicing, so a malformed one
-        // panics rather than risks UB.
+        // Expand to the load-free wide form (fast for a bulk decode). The
+        // dictionary view guarantees the preconditions of `to_wide`.
         let wide = self.dict.to_wide();
         // SAFETY: the wide form is read-padded by construction (`n` exact 16-byte
         // rows); the only caller precondition is the buffer size.
@@ -227,12 +162,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// [`InvalidColumn::CodeOutOfRange`] (never UB).
     ///
     /// # Safety
-    /// `out.len() >= self.row_decoded_len(k) + DECODE_PADDING`. The dictionary's
-    /// validity is a type invariant of [`CompactDictionaryView`], so it is not a
-    /// precondition.
+    /// `out.len() >= self.row_decoded_len(k) + DECODE_PADDING`.
     #[inline]
     pub unsafe fn decompress_row_into(&self, k: usize, out: &mut [MaybeUninit<u8>]) -> usize {
-        // SAFETY: `self.dict` is trusted and read-padded, so each token's fixed
+        // SAFETY: `self.dict` is structurally valid and read-padded, so each token's fixed
         // 16-byte over-read stays in bounds; the caller guarantees `out` holds the
         // row's decoded length plus DECODE_PADDING for the final over-store.
         unsafe { decoding::decode_into(self.row_codes(k), self.dict, out) }
@@ -260,81 +193,92 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         self.select(|codes| contains(codes, &table))
     }
 
-    /// Ascending indices of the rows containing `pattern` — identical to
-    /// [`rows_containing`](Self::rows_containing), but a SIMD
-    /// [`ContainsPrefilter`](crate::search::ContainsPrefilter) rejects most rows
-    /// before the token-KMP verify, so it is faster at low selectivity. Panics if
-    /// `pattern` exceeds 255 bytes.
+    /// Ascending indices of the rows containing `pattern`, narrowed by the SIMD
+    /// prefilter and verified in the compressed domain.
     ///
-    /// This assembles the "prefilter, then verify" recipe for convenience: the
-    /// prefilter collects a sound superset, then each survivor is verified in the
-    /// compressed domain with the token-KMP [`contains`](crate::search::contains).
-    /// See [`rows_containing_prefiltered_memmem`](Self::rows_containing_prefiltered_memmem)
-    /// for the same prefilter with a decode-and-`memmem` verify instead.
-    pub fn rows_containing_prefiltered(&self, pattern: &[u8]) -> Vec<usize> {
-        if pattern.is_empty() {
-            return (0..self.num_rows()).collect();
-        }
-        // Build the verifier first, so an over-long pattern fails fast (like
-        // `rows_containing`) before any cover-compile work.
+    /// [`prefilter_candidates`](crate::search::prefilter_candidates) collects a
+    /// sound superset of the rows from the code stream, and each survivor then
+    /// takes the same [`ContainsTable`] walk
+    /// [`rows_containing`](Self::rows_containing) applies to every row — paid on
+    /// the candidates only. Worth it exactly when the pattern is selective; a
+    /// pattern most rows match is more cheaply answered by `rows_containing`
+    /// directly.
+    ///
+    /// `frequencies` must have been built for this view's code stream and
+    /// dictionary ([`build_token_frequency_index`](crate::search::build_token_frequency_index)),
+    /// and is reusable across every query against this column.
+    ///
+    /// # Errors
+    /// Whatever the prefilter refused with, unchanged. It does not fall back to a
+    /// full scan on its own: a [`PrefilterError`] means this column and pattern
+    /// are not a case prefiltering helps, and choosing what to do instead —
+    /// usually [`rows_containing`](Self::rows_containing) — is the caller's.
+    ///
+    /// # Panics
+    /// If `pattern` is longer than 255 bytes, the state width of
+    /// [`ContainsTable`]. The check happens before the prefilter runs, so it does
+    /// not depend on whether the prefilter would have refused; for longer
+    /// patterns use
+    /// [`rows_containing_prefiltered_memmem`](Self::rows_containing_prefiltered_memmem).
+    pub fn rows_containing_prefiltered(
+        &self,
+        pattern: &[u8],
+        frequencies: &TokenFrequencyIndex,
+    ) -> Result<Vec<usize>, PrefilterError> {
         let table = ContainsTable::new(pattern, self.dict);
-        let mut cand = self.prefilter_rows(pattern);
-        cand.retain(|&r| contains(self.row_codes(r), &table));
-        cand
+        let mut rows = Vec::new();
+        self.prefilter_into(pattern, frequencies, &mut rows)?;
+        rows.retain(|&k| contains(self.row_codes(k), &table));
+        Ok(rows)
     }
 
-    /// Ascending indices of the rows containing `pattern` — the same prefilter as
-    /// [`rows_containing_prefiltered`](Self::rows_containing_prefiltered), but each
-    /// surviving row is verified by **decoding it and running `memmem`** over the
-    /// bytes, rather than stepping the token-KMP automaton over its codes. The two
-    /// return identical results; which verify wins depends on the corpus (decode +
-    /// SIMD `memmem` vs. compressed-domain KMP).
+    /// Ascending indices of the rows containing `pattern`, narrowed by the SIMD
+    /// prefilter and verified by decoding each candidate and searching its bytes.
     ///
-    /// Unlike [`rows_containing_prefiltered`](Self::rows_containing_prefiltered),
-    /// this has **no 255-byte limit** — the token-KMP [`ContainsTable`] caps the
-    /// pattern at 255 bytes, but `memmem` and the prefilter cover do not.
-    pub fn rows_containing_prefiltered_memmem(&self, pattern: &[u8]) -> Vec<usize> {
-        if pattern.is_empty() {
-            return (0..self.num_rows()).collect();
+    /// The same prefilter as
+    /// [`rows_containing_prefiltered`](Self::rows_containing_prefiltered) with the
+    /// other verifier behind it — see [`BytesVerifier`] for why decoding the
+    /// survivors beats walking their codes, and note that this one has no
+    /// pattern-length limit.
+    ///
+    /// One decode buffer serves every candidate. It is discarded when this returns,
+    /// so a caller issuing many queries against one column should drive
+    /// [`prefilter_candidates`](crate::search::prefilter_candidates) and a kept
+    /// [`BytesVerifier`] directly and reuse both buffers.
+    ///
+    /// # Errors
+    /// As [`rows_containing_prefiltered`](Self::rows_containing_prefiltered): the
+    /// prefilter's refusal, unchanged.
+    pub fn rows_containing_prefiltered_memmem(
+        &self,
+        pattern: &[u8],
+        frequencies: &TokenFrequencyIndex,
+    ) -> Result<Vec<usize>, PrefilterError> {
+        let mut rows = Vec::new();
+        self.prefilter_into(pattern, frequencies, &mut rows)?;
+        // The empty pattern occurs at offset 0 of every row, so the prefilter's
+        // answer is already exact and decoding the column would only confirm it.
+        if !pattern.is_empty() {
+            BytesVerifier::new(pattern).retain(*self, &mut rows);
         }
-        let finder = memchr::memmem::Finder::new(pattern);
-        let mut cand = self.prefilter_rows(pattern);
-
-        // Size one reusable decode buffer to the largest candidate row's worst
-        // case: each of its codes expands to at most `MAX_TOKEN_SIZE` bytes, plus
-        // the decoder's fixed over-store. A row's code count is O(1) from
-        // `row_offsets`, so this replaces the per-row `row_decoded_len` (an O(row)
-        // sum over token lengths) — which would double the verify's per-row cost —
-        // with a single up-front sizing pass.
-        let row_codes =
-            |r: usize| self.row_offsets[r + 1].to_usize() - self.row_offsets[r].to_usize();
-        let cap = cand
-            .iter()
-            .map(|&r| row_codes(r))
-            .max()
-            .map_or(0, |mx| MAX_TOKEN_SIZE * mx + crate::DECODE_PADDING);
-        let mut buf = vec![MaybeUninit::uninit(); cap];
-
-        cand.retain(|&r| {
-            // SAFETY: `cap` bounds every candidate's decoded length + DECODE_PADDING
-            // (≤ MAX_TOKEN_SIZE per code); the view comes from a trusted column.
-            let w = unsafe { self.decompress_row_into(r, &mut buf) };
-            // SAFETY: `decompress_row_into` initialized the first `w` bytes.
-            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) };
-            finder.find(bytes).is_some()
-        });
-        cand
+        Ok(rows)
     }
 
-    /// The prefilter's **sound superset** of the rows containing `pattern`
-    /// (ascending) — candidates for either verify path to confirm. Reads the
-    /// column's stored `cum_token_freq`, so no per-query pass over `codes`.
-    /// Precondition: `pattern` is non-empty (the callers special-case `%%`).
-    fn prefilter_rows(&self, pattern: &[u8]) -> Vec<usize> {
-        let pf = ContainsPrefilter::new(pattern, self.dict, self.cum_token_freq);
-        let mut cand = Vec::new();
-        prefilter_candidates(self.codes, self.row_offsets, &pf, &mut cand);
-        cand
+    /// The prefilter half both `rows_containing_prefiltered*` methods share.
+    fn prefilter_into(
+        &self,
+        pattern: &[u8],
+        frequencies: &TokenFrequencyIndex,
+        out: &mut Vec<usize>,
+    ) -> Result<(), PrefilterError> {
+        prefilter_candidates(
+            self.codes,
+            self.row_offsets,
+            pattern,
+            self.dict,
+            frequencies,
+            out,
+        )
     }
 
     /// Ascending indices of the rows whose codes satisfy `pred`.
@@ -347,9 +291,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        ColumnView, Config, DECODE_PADDING, DEFAULT_CONFIG, InvalidColumn, MaxDictBits, compress,
-    };
+    use crate::{ColumnView, Config, DECODE_PADDING, DEFAULT_CONFIG, MaxDictBits, compress};
 
     fn pack(rows: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
         let mut bytes = Vec::new();
@@ -450,45 +392,6 @@ mod tests {
         assert!(col.dict.code_bits() <= 12);
     }
 
-    #[test]
-    fn validate_classifies_column_corruption() {
-        let (bytes, offsets) = pack(&[b"alpha", b"beta", b"alpha"]);
-        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
-        let view = col.view();
-        assert_eq!(view.validate(), Ok(()));
-
-        // A code past the dictionary.
-        let bad_codes = vec![u16::MAX];
-        let ro = vec![0u32, 1];
-        let bad = ColumnView {
-            dict: view.dict,
-            codes: &bad_codes,
-            row_offsets: &ro,
-            cum_token_freq: view.cum_token_freq,
-        };
-        assert_eq!(bad.validate(), Err(InvalidColumn::CodeOutOfRange));
-
-        // Row offsets that decrease.
-        let ro = vec![0u32, 2, 1];
-        let bad = ColumnView {
-            dict: view.dict,
-            codes: view.codes,
-            row_offsets: &ro,
-            cum_token_freq: view.cum_token_freq,
-        };
-        assert_eq!(bad.validate(), Err(InvalidColumn::BadRowOffsets));
-
-        // A row offset past the code stream.
-        let ro = vec![0u32, (view.codes.len() + 1) as u32];
-        let bad = ColumnView {
-            dict: view.dict,
-            codes: view.codes,
-            row_offsets: &ro,
-            cum_token_freq: view.cum_token_freq,
-        };
-        assert_eq!(bad.validate(), Err(InvalidColumn::BadRowOffsets));
-    }
-
     /// A malformed row layer surfaces as a typed `BadRowOffsets` panic through the
     /// safe row accessor, not a generic slice-index panic.
     #[test]
@@ -503,7 +406,6 @@ mod tests {
             dict: view.dict,
             codes: view.codes,
             row_offsets: &ro,
-            cum_token_freq: view.cum_token_freq,
         };
         let _ = bad.row_codes(0);
     }
@@ -584,6 +486,68 @@ mod tests {
                 })
                 .collect();
             assert_eq!(view.rows_containing(needle), con, "contains {needle:?}");
+        }
+    }
+
+    /// Both prefiltered paths are optimizations of `rows_containing` and nothing
+    /// else: same rows, same order. A refusal is a legitimate answer — the
+    /// prefilter declines rather than degrading — but it has to be the same
+    /// decision for both, since they share the plan and differ only in how they
+    /// verify.
+    #[test]
+    fn prefiltered_search_agrees_with_rows_containing() {
+        use crate::DictionaryView;
+        use crate::search::build_token_frequency_index;
+        use crate::test_corpus::user_strings;
+        let corpus: Vec<Vec<u8>> = user_strings(60)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+        let (bytes, offsets) = pack(&rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+        let needles: &[&[u8]] = &[
+            b"",
+            b"h",
+            b"https",
+            b"https://www.example.com/",
+            b"example",
+            b".com",
+            b"://",
+            b"zzz",
+        ];
+        for &needle in needles {
+            let want = view.rows_containing(needle);
+            let kmp = view.rows_containing_prefiltered(needle, &freqs);
+            let mem = view.rows_containing_prefiltered_memmem(needle, &freqs);
+            assert_eq!(kmp.is_ok(), mem.is_ok(), "split refusal for {needle:?}");
+            if let (Ok(kmp), Ok(mem)) = (kmp, mem) {
+                assert_eq!(kmp, want, "prefiltered kmp {needle:?}");
+                assert_eq!(mem, want, "prefiltered memmem {needle:?}");
+            }
+        }
+    }
+
+    /// `ContainsTable` caps the pattern at 255 bytes and the decoded-domain
+    /// verifier does not, which is the whole reason both methods exist.
+    #[test]
+    fn prefiltered_memmem_takes_patterns_the_kmp_table_rejects() {
+        use crate::DictionaryView;
+        use crate::search::build_token_frequency_index;
+        let long = vec![b'q'; 400];
+        let mut hit = long.clone();
+        hit.extend_from_slice(b"tail");
+        let rows: &[&[u8]] = &[b"short", hit.as_slice(), b"qqq"];
+        let (bytes, offsets) = pack(rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+        if let Ok(got) = view.rows_containing_prefiltered_memmem(&long, &freqs) {
+            assert_eq!(got, vec![1]);
         }
     }
 }

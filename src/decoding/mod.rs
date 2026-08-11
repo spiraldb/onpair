@@ -34,7 +34,8 @@ pub const DECODE_PADDING: usize = MAX_TOKEN_SIZE;
 ///
 /// Bounds-checks each code, so a malformed code stream panics with
 /// [`InvalidColumn::CodeOutOfRange`] rather than reading out of bounds. The sum
-/// is only meaningful for a structurally valid dictionary.
+/// is only meaningful for a dictionary satisfying [`DictionaryView`]'s
+/// structural invariants.
 #[inline]
 pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
     let n = dict.num_tokens();
@@ -52,15 +53,11 @@ pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
     sum
 }
 
-/// Decode `codes` against an **already-validated** `dict` into `out`, returning
-/// the bytes written. It over-reads a fixed 16 bytes per token, trusting the
-/// dictionary's offsets/lengths (validated up front). Each code is bounds-checked
-/// in the loop (a near-free, predicted-not-taken branch); an out-of-range code
-/// panics with [`InvalidColumn::CodeOutOfRange`].
-///
-/// `dict`'s validity is a *type* invariant — only a trusted [`DictionaryView`]
-/// (sealed; obtained through `validate`/`to_wide`) can be passed — so it is not a
-/// precondition here.
+/// Decode `codes` against `dict` into `out`, returning the bytes written. It
+/// over-reads a fixed 16 bytes per token, relying on the structural invariants
+/// guaranteed by [`DictionaryView`]. Each code is bounds-checked in the loop (a
+/// near-free, predicted-not-taken branch); an out-of-range code panics with
+/// [`InvalidColumn::CodeOutOfRange`].
 ///
 /// # Safety
 /// `out.len() >= decoded_len(codes, dict) + DECODE_PADDING`.
@@ -97,8 +94,7 @@ pub unsafe fn decode_into<V: DictionaryView>(
 /// [`InvalidColumn`]: a too-small caller buffer is not a
 /// malformation of the compressed data, so it does not belong to the validation
 /// vocabulary. An out-of-range code *is* a malformation and is handled like the
-/// other decoders — a panic, recoverable up front via
-/// [`ColumnView::validate`](crate::ColumnView::validate) — not a variant here.
+/// other decoders — a panic at the point of use — not a variant here.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct OutputTooSmall;
 
@@ -110,7 +106,7 @@ impl std::fmt::Display for OutputTooSmall {
 
 impl std::error::Error for OutputTooSmall {}
 
-/// Decode `codes` against an already-validated `dict` into `out` — the **safe,
+/// Decode `codes` against `dict` into `out` — the **safe,
 /// buffer-checked** counterpart of [`decode_into`]. Returns `Ok(bytes_written)`, or
 /// `Err(`[`OutputTooSmall`]`)` if `out` cannot hold the result (in which case
 /// nothing is written past the end of `out`). Never reads or writes out of bounds.
@@ -132,15 +128,13 @@ impl std::error::Error for OutputTooSmall {}
 /// than this column's own decoded length can still overflow. This routine derives
 /// the bound from `out` itself, so it is sound for any `(codes, out)` pair.
 ///
-/// `dict`'s validity is a type invariant (only a trusted [`DictionaryView`] can be
-/// passed), so its tokens are read-padded and the 16-byte over-read is in bounds.
+/// The [`DictionaryView`] contract guarantees that token reads and the fixed
+/// 16-byte over-read are in bounds.
 ///
 /// # Panics
 /// With [`InvalidColumn::CodeOutOfRange`] on a code that does not index the
 /// dictionary — the same malformation backstop as [`decode_into`] / [`decoded_len`]
-/// (never UB). Recover it up front, as a `Result`, with
-/// [`ColumnView::validate`](crate::ColumnView::validate); buffer fit, which `validate`
-/// cannot pre-check, is this function's recoverable concern.
+/// (never UB). Buffer fit is this function's recoverable concern.
 pub fn try_decode_into<V: DictionaryView>(
     codes: &[Token],
     dict: V,

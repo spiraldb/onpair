@@ -5,7 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0](https://github.com/spiraldb/onpair/compare/v0.0.4...v0.1.0) - 2026-07-06
+## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.2.0...HEAD)
+
+### Added
+
+- Add row-based training and compression without flattening input first.
+- Add encoding into reusable caller-owned buffers.
+
+### Changed
+
+- Scan dynamic training samples sequentially without changing their contents or
+  order.
+- Speed up matching for large dictionaries.
+- Speed up token-pair frequency counting and reserve capacity for training tables
+  and matcher maps.
+- Speed up compression by reserving final matcher maps for the dictionary size
+  and long-token count.
+
+### Fixed
+
+- Train on the randomly selected rows returned by partial shuffling, expanding
+  the selection when needed to cover the sampling budget.
+- Ignore bytes outside the row offsets when calculating the training budget.
+
+## [0.2.0](https://github.com/spiraldb/onpair/compare/v0.1.1...v0.2.0) - 2026-07-30
+
+### Added
+
+- Make `CompactDictionary` storage-backed, allowing validated dictionary bytes
+  and offsets to be borrowed or shared without copying.
+- Separate dictionary safety validation from correctness validation, allowing
+  bounded decoding and tokenization checks without requiring full semantic
+  validation.
+
+### Changed
+
+- Add `rust-analyzer` to the pinned Rust toolchain.
+
+### Removed
+
+- Remove the obsolete cross-implementation benchmark harness and standalone
+  TPC-H example, retaining the Rust benchmarks under `benches/`.
+
+### Fixed
+
+- Ensure the Rust setup action installs the pinned toolchain without referring to a nonexistent cache step.
+- Remove the vulnerable transitive `thrift` dependency by upgrading the Arrow,
+  Parquet, and TPC-H benchmark dependencies.
+
+## [0.1.1](https://github.com/spiraldb/onpair/compare/v0.1.0...v0.1.1) - 2026-07-17
+
+### Fixed
+
+- Use a deterministic seed in the default training configuration.
+- Reject compact dictionaries containing more than 65,536 tokens, which cannot
+  be addressed by the `u16` token type.
+- Add regression coverage for the 65,536-token boundary and document the
+  dictionary size limit in the invariants and interchange format.
+
+## [0.1.0](https://github.com/spiraldb/onpair/compare/v0.0.4...v0.1.0) - 2026-07-14
 
 ### Added
 
@@ -19,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rename the training dictionary-width knob to `MaxDictBits` / `Config::max_dict_bits`, making it explicit that it is a dictionary-size budget; runtime code width is derived from dictionary size via `CompactDictionary::code_bits`.
 - Bump the crate to 0.1.0 for the breaking public API changes.
 
-## [0.0.4](https://github.com/spiraldb/onpair/compare/v0.0.3...v0.0.4) - 2026-05-29
+## [0.0.4](https://github.com/spiraldb/onpair/compare/v0.0.3...v0.0.4) - 2026-06-01
 
 ### Added
 

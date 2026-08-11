@@ -14,21 +14,31 @@
 //! Both borrowed views implement [`DictionaryView`], the layout-agnostic
 //! token-read interface; the owned forms implement [`Dictionary`], which lends
 //! the matching view. The compact form is the serialized one; accelerate decoding
-//! by materializing the wide form with [`CompactDictionaryView::to_wide`].
+//! by materializing the wide form with [`CompactDictionaryView::to_wide`] or
+//! [`WideDictionary::validate_safety`] when starting from raw storage.
 //!
-//! # Trust
-//! The four trusted types above are crate-private in their fields and implement a
-//! **sealed** [`DictionaryView`], so external code cannot forge one. Raw
-//! deserialized buffers cross into the trusted forms only through the
-//! [`validate`](CompactDictionary::validate) (checked) and
-//! [`new_unchecked`](CompactDictionary::new_unchecked) (`unsafe` backdoor)
-//! constructors on the compact types.
+//! # Invariants and trust
+//! The dictionary types above are crate-private in their fields and implement a
+//! **sealed** [`DictionaryView`], so external code cannot forge one.
+//! A `DictionaryView` guarantees the structural invariants required for bounded
+//! token access. Sortedness, uniqueness, and alphabet completeness are separate
+//! semantic properties used by search and tokenization.
+//!
+//! Raw deserialized buffers cross into the trusted forms through
+//! [`CompactDictionary::validate_safety`] / [`CompactDictionary::validate`] or
+//! directly into the decode-optimized [`WideDictionary`] with
+//! [`WideDictionary::validate_safety`]. The `new_unchecked` constructors are
+//! unsafe backdoors for callers that already guarantee the structural dictionary
+//! invariants.
 
 mod compact;
 mod wide;
 
 pub(crate) use compact::pad_raw;
-pub use compact::{CompactDictionary, CompactDictionaryView, code_bits_for_num_tokens};
+pub use compact::{
+    CompactDictionary, CompactDictionaryView, DictionaryStorage, OwnedDictionaryStorage,
+    code_bits_for_num_tokens,
+};
 pub use wide::{WideDictionary, WideDictionaryView};
 
 use crate::core::types::Token;
@@ -56,12 +66,13 @@ pub trait Dictionary {
     fn as_view(&self) -> Self::View<'_>;
 }
 
-/// A borrowed **trusted** dictionary's token-read interface, abstracted over the
-/// layout ([`CompactDictionaryView`] or [`WideDictionaryView`]).
+/// A borrowed dictionary's token-read interface, abstracted over the layout
+/// ([`CompactDictionaryView`] or [`WideDictionaryView`]).
 ///
 /// **Sealed:** implemented only by this crate's trusted view types, so a value of
-/// `V: DictionaryView` is by construction a validated dictionary — the unchecked
-/// accessors below rely on that. Untrusted buffers reach a view through
+/// `V: DictionaryView` has the structural invariants required by the unchecked
+/// accessors below. Semantic conformance is not part of this trait. Untrusted
+/// buffers reach a view through [`CompactDictionaryView::validate_safety`] or
 /// [`CompactDictionaryView::validate`], not by implementing this trait.
 pub trait DictionaryView: Copy + sealed::Sealed {
     /// Number of tokens in the dictionary. The valid token ids are
