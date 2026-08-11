@@ -6,21 +6,21 @@
 
 use super::cover::ProbeCover;
 use super::frequency::checked_frequency_total;
-use super::graph::{AlignmentGraph, build_alignment_graph};
+use super::graph::{AlignmentGraph, build_alignment_graph, contained_tokens};
 use super::mincut::minimum_vertex_cut;
 use super::plan::plan;
 use super::{
     PrefilterError, TokenFrequencyIndex, TokenFrequencyIndexError, build_token_frequency_index,
     prefilter_candidates,
 };
-use crate::core::dictionary::{Dictionary, DictionaryView};
+use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{Token, TokenRange};
 use crate::search::{ContainsTable, contains};
 use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
 
-fn candidates<V: DictionaryView>(
+fn candidates(
     view: ColumnView<'_, u32>,
-    dict: V,
+    dict: CompactDictionaryView<'_>,
     frequencies: &TokenFrequencyIndex,
     pattern: &[u8],
 ) -> Vec<usize> {
@@ -35,6 +35,20 @@ fn candidates<V: DictionaryView>(
     )
     .unwrap();
     out
+}
+
+/// The obvious way to find the tokens containing `needle`: compare every window
+/// of every token. This is the oracle for the flat-payload `memmem` sweep that
+/// replaced it — the sweep is a different algorithm over a different buffer, with
+/// match attribution and a resume rule of its own, so it earns a reference
+/// implementation rather than only end-to-end soundness checks.
+fn contained_tokens_by_scan(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Vec<Token> {
+    (0..dict.num_tokens() as Token)
+        .filter(|&id| {
+            let token = dict.token(id);
+            token.len() >= needle.len() && token.windows(needle.len()).any(|w| w == needle)
+        })
+        .collect()
 }
 
 fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
@@ -232,7 +246,6 @@ fn check_graph(
 fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
     let col = compress_rows(rows);
     let view = col.view();
-    let wide = view.wide_dict();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     for &pat in patterns {
         let want: Vec<usize> = (0..view.num_rows())
@@ -240,10 +253,14 @@ fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
             .collect();
         if !pat.is_empty() {
             check_graph(view, &frequencies, pat, &want);
+            assert_eq!(
+                contained_tokens(view.dict, pat),
+                contained_tokens_by_scan(view.dict, pat),
+                "the payload sweep and a per-token scan disagree for {pat:?}"
+            );
         }
 
         let cand = candidates(view, view.dict, &frequencies, pat);
-        assert_eq!(cand, candidates(view, wide.as_view(), &frequencies, pat));
         assert!(want.iter().all(|row| cand.contains(row)), "unsound {pat:?}");
         assert!(
             cand.windows(2).all(|w| w[0] < w[1]),
@@ -291,14 +308,9 @@ fn contained_tokens_survive_a_match_spanning_two_tokens() {
     let frequencies = build_token_frequency_index(view.codes, ntok).unwrap();
     for pat in [b"aa".as_slice(), b"aaa", b"aaaa"] {
         let graph = build_alignment_graph(dict, pat, &frequencies);
-        let want: Vec<Token> = (0..ntok as Token)
-            .filter(|&id| {
-                let token = dict.token(id);
-                token.len() >= pat.len() && token.windows(pat.len()).any(|w| w == pat)
-            })
-            .collect();
         assert_eq!(
-            graph.contained, want,
+            graph.contained,
+            contained_tokens_by_scan(dict, pat),
             "contained tokens for {pat:?} disagree with a per-token scan"
         );
     }

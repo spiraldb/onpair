@@ -431,6 +431,29 @@ impl<'a> CompactDictionaryView<'a> {
         Self { bytes, offsets }
     }
 
+    /// The token bytes without the trailing read-padding, plus the offsets
+    /// attributing them.
+    ///
+    /// Every byte of the returned buffer belongs to exactly one token, which is
+    /// what makes the buffer a valid haystack for a bulk substring search: a match
+    /// at `hit` lies inside token `id` exactly when `offsets[id] <= hit` and
+    /// `hit + len <= offsets[id + 1]`. The substring prefilter uses this to sweep
+    /// the whole dictionary with a single `memmem` search rather than one per
+    /// token. Trimming the read-padding is the one care needed — it is the only
+    /// part of `bytes` belonging to no token.
+    ///
+    /// Inherent and crate-internal on purpose, rather than a method on
+    /// [`DictionaryView`](super::DictionaryView): the buffer is a fact about *this*
+    /// layout, so a caller that needs it needs this type. The strided
+    /// [`WideDictionaryView`](super::WideDictionaryView) has no counterpart — the
+    /// tail of each of its rows holds the bytes of the *following* tokens, so a
+    /// match found there need not lie in any token at all.
+    #[inline]
+    pub(crate) fn token_payload(&self) -> (&'a [u8], &'a [u32]) {
+        let logical = self.offsets.last().copied().unwrap_or(0) as usize;
+        (&self.bytes[..logical], self.offsets)
+    }
+
     /// Validate raw borrowed `(bytes, offsets)` for safe decoding over the same
     /// slices (no copy) — the checked door across the safety boundary. The
     /// borrowed bytes must already be read-padded (a borrow cannot be extended).
@@ -528,18 +551,6 @@ impl<'a> CompactDictionaryView<'a> {
             }
         }
         WideDictionary::from_raw(data, lens)
-    }
-}
-
-impl super::internal::ViewInternal for CompactDictionaryView<'_> {
-    /// Storing the tokens back to back *is* this layout's definition, so the
-    /// property holds by construction. The one care needed is to stop at the
-    /// logical length, leaving out the trailing read-padding — the only bytes here
-    /// that belong to no token.
-    #[inline]
-    fn token_payload(&self) -> Option<(&[u8], &[u32])> {
-        let logical = self.offsets.last().copied().unwrap_or(0) as usize;
-        Some((&self.bytes[..logical], self.offsets))
     }
 }
 

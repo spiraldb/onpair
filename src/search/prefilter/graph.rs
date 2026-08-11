@@ -35,7 +35,7 @@
 use memchr::memmem::Finder;
 
 use super::frequency::TokenFrequencyIndex;
-use crate::core::dictionary::DictionaryView;
+use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::prefix_range;
 
@@ -120,7 +120,7 @@ impl AlignmentGraph {
 
 /// Greedy longest in-needle token at `suffix`, capped at [`MAX_TOKEN_SIZE`].
 /// Replicates the encoder's longest-prefix match restricted to the needle.
-fn greedy_in_needle<V: DictionaryView>(dict: V, suffix: &[u8]) -> (Token, usize) {
+fn greedy_in_needle(dict: CompactDictionaryView<'_>, suffix: &[u8]) -> (Token, usize) {
     debug_assert!(
         !suffix.is_empty(),
         "greedy_in_needle needs a non-empty suffix"
@@ -139,22 +139,13 @@ fn greedy_in_needle<V: DictionaryView>(dict: V, suffix: &[u8]) -> (Token, usize)
 /// own. Provably empty once the needle outgrows a token, which skips the pass.
 ///
 /// Ascending, without duplicates.
-fn contained_tokens<V: DictionaryView>(dict: V, needle: &[u8]) -> Vec<Token> {
+pub(super) fn contained_tokens(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Vec<Token> {
     let mut out = Vec::new();
     if needle.len() > MAX_TOKEN_SIZE {
         return out;
     }
-    match dict.token_payload() {
-        Some((payload, offsets)) => contained_by_search(payload, offsets, needle, &mut out),
-        None => {
-            for id in 0..dict.num_tokens() {
-                let token = dict.token(id as Token);
-                if token.len() >= needle.len() && token.windows(needle.len()).any(|w| w == needle) {
-                    out.push(id as Token);
-                }
-            }
-        }
-    }
+    let (payload, offsets) = dict.token_payload();
+    contained_by_search(payload, offsets, needle, &mut out);
     out
 }
 
@@ -197,8 +188,8 @@ fn contained_by_search(payload: &[u8], offsets: &[u32], needle: &[u8], out: &mut
     }
 }
 
-struct Builder<'a, V: DictionaryView> {
-    dict: V,
+struct Builder<'a> {
+    dict: CompactDictionaryView<'a>,
     needle: &'a [u8],
     frequencies: &'a TokenFrequencyIndex,
     probe: Vec<ProbeSet>,
@@ -213,7 +204,7 @@ struct Builder<'a, V: DictionaryView> {
     state_node: Vec<Option<u32>>,
 }
 
-impl<V: DictionaryView> Builder<'_, V> {
+impl Builder<'_> {
     /// Term frequency of `set`. Summing an explicit set cannot overflow: its
     /// ids are distinct, so the sum is at most the code stream's length.
     fn weight_of(&self, set: ProbeSet) -> u32 {
@@ -316,8 +307,8 @@ impl<V: DictionaryView> Builder<'_, V> {
 
 /// Build the alignment DAG for `needle` over `dict`, weighting each probe by
 /// its term frequency in the indexed code stream.
-pub(super) fn build_alignment_graph<V: DictionaryView>(
-    dict: V,
+pub(super) fn build_alignment_graph(
+    dict: CompactDictionaryView<'_>,
     needle: &[u8],
     frequencies: &TokenFrequencyIndex,
 ) -> AlignmentGraph {

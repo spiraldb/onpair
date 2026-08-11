@@ -193,17 +193,6 @@ pub struct WideDictionaryView<'a> {
     lens: &'a [u8],
 }
 
-impl super::internal::ViewInternal for WideDictionaryView<'_> {
-    /// There is no such buffer here. `data` is one allocation, but the bytes past
-    /// `lens[id]` in each row are the *following* tokens' bytes (see the padding
-    /// invariant above), so they belong to no token at this row — which is the
-    /// property a payload has to have.
-    #[inline]
-    fn token_payload(&self) -> Option<(&[u8], &[u32])> {
-        None
-    }
-}
-
 impl DictionaryView for WideDictionaryView<'_> {
     #[inline]
     fn num_tokens(&self) -> usize {
