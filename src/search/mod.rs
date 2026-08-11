@@ -37,7 +37,7 @@
 //!   a code stream.
 //! * [`prefilter_candidates`] — a sound *superset* of the rows containing a
 //!   pattern, collected by a SIMD scan over the code stream. The caller verifies
-//!   the survivors with [`contains`] or another exact check.
+//!   the survivors with [`contains()`] or another exact check.
 //! * [`BytesVerifier`] — that exact check in the decoded domain: decode a
 //!   candidate row into a reused buffer and `memmem` it. The faster of the two
 //!   verifies, and the one without a pattern-length cap.

@@ -196,9 +196,8 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// Ascending indices of the rows containing `pattern`, narrowed by the SIMD
     /// prefilter and verified in the compressed domain.
     ///
-    /// [`prefilter_candidates`](crate::search::prefilter_candidates) collects a
-    /// sound superset of the rows from the code stream, and each survivor then
-    /// takes the same [`ContainsTable`] walk
+    /// [`prefilter_candidates`] collects a sound superset of the rows from the
+    /// code stream, and each survivor then takes the same [`ContainsTable`] walk
     /// [`rows_containing`](Self::rows_containing) applies to every row — paid on
     /// the candidates only. Worth it exactly when the pattern is selective; a
     /// pattern most rows match is more cheaply answered by `rows_containing`
@@ -243,8 +242,8 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     ///
     /// One decode buffer serves every candidate. It is discarded when this returns,
     /// so a caller issuing many queries against one column should drive
-    /// [`prefilter_candidates`](crate::search::prefilter_candidates) and a kept
-    /// [`BytesVerifier`] directly and reuse both buffers.
+    /// [`prefilter_candidates`] and a kept [`BytesVerifier`] directly and reuse
+    /// both buffers.
     ///
     /// # Errors
     /// As [`rows_containing_prefiltered`](Self::rows_containing_prefiltered): the
