@@ -51,7 +51,7 @@ mod tests;
 
 pub use frequency::{TokenFrequencyIndex, TokenFrequencyIndexError, build_token_frequency_index};
 
-use crate::core::dictionary::DictionaryView;
+use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 
@@ -98,16 +98,26 @@ impl std::error::Error for PrefilterError {}
 /// index shape does not match the inputs, it returns an error without modifying
 /// `out`.
 ///
+/// # Precondition
+/// `dict` is conformant: **sorted** (strict bytewise-lexicographic order) and
+/// **complete** (all 256 single-byte tokens present). These properties are
+/// guaranteed for any dictionary trained by [`Parser::train`](crate::Parser::train)
+/// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
+/// Planning binary-searches the dictionary (see
+/// [`prefix_range`](super::prefix_range)), so an unsorted dictionary yields a
+/// cover that can miss matching tokens — the result stops being a superset. See
+/// [`crate::search`] for the general search precondition.
+///
 /// # Errors
 /// Returns [`PrefilterError::UnsupportedArchitecture`] when no SIMD kernel is
 /// available, [`PrefilterError::ProbeCoverTooWide`] when the cover exceeds the
 /// SIMD comparison budget, or [`PrefilterError::IndexMismatch`] when the index's
 /// token count or total frequency does not match the inputs.
-pub fn prefilter_candidates<V: DictionaryView, O: Offset>(
+pub fn prefilter_candidates<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pattern: &[u8],
-    dict: V,
+    dict: CompactDictionaryView<'_>,
     frequencies: &TokenFrequencyIndex,
     out: &mut Vec<usize>,
 ) -> Result<(), PrefilterError> {

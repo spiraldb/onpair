@@ -25,12 +25,12 @@ use super::cover::ProbeCover;
 use super::frequency::TokenFrequencyIndex;
 use super::graph::build_alignment_graph;
 use super::mincut::minimum_vertex_cut;
-use crate::core::dictionary::DictionaryView;
+use crate::core::dictionary::CompactDictionaryView;
 
 /// Compile a sound probe cover for `pattern` over `dict`, cheapest by term
 /// frequency in the code stream `frequencies` was built from.
-pub(super) fn plan<V: DictionaryView>(
-    dict: V,
+pub(super) fn plan(
+    dict: CompactDictionaryView<'_>,
     pattern: &[u8],
     frequencies: &TokenFrequencyIndex,
 ) -> ProbeCover {

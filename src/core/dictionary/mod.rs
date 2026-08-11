@@ -43,37 +43,12 @@ pub use wide::{WideDictionary, WideDictionaryView};
 
 use crate::core::types::Token;
 
-/// The crate-internal half of [`DictionaryView`].
-///
-/// Two jobs, and the first follows from the second. The module is `pub(crate)`, so
-/// the trait is unreachable and undocumented outside the crate even though it is
-/// nominally `pub` — which seals [`DictionaryView`], since that trait cannot be
-/// implemented without also implementing this one. And it is where the crate keeps
-/// the layout questions it needs to ask a view but does not publish, because a
-/// caller holding layout assumptions is exactly what the trust model above rules
-/// out. See [`internal::ViewInternal::token_payload`].
-///
-/// Contrast the `Sealed` marker behind [`Offset`](crate::Offset), which carries
-/// nothing and is therefore named for the sealing alone.
-pub(crate) mod internal {
-    /// What the crate asks a view about its layout, and — by being unreachable
-    /// downstream — the seal on [`DictionaryView`](super::DictionaryView).
-    pub trait ViewInternal {
-        /// The tokens as one buffer in which **every byte belongs to exactly one
-        /// token**, plus the `num_tokens + 1` offsets attributing them — or `None`
-        /// from a layout that has no such buffer.
-        ///
-        /// That property, rather than contiguity as such, is what a caller needs:
-        /// it makes the buffer a valid haystack, because any match found within it
-        /// can be attributed to the token whose offsets bracket it. The strided
-        /// layout has to answer `None` precisely because the property fails for
-        /// its padding, which holds the bytes of *following* tokens and would
-        /// manufacture matches that no token contains.
-        ///
-        /// `None` is a permanent fact about a layout and not an unimplemented
-        /// case, so a caller needs a fallback that does not read a payload at all.
-        fn token_payload(&self) -> Option<(&[u8], &[u32])>;
-    }
+/// Sealing for [`DictionaryView`] — implemented only by the crate's trusted view
+/// types, so `DictionaryView` cannot be implemented downstream.
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::CompactDictionaryView<'_> {}
+    impl Sealed for super::WideDictionaryView<'_> {}
 }
 
 /// An owned dictionary that can lend its borrowed [`DictionaryView`].
@@ -99,7 +74,7 @@ pub trait Dictionary {
 /// accessors below. Semantic conformance is not part of this trait. Untrusted
 /// buffers reach a view through [`CompactDictionaryView::validate_safety`] or
 /// [`CompactDictionaryView::validate`], not by implementing this trait.
-pub trait DictionaryView: Copy + internal::ViewInternal {
+pub trait DictionaryView: Copy + sealed::Sealed {
     /// Number of tokens in the dictionary. The valid token ids are
     /// `0..num_tokens()`.
     fn num_tokens(&self) -> usize;
