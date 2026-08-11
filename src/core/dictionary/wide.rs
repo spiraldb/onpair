@@ -4,7 +4,7 @@
 //! The wide (decode-optimized) dictionary representation.
 //!
 //! [`WideDictionary`] stores `num_tokens` rows of [`MAX_TOKEN_SIZE`] bytes — row
-//! `id` holds token `id` (zero-padded) — plus a per-token length. Trades space
+//! `id` holds token `id`, then padding — plus a per-token length. Trades space
 //! for a **load-free** token address: token `id`'s bytes are at `data + id*16`,
 //! with no `code → offset → bytes` indirection, so a decode is one independent
 //! load.
@@ -27,6 +27,12 @@
 //! - **Bounded lengths** — every `lens[id]` is in `1..=MAX_TOKEN_SIZE`, so every
 //!   token is non-empty; row `id`'s first `lens[id]` bytes are token `id`, and the
 //!   rest of the row is unused.
+//! - **Padding is not zeroed** — both producers copy a fixed [`MAX_TOKEN_SIZE`]
+//!   bytes per row rather than branching on the length, so the unused tail of row
+//!   `id` holds whatever followed token `id` in the source payload: the bytes of
+//!   the tokens after it. Nothing may read past `lens[id]` and interpret what it
+//!   finds — the fast decode path over-reads the full row precisely because it
+//!   then discards the tail.
 //!
 use super::{Dictionary, DictionaryStorage, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
@@ -43,7 +49,7 @@ use crate::core::validate::InvalidColumn;
 #[derive(Default, Debug, Clone)]
 pub struct WideDictionary {
     /// `num_tokens * MAX_TOKEN_SIZE` row-major token bytes; row `id` holds token
-    /// `id`, zero-padded to the row width.
+    /// `id` in its first `lens[id]` bytes, then padding that is *not* zeroed.
     data: Vec<u8>,
     /// `num_tokens` true token lengths.
     lens: Vec<u8>,
@@ -187,6 +193,17 @@ pub struct WideDictionaryView<'a> {
     lens: &'a [u8],
 }
 
+impl super::internal::ViewInternal for WideDictionaryView<'_> {
+    /// There is no such buffer here. `data` is one allocation, but the bytes past
+    /// `lens[id]` in each row are the *following* tokens' bytes (see the padding
+    /// invariant above), so they belong to no token at this row — which is the
+    /// property a payload has to have.
+    #[inline]
+    fn token_payload(&self) -> Option<(&[u8], &[u32])> {
+        None
+    }
+}
+
 impl DictionaryView for WideDictionaryView<'_> {
     #[inline]
     fn num_tokens(&self) -> usize {
@@ -293,7 +310,9 @@ mod tests {
 
     #[test]
     fn to_wide_rows_and_lens_match_tokens() {
-        // `to_wide` lays each token in its own zero-padded MAX_TOKEN_SIZE row.
+        // `to_wide` gives each token its own MAX_TOKEN_SIZE row. Only the first
+        // `lens[id]` bytes are asserted: the rest of the row is padding whose
+        // contents are unspecified (see the padding invariant).
         let tokens: &[&[u8]] = &[b"a", b"bc", b"def", b"ghij"];
         let wide = padded_compact(tokens).to_wide();
         assert_eq!(wide.num_tokens(), tokens.len());
