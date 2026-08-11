@@ -443,8 +443,8 @@ impl<'a> CompactDictionaryView<'a> {
     /// part of `bytes` belonging to no token.
     ///
     /// Inherent and crate-internal on purpose, rather than a method on
-    /// [`DictionaryView`](super::DictionaryView): the buffer is a fact about *this*
-    /// layout, so a caller that needs it needs this type. The strided
+    /// [`DictionaryView`]: the buffer is a fact about *this* layout, so a caller
+    /// that needs it needs this type. The strided
     /// [`WideDictionaryView`](super::WideDictionaryView) has no counterpart — the
     /// tail of each of its rows holds the bytes of the *following* tokens, so a
     /// match found there need not lie in any token at all.
