@@ -27,14 +27,9 @@
 //! belongs to whoever sees the ids merged, one maximal run at a time, which is
 //! [`ProbeCover::from_membership`] (see [`live_span`]).
 //!
-//! What the cut is deliberately not told about is the SIMD comparison budget:
-//! its objective is frequency weight, and the budget counts probes. The two
-//! mostly agree — merging runs pulls the count down, and a cheap cover is
-//! usually a narrow one — but where they don't, the scan refuses with
-//! [`ProbeCoverTooWide`](super::PrefilterError::ProbeCoverTooWide) rather than
-//! have the plan pick a heavier cut to fit. A pattern whose *cheapest* cover is
-//! that wide is one prefiltering has little to offer, and saying so is worth
-//! more to the caller than scanning for it anyway.
+//! Profitability is deliberately not part of planning. The caller receives the
+//! normalized cover and its frequency, and decides whether the scan is worth
+//! running.
 
 use super::cover::ProbeCover;
 use super::frequency::TokenFrequencyIndex;

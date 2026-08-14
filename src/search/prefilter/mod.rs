@@ -34,11 +34,10 @@
 //! * `graph` — pattern to alignment DAG: every layout of the pattern across
 //!   token boundaries, as one graph whose cuts are exactly the sound covers.
 //! * `mincut` — the cheapest such cut, by max-flow over the split DAG.
-//! * `plan` — the two of them end to end: pattern in, cover out, minus the ids
-//!   the code stream never uses.
+//! * `plan` — the two of them end to end: pattern in, normalized cover out,
+//!   minus the ids the code stream never uses.
 //! * `cover` — the cover itself, in both the shapes the scan wants.
-//! * `scan` — the vector kernels, and the refusal that keeps a wide cover off a
-//!   slow path.
+//! * `scan` — the vector kernels. Profitability stays outside execution.
 
 mod cover;
 mod frequency;
@@ -50,21 +49,18 @@ mod scan;
 #[cfg(test)]
 mod tests;
 
+pub use cover::ProbeCover;
 pub use frequency::{TokenFrequencyIndex, TokenFrequencyIndexError, build_token_frequency_index};
 
-use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
+use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 
-/// Reason the SIMD substring prefilter refused to run.
+/// Reason SIMD prefilter execution could not proceed.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum PrefilterError {
     /// The crate has no SIMD prefilter kernel for this target architecture.
     UnsupportedArchitecture,
-    /// The compiled probe cover requires too many comparisons for the SIMD path.
-    ProbeCoverTooWide,
-    /// The frequency index does not describe the supplied dictionary/code stream.
-    IndexMismatch,
 }
 
 impl std::fmt::Display for PrefilterError {
@@ -73,70 +69,117 @@ impl std::fmt::Display for PrefilterError {
             Self::UnsupportedArchitecture => {
                 "the substring prefilter has no SIMD kernel for this architecture"
             }
-            Self::ProbeCoverTooWide => "the substring prefilter probe cover is too wide for SIMD",
-            Self::IndexMismatch => {
-                "the token frequency index does not match the dictionary/code stream"
-            }
         })
     }
 }
 
 impl std::error::Error for PrefilterError {}
 
-/// Append the ascending rows that may contain `pattern`.
+/// The normalized probe cover selected for a pattern and its frequency.
+///
+/// Points and ranges are disjoint, so each covered token occurrence is counted
+/// exactly once.
+#[derive(Debug, Clone)]
+pub struct PrefilterAnalysis {
+    probe_cover: ProbeCover,
+    covered_frequency: u32,
+    total_frequency: u32,
+}
+
+impl PrefilterAnalysis {
+    /// The normalized checks the SIMD prefilter can execute.
+    pub fn probe_cover(&self) -> &ProbeCover {
+        &self.probe_cover
+    }
+
+    /// Number of code positions whose token is covered by the probes.
+    pub fn covered_frequency(&self) -> u32 {
+        self.covered_frequency
+    }
+
+    /// Fraction of code positions whose token is covered by the probes.
+    ///
+    /// Returns `0.0` when the indexed code stream is empty.
+    pub fn covered_fraction(&self) -> f64 {
+        if self.total_frequency == 0 {
+            0.0
+        } else {
+            f64::from(self.covered_frequency) / f64::from(self.total_frequency)
+        }
+    }
+}
+
+/// Analyze `pattern` and return its normalized minimum-cut probe cover.
+///
+/// This function constructs the checks and reports their frequency; the caller
+/// decides whether executing them is profitable.
+///
+/// # Precondition
+/// `dict` is conformant: sorted, complete, and unique. These properties are
+/// guaranteed for a dictionary trained by [`Parser::train`](crate::Parser::train)
+/// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
+/// `frequencies` must describe the dictionary and code stream that the returned
+/// cover may later scan.
+///
+/// # Panics
+/// Panics when `pattern` is empty. The empty pattern matches every row and
+/// should bypass prefilter analysis.
+pub fn analyze_prefilter(
+    pattern: &[u8],
+    dict: CompactDictionaryView<'_>,
+    frequencies: &TokenFrequencyIndex,
+) -> PrefilterAnalysis {
+    assert!(
+        !pattern.is_empty(),
+        "the empty pattern matches every row and needs no prefilter"
+    );
+    let probe_cover = plan::plan(dict, pattern, frequencies);
+    let covered_frequency = probe_cover
+        .points
+        .iter()
+        .map(|&token| frequencies.frequency(token))
+        .chain(
+            probe_cover
+                .ranges
+                .iter()
+                .map(|&range| frequencies.range_frequency(range)),
+        )
+        .sum();
+
+    PrefilterAnalysis {
+        probe_cover,
+        covered_frequency,
+        total_frequency: frequencies.total_frequency(),
+    }
+}
+
+/// Execute `probes` and append the ascending rows that contain a covered code.
 ///
 /// The result is a **sound superset**. Verify the survivors with an exact check,
 /// such as a [`ContainsTable`](super::ContainsTable) passed to
 /// [`contains`](super::contains()), to recover the precise answer.
 ///
-/// `codes` is the row-concatenated code stream, `row_offsets` contains its `R + 1`
-/// row delimiters, and `frequencies` must have been built for this `codes` stream
-/// and the supplied dictionary. An empty pattern appends every row without
-/// requiring SIMD support.
+/// This function only executes the supplied cover; the caller decides whether
+/// scanning it is profitable.
 ///
 /// The function does not silently fall back to a full scalar scan. If the target
-/// has no SIMD implementation, the probe cover is too expensive for SIMD, or the
-/// index shape does not match the inputs, it returns an error without modifying
-/// `out`.
+/// has no SIMD implementation, it returns an error without modifying `out`.
 ///
-/// A pattern whose cover names only tokens absent from `codes` is the exception:
-/// no row can match, so it appends nothing and succeeds on any target, SIMD or
-/// not.
+/// An empty cover appends nothing and succeeds without SIMD support.
 ///
 /// # Precondition
-/// `dict` is conformant: **sorted** (strict bytewise-lexicographic order) and
-/// **complete** (all 256 single-byte tokens present). These properties are
-/// guaranteed for any dictionary trained by [`Parser::train`](crate::Parser::train)
-/// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
-/// Planning binary-searches the dictionary (see
-/// [`prefix_range`](super::prefix_range)), so an unsorted dictionary yields a
-/// cover that can miss matching tokens — the result stops being a superset. See
-/// [`crate::search`] for the general search precondition.
+/// `row_offsets` are valid delimiters for `codes`, and every code lies in the
+/// token domain of `probes`. A validated [`Column`](crate::Column) and a cover
+/// analyzed for that column satisfy these properties.
 ///
 /// # Errors
 /// Returns [`PrefilterError::UnsupportedArchitecture`] when no SIMD kernel is
-/// available, [`PrefilterError::ProbeCoverTooWide`] when the cover exceeds the
-/// SIMD comparison budget, or [`PrefilterError::IndexMismatch`] when the index's
-/// token count or total frequency does not match the inputs.
+/// available for a non-empty cover.
 pub fn prefilter_candidates<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
-    pattern: &[u8],
-    dict: CompactDictionaryView<'_>,
-    frequencies: &TokenFrequencyIndex,
+    probes: &ProbeCover,
     out: &mut Vec<usize>,
 ) -> Result<(), PrefilterError> {
-    let n = row_offsets.len().saturating_sub(1);
-    if pattern.is_empty() {
-        out.extend(0..n);
-        return Ok(());
-    }
-    if frequencies.num_tokens() != dict.num_tokens()
-        || frequencies.total_frequency() as usize != codes.len()
-    {
-        return Err(PrefilterError::IndexMismatch);
-    }
-
-    let pf = plan::plan(dict, pattern, frequencies);
-    scan::scan(codes, row_offsets, &pf, out)
+    scan::scan(codes, row_offsets, probes, out)
 }

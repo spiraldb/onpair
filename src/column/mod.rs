@@ -18,8 +18,8 @@ use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
 use crate::search::{
-    BytesVerifier, ContainsTable, PrefilterError, PrefixQuery, TokenFrequencyIndex, contains,
-    equals, prefilter_candidates, starts_with, tokenize,
+    BytesVerifier, ContainsTable, PrefilterError, PrefixQuery, TokenFrequencyIndex,
+    analyze_prefilter, contains, equals, prefilter_candidates, starts_with, tokenize,
 };
 
 /// Owned compressed column, produced by [`Column::compress`] /
@@ -201,17 +201,18 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// [`rows_containing`](Self::rows_containing) applies to every row — paid on
     /// the candidates only. Worth it exactly when the pattern is selective; a
     /// pattern most rows match is more cheaply answered by `rows_containing`
-    /// directly.
+    /// directly. This explicitly named method always runs the prefilter. An
+    /// adaptive caller can use [`analyze_prefilter`] to inspect the probe cover
+    /// and its frequency before choosing whether to scan it.
     ///
     /// `frequencies` must have been built for this view's code stream and
     /// dictionary ([`build_token_frequency_index`](crate::search::build_token_frequency_index)),
     /// and is reusable across every query against this column.
     ///
     /// # Errors
-    /// Whatever the prefilter refused with, unchanged. It does not fall back to a
-    /// full scan on its own: a [`PrefilterError`] means this column and pattern
-    /// are not a case prefiltering helps, and choosing what to do instead —
-    /// usually [`rows_containing`](Self::rows_containing) — is the caller's.
+    /// Returns [`PrefilterError::UnsupportedArchitecture`] when a code scan is
+    /// required but no SIMD kernel is available. It never falls back to
+    /// [`rows_containing`](Self::rows_containing) on its own.
     ///
     /// # Panics
     /// If `pattern` is longer than 255 bytes, the state width of
@@ -246,8 +247,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// both buffers.
     ///
     /// # Errors
-    /// As [`rows_containing_prefiltered`](Self::rows_containing_prefiltered): the
-    /// prefilter's refusal, unchanged.
+    /// As [`rows_containing_prefiltered`](Self::rows_containing_prefiltered).
     pub fn rows_containing_prefiltered_memmem(
         &self,
         pattern: &[u8],
@@ -270,14 +270,12 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         frequencies: &TokenFrequencyIndex,
         out: &mut Vec<usize>,
     ) -> Result<(), PrefilterError> {
-        prefilter_candidates(
-            self.codes,
-            self.row_offsets,
-            pattern,
-            self.dict,
-            frequencies,
-            out,
-        )
+        if pattern.is_empty() {
+            out.extend(0..self.num_rows());
+            return Ok(());
+        }
+        let analysis = analyze_prefilter(pattern, self.dict, frequencies);
+        prefilter_candidates(self.codes, self.row_offsets, analysis.probe_cover(), out)
     }
 
     /// Ascending indices of the rows whose codes satisfy `pred`.

@@ -8,26 +8,16 @@
 //! lanes fall in. They differ only in vector width and in how the target spells
 //! an unsigned 16-bit comparison.
 //!
-//! There is deliberately **no production scalar path**. Past [`SIMD_CAP`] a cover
-//! is refused rather than scanned one code at a time, so a query can never
-//! silently fall off a vector kernel onto something slower than the exact check
-//! it was meant to avoid. The scalar routine below exists only under `cfg(test)`,
-//! as the oracle the four kernels are proven against.
+//! There is deliberately **no production scalar fallback**. Every non-empty
+//! cover runs through a vector kernel when the target has one, regardless of its
+//! width. Whether that work is profitable is a policy decision made before this
+//! module is called. The scalar routine below exists only under `cfg(test)`, as
+//! the oracle the four kernels are proven against.
 
 use super::PrefilterError;
 use super::cover::ProbeCover;
 use crate::core::offset::Offset;
 use crate::core::types::{Token, TokenRange};
-
-/// Use the vectorized scan only while the cover's probe count stays at or below
-/// this. The public API refuses a wider cover instead of silently switching to a
-/// scalar algorithm.
-///
-/// The unit is probes, not machine comparisons: a range issues two compares and
-/// an AND where a point issues one compare, so an all-range cover does roughly
-/// twice the work of an all-point cover at the same budget.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(super) const SIMD_CAP: usize = 32;
 
 /// Dispatch to the widest available SIMD kernel; never fall back to a scalar scan.
 pub(super) fn scan<O: Offset>(
@@ -42,11 +32,6 @@ pub(super) fn scan<O: Offset>(
     // turned away for want of SIMD.
     if pf.is_empty() {
         return Ok(());
-    }
-
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if pf.cmp_cost() > SIMD_CAP {
-        return Err(PrefilterError::ProbeCoverTooWide);
     }
 
     #[cfg(target_arch = "aarch64")]
