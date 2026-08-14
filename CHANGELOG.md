@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.1.1...HEAD)
+## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.2.0...HEAD)
+
+### Added
+
+- Add a SIMD substring prefilter with frequency-aware min-cut probe planning
+  and exact compressed-domain or decoded-byte verification.
+
+## [0.2.0](https://github.com/spiraldb/onpair/compare/v0.1.1...v0.2.0) - 2026-07-30
 
 ### Added
 
@@ -15,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded decoding and tokenization checks without requiring full semantic
   validation.
 
+### Changed
+
+- Add `rust-analyzer` to the pinned Rust toolchain.
+
 ### Removed
 
 - Remove the obsolete cross-implementation benchmark harness and standalone
@@ -23,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Ensure the Rust setup action installs the pinned toolchain without referring to a nonexistent cache step.
+- Remove the vulnerable transitive `thrift` dependency by upgrading the Arrow,
+  Parquet, and TPC-H benchmark dependencies.
 
 ## [0.1.1](https://github.com/spiraldb/onpair/compare/v0.1.0...v0.1.1) - 2026-07-15
 

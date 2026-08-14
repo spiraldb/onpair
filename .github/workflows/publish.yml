@@ -20,21 +20,31 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-rust
-      - name: Install cargo-edit
-        uses: taiki-e/cache-cargo-install-action@66c9585ef5ca780ee69399975a5e911f47905995
-        with:
-          tool: cargo-edit@0.13.10
 
-      - name: Cargo Set Version
+      - name: Verify release tag matches package version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          # Release Drafter tags are prefixed with "v" (e.g. v0.0.5); cargo
-          # wants a bare semver, so strip the leading "v".
-          VERSION="${{ github.event.release.tag_name }}"
-          cargo set-version "${VERSION#v}"
+          set -euo pipefail
+
+          PACKAGE_VERSION="$(
+            cargo metadata --no-deps --format-version 1 --locked |
+              jq -r '.packages[] | select(.name == "onpair") | .version'
+          )"
+          TAG_VERSION="${RELEASE_TAG#v}"
+
+          if [[ -z "${PACKAGE_VERSION}" || "${PACKAGE_VERSION}" == "null" ]]; then
+            echo "::error::Could not read the onpair package version from cargo metadata."
+            exit 1
+          fi
+
+          if [[ "${PACKAGE_VERSION}" != "${TAG_VERSION}" ]]; then
+            echo "::error::Package version ${PACKAGE_VERSION} does not match release tag ${RELEASE_TAG}."
+            exit 1
+          fi
 
       - name: Publish to crates.io
-        run: |
-          cargo publish --no-verify --allow-dirty
+        run: cargo publish --locked
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
