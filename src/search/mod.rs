@@ -35,9 +35,11 @@
 //!   token-level KMP [`ContainsTable`].
 //! * [`build_token_frequency_index`] — build the reusable selectivity index for
 //!   a code stream.
+//! * [`analyze_prefilter`] — derive a normalized probe cover and report its
+//!   frequency.
 //! * [`prefilter_candidates`] — a sound *superset* of the rows containing a
-//!   pattern, collected by a SIMD scan over the code stream. The caller verifies
-//!   the survivors with [`contains()`] or another exact check.
+//!   pattern, collected by running a probe cover over the code stream. The caller
+//!   verifies the survivors with [`contains()`] or another exact check.
 //! * [`BytesVerifier`] — that exact check in the decoded domain: decode a
 //!   candidate row into a reused buffer and `memmem` it. The faster of the two
 //!   verifies, and the one without a pattern-length cap.
@@ -55,8 +57,8 @@ pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefilter::{
-    PrefilterError, TokenFrequencyIndex, TokenFrequencyIndexError, build_token_frequency_index,
-    prefilter_candidates,
+    PrefilterAnalysis, PrefilterError, ProbeCover, TokenFrequencyIndex, TokenFrequencyIndexError,
+    analyze_prefilter, build_token_frequency_index, prefilter_candidates,
 };
 pub use prefix::{PrefixQuery, starts_with};
 pub use tokenize::tokenize;

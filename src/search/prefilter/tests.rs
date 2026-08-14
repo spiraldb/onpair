@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Tests for the whole prefilter: index construction, cover soundness against a
-//! brute-force oracle, kernel agreement, and the refusals.
+//! brute-force oracle, analysis metadata, and kernel agreement.
 
 use super::cover::ProbeCover;
 use super::frequency::checked_frequency_total;
@@ -10,7 +10,7 @@ use super::graph::{AlignmentGraph, build_alignment_graph, contained_tokens};
 use super::mincut::minimum_vertex_cut;
 use super::plan::plan;
 use super::{
-    PrefilterError, TokenFrequencyIndex, TokenFrequencyIndexError, build_token_frequency_index,
+    TokenFrequencyIndex, TokenFrequencyIndexError, analyze_prefilter, build_token_frequency_index,
     prefilter_candidates,
 };
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -24,13 +24,15 @@ fn candidates(
     frequencies: &TokenFrequencyIndex,
     pattern: &[u8],
 ) -> Vec<usize> {
+    if pattern.is_empty() {
+        return (0..view.num_rows()).collect();
+    }
     let mut out = Vec::new();
+    let analysis = analyze_prefilter(pattern, dict, frequencies);
     prefilter_candidates(
         view.codes,
         view.row_offsets,
-        pattern,
-        dict,
-        frequencies,
+        analysis.probe_cover(),
         &mut out,
     )
     .unwrap();
@@ -378,12 +380,11 @@ fn prefilter_accepts_pattern_over_255_bytes() {
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     let pat = vec![b'a'; 256];
     let mut candidates = Vec::new();
+    let analysis = analyze_prefilter(&pat, view.dict, &frequencies);
     prefilter_candidates(
         view.codes,
         view.row_offsets,
-        &pat,
-        view.dict,
-        &frequencies,
+        analysis.probe_cover(),
         &mut candidates,
     )
     .unwrap();
@@ -392,24 +393,29 @@ fn prefilter_accepts_pattern_over_255_bytes() {
 }
 
 #[test]
-fn mismatched_index_is_rejected_without_modifying_output() {
+fn analysis_reports_normalized_cover_frequency() {
     let col = compress_rows(&[b"alpha", b"beta"]);
     let view = col.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let mut candidates = vec![usize::MAX];
+    let analysis = analyze_prefilter(b"a", view.dict, &frequencies);
+    let cover = analysis.probe_cover();
+    let expected: u32 = cover
+        .points()
+        .iter()
+        .map(|&token| frequencies.frequency(token))
+        .chain(
+            cover
+                .ranges()
+                .iter()
+                .map(|&range| frequencies.range_frequency(range)),
+        )
+        .sum();
 
+    assert_eq!(analysis.covered_frequency(), expected);
     assert_eq!(
-        prefilter_candidates(
-            &view.codes[..view.codes.len() - 1],
-            view.row_offsets,
-            b"a",
-            view.dict,
-            &frequencies,
-            &mut candidates,
-        ),
-        Err(PrefilterError::IndexMismatch)
+        analysis.covered_fraction(),
+        f64::from(expected) / view.codes.len() as f64
     );
-    assert_eq!(candidates, vec![usize::MAX]);
 }
 
 /// A cut hands over overlapping probe sets — a range and a point naming the
@@ -543,19 +549,16 @@ fn a_fully_unused_cover_admits_no_rows() {
     let view = col.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
 
-    // 0xff is in the dictionary — all 256 single-byte tokens always are — but
-    // occurs nowhere in these rows, so the cover for it prunes to nothing.
-    let pf = plan(view.dict, b"\xff", &frequencies);
-    assert!(pf.points.is_empty() && pf.ranges.is_empty());
-
     let mut out = Vec::new();
+    let analysis = analyze_prefilter(b"\xff", view.dict, &frequencies);
+    assert_eq!(analysis.covered_frequency(), 0);
+    assert_eq!(analysis.covered_fraction(), 0.0);
+    assert!(analysis.probe_cover().is_empty());
     assert_eq!(
         prefilter_candidates(
             view.codes,
             view.row_offsets,
-            b"\xff",
-            view.dict,
-            &frequencies,
+            analysis.probe_cover(),
             &mut out,
         ),
         Ok(())
@@ -565,19 +568,16 @@ fn a_fully_unused_cover_admits_no_rows() {
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[test]
-fn wide_probe_cover_is_refused_without_scanning() {
+fn wide_probe_cover_stays_on_the_vectorized_scan() {
     let pf = ProbeCover {
-        points: vec![0; super::scan::SIMD_CAP + 1],
+        points: vec![0; 33],
         ranges: Vec::new(),
-        table: vec![false],
+        table: vec![true],
     };
     let mut candidates = Vec::new();
 
-    assert_eq!(
-        super::scan::scan(&[0], &[0u32, 1], &pf, &mut candidates),
-        Err(PrefilterError::ProbeCoverTooWide)
-    );
-    assert!(candidates.is_empty());
+    super::scan::scan(&[0], &[0u32, 1], &pf, &mut candidates).unwrap();
+    assert_eq!(candidates, vec![0]);
 }
 
 /// Each hit row is appended exactly once, ascending, however the hits fall

@@ -18,13 +18,23 @@ use crate::core::types::{Token, TokenRange};
 /// token, so a scan for these ids drops no true match. Nothing here enforces
 /// that — it is established by whoever selects the ids.
 #[derive(Debug, Clone)]
-pub(super) struct ProbeCover {
+pub struct ProbeCover {
     pub(super) points: Vec<Token>,
     pub(super) ranges: Vec<TokenRange>,
     pub(super) table: Vec<bool>,
 }
 
 impl ProbeCover {
+    /// Equality probes issued for every SIMD vector.
+    pub fn points(&self) -> &[Token] {
+        &self.points
+    }
+
+    /// Inclusive range probes issued for every SIMD vector.
+    pub fn ranges(&self) -> &[TokenRange] {
+        &self.ranges
+    }
+
     /// Describe the ids `table` marks with as few probes as they can be
     /// described: every maximal run of set ids becomes one [`TokenRange`], or a
     /// point when the run is a single id.
@@ -33,9 +43,8 @@ impl ProbeCover {
     /// probe can name the same token, two ranges can abut, and the mandatory
     /// contained tokens are unioned in on top — so probing for them as selected
     /// would have the kernels compare against ids they already cover. Reading
-    /// runs back off the table makes [`cmp_cost`](Self::cmp_cost) minimal for
-    /// the set, and a comparison saved here is one saved per vector of the
-    /// entire code stream.
+    /// runs back off the table minimizes the cover's checks, and a comparison
+    /// saved here is one saved per vector of the entire code stream.
     ///
     /// `probe_for` gets each run and answers with the sub-run to actually probe
     /// for, or `None` to drop it; whatever it gives up is cleared from the table
@@ -90,13 +99,6 @@ impl ProbeCover {
         }
     }
 
-    /// Per-vector comparison budget: one compare per point or range.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    #[inline]
-    pub(super) fn cmp_cost(&self) -> usize {
-        self.points.len() + self.ranges.len()
-    }
-
     /// Whether the cover names no id at all.
     ///
     /// Reachable only through pruning: the planner drops ids the code stream
@@ -104,7 +106,7 @@ impl ProbeCover {
     /// those. It is the strongest answer the prefilter can give — no row holds a
     /// covered code, so no row matches, and no scan is needed to find that out.
     #[inline]
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.points.is_empty() && self.ranges.is_empty()
     }
 }
