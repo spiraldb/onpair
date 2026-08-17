@@ -29,13 +29,7 @@ fn candidates(
     }
     let mut out = Vec::new();
     let analysis = analyze_prefilter(pattern, dict, frequencies);
-    prefilter_candidates(
-        view.codes,
-        view.row_offsets,
-        analysis.probe_cover(),
-        &mut out,
-    )
-    .unwrap();
+    prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut out).unwrap();
     out
 }
 
@@ -381,13 +375,7 @@ fn prefilter_accepts_pattern_over_255_bytes() {
     let pat = vec![b'a'; 256];
     let mut candidates = Vec::new();
     let analysis = analyze_prefilter(&pat, view.dict, &frequencies);
-    prefilter_candidates(
-        view.codes,
-        view.row_offsets,
-        analysis.probe_cover(),
-        &mut candidates,
-    )
-    .unwrap();
+    prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut candidates).unwrap();
 
     assert!(candidates.contains(&0));
 }
@@ -555,12 +543,7 @@ fn a_fully_unused_cover_admits_no_rows() {
     assert_eq!(analysis.covered_fraction(), 0.0);
     assert!(analysis.probe_cover().is_empty());
     assert_eq!(
-        prefilter_candidates(
-            view.codes,
-            view.row_offsets,
-            analysis.probe_cover(),
-            &mut out,
-        ),
+        prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut out,),
         Ok(())
     );
     assert!(out.is_empty());
@@ -576,7 +559,7 @@ fn wide_probe_cover_stays_on_the_vectorized_scan() {
     };
     let mut candidates = Vec::new();
 
-    super::scan::scan(&[0], &[0u32, 1], &pf, &mut candidates).unwrap();
+    super::scan::scan(&[0], &[0u32, 1], &pf, false, &mut candidates).unwrap();
     assert_eq!(candidates, vec![0]);
 }
 
@@ -607,7 +590,7 @@ fn each_hit_row_is_appended_once_in_order() {
 
     let pf = ProbeCover::from_membership(vec![false, true], Some);
     let mut out = Vec::new();
-    super::scan::scan(&codes, &row_offsets, &pf, &mut out).unwrap();
+    super::scan::scan(&codes, &row_offsets, &pf, false, &mut out).unwrap();
     assert_eq!(out, vec![1, 4]);
 
     let mut oracle = Vec::new();
@@ -616,7 +599,9 @@ fn each_hit_row_is_appended_once_in_order() {
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn assert_kernel_matches_scalar(kernel: impl Fn(&[Token], &[u32], &ProbeCover, &mut Vec<usize>)) {
+fn assert_kernel_matches_scalar(
+    kernel: impl Fn(&[Token], &[u32], &ProbeCover, bool, &mut Vec<usize>),
+) {
     use crate::test_corpus::user_strings;
     let corpus: Vec<Vec<u8>> = user_strings(60)
         .into_iter()
@@ -639,7 +624,7 @@ fn assert_kernel_matches_scalar(kernel: impl Fn(&[Token], &[u32], &ProbeCover, &
         let mut scalar = Vec::new();
         let mut simd = Vec::new();
         super::scan::scan_scalar(view.codes, view.row_offsets, &pf, &mut scalar);
-        kernel(view.codes, view.row_offsets, &pf, &mut simd);
+        kernel(view.codes, view.row_offsets, &pf, false, &mut simd);
         assert_eq!(scalar, simd, "kernel disagrees with scalar for {pat:?}");
     }
 }
@@ -655,13 +640,13 @@ fn neon_matches_scalar() {
 fn x86_kernels_match_scalar() {
     assert_kernel_matches_scalar(super::scan::scan_sse2::<u32>);
     if std::is_x86_feature_detected!("avx2") {
-        assert_kernel_matches_scalar(|codes, ro, pf, cand| unsafe {
-            super::scan::scan_avx2(codes, ro, pf, cand)
+        assert_kernel_matches_scalar(|codes, ro, pf, sparse_row_mapping, cand| unsafe {
+            super::scan::scan_avx2(codes, ro, pf, sparse_row_mapping, cand)
         });
     }
     if std::is_x86_feature_detected!("avx512bw") {
-        assert_kernel_matches_scalar(|codes, ro, pf, cand| unsafe {
-            super::scan::scan_avx512(codes, ro, pf, cand)
+        assert_kernel_matches_scalar(|codes, ro, pf, sparse_row_mapping, cand| unsafe {
+            super::scan::scan_avx512(codes, ro, pf, sparse_row_mapping, cand)
         });
     }
 }

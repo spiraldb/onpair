@@ -59,6 +59,7 @@ pub use lookup::prefix_range;
 pub use prefilter::{
     PrefilterAnalysis, PrefilterError, ProbeCover, TokenFrequencyIndex, TokenFrequencyIndexError,
     analyze_prefilter, build_token_frequency_index, prefilter_candidates,
+    prefilter_is_likely_profitable,
 };
 pub use prefix::{PrefixQuery, starts_with};
 pub use tokenize::tokenize;

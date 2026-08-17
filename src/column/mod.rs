@@ -275,7 +275,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
             return Ok(());
         }
         let analysis = analyze_prefilter(pattern, self.dict, frequencies);
-        prefilter_candidates(self.codes, self.row_offsets, analysis.probe_cover(), out)
+        prefilter_candidates(self.codes, self.row_offsets, &analysis, out)
     }
 
     /// Ascending indices of the rows whose codes satisfy `pred`.
