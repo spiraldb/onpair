@@ -107,6 +107,50 @@ impl PrefilterAnalysis {
             f64::from(self.covered_frequency) / f64::from(self.total_frequency)
         }
     }
+
+    /// Whether sparse code hits should use binary search to find their rows.
+    fn use_sparse_row_mapping(&self) -> bool {
+        const MAX_COVERED_FRACTION: f64 = 0.0001;
+        self.covered_fraction() < MAX_COVERED_FRACTION
+    }
+}
+
+/// Return whether the default empirical policy expects prefiltering to beat a
+/// bulk-decode fallback for this pattern.
+///
+/// The policy uses only information available after [`analyze_prefilter`]:
+/// pattern length, the number of SIMD comparisons in the normalized cover, and
+/// the fraction of code positions covered. A point costs one comparison and an
+/// inclusive range costs two. It selects the prefilter when all of these hold:
+///
+/// * `pattern_len >= 4`;
+/// * at most 16 SIMD comparisons; and
+/// * covered-code fraction strictly below 1%.
+///
+/// Empty covers are accepted for patterns of at least four bytes: they prove
+/// that no encoded row can match and execute no SIMD scan. Patterns shorter
+/// than four bytes are conservatively rejected even when a particular absent
+/// pattern would produce an empty cover.
+///
+/// This is a performance hint, not a correctness requirement. It was
+/// calibrated on selective `contains` workloads through 5% row selectivity on
+/// AArch64, against both OnPair bulk decode and bulk decode followed by a
+/// full-haystack `memmem`. Callers with materially different columns, batch
+/// sizes, or architectures may choose their own policy. This function does not
+/// execute or bypass the prefilter itself.
+pub fn prefilter_is_likely_profitable(pattern_len: usize, analysis: &PrefilterAnalysis) -> bool {
+    const MIN_PATTERN_LEN: usize = 4;
+    const MAX_SIMD_COMPARISONS: usize = 16;
+    const MAX_COVERED_FRACTION: f64 = 0.01;
+
+    let cover = analysis.probe_cover();
+    let comparisons = cover
+        .points()
+        .len()
+        .saturating_add(cover.ranges().len().saturating_mul(2));
+    pattern_len >= MIN_PATTERN_LEN
+        && comparisons <= MAX_SIMD_COMPARISONS
+        && analysis.covered_fraction() < MAX_COVERED_FRACTION
 }
 
 /// Analyze `pattern` and return its normalized minimum-cut probe cover.
@@ -145,7 +189,6 @@ pub fn analyze_prefilter(
                 .map(|&range| frequencies.range_frequency(range)),
         )
         .sum();
-
     PrefilterAnalysis {
         probe_cover,
         covered_frequency,
@@ -153,13 +196,13 @@ pub fn analyze_prefilter(
     }
 }
 
-/// Execute `probes` and append the ascending rows that contain a covered code.
+/// Execute `analysis` and append the ascending rows that contain a covered code.
 ///
 /// The result is a **sound superset**. Verify the survivors with an exact check,
 /// such as a [`ContainsTable`](super::ContainsTable) passed to
 /// [`contains`](super::contains()), to recover the precise answer.
 ///
-/// This function only executes the supplied cover; the caller decides whether
+/// This function only executes the analyzed cover; the caller decides whether
 /// scanning it is profitable.
 ///
 /// The function does not silently fall back to a full scalar scan. If the target
@@ -169,8 +212,8 @@ pub fn analyze_prefilter(
 ///
 /// # Precondition
 /// `row_offsets` are valid delimiters for `codes`, and every code lies in the
-/// token domain of `probes`. A validated [`Column`](crate::Column) and a cover
-/// analyzed for that column satisfy these properties.
+/// token domain of the analyzed cover. A validated [`Column`](crate::Column)
+/// and an analysis built for that column satisfy these properties.
 ///
 /// # Errors
 /// Returns [`PrefilterError::UnsupportedArchitecture`] when no SIMD kernel is
@@ -178,8 +221,14 @@ pub fn analyze_prefilter(
 pub fn prefilter_candidates<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
-    probes: &ProbeCover,
+    analysis: &PrefilterAnalysis,
     out: &mut Vec<usize>,
 ) -> Result<(), PrefilterError> {
-    scan::scan(codes, row_offsets, probes, out)
+    scan::scan(
+        codes,
+        row_offsets,
+        analysis.probe_cover(),
+        analysis.use_sparse_row_mapping(),
+        out,
+    )
 }
