@@ -107,12 +107,6 @@ impl PrefilterAnalysis {
             f64::from(self.covered_frequency) / f64::from(self.total_frequency)
         }
     }
-
-    /// Whether sparse code hits should use binary search to find their rows.
-    fn use_sparse_row_mapping(&self) -> bool {
-        const MAX_COVERED_FRACTION: f64 = 0.0001;
-        self.covered_fraction() < MAX_COVERED_FRACTION
-    }
 }
 
 /// Return whether the default empirical policy expects prefiltering to beat a
@@ -228,7 +222,7 @@ pub fn prefilter_candidates<O: Offset>(
         codes,
         row_offsets,
         analysis.probe_cover(),
-        analysis.use_sparse_row_mapping(),
+        analysis.covered_frequency() as usize,
         out,
     )
 }
