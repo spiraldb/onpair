@@ -426,7 +426,7 @@ fn cover_probes_the_maximal_runs_of_its_membership() {
     assert_eq!(pf.table, table);
     assert_eq!(
         ProbeCover::from_membership(vec![false; 4], Some).points,
-        vec![]
+        Vec::<Token>::new()
     );
 }
 
