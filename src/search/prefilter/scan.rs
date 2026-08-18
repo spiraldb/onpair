@@ -72,6 +72,16 @@ pub(super) fn scan<O: Offset>(
         let use_nibble_six =
             pf.table.len() <= 1 << 12 && covered_frequency as u128 * 100 < codes.len() as u128;
         let max_compare_cost = if pf.table.len() <= 1 << 12 { 10 } else { 13 };
+        let comparison_cost = pf.points.len() + 2 * pf.ranges.len();
+        // Wide covers favor table lookup. Dense covers favor walking each row
+        // directly, with a lower density crossover when rows contain enough
+        // codes to amortize row mapping.
+        let use_sse2_row_table = (use_row_table && comparison_cost > max_compare_cost)
+            || (comparison_cost >= 17
+                && (covered_frequency as u128 * 20 >= codes.len() as u128
+                    || (row_count != 0
+                        && codes.len() / row_count >= 8
+                        && covered_frequency as u128 * 100 >= codes.len() as u128 * 3)));
         if std::is_x86_feature_detected!("avx512bw") {
             // SAFETY: AVX-512BW was detected and implies AVX-512F.
             unsafe { scan_avx512(codes, row_offsets, pf, sparse_row_mapping, out) };
@@ -200,6 +210,8 @@ pub(super) fn scan<O: Offset>(
                     _ => scan_avx2_gather(codes, row_offsets, pf, sparse_row_mapping, out),
                 }
             }
+        } else if use_sse2_row_table {
+            scan_sse2_rows_table(codes, row_offsets, pf, out);
         } else {
             scan_sse2(codes, row_offsets, pf, sparse_row_mapping, out);
         }
@@ -703,7 +715,193 @@ pub(super) fn scan_neon<O: Offset>(
     scan_tail(codes, pf, i, &mut sink);
 }
 
-/// SSE2: eight lanes; XOR with `0x8000` maps unsigned range order to signed.
+/// Shared four-vector SSE2 walk. Comparison masks are packed to one bit per
+/// code only on hit blocks, keeping the common no-hit path compact.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn scan_sse2_four_vectors<O: Offset>(
+    codes: &[Token],
+    sink: &mut RowSink<'_, O>,
+    always_pack: bool,
+    mut matching_masks: impl FnMut(
+        core::arch::x86_64::__m128i,
+        core::arch::x86_64::__m128i,
+        core::arch::x86_64::__m128i,
+        core::arch::x86_64::__m128i,
+    ) -> (
+        core::arch::x86_64::__m128i,
+        core::arch::x86_64::__m128i,
+        core::arch::x86_64::__m128i,
+        core::arch::x86_64::__m128i,
+    ),
+) -> usize {
+    use core::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_packs_epi16,
+    };
+
+    let total = codes.len();
+    let base = codes.as_ptr();
+    let mut i = 0usize;
+    while i + 32 <= total {
+        // SAFETY: `i + 32 <= total`; SSE2 is an x86-64 baseline feature.
+        let (v0, v1, v2, v3) = unsafe {
+            (
+                _mm_loadu_si128(base.add(i).cast::<__m128i>()),
+                _mm_loadu_si128(base.add(i + 8).cast::<__m128i>()),
+                _mm_loadu_si128(base.add(i + 16).cast::<__m128i>()),
+                _mm_loadu_si128(base.add(i + 24).cast::<__m128i>()),
+            )
+        };
+        let (m0, m1, m2, m3) = matching_masks(v0, v1, v2, v3);
+        // SAFETY: all operations require only baseline SSE2.
+        unsafe {
+            let any = _mm_or_si128(_mm_or_si128(m0, m1), _mm_or_si128(m2, m3));
+            if always_pack || _mm_movemask_epi8(any) != 0 {
+                let lanes01 = _mm_movemask_epi8(_mm_packs_epi16(m0, m1)) as u16;
+                let lanes23 = _mm_movemask_epi8(_mm_packs_epi16(m2, m3)) as u16;
+                let lanes = lanes01 as u64 | ((lanes23 as u64) << 16);
+                if lanes != 0 {
+                    sink.mark_mask(i, lanes);
+                }
+            }
+        }
+        i += 32;
+    }
+    i
+}
+
+#[cfg(target_arch = "x86_64")]
+fn scan_sse2_one_point<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    pf: &ProbeCover,
+    sparse_row_mapping: bool,
+    out: &mut Vec<usize>,
+) {
+    use core::arch::x86_64::{_mm_cmpeq_epi16, _mm_set1_epi16};
+
+    debug_assert_eq!(pf.points.len(), 1);
+    debug_assert!(pf.ranges.is_empty());
+    // SAFETY: SSE2 is an x86-64 baseline feature.
+    let point = unsafe { _mm_set1_epi16(pf.points[0] as i16) };
+    let mut sink = RowSink::new(row_offsets, out, sparse_row_mapping);
+    let i = scan_sse2_four_vectors(codes, &mut sink, false, |v0, v1, v2, v3| unsafe {
+        (
+            _mm_cmpeq_epi16(v0, point),
+            _mm_cmpeq_epi16(v1, point),
+            _mm_cmpeq_epi16(v2, point),
+            _mm_cmpeq_epi16(v3, point),
+        )
+    });
+    scan_tail(codes, pf, i, &mut sink);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn sse2_fixed_mask<const POINTS: usize, const RANGES: usize>(
+    v: core::arch::x86_64::__m128i,
+    point_probes: &[core::arch::x86_64::__m128i; POINTS],
+    range_los: &[core::arch::x86_64::__m128i; RANGES],
+    range_spans: &[core::arch::x86_64::__m128i; RANGES],
+    zero: core::arch::x86_64::__m128i,
+) -> core::arch::x86_64::__m128i {
+    use core::arch::x86_64::{_mm_cmpeq_epi16, _mm_or_si128, _mm_sub_epi16, _mm_subs_epu16};
+
+    // SAFETY: all operations require only baseline SSE2.
+    unsafe {
+        let mut acc = zero;
+        for &point in point_probes {
+            acc = _mm_or_si128(acc, _mm_cmpeq_epi16(v, point));
+        }
+        for range in 0..RANGES {
+            let delta = _mm_sub_epi16(v, range_los[range]);
+            let excess = _mm_subs_epu16(delta, range_spans[range]);
+            acc = _mm_or_si128(acc, _mm_cmpeq_epi16(excess, zero));
+        }
+        acc
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn scan_sse2_fixed<O: Offset, const POINTS: usize, const RANGES: usize>(
+    codes: &[Token],
+    row_offsets: &[O],
+    pf: &ProbeCover,
+    sparse_row_mapping: bool,
+    out: &mut Vec<usize>,
+) {
+    use core::arch::x86_64::{_mm_set1_epi16, _mm_setzero_si128};
+
+    debug_assert_eq!(pf.points.len(), POINTS);
+    debug_assert_eq!(pf.ranges.len(), RANGES);
+    // SAFETY: SSE2 is an x86-64 baseline feature.
+    let zero = unsafe { _mm_setzero_si128() };
+    let mut point_probes = [zero; POINTS];
+    let mut range_los = [zero; RANGES];
+    let mut range_spans = [zero; RANGES];
+    for (probe, &point) in point_probes.iter_mut().zip(&pf.points) {
+        *probe = unsafe { _mm_set1_epi16(point as i16) };
+    }
+    for ((lo, span), range) in range_los.iter_mut().zip(&mut range_spans).zip(&pf.ranges) {
+        *lo = unsafe { _mm_set1_epi16(range.begin as i16) };
+        *span = unsafe { _mm_set1_epi16((range.last - range.begin) as i16) };
+    }
+
+    let mut sink = RowSink::new(row_offsets, out, sparse_row_mapping);
+    let i = scan_sse2_four_vectors(
+        codes,
+        &mut sink,
+        POINTS == 0 && RANGES == 1,
+        |v0, v1, v2, v3| {
+            (
+                sse2_fixed_mask(v0, &point_probes, &range_los, &range_spans, zero),
+                sse2_fixed_mask(v1, &point_probes, &range_los, &range_spans, zero),
+                sse2_fixed_mask(v2, &point_probes, &range_los, &range_spans, zero),
+                sse2_fixed_mask(v3, &point_probes, &range_los, &range_spans, zero),
+            )
+        },
+    );
+    scan_tail(codes, pf, i, &mut sink);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn scan_sse2_rows_table<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    pf: &ProbeCover,
+    out: &mut Vec<usize>,
+) {
+    for row in 0..row_offsets.len().saturating_sub(1) {
+        let begin = row_offsets[row].to_usize();
+        let end = row_offsets[row + 1].to_usize();
+        if codes[begin..end].iter().any(|&code| {
+            // SAFETY: compressed codes are dictionary token ids, and the cover
+            // table has exactly one entry per dictionary token.
+            unsafe { *pf.table.get_unchecked(code as usize) }
+        }) {
+            out.push(row);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn scan_sse2_codes_table<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    pf: &ProbeCover,
+    sparse_row_mapping: bool,
+    out: &mut Vec<usize>,
+) {
+    let mut sink = RowSink::new(row_offsets, out, sparse_row_mapping);
+    for (code_index, &code) in codes.iter().enumerate() {
+        // SAFETY: compressed codes are dictionary token ids, and the cover
+        // table has exactly one entry per dictionary token.
+        if unsafe { *pf.table.get_unchecked(code as usize) } {
+            sink.hit(code_index);
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub(super) fn scan_sse2<O: Offset>(
     codes: &[Token],
@@ -712,49 +910,89 @@ pub(super) fn scan_sse2<O: Offset>(
     sparse_row_mapping: bool,
     out: &mut Vec<usize>,
 ) {
+    match (pf.points.len(), pf.ranges.len()) {
+        (1, 0) => scan_sse2_one_point(codes, row_offsets, pf, sparse_row_mapping, out),
+        (0, 1) => scan_sse2_fixed::<O, 0, 1>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (2, 0) => scan_sse2_fixed::<O, 2, 0>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (3, 0) => scan_sse2_fixed::<O, 3, 0>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (1, 1) => scan_sse2_fixed::<O, 1, 1>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (4, 0) => scan_sse2_fixed::<O, 4, 0>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (2, 1) => scan_sse2_fixed::<O, 2, 1>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (5, 0) => scan_sse2_fixed::<O, 5, 0>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (0, 2) => scan_sse2_fixed::<O, 0, 2>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (1, 2) => scan_sse2_fixed::<O, 1, 2>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (3, 1) => scan_sse2_fixed::<O, 3, 1>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (6, 0) => scan_sse2_fixed::<O, 6, 0>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (4, 1) => scan_sse2_fixed::<O, 4, 1>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (2, 2) => scan_sse2_fixed::<O, 2, 2>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (0, 3) => scan_sse2_fixed::<O, 0, 3>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (3, 2) => scan_sse2_fixed::<O, 3, 2>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (1, 3) => scan_sse2_fixed::<O, 1, 3>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (4, 2) => scan_sse2_fixed::<O, 4, 2>(codes, row_offsets, pf, sparse_row_mapping, out),
+        (points, ranges) if points + 2 * ranges >= 17 => {
+            scan_sse2_codes_table(codes, row_offsets, pf, sparse_row_mapping, out)
+        }
+        _ => scan_sse2_generic(codes, row_offsets, pf, sparse_row_mapping, out),
+    }
+}
+
+/// SSE2: eight lanes; XOR with `0x8000` maps unsigned range order to signed.
+#[cfg(target_arch = "x86_64")]
+fn scan_sse2_generic<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    pf: &ProbeCover,
+    sparse_row_mapping: bool,
+    out: &mut Vec<usize>,
+) {
     use core::arch::x86_64::{
-        __m128i, _mm_andnot_si128, _mm_cmpeq_epi16, _mm_cmpgt_epi16, _mm_loadu_si128,
-        _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi16, _mm_setzero_si128, _mm_storeu_si128,
-        _mm_xor_si128,
+        __m128i, _mm_cmpeq_epi16, _mm_or_si128, _mm_set1_epi16, _mm_setzero_si128, _mm_sub_epi16,
+        _mm_subs_epu16,
     };
 
-    let total = codes.len();
-    let base = codes.as_ptr();
+    // Hoist every broadcast out of the code-stream loop. The dynamic fallback
+    // handles arbitrary cover widths; common small shapes use fixed kernels.
+    let zero = unsafe { _mm_setzero_si128() };
+    let point_probes: Vec<__m128i> = pf
+        .points
+        .iter()
+        .map(|&point| unsafe { _mm_set1_epi16(point as i16) })
+        .collect();
+    let range_probes: Vec<(__m128i, __m128i)> = pf
+        .ranges
+        .iter()
+        .map(|range| unsafe {
+            (
+                _mm_set1_epi16(range.begin as i16),
+                _mm_set1_epi16((range.last - range.begin) as i16),
+            )
+        })
+        .collect();
+
     let mut sink = RowSink::new(row_offsets, out, sparse_row_mapping);
-    let mut i = 0usize;
-    while i + 8 <= total {
-        // SAFETY: `i + 8 <= total`; SSE2 is an x86-64 baseline feature.
-        let hits = unsafe {
-            let v = _mm_loadu_si128(base.add(i).cast::<__m128i>());
-            let bias = _mm_set1_epi16(i16::MIN); // 0x8000: unsigned → signed order
-            let cb = _mm_xor_si128(v, bias); // codes in sign-biased space
-            let ones = _mm_set1_epi16(-1);
-            let mut acc = _mm_setzero_si128();
-            for &p in &pf.points {
-                acc = _mm_or_si128(acc, _mm_cmpeq_epi16(v, _mm_set1_epi16(p as i16)));
-            }
-            for &TokenRange { begin, last } in &pf.ranges {
-                let lob = _mm_xor_si128(_mm_set1_epi16(begin as i16), bias);
-                let hib = _mm_xor_si128(_mm_set1_epi16(last as i16), bias);
-                // Out of range = below lo OR above hi; in-range is its complement.
-                let below = _mm_cmpgt_epi16(lob, cb);
-                let above = _mm_cmpgt_epi16(cb, hib);
-                let out = _mm_or_si128(below, above);
-                acc = _mm_or_si128(acc, _mm_andnot_si128(out, ones));
-            }
-            if _mm_movemask_epi8(acc) == 0 {
-                None
-            } else {
-                let mut m = [0u16; 8];
-                _mm_storeu_si128(m.as_mut_ptr().cast::<__m128i>(), acc);
-                Some(m)
-            }
-        };
-        if let Some(m) = hits {
-            mark_block(i, &m, &mut sink);
+    let i = scan_sse2_four_vectors(codes, &mut sink, false, |v0, v1, v2, v3| unsafe {
+        let mut m0 = zero;
+        let mut m1 = zero;
+        let mut m2 = zero;
+        let mut m3 = zero;
+        for &point in &point_probes {
+            m0 = _mm_or_si128(m0, _mm_cmpeq_epi16(v0, point));
+            m1 = _mm_or_si128(m1, _mm_cmpeq_epi16(v1, point));
+            m2 = _mm_or_si128(m2, _mm_cmpeq_epi16(v2, point));
+            m3 = _mm_or_si128(m3, _mm_cmpeq_epi16(v3, point));
         }
-        i += 8;
-    }
+        for &(lo, span) in &range_probes {
+            let e0 = _mm_subs_epu16(_mm_sub_epi16(v0, lo), span);
+            let e1 = _mm_subs_epu16(_mm_sub_epi16(v1, lo), span);
+            let e2 = _mm_subs_epu16(_mm_sub_epi16(v2, lo), span);
+            let e3 = _mm_subs_epu16(_mm_sub_epi16(v3, lo), span);
+            m0 = _mm_or_si128(m0, _mm_cmpeq_epi16(e0, zero));
+            m1 = _mm_or_si128(m1, _mm_cmpeq_epi16(e1, zero));
+            m2 = _mm_or_si128(m2, _mm_cmpeq_epi16(e2, zero));
+            m3 = _mm_or_si128(m3, _mm_cmpeq_epi16(e3, zero));
+        }
+        (m0, m1, m2, m3)
+    });
     scan_tail(codes, pf, i, &mut sink);
 }
 
