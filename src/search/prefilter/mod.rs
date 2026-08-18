@@ -107,6 +107,11 @@ impl PrefilterAnalysis {
             f64::from(self.covered_frequency) / f64::from(self.total_frequency)
         }
     }
+
+    /// Number of code positions represented by the frequency index.
+    pub(super) fn total_frequency(&self) -> u32 {
+        self.total_frequency
+    }
 }
 
 /// Return whether the default empirical policy expects prefiltering to beat a
@@ -218,11 +223,8 @@ pub fn prefilter_candidates<O: Offset>(
     analysis: &PrefilterAnalysis,
     out: &mut Vec<usize>,
 ) -> Result<(), PrefilterError> {
-    scan::scan(
-        codes,
-        row_offsets,
-        analysis.probe_cover(),
-        analysis.covered_frequency() as usize,
-        out,
-    )
+    let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
+    let plan = scan::plan(input, analysis);
+    out.reserve(scan::reserve(plan));
+    scan::execute(plan, input, out)
 }
