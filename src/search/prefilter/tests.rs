@@ -551,7 +551,7 @@ fn a_fully_unused_cover_admits_no_rows() {
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[test]
-fn wide_probe_cover_stays_on_the_vectorized_scan() {
+fn wide_probe_cover_dispatches_soundly() {
     let pf = ProbeCover {
         points: vec![0; 33],
         ranges: Vec::new(),
@@ -559,7 +559,7 @@ fn wide_probe_cover_stays_on_the_vectorized_scan() {
     };
     let mut candidates = Vec::new();
 
-    super::scan::scan(&[0], &[0u32, 1], &pf, false, &mut candidates).unwrap();
+    super::scan::scan(&[0], &[0u32, 1], &pf, 1, &mut candidates).unwrap();
     assert_eq!(candidates, vec![0]);
 }
 
@@ -590,7 +590,7 @@ fn each_hit_row_is_appended_once_in_order() {
 
     let pf = ProbeCover::from_membership(vec![false, true], Some);
     let mut out = Vec::new();
-    super::scan::scan(&codes, &row_offsets, &pf, false, &mut out).unwrap();
+    super::scan::scan(&codes, &row_offsets, &pf, 43, &mut out).unwrap();
     assert_eq!(out, vec![1, 4]);
 
     let mut oracle = Vec::new();
