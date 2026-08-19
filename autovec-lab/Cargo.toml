@@ -1,0 +1,12 @@
+[package]
+name = "point-scan-lab"
+version = "0.0.0"
+edition = "2021"
+
+# Standalone: not part of the benchmark workspace.
+[workspace]
+
+[profile.release]
+opt-level = 3
+debug = true
+codegen-units = 1
