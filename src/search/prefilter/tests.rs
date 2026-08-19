@@ -603,7 +603,9 @@ fn assert_kernel_matches_scalar(
     kernel: impl Fn(&[Token], &[u32], &ProbeCover, bool, &mut Vec<usize>),
 ) {
     use crate::test_corpus::user_strings;
-    let corpus: Vec<Vec<u8>> = user_strings(60)
+    // Enough rows that the code stream spans several 512-code superblocks, so
+    // the AVX-512 gated path runs, not just the vector loop and scalar tail.
+    let corpus: Vec<Vec<u8>> = user_strings(600)
         .into_iter()
         .map(String::into_bytes)
         .collect();

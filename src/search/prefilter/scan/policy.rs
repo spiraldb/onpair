@@ -400,7 +400,11 @@ fn select_x86_64(
 ) -> KernelPlan {
     let reserve = facts.region.row_count.min(facts.expected_covered_codes());
     let kernel = if avx512bw {
-        Kernel::Avx512(Avx512Kernel::Generic)
+        if use_avx512_rows_table(facts) {
+            Kernel::RowsTable
+        } else {
+            Kernel::Avx512(Avx512Kernel::Generic)
+        }
     } else if avx2 {
         select_avx2(facts)
     } else if use_sse2_rows_table(facts) {
@@ -429,6 +433,20 @@ fn base_rows_table(facts: ScanFacts) -> bool {
     facts.region.row_count != 0
         && facts.average_row_len() >= LONG_ROW_CODES
         && facts.expected_covered_codes() >= facts.region.row_count
+}
+
+/// The AVX-512 kernel compares twice the lanes of AVX2 per instruction, so a
+/// comparison-based scan stays profitable to twice the compare cost; the
+/// row-table escapes sit at doubled thresholds accordingly.
+#[cfg(any(target_arch = "x86_64", test))]
+fn use_avx512_rows_table(facts: ScanFacts) -> bool {
+    let cost = facts.analysis.shape.comparison_cost();
+    (base_rows_table(facts) && cost > 2 * max_compare_cost(facts.analysis.table_len))
+        || (cost >= 2 * WIDE_COVER_COMPARE_COST
+            && (facts.covered_at_least(WIDE_COVER_ROW_TABLE_MIN_COVERAGE)
+                || (facts.region.row_count != 0
+                    && facts.average_row_len() >= MEDIUM_ROW_CODES
+                    && facts.covered_at_least(LONG_ROW_TABLE_MIN_COVERAGE))))
 }
 
 #[cfg(any(target_arch = "x86_64", test))]
@@ -598,6 +616,31 @@ mod tests {
                 input,
             )
             .kernel,
+            Kernel::Avx512(Avx512Kernel::Generic)
+        );
+    }
+
+    #[test]
+    fn avx512_wide_dense_covers_escape_to_rows_table() {
+        let caps = TargetCaps::X86_64 {
+            avx2: true,
+            avx512bw: true,
+        };
+        // Wide and dense: cost 40 >= 34, coverage 10% >= 1/20 -> row table.
+        let mut wide = facts(40, 0);
+        wide.analysis.covered_codes = 1_000;
+        assert_eq!(select_kernel(caps, wide).kernel, Kernel::RowsTable);
+        // Same density at cost 16 stays on the vector kernel.
+        let mut small = facts(8, 4);
+        small.analysis.covered_codes = 1_000;
+        assert_eq!(
+            select_kernel(caps, small).kernel,
+            Kernel::Avx512(Avx512Kernel::Generic)
+        );
+        // Wide but nearly empty: comparisons still win.
+        let sparse_wide = facts(40, 0);
+        assert_eq!(
+            select_kernel(caps, sparse_wide).kernel,
             Kernel::Avx512(Avx512Kernel::Generic)
         );
     }
