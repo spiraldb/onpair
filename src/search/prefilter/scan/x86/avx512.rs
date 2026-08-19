@@ -28,8 +28,8 @@ pub(in crate::search::prefilter) fn scan_avx512<O: Offset>(
     out: &mut Vec<usize>,
 ) {
     use core::arch::x86_64::{
-        _mm512_cmpeq_epu16_mask, _mm512_cmple_epu16_mask, _mm512_loadu_si512, _mm512_set1_epi16,
-        _mm512_sub_epi16,
+        __m512i, _mm512_cmpeq_epu16_mask, _mm512_cmple_epu16_mask, _mm512_loadu_si512,
+        _mm512_set1_epi16, _mm512_sub_epi16,
     };
 
     /// Codes per superblock: one gate branch per this many codes.
@@ -39,20 +39,37 @@ pub(in crate::search::prefilter) fn scan_avx512<O: Offset>(
     let base = codes.as_ptr();
     let mut sink = RowSink::new(row_offsets, out, sparse_row_mapping);
 
-    // The closure inherits the enclosing target features (RFC 2396); the
-    // loop-invariant broadcasts hoist out of the scan loops.
+    // Broadcast every probe once, so the per-vector loop issues plain loads
+    // instead of `vpbroadcastw` µops that would contend with the compares for
+    // the mask port.
+    let points: Vec<__m512i> = pf
+        .points
+        .iter()
+        .map(|&p| _mm512_set1_epi16(p as i16))
+        .collect();
+    let ranges: Vec<(__m512i, __m512i)> = pf
+        .ranges
+        .iter()
+        .map(|&TokenRange { begin, last }| {
+            (
+                _mm512_set1_epi16(begin as i16),
+                _mm512_set1_epi16(last.wrapping_sub(begin) as i16),
+            )
+        })
+        .collect();
+
+    // The closure inherits the enclosing target features (RFC 2396).
     // SAFETY (for both loops below): every `mask_at(i)` has `i + 32 <= total`,
     // and the caller established AVX-512F/BW.
     let mask_at = |i: usize| -> u32 {
         unsafe {
             let v = _mm512_loadu_si512(base.add(i).cast());
             let mut m: u32 = 0;
-            for &p in &pf.points {
-                m |= _mm512_cmpeq_epu16_mask(v, _mm512_set1_epi16(p as i16));
+            for &point in &points {
+                m |= _mm512_cmpeq_epu16_mask(v, point);
             }
-            for &TokenRange { begin, last } in &pf.ranges {
-                let delta = _mm512_sub_epi16(v, _mm512_set1_epi16(begin as i16));
-                let span = _mm512_set1_epi16(last.wrapping_sub(begin) as i16);
+            for &(lo, span) in &ranges {
+                let delta = _mm512_sub_epi16(v, lo);
                 m |= _mm512_cmple_epu16_mask(delta, span);
             }
             m
