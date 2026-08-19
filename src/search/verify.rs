@@ -47,9 +47,8 @@ use crate::decoding::DECODE_PADDING;
 /// throws it away.
 ///
 /// ```
-/// use onpair::search::{
-///     BytesVerifier, analyze_prefilter, build_token_frequency_index, prefilter_candidates,
-/// };
+/// use onpair::search::index::build_token_frequency_index;
+/// use onpair::search::{BytesVerifier, analyze_prefilter, prefilter_candidates};
 /// # use onpair::{Column, DictionaryView, DEFAULT_CONFIG};
 /// # let rows: &[&[u8]] = &[b"alpha", b"beta", b"alphabet"];
 /// # let mut bytes = Vec::new();

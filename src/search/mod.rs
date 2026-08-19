@@ -33,8 +33,8 @@
 //!   [`PrefixQuery`].
 //! * [`contains`](contains()) — rows containing a pattern, via a precomputed
 //!   token-level KMP [`ContainsTable`].
-//! * [`build_token_frequency_index`] — build the reusable selectivity index for
-//!   a code stream.
+//! * [`index::build_token_frequency_index`] — build the reusable selectivity
+//!   index for a code stream.
 //! * [`analyze_prefilter`] — derive a normalized probe cover and report its
 //!   frequency.
 //! * [`prefilter_candidates`] — a sound *superset* of the rows containing a
@@ -47,6 +47,7 @@
 
 mod contains;
 mod equals;
+pub mod index;
 mod lookup;
 mod prefilter;
 mod prefix;
@@ -57,8 +58,7 @@ pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefilter::{
-    PrefilterAnalysis, PrefilterError, ProbeCover, TokenFrequencyIndex, TokenFrequencyIndexError,
-    analyze_prefilter, build_token_frequency_index, prefilter_candidates,
+    PrefilterAnalysis, PrefilterError, ProbeCover, analyze_prefilter, prefilter_candidates,
     prefilter_is_likely_profitable,
 };
 pub use prefix::{PrefixQuery, starts_with};

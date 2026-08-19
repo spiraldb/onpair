@@ -29,18 +29,17 @@
 //!   occurrence takes, it runs into a probe.
 //!
 //! # Shape
-//! * `frequency` — the per-column selectivity index the compiler reads, the one
-//!   part of this module the caller builds and owns ([`TokenFrequencyIndex`]).
+//! * [`TokenFrequencyIndex`] — the reusable per-column selectivity index the
+//!   compiler reads and the caller owns.
 //! * `graph` — pattern to alignment DAG: every layout of the pattern across
 //!   token boundaries, as one graph whose cuts are exactly the sound covers.
 //! * `mincut` — the cheapest such cut, by max-flow over the split DAG.
 //! * `plan` — the two of them end to end: pattern in, normalized cover out,
-//!   minus the ids the code stream never uses.
+//!   preserving every selected id regardless of its advisory frequency.
 //! * `cover` — the cover itself, in both the shapes the scan wants.
 //! * `scan` — the vector kernels. Profitability stays outside execution.
 
 mod cover;
-mod frequency;
 mod graph;
 mod mincut;
 mod plan;
@@ -50,11 +49,11 @@ mod scan;
 mod tests;
 
 pub use cover::ProbeCover;
-pub use frequency::{TokenFrequencyIndex, TokenFrequencyIndexError, build_token_frequency_index};
 
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
+use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
 /// Reason SIMD prefilter execution could not proceed.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -161,31 +160,33 @@ pub fn prefilter_is_likely_profitable(pattern_len: usize, analysis: &PrefilterAn
 /// `dict` is conformant: sorted, complete, and unique. These properties are
 /// guaranteed for a dictionary trained by [`Parser::train`](crate::Parser::train)
 /// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
-/// `frequencies` must describe the dictionary and code stream that the returned
-/// cover may later scan.
+/// `frequencies` must use `dict`'s token domain and the scanned code count.
+/// Values are advisory weights: they affect the plan and profitability, but
+/// never remove members from the resulting cover.
 ///
 /// # Panics
 /// Panics when `pattern` is empty. The empty pattern matches every row and
 /// should bypass prefilter analysis.
-pub fn analyze_prefilter(
+pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
     pattern: &[u8],
     dict: CompactDictionaryView<'_>,
-    frequencies: &TokenFrequencyIndex,
+    frequencies: &TokenFrequencyIndex<S>,
 ) -> PrefilterAnalysis {
     assert!(
         !pattern.is_empty(),
         "the empty pattern matches every row and needs no prefilter"
     );
-    let probe_cover = plan::plan(dict, pattern, frequencies);
+    let frequencies_view = frequencies.as_view();
+    let probe_cover = plan::plan(dict, pattern, frequencies_view);
     let covered_frequency = probe_cover
         .points
         .iter()
-        .map(|&token| frequencies.frequency(token))
+        .map(|&token| frequencies_view.frequency(token))
         .chain(
             probe_cover
                 .ranges
                 .iter()
-                .map(|&range| frequencies.range_frequency(range)),
+                .map(|&range| frequencies_view.range_frequency(range)),
         )
         .sum();
     PrefilterAnalysis {
