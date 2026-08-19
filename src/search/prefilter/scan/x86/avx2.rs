@@ -280,6 +280,10 @@ pub(in crate::search::prefilter::scan) fn scan_avx2_nibble_points<O: Offset>(
 /// Walk four AVX2 vectors per iteration and materialize only blocks with hits.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the hot SIMD loop keeps scan state explicit so LLVM can optimize it away"
+)]
 fn scan_avx2_four_vectors<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
@@ -350,6 +354,7 @@ fn scan_avx2_four_vectors<O: Offset>(
 /// Four-vector AVX2 kernel for the most compact possible cover.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 pub(in crate::search::prefilter::scan) fn scan_avx2_one_point<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
@@ -385,6 +390,7 @@ pub(in crate::search::prefilter::scan) fn scan_avx2_one_point<O: Offset>(
 /// Four-vector AVX2 kernel for one inclusive token range.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 pub(in crate::search::prefilter::scan) fn scan_avx2_one_range<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
@@ -424,6 +430,7 @@ pub(in crate::search::prefilter::scan) fn scan_avx2_one_range<O: Offset>(
 /// Four-vector AVX2 kernel for a fixed small point/range cover.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(never)]
 pub(in crate::search::prefilter::scan) fn scan_avx2_fixed<
     O: Offset,
     const POINTS: usize,

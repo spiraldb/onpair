@@ -100,9 +100,10 @@ pub(super) unsafe fn execute_avx2<O: Offset>(
         cover,
         ..
     } = input;
-    // Keep the executor itself baseline-compatible. Besides making the runtime
-    // feature boundary explicit, this prevents LTO from folding every large
-    // shape specialization into one instruction-cache-heavy dispatcher.
+    // Keep the executor itself baseline-compatible to make the runtime feature
+    // boundary explicit. The large AVX2 leaf kernels are also `#[inline(never)]`:
+    // ThinLTO otherwise folds their shape specializations into one
+    // instruction-cache-heavy dispatcher.
     unsafe {
         match kernel {
             Avx2Kernel::OnePoint { hits } => scan_avx2_one_point(
