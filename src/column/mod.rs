@@ -17,9 +17,10 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
+use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 use crate::search::{
-    BytesVerifier, ContainsTable, PrefilterError, PrefixQuery, TokenFrequencyIndex,
-    analyze_prefilter, contains, equals, prefilter_candidates, starts_with, tokenize,
+    BytesVerifier, ContainsTable, PrefilterError, PrefixQuery, analyze_prefilter, contains, equals,
+    prefilter_candidates, starts_with, tokenize,
 };
 
 /// Owned compressed column, produced by [`Column::compress`] /
@@ -205,9 +206,11 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// adaptive caller can use [`analyze_prefilter`] to inspect the probe cover
     /// and its frequency before choosing whether to scan it.
     ///
-    /// `frequencies` must have been built for this view's code stream and
-    /// dictionary ([`build_token_frequency_index`](crate::search::build_token_frequency_index)),
-    /// and is reusable across every query against this column.
+    /// `frequencies` must use this view's token domain and code count. Build an
+    /// exact index with
+    /// [`build_token_frequency_index`](crate::search::index::build_token_frequency_index),
+    /// or validate stored weights with [`TokenFrequencyIndex::validate_safety`].
+    /// Inexact weights affect planning, not query correctness.
     ///
     /// # Errors
     /// Returns [`PrefilterError::UnsupportedArchitecture`] when a code scan is
@@ -220,10 +223,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// not depend on whether the prefilter would have refused; for longer
     /// patterns use
     /// [`rows_containing_prefiltered_memmem`](Self::rows_containing_prefiltered_memmem).
-    pub fn rows_containing_prefiltered(
+    pub fn rows_containing_prefiltered<S: TokenFrequencyIndexStorage>(
         &self,
         pattern: &[u8],
-        frequencies: &TokenFrequencyIndex,
+        frequencies: &TokenFrequencyIndex<S>,
     ) -> Result<Vec<usize>, PrefilterError> {
         let table = ContainsTable::new(pattern, self.dict);
         let mut rows = Vec::new();
@@ -248,10 +251,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     ///
     /// # Errors
     /// As [`rows_containing_prefiltered`](Self::rows_containing_prefiltered).
-    pub fn rows_containing_prefiltered_memmem(
+    pub fn rows_containing_prefiltered_memmem<S: TokenFrequencyIndexStorage>(
         &self,
         pattern: &[u8],
-        frequencies: &TokenFrequencyIndex,
+        frequencies: &TokenFrequencyIndex<S>,
     ) -> Result<Vec<usize>, PrefilterError> {
         let mut rows = Vec::new();
         self.prefilter_into(pattern, frequencies, &mut rows)?;
@@ -264,10 +267,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     }
 
     /// The prefilter half both `rows_containing_prefiltered*` methods share.
-    fn prefilter_into(
+    fn prefilter_into<S: TokenFrequencyIndexStorage>(
         &self,
         pattern: &[u8],
-        frequencies: &TokenFrequencyIndex,
+        frequencies: &TokenFrequencyIndex<S>,
         out: &mut Vec<usize>,
     ) -> Result<(), PrefilterError> {
         if pattern.is_empty() {
@@ -494,7 +497,7 @@ mod tests {
     #[test]
     fn prefiltered_search_agrees_with_rows_containing() {
         use crate::DictionaryView;
-        use crate::search::build_token_frequency_index;
+        use crate::search::index::build_token_frequency_index;
         use crate::test_corpus::user_strings;
         let corpus: Vec<Vec<u8>> = user_strings(60)
             .into_iter()
@@ -533,7 +536,7 @@ mod tests {
     #[test]
     fn prefiltered_memmem_takes_patterns_the_kmp_table_rejects() {
         use crate::DictionaryView;
-        use crate::search::build_token_frequency_index;
+        use crate::search::index::build_token_frequency_index;
         let long = vec![b'q'; 400];
         let mut hit = long.clone();
         hit.extend_from_slice(b"tail");

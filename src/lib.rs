@@ -79,7 +79,7 @@ pub use crate::core::dictionary::{
 };
 pub use crate::core::offset::Offset;
 pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
-pub use crate::core::validate::InvalidColumn;
+pub use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex};
 pub use crate::decoding::{
     DECODE_PADDING, OutputTooSmall, decode_into, decoded_len, try_decode_into,
 };
