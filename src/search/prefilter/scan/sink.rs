@@ -37,6 +37,8 @@ pub(super) struct RowSink<'a, O> {
     /// row that has already been appended.
     row_end: usize,
     binary_search_sparse_gaps: bool,
+    /// `out.len()` at construction; everything above it is this scan's output.
+    initial_len: usize,
 }
 
 impl<'a, O: Offset> RowSink<'a, O> {
@@ -46,13 +48,43 @@ impl<'a, O: Offset> RowSink<'a, O> {
         out: &'a mut Vec<usize>,
         binary_search_sparse_gaps: bool,
     ) -> Self {
+        let initial_len = out.len();
         Self {
             row_offsets,
             out,
             row: 0,
             row_end: 0,
             binary_search_sparse_gaps,
+            initial_len,
         }
+    }
+
+    /// Candidate rows appended by this scan so far.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(super) fn appended(&self) -> usize {
+        self.out.len() - self.initial_len
+    }
+
+    /// Rows fully decided so far: everything up to and including the last
+    /// appended row. Rows past it that the scan already found empty are not
+    /// counted — an undercount, which only delays a bail decision, never
+    /// corrupts one.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(super) fn rows_decided(&self) -> usize {
+        if self.row_end == 0 { 0 } else { self.row + 1 }
+    }
+
+    /// Give up pruning: append every row not yet appended, keeping the output
+    /// ascending and deduplicated. The result remains a sound superset; rows
+    /// scanned before the bail keep their exact verdicts.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub(super) fn append_remaining(&mut self) {
+        let first = self.rows_decided();
+        let rows = self.row_offsets.len() - 1;
+        self.out.extend(first..rows);
     }
 
     /// Record a hit at `code_index`, appending its row unless already appended.

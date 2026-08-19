@@ -333,7 +333,25 @@ pub(in crate::search::prefilter) struct KernelPlan {
     pub(super) kernel: Kernel,
     pub(super) row_mapping: RowMapping,
     pub(super) reserve: usize,
+    /// Allow the scan to stop pruning when it observes that almost every row
+    /// is a candidate anyway (see `BAIL_*`). Enabled only for covers dense
+    /// enough that the situation can arise, so sparse scans pay nothing.
+    pub(super) bail: bool,
 }
+
+/// Runtime bail-out: once at least `rows / BAIL_MIN_SEEN_DIVISOR` rows are
+/// decided and `BAIL_RATIO_NUM / BAIL_RATIO_DEN` of them were appended as
+/// candidates, the scan appends every remaining row and stops. The output
+/// stays a sound superset; the verifier was going to visit nearly every row
+/// regardless, so finishing the scan only added cost. Only plans whose cover
+/// reaches `BAIL_MIN_COVERAGE` of code positions enable the check at all.
+#[cfg(any(target_arch = "x86_64", test))]
+pub(super) const BAIL_MIN_SEEN_DIVISOR: usize = 8;
+#[cfg(any(target_arch = "x86_64", test))]
+pub(super) const BAIL_RATIO_NUM: usize = 3;
+#[cfg(any(target_arch = "x86_64", test))]
+pub(super) const BAIL_RATIO_DEN: usize = 4;
+const BAIL_MIN_COVERAGE: Ratio = Ratio::new(1, 20);
 
 /// Select a kernel without inspecting code values or executing SIMD.
 #[inline]
@@ -343,6 +361,7 @@ pub(super) fn select_kernel(caps: TargetCaps, facts: ScanFacts) -> KernelPlan {
             kernel: Kernel::Empty,
             row_mapping: RowMapping::Linear,
             reserve: 0,
+            bail: false,
         };
     }
 
@@ -352,6 +371,7 @@ pub(super) fn select_kernel(caps: TargetCaps, facts: ScanFacts) -> KernelPlan {
         } else {
             RowMapping::Linear
         };
+    let bail = facts.covered_at_least(BAIL_MIN_COVERAGE);
 
     match caps {
         #[cfg(any(target_arch = "aarch64", test))]
@@ -359,14 +379,18 @@ pub(super) fn select_kernel(caps: TargetCaps, facts: ScanFacts) -> KernelPlan {
             kernel: Kernel::Neon(select_neon(facts.analysis.shape)),
             row_mapping,
             reserve: 0,
+            bail,
         },
         #[cfg(any(target_arch = "x86_64", test))]
-        TargetCaps::X86_64 { avx2, avx512bw } => select_x86_64(facts, row_mapping, avx2, avx512bw),
+        TargetCaps::X86_64 { avx2, avx512bw } => {
+            select_x86_64(facts, row_mapping, bail, avx2, avx512bw)
+        }
         #[cfg(any(not(any(target_arch = "aarch64", target_arch = "x86_64")), test))]
         TargetCaps::Unsupported => KernelPlan {
             kernel: Kernel::Unsupported,
             row_mapping,
             reserve: 0,
+            bail,
         },
     }
 }
@@ -395,6 +419,7 @@ pub(super) fn select_neon(shape: CoverShape) -> NeonKernel {
 fn select_x86_64(
     facts: ScanFacts,
     row_mapping: RowMapping,
+    bail: bool,
     avx2: bool,
     avx512bw: bool,
 ) -> KernelPlan {
@@ -416,6 +441,7 @@ fn select_x86_64(
         kernel,
         row_mapping,
         reserve,
+        bail,
     }
 }
 
@@ -435,13 +461,22 @@ fn base_rows_table(facts: ScanFacts) -> bool {
         && facts.expected_covered_codes() >= facts.region.row_count
 }
 
+/// Above this comparison cost the generic kernel pays more per vector than a
+/// one-probe-per-code membership-table scan costs at any hit density, so the
+/// escape no longer needs a density condition. Measured on clickbench-url-1m:
+/// the generic loop scales at ~0.017 ns/code per comparison while the row
+/// table scans at 1.2–1.7 ns/code flat.
+#[cfg(any(target_arch = "x86_64", test))]
+const AVX512_TABLE_ESCAPE_COST: usize = 64;
+
 /// The AVX-512 kernel compares twice the lanes of AVX2 per instruction, so a
 /// comparison-based scan stays profitable to twice the compare cost; the
 /// row-table escapes sit at doubled thresholds accordingly.
 #[cfg(any(target_arch = "x86_64", test))]
 fn use_avx512_rows_table(facts: ScanFacts) -> bool {
     let cost = facts.analysis.shape.comparison_cost();
-    (base_rows_table(facts) && cost > 2 * max_compare_cost(facts.analysis.table_len))
+    cost > AVX512_TABLE_ESCAPE_COST
+        || (base_rows_table(facts) && cost > 2 * max_compare_cost(facts.analysis.table_len))
         || (cost >= 2 * WIDE_COVER_COMPARE_COST
             && (facts.covered_at_least(WIDE_COVER_ROW_TABLE_MIN_COVERAGE)
                 || (facts.region.row_count != 0
@@ -637,12 +672,15 @@ mod tests {
             select_kernel(caps, small).kernel,
             Kernel::Avx512(Avx512Kernel::Generic)
         );
-        // Wide but nearly empty: comparisons still win.
+        // Moderately wide but nearly empty: comparisons still win.
         let sparse_wide = facts(40, 0);
         assert_eq!(
             select_kernel(caps, sparse_wide).kernel,
             Kernel::Avx512(Avx512Kernel::Generic)
         );
+        // Beyond the flat escape cost the table wins at any density.
+        let sparse_very_wide = facts(40, 20);
+        assert_eq!(select_kernel(caps, sparse_very_wide).kernel, Kernel::RowsTable);
     }
 
     #[test]

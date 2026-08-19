@@ -137,7 +137,7 @@ pub(super) fn execute<O: Offset>(
         }
         #[cfg(target_arch = "x86_64")]
         Kernel::RowsTable => {
-            table::scan_rows(input.codes, input.row_offsets, input.cover, out);
+            table::scan_rows(input.codes, input.row_offsets, input.cover, plan.bail, out);
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
@@ -161,6 +161,7 @@ pub(super) fn execute<O: Offset>(
                     input.row_offsets,
                     input.cover,
                     sparse_row_mapping,
+                    plan.bail,
                     out,
                 )
             };

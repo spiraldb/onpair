@@ -648,7 +648,7 @@ fn x86_kernels_match_scalar() {
     }
     if std::is_x86_feature_detected!("avx512bw") {
         assert_kernel_matches_scalar(|codes, ro, pf, sparse_row_mapping, cand| unsafe {
-            super::scan::scan_avx512(codes, ro, pf, sparse_row_mapping, cand)
+            super::scan::scan_avx512(codes, ro, pf, sparse_row_mapping, false, cand)
         });
     }
 }
@@ -680,4 +680,51 @@ fn signed_bias_range_matches_unsigned() {
             );
         }
     }
+}
+
+/// A scan whose cover admits almost every row may bail: the output must stay
+/// ascending, deduplicated, and a superset of the exact answer. Exercises the
+/// vector-kernel path (small cover) and the row-table path (wide cover).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn dense_scans_bail_to_a_sound_superset() {
+    let rows = 40_000usize;
+    let build = |hit_code: Token, miss_code: Token| {
+        let mut codes = Vec::with_capacity(rows * 2);
+        let mut row_offsets = vec![0u32];
+        for r in 0..rows {
+            codes.push(if r % 10 != 0 { hit_code } else { miss_code });
+            codes.push(miss_code);
+            row_offsets.push(codes.len() as u32);
+        }
+        (codes, row_offsets)
+    };
+    let check = |codes: &[Token], row_offsets: &[u32], pf: &ProbeCover| {
+        let covered = codes.iter().filter(|&&c| pf.table[c as usize]).count();
+        let mut out = Vec::new();
+        super::scan::scan(codes, row_offsets, pf, covered, &mut out).unwrap();
+        let mut oracle = Vec::new();
+        super::scan::scan_scalar(codes, row_offsets, pf, &mut oracle);
+        assert!(out.windows(2).all(|w| w[0] < w[1]), "ascending, deduplicated");
+        let set: std::collections::HashSet<usize> = out.iter().copied().collect();
+        assert!(oracle.iter().all(|r| set.contains(r)), "superset of exact");
+        assert!(out.len() > oracle.len(), "the dense scan bailed");
+    };
+
+    // Small cover: the vector kernel path.
+    let mut table = vec![false; 16];
+    table[7] = true;
+    let pf = ProbeCover::from_membership(table, Some);
+    let (codes, row_offsets) = build(7, 3);
+    check(&codes, &row_offsets, &pf);
+
+    // Wide cover (65 points, comparison cost > the flat table-escape cost):
+    // the rows-table path.
+    let mut table = vec![false; 130];
+    for id in (0..130).step_by(2) {
+        table[id] = true;
+    }
+    let pf = ProbeCover::from_membership(table, Some);
+    let (codes, row_offsets) = build(4, 1);
+    check(&codes, &row_offsets, &pf);
 }

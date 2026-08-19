@@ -3,6 +3,7 @@
 
 //! AVX-512BW prefilter execution.
 
+use super::super::policy::{BAIL_MIN_SEEN_DIVISOR, BAIL_RATIO_DEN, BAIL_RATIO_NUM};
 use super::super::sink::{LaneMask, RowSink, scan_tail};
 use crate::core::offset::Offset;
 use crate::core::types::{Token, TokenRange};
@@ -25,6 +26,7 @@ pub(in crate::search::prefilter) fn scan_avx512<O: Offset>(
     row_offsets: &[O],
     pf: &ProbeCover,
     sparse_row_mapping: bool,
+    bail: bool,
     out: &mut Vec<usize>,
 ) {
     use core::arch::x86_64::{
@@ -76,6 +78,8 @@ pub(in crate::search::prefilter) fn scan_avx512<O: Offset>(
         }
     };
 
+    let rows = row_offsets.len().saturating_sub(1);
+    let min_seen = (rows / BAIL_MIN_SEEN_DIVISOR).max(1);
     let mut i = 0usize;
     while i + SUPERBLOCK <= total {
         let mut lanes = [0u64; SUPERBLOCK / 64];
@@ -91,6 +95,13 @@ pub(in crate::search::prefilter) fn scan_avx512<O: Offset>(
             for (k, &pair) in lanes.iter().enumerate() {
                 if pair != 0 {
                     sink.mark_mask(i + k * 64, LaneMask::from_bits(pair));
+                }
+            }
+            if bail {
+                let seen = sink.rows_decided();
+                if seen >= min_seen && sink.appended() * BAIL_RATIO_DEN >= seen * BAIL_RATIO_NUM {
+                    sink.append_remaining();
+                    return;
                 }
             }
         }

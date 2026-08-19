@@ -4,18 +4,28 @@
 //! Exact membership-table scans and AVX2 table preparation.
 
 use super::super::cover::ProbeCover;
+use super::policy::{BAIL_MIN_SEEN_DIVISOR, BAIL_RATIO_DEN, BAIL_RATIO_NUM};
 use super::sink::RowSink;
 use crate::core::offset::Offset;
 use crate::core::types::{Token, TokenRange};
 
 /// Scan row by row and stop at the first covered code in each row.
+///
+/// With `bail` set, the scan may stop pruning once almost every row it has
+/// decided turned out to be a candidate (see the `BAIL_*` policy constants),
+/// appending all remaining rows: still a sound superset, exact up to the
+/// bail point.
 pub(super) fn scan_rows<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     cover: &ProbeCover,
+    bail: bool,
     out: &mut Vec<usize>,
 ) {
-    for row in 0..row_offsets.len().saturating_sub(1) {
+    let rows = row_offsets.len().saturating_sub(1);
+    let initial = out.len();
+    let min_seen = (rows / BAIL_MIN_SEEN_DIVISOR).max(1);
+    for row in 0..rows {
         let begin = row_offsets[row].to_usize();
         let end = row_offsets[row + 1].to_usize();
         if codes[begin..end]
@@ -23,6 +33,13 @@ pub(super) fn scan_rows<O: Offset>(
             .any(|&code| cover.table[code as usize])
         {
             out.push(row);
+        }
+        if bail && row & 0x0fff == 0x0fff && row + 1 >= min_seen {
+            let appended = out.len() - initial;
+            if appended * BAIL_RATIO_DEN >= (row + 1) * BAIL_RATIO_NUM {
+                out.extend(row + 1..rows);
+                return;
+            }
         }
     }
 }
