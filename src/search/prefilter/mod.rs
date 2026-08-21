@@ -108,47 +108,60 @@ impl PrefilterAnalysis {
     }
 
     /// Number of code positions represented by the frequency index.
-    pub(super) fn total_frequency(&self) -> u32 {
+    pub fn total_frequency(&self) -> u32 {
         self.total_frequency
+    }
+
+    /// SIMD comparisons each vector of the code stream pays for this cover: one
+    /// per point, two per inclusive range.
+    pub fn comparison_cost(&self) -> usize {
+        let cover = self.probe_cover();
+        cover
+            .points()
+            .len()
+            .saturating_add(cover.ranges().len().saturating_mul(2))
+    }
+
+    /// Expected share of `row_count` rows the scan will admit for verification.
+    ///
+    /// Verification is charged per row, so the estimate is covered codes per
+    /// row: exact when no row holds two covered codes, an over-estimate
+    /// otherwise. Returns `0.0` for an empty region and never exceeds `1.0`.
+    pub fn expected_candidate_row_fraction(&self, row_count: usize) -> f64 {
+        if row_count == 0 {
+            return 0.0;
+        }
+        (f64::from(self.covered_frequency) / row_count as f64).min(1.0)
     }
 }
 
-/// Return whether the default empirical policy expects prefiltering to beat a
-/// bulk-decode fallback for this pattern.
-///
-/// The policy uses only information available after [`analyze_prefilter`]:
-/// pattern length, the number of SIMD comparisons in the normalized cover, and
-/// the fraction of code positions covered. A point costs one comparison and an
-/// inclusive range costs two. It selects the prefilter when all of these hold:
-///
-/// * `pattern_len >= 4`;
-/// * at most 16 SIMD comparisons; and
-/// * covered-code fraction strictly below 1%.
-///
-/// Empty covers are accepted for patterns of at least four bytes: they prove
-/// that no encoded row can match and execute no SIMD scan. Patterns shorter
-/// than four bytes are conservatively rejected even when a particular absent
-/// pattern would produce an empty cover.
-///
-/// This is a performance hint, not a correctness requirement. It was
-/// calibrated on selective `contains` workloads through 5% row selectivity on
-/// AArch64, against both OnPair bulk decode and bulk decode followed by a
-/// full-haystack `memmem`. Callers with materially different columns, batch
-/// sizes, or architectures may choose their own policy. This function does not
-/// execute or bypass the prefilter itself.
-pub fn prefilter_is_likely_profitable(pattern_len: usize, analysis: &PrefilterAnalysis) -> bool {
-    const MIN_PATTERN_LEN: usize = 4;
-    const MAX_SIMD_COMPARISONS: usize = 16;
-    const MAX_COVERED_FRACTION: f64 = 0.01;
+/// Widest cover the specialized SIMD kernels serve; wider covers fall through to
+/// a generic loop costing roughly 1.8x more per comparison.
+const MAX_SIMD_COMPARISONS: usize = 16;
 
-    let cover = analysis.probe_cover();
-    let comparisons = cover
-        .points()
-        .len()
-        .saturating_add(cover.ranges().len().saturating_mul(2));
-    pattern_len >= MIN_PATTERN_LEN
-        && comparisons <= MAX_SIMD_COMPARISONS
-        && analysis.covered_fraction() < MAX_COVERED_FRACTION
+/// Largest share of rows the default policy sends to exact verification, which
+/// costs 2.1x to 6.5x per row what bulk decoding does.
+const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
+
+/// Return whether the default empirical policy expects prefiltering to beat a
+/// bulk-decode fallback over a region of `row_count` rows.
+///
+/// The policy prices the two costs a scan pays, both known after
+/// [`analyze_prefilter`]: its
+/// [`comparison_cost`](PrefilterAnalysis::comparison_cost) per code, and the
+/// [`expected_candidate_row_fraction`](PrefilterAnalysis::expected_candidate_row_fraction)
+/// it sends to per-row verification. An empty cover passes both: it proves no
+/// encoded row can match, so it scans nothing and admits nothing.
+///
+/// This is a performance hint, not a correctness requirement, and it neither
+/// executes nor bypasses the prefilter. The thresholds were calibrated on
+/// AArch64 over 2877 `contains` queries against a bulk-decode-plus-`memmem`
+/// fallback, where they admit no query the fallback would have won. Callers
+/// with materially different columns or architectures may choose their own
+/// policy.
+pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: usize) -> bool {
+    analysis.comparison_cost() <= MAX_SIMD_COMPARISONS
+        && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION
 }
 
 /// Analyze `pattern` and return its normalized minimum-cut probe cover.
