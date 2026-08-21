@@ -10,6 +10,7 @@ debug/
 # Criterion / benchmark output
 /criterion/
 **/criterion/
+/.benchmark-data/
 
 # Flamegraphs / profiling
 flamegraph.svg
@@ -45,4 +46,3 @@ perf.data.old
 
 # Local Claude / agent state
 .claude/settings.local.json
-

@@ -519,7 +519,7 @@ mod simd {
         _s: &mut Scratch,
         out: &mut Vec<usize>,
     ) {
-        debug_assert!(V % 2 == 0);
+        debug_assert!(V.is_multiple_of(2));
         let n = inp.codes.len();
         let base = inp.codes.as_ptr();
         let point = _mm512_set1_epi16(p as i16);

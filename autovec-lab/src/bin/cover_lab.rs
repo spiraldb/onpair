@@ -23,6 +23,14 @@ use std::time::Instant;
 
 const REPS: usize = 3;
 
+fn reps() -> usize {
+    std::env::var("LAB_REPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(REPS)
+}
+
 struct Cover {
     points: Vec<u16>,
     ranges: Vec<(u16, u16)>, // inclusive (lo, hi)
@@ -40,10 +48,16 @@ impl Cover {
                 table[v as usize] = 1;
             }
         }
-        Cover { points, ranges, table }
+        Cover {
+            points,
+            ranges,
+            table,
+        }
     }
     fn covered_values(&self) -> Vec<u16> {
-        (0..=u16::MAX).filter(|&v| self.table[v as usize] != 0).collect()
+        (0..=u16::MAX)
+            .filter(|&v| self.table[v as usize] != 0)
+            .collect()
     }
 }
 
@@ -75,7 +89,13 @@ struct Sink<'a> {
 
 impl<'a> Sink<'a> {
     fn new(off: &'a [u32], out: &'a mut Vec<usize>, sparse: bool) -> Self {
-        Sink { off, out, row: 0, row_end: 0, sparse }
+        Sink {
+            off,
+            out,
+            row: 0,
+            row_end: 0,
+            sparse,
+        }
     }
     #[inline]
     fn hit(&mut self, i: usize) {
@@ -124,7 +144,10 @@ fn tail_table(cover: &Cover, inp: &Input, from: usize, sink: &mut Sink) {
 fn a1t_rows_table(cover: &Cover, inp: &Input, _s: &mut Scratch, out: &mut Vec<usize>) {
     for r in 0..inp.rows() {
         let (a, b) = (inp.off[r] as usize, inp.off[r + 1] as usize);
-        if inp.codes[a..b].iter().any(|&c| cover.table[c as usize] != 0) {
+        if inp.codes[a..b]
+            .iter()
+            .any(|&c| cover.table[c as usize] != 0)
+        {
             out.push(r);
         }
     }
@@ -159,9 +182,9 @@ fn c4p_sb512(cover: &Cover, inp: &Input, s: &mut Scratch, out: &mut Vec<usize>) 
     let full = n / G;
     for sb in 0..full {
         let base = sb * G;
-        let any = inp.codes[base..base + G]
-            .iter()
-            .fold(false, |acc, &c| acc | hit_probes(c, &cover.points, &cover.ranges));
+        let any = inp.codes[base..base + G].iter().fold(false, |acc, &c| {
+            acc | hit_probes(c, &cover.points, &cover.ranges)
+        });
         s.blockany[sb] = any as u8;
     }
     let mut sink = Sink::new(&inp.off, out, inp.sparse);
@@ -364,10 +387,29 @@ fn av_shape_g<const G: usize>(cover: &Cover, inp: &Input, s: &mut Scratch, out: 
         };
     }
     arms!(
-        (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (8, 0),
-        (0, 1), (1, 1), (2, 1), (3, 1), (4, 1),
-        (0, 2), (1, 2), (2, 2), (3, 2), (4, 2),
-        (0, 3), (1, 3), (2, 3), (0, 4), (2, 4), (4, 4),
+        (1, 0),
+        (2, 0),
+        (3, 0),
+        (4, 0),
+        (5, 0),
+        (6, 0),
+        (8, 0),
+        (0, 1),
+        (1, 1),
+        (2, 1),
+        (3, 1),
+        (4, 1),
+        (0, 2),
+        (1, 2),
+        (2, 2),
+        (3, 2),
+        (4, 2),
+        (0, 3),
+        (1, 3),
+        (2, 3),
+        (0, 4),
+        (2, 4),
+        (4, 4),
     )
 }
 
@@ -467,7 +509,11 @@ mod simd {
         let mut i = 0usize;
         while i + 32 <= n {
             let v = _mm512_loadu_si512(base.add(i).cast());
-            let mut m = if SUB { mask_sub(v, &p) } else { mask_2cmp(v, &p) };
+            let mut m = if SUB {
+                mask_sub(v, &p)
+            } else {
+                mask_2cmp(v, &p)
+            };
             while m != 0 {
                 let j = m.trailing_zeros() as usize;
                 sink.hit(i + j);
@@ -487,7 +533,7 @@ mod simd {
         _s: &mut Scratch,
         out: &mut Vec<usize>,
     ) {
-        debug_assert!(V % 2 == 0);
+        debug_assert!(V.is_multiple_of(2));
         let n = inp.codes.len();
         let base = inp.codes.as_ptr();
         let p = broadcast(cover);
@@ -527,29 +573,76 @@ struct Algo {
 }
 
 fn registry() -> Vec<Algo> {
-    // KERNELS_ONLY: the shipped-original compare loop plus the five strongest
-    // new scan kernels, no scalar exploratory variants.
+    // Keep only the oracle, portable autovec candidates, the original
+    // intrinsic baseline, and retained-mask block-size comparisons.
     let mut v: Vec<Algo> = vec![
-        Algo { name: "rows_tbl", f: a1t_rows_table },
-        Algo { name: "av_c4t", f: av_c4t256 },
-        Algo { name: "av_shape", f: av_shape },
-        Algo { name: "av_shp64", f: av_shape64 },
+        Algo {
+            name: "rows_tbl",
+            f: a1t_rows_table,
+        },
+        Algo {
+            name: "av_c4t",
+            f: av_c4t256,
+        },
+        Algo {
+            name: "av_shape",
+            f: av_shape,
+        },
+        Algo {
+            name: "av_shp64",
+            f: av_shape64,
+        },
     ];
     if std::env::var_os("LAB_ALL_SCALARS").is_some() {
-        v.push(Algo { name: "b1t_codes", f: b1t_codes_table });
-        v.push(Algo { name: "c4p_512", f: c4p_sb512 });
-        v.push(Algo { name: "c4po_512", f: c4po_sb512 });
-        v.push(Algo { name: "c4t_512", f: c4t_sb512 });
+        v.push(Algo {
+            name: "b1t_codes",
+            f: b1t_codes_table,
+        });
+        v.push(Algo {
+            name: "c4p_512",
+            f: c4p_sb512,
+        });
+        v.push(Algo {
+            name: "c4po_512",
+            f: c4po_sb512,
+        });
+        v.push(Algo {
+            name: "c4t_512",
+            f: c4t_sb512,
+        });
     }
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
-            v.push(Algo { name: "ORIGINAL", f: |c, i, s, o| unsafe { simd::r2g::<false>(c, i, s, o) } });
-            v.push(Algo { name: "r2g_sub", f: |c, i, s, o| unsafe { simd::r2g::<true>(c, i, s, o) } });
-            v.push(Algo { name: "r6g_64", f: |c, i, s, o| unsafe { simd::r6g::<2>(c, i, s, o) } });
-            v.push(Algo { name: "r6g_256", f: |c, i, s, o| unsafe { simd::r6g::<8>(c, i, s, o) } });
-            v.push(Algo { name: "r6g_512", f: |c, i, s, o| unsafe { simd::r6g::<16>(c, i, s, o) } });
+            v.push(Algo {
+                name: "ORIGINAL",
+                f: |c, i, s, o| unsafe { simd::r2g::<false>(c, i, s, o) },
+            });
+            v.push(Algo {
+                name: "r2g_sub",
+                f: |c, i, s, o| unsafe { simd::r2g::<true>(c, i, s, o) },
+            });
+            v.push(Algo {
+                name: "r6g_64",
+                f: |c, i, s, o| unsafe { simd::r6g::<2>(c, i, s, o) },
+            });
+            v.push(Algo {
+                name: "r6g_128",
+                f: |c, i, s, o| unsafe { simd::r6g::<4>(c, i, s, o) },
+            });
+            v.push(Algo {
+                name: "r6g_256",
+                f: |c, i, s, o| unsafe { simd::r6g::<8>(c, i, s, o) },
+            });
+            v.push(Algo {
+                name: "r6g_512",
+                f: |c, i, s, o| unsafe { simd::r6g::<16>(c, i, s, o) },
+            });
         }
+    }
+    if let Ok(filter) = std::env::var("LAB_ALGO") {
+        v.retain(|algo| algo.name == filter);
+        assert!(!v.is_empty(), "unknown LAB_ALGO: {filter}");
     }
     v
 }
@@ -567,7 +660,7 @@ fn measure(
         return Err(format!("MISMATCH {} vs {}", out.len(), expect.len()));
     }
     let mut best = f64::INFINITY;
-    for _ in 0..REPS {
+    for _ in 0..reps() {
         out.clear();
         let t = Instant::now();
         (algo.f)(black_box(cover), black_box(inp), s, &mut out);
@@ -637,7 +730,10 @@ fn gen_input(n: usize, avg_row: usize, density: f64, cover: &Cover, rng: &mut Rn
         cum = (cum + len).min(n);
         off.push(cum as u32);
     }
-    let hits = codes.iter().filter(|&&c| cover.table[c as usize] != 0).count();
+    let hits = codes
+        .iter()
+        .filter(|&&c| cover.table[c as usize] != 0)
+        .count();
     let sparse = (hits as f64) < (n as f64) * 1e-4;
     Input { codes, off, sparse }
 }
@@ -645,14 +741,27 @@ fn gen_input(n: usize, avg_row: usize, density: f64, cover: &Cover, rng: &mut Rn
 fn run_synth() {
     let n = 16_000_000usize;
     let shapes: &[(usize, usize)] = &[
-        (1, 0), (0, 1), (2, 0), (1, 1), (0, 2),
-        (4, 0), (2, 2), (0, 4),
-        (8, 0), (6, 2), (4, 4), (2, 6), (0, 8),
+        (1, 0),
+        (0, 1),
+        (2, 0),
+        (1, 1),
+        (0, 2),
+        (4, 0),
+        (2, 2),
+        (0, 4),
+        (8, 0),
+        (6, 2),
+        (4, 4),
+        (2, 6),
+        (0, 8),
     ];
     let densities = [1e-5, 1e-3, 1e-2, 5e-2];
     let algos = registry();
     for &d in &densities {
-        println!("\n== synth covers: n=16M, avg_row=11, density={d:.0e} (ns/code, best of {REPS}) ==");
+        println!(
+            "\n== synth covers: n=16M, avg_row=11, density={d:.0e} (ns/code, best of {}) ==",
+            reps()
+        );
         print!("{:10}", "shape P,R");
         for a in &algos {
             print!("{:>10}", a.name);
@@ -665,7 +774,9 @@ fn run_synth() {
             let mut expect = Vec::new();
             let mut s0 = Scratch { blockany: vec![] };
             a1t_rows_table(&cover, &inp, &mut s0, &mut expect);
-            let mut scratch = Scratch { blockany: vec![0u8; n / 64 + 16] };
+            let mut scratch = Scratch {
+                blockany: vec![0u8; n / 64 + 16],
+            };
             print!("{:10}", format!("({np},{nr})"));
             for algo in &algos {
                 match measure(algo, &cover, &inp, &mut scratch, &expect) {
@@ -690,13 +801,17 @@ fn run_real(codes_path: &str, off_path: &str, covers_path: &str) {
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
     let algos = registry();
-    println!("== real covers, P+R in 1..=8 (ns/code, best of {REPS}) ==");
+    println!(
+        "== real covers, P+R in 1..=8 (ns/code, best of {}) ==",
+        reps()
+    );
     print!("{:>6}{:>10}{:>8}", "P,R", "coverage", "rows");
     for a in &algos {
         print!("{:>10}", a.name);
     }
     println!();
-    let mut rows_meta: Vec<(usize, usize, f64, Vec<u16>, Vec<(u16, u16)>, String)> = Vec::new();
+    type CoverRecord = (usize, usize, f64, Vec<u16>, Vec<(u16, u16)>, String);
+    let mut rows_meta: Vec<CoverRecord> = Vec::new();
     for line in std::fs::read_to_string(covers_path).unwrap().lines() {
         let f: Vec<&str> = line.split('\t').collect();
         let coverage: f64 = f[1].parse().unwrap();
@@ -737,12 +852,22 @@ fn run_real(codes_path: &str, off_path: &str, covers_path: &str) {
     }
     for (np, nr, coverage, points, ranges, id) in rows_meta {
         let cover = Cover::build(points, ranges);
-        let inp = Input { codes: codes.clone(), off: off.clone(), sparse: coverage < 1e-4 };
+        let inp = Input {
+            codes: codes.clone(),
+            off: off.clone(),
+            sparse: coverage < 1e-4,
+        };
         let mut expect = Vec::new();
         let mut s0 = Scratch { blockany: vec![] };
         a1t_rows_table(&cover, &inp, &mut s0, &mut expect);
-        let mut scratch = Scratch { blockany: vec![0u8; inp.codes.len() / 64 + 16] };
-        print!("{:>6}{coverage:>10.6}{:>8}", format!("{np},{nr}"), expect.len());
+        let mut scratch = Scratch {
+            blockany: vec![0u8; inp.codes.len() / 64 + 16],
+        };
+        print!(
+            "{:>6}{coverage:>10.6}{:>8}",
+            format!("{np},{nr}"),
+            expect.len()
+        );
         for algo in &algos {
             match measure(algo, &cover, &inp, &mut scratch, &expect) {
                 Ok(ns) => print!("{ns:>10.3}"),
