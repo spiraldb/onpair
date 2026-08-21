@@ -28,10 +28,11 @@ pub(super) fn scan_rows<O: Offset>(
     for row in 0..rows {
         let begin = row_offsets[row].to_usize();
         let end = row_offsets[row + 1].to_usize();
-        if codes[begin..end]
-            .iter()
-            .any(|&code| cover.table[code as usize])
-        {
+        if codes[begin..end].iter().any(|&code| {
+            // SAFETY: compressed codes are dictionary token ids, and the cover
+            // table has exactly one entry per dictionary token.
+            unsafe { *cover.table.get_unchecked(code as usize) }
+        }) {
             out.push(row);
         }
         if bail && row & 0x0fff == 0x0fff && row + 1 >= min_seen {

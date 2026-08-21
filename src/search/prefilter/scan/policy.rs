@@ -64,8 +64,26 @@ macro_rules! with_avx2_fixed_shapes {
     };
 }
 
+/// Fixed cover shapes used by the sparse AVX-512 superblock gate. These are
+/// common selective shapes whose broadcasts fit comfortably in registers.
 #[cfg(any(target_arch = "x86_64", test))]
-pub(super) use {with_avx2_fixed_shapes, with_sse2_fixed_shapes};
+macro_rules! with_avx512_sparse_fixed_shapes {
+    ($apply:ident) => {
+        $apply! {
+            (0, 1),
+            (1, 1),
+            (2, 0),
+            (2, 2),
+            (3, 1),
+            (4, 2),
+            (5, 0),
+            (10, 3),
+        }
+    };
+}
+
+#[cfg(any(target_arch = "x86_64", test))]
+pub(super) use {with_avx2_fixed_shapes, with_avx512_sparse_fixed_shapes, with_sse2_fixed_shapes};
 
 /// Shape of a normalized probe cover.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +201,8 @@ impl Ratio {
 }
 
 const SPARSE_ROW_MAPPING_MAX_COVERAGE: Ratio = Ratio::new(1, 10_000);
+#[cfg(any(target_arch = "x86_64", test))]
+const AVX512_BLOCK_ROWS_MAX_COVERAGE: Ratio = Ratio::new(1, 1_000);
 #[cfg(any(target_arch = "x86_64", test))]
 const COMPACT_ONE_POINT_MIN_COVERAGE: Ratio = Ratio::new(7, 10_000);
 #[cfg(any(target_arch = "x86_64", test))]
@@ -307,6 +327,10 @@ pub(super) enum Avx2Kernel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(any(target_arch = "x86_64", test))]
 pub(super) enum Avx512Kernel {
+    SparseFixed(FixedShape),
+    SparseGeneric,
+    OnePoint,
+    OneRange,
     Generic,
 }
 
@@ -315,6 +339,8 @@ pub(super) enum Kernel {
     Empty,
     #[cfg(any(target_arch = "x86_64", test))]
     RowsTable,
+    #[cfg(any(target_arch = "x86_64", test))]
+    CodesTable,
     #[cfg(any(target_arch = "aarch64", test))]
     Neon(NeonKernel),
     #[cfg(any(target_arch = "x86_64", test))]
@@ -351,7 +377,7 @@ pub(super) const BAIL_MIN_SEEN_DIVISOR: usize = 8;
 pub(super) const BAIL_RATIO_NUM: usize = 3;
 #[cfg(any(target_arch = "x86_64", test))]
 pub(super) const BAIL_RATIO_DEN: usize = 4;
-const BAIL_MIN_COVERAGE: Ratio = Ratio::new(1, 20);
+const BAIL_MIN_COVERAGE: Ratio = Ratio::new(1, 10);
 
 /// Select a kernel without inspecting code values or executing SIMD.
 #[inline]
@@ -426,9 +452,27 @@ fn select_x86_64(
     let reserve = facts.region.row_count.min(facts.expected_covered_codes());
     let kernel = if avx512bw {
         if use_avx512_rows_table(facts) {
-            Kernel::RowsTable
+            if facts.covered_below(LONG_ROW_TABLE_MIN_COVERAGE) {
+                Kernel::CodesTable
+            } else {
+                Kernel::RowsTable
+            }
+        } else if facts.covered_below(AVX512_BLOCK_ROWS_MAX_COVERAGE) {
+            let shape = facts.analysis.shape;
+            if is_avx512_sparse_fixed(shape) {
+                Kernel::Avx512(Avx512Kernel::SparseFixed(FixedShape::new(
+                    shape.points,
+                    shape.ranges,
+                )))
+            } else {
+                Kernel::Avx512(Avx512Kernel::SparseGeneric)
+            }
         } else {
-            Kernel::Avx512(Avx512Kernel::Generic)
+            match (facts.analysis.shape.points, facts.analysis.shape.ranges) {
+                (1, 0) => Kernel::Avx512(Avx512Kernel::OnePoint),
+                (0, 1) => Kernel::Avx512(Avx512Kernel::OneRange),
+                _ => Kernel::Avx512(Avx512Kernel::Generic),
+            }
         }
     } else if avx2 {
         select_avx2(facts)
@@ -443,6 +487,16 @@ fn select_x86_64(
         reserve,
         bail,
     }
+}
+
+#[cfg(any(target_arch = "x86_64", test))]
+fn is_avx512_sparse_fixed(shape: CoverShape) -> bool {
+    macro_rules! matches_shape {
+        ($(($points:literal, $ranges:literal),)+) => {
+            matches!((shape.points, shape.ranges), $(($points, $ranges))|+)
+        };
+    }
+    with_avx512_sparse_fixed_shapes!(matches_shape)
 }
 
 #[cfg(any(target_arch = "x86_64", test))]
@@ -620,6 +674,57 @@ mod tests {
     }
 
     #[test]
+    fn bailout_starts_at_ten_percent_coverage() {
+        let mut below = facts(1, 0);
+        below.analysis.covered_codes = 999;
+        assert!(!select_kernel(TargetCaps::Aarch64Neon, below).bail);
+        below.analysis.covered_codes = 1_000;
+        assert!(select_kernel(TargetCaps::Aarch64Neon, below).bail);
+    }
+
+    #[test]
+    fn avx512_selects_fixed_single_probe_leaves() {
+        let caps = TargetCaps::X86_64 {
+            avx2: true,
+            avx512bw: true,
+        };
+        let mut point = facts(1, 0);
+        point.analysis.covered_codes = 10;
+        let mut range = facts(0, 1);
+        range.analysis.covered_codes = 10;
+        assert_eq!(
+            select_kernel(caps, point).kernel,
+            Kernel::Avx512(Avx512Kernel::OnePoint)
+        );
+        assert_eq!(
+            select_kernel(caps, range).kernel,
+            Kernel::Avx512(Avx512Kernel::OneRange)
+        );
+    }
+
+    #[test]
+    fn avx512_superblock_gate_is_strictly_below_one_tenth_percent() {
+        let caps = TargetCaps::X86_64 {
+            avx2: true,
+            avx512bw: true,
+        };
+        assert_eq!(
+            select_kernel(caps, facts(1, 1)).kernel,
+            Kernel::Avx512(Avx512Kernel::SparseFixed(FixedShape::new(1, 1)))
+        );
+        assert_eq!(
+            select_kernel(caps, facts(20, 8)).kernel,
+            Kernel::Avx512(Avx512Kernel::SparseGeneric)
+        );
+        let mut at = facts(1, 1);
+        at.analysis.covered_codes = 10;
+        assert_eq!(
+            select_kernel(caps, at).kernel,
+            Kernel::Avx512(Avx512Kernel::Generic)
+        );
+    }
+
+    #[test]
     fn neon_shape_matrix_preserves_specializations() {
         let cases = [
             ((0, 1), NeonKernel::OneRange),
@@ -676,11 +781,27 @@ mod tests {
         let sparse_wide = facts(40, 0);
         assert_eq!(
             select_kernel(caps, sparse_wide).kernel,
-            Kernel::Avx512(Avx512Kernel::Generic)
+            Kernel::Avx512(Avx512Kernel::SparseGeneric)
         );
         // Beyond the flat escape cost the table wins at any density.
         let sparse_very_wide = facts(40, 20);
-        assert_eq!(select_kernel(caps, sparse_very_wide).kernel, Kernel::RowsTable);
+        assert_eq!(
+            select_kernel(caps, sparse_very_wide).kernel,
+            Kernel::CodesTable
+        );
+    }
+
+    #[test]
+    fn avx512_very_wide_table_materialization_tracks_density() {
+        let caps = TargetCaps::X86_64 {
+            avx2: true,
+            avx512bw: true,
+        };
+        let mut input = facts(65, 0);
+        input.analysis.covered_codes = 299;
+        assert_eq!(select_kernel(caps, input).kernel, Kernel::CodesTable);
+        input.analysis.covered_codes = 300;
+        assert_eq!(select_kernel(caps, input).kernel, Kernel::RowsTable);
     }
 
     #[test]

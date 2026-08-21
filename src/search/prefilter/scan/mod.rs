@@ -9,7 +9,8 @@
 //! membership-table scan with one early exit per row.
 //!
 //! There is no silent full-column fallback when SIMD is unavailable. The x86
-//! row-centric path is an explicit density and row-length policy; other covers
+//! table paths are explicit density and row-length policy: sparse wide covers
+//! walk codes, while dense wide covers walk rows for early exit. Other covers
 //! use the detected vector kernel. The scalar routine under `cfg(test)` is the
 //! common correctness oracle.
 
@@ -141,6 +142,17 @@ pub(super) fn execute<O: Offset>(
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
+        Kernel::CodesTable => {
+            table::scan_codes(
+                input.codes,
+                input.row_offsets,
+                input.cover,
+                sparse_row_mapping,
+                out,
+            );
+            Ok(())
+        }
+        #[cfg(target_arch = "x86_64")]
         Kernel::Sse2(kernel) => {
             x86::execute_sse2(kernel, input, sparse_row_mapping, out);
             Ok(())
@@ -149,6 +161,52 @@ pub(super) fn execute<O: Offset>(
         Kernel::Avx2(kernel) => {
             // SAFETY: the plan is created only after runtime AVX2 detection.
             unsafe { x86::execute_avx2(kernel, input, sparse_row_mapping, out) };
+            Ok(())
+        }
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx512(Avx512Kernel::SparseFixed(shape)) => {
+            // SAFETY: the plan is created only after runtime AVX-512BW
+            // detection, which implies AVX-512F.
+            unsafe { x86::execute_avx512_sparse_fixed(shape, input, out) };
+            Ok(())
+        }
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx512(Avx512Kernel::SparseGeneric) => {
+            // SAFETY: the plan is created only after runtime AVX-512BW
+            // detection, which implies AVX-512F.
+            unsafe { x86::scan_avx512_sparse(input.codes, input.row_offsets, input.cover, out) };
+            Ok(())
+        }
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx512(Avx512Kernel::OnePoint) => {
+            // SAFETY: the plan is created only after runtime AVX-512BW
+            // detection, which implies AVX-512F.
+            unsafe {
+                x86::scan_avx512_one_point(
+                    input.codes,
+                    input.row_offsets,
+                    input.cover,
+                    sparse_row_mapping,
+                    plan.bail,
+                    out,
+                )
+            };
+            Ok(())
+        }
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Avx512(Avx512Kernel::OneRange) => {
+            // SAFETY: the plan is created only after runtime AVX-512BW
+            // detection, which implies AVX-512F.
+            unsafe {
+                x86::scan_avx512_one_range(
+                    input.codes,
+                    input.row_offsets,
+                    input.cover,
+                    sparse_row_mapping,
+                    plan.bail,
+                    out,
+                )
+            };
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]

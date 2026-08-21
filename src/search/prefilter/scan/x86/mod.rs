@@ -6,7 +6,7 @@
 use super::ScanInput;
 use super::policy::{
     Avx2Kernel, FixedShape, HitMaterialization, Sse2Kernel, with_avx2_fixed_shapes,
-    with_sse2_fixed_shapes,
+    with_avx512_sparse_fixed_shapes, with_sse2_fixed_shapes,
 };
 use super::table;
 use crate::core::offset::Offset;
@@ -23,7 +23,10 @@ pub(super) use avx2::{
     scan_avx2_few, scan_avx2_fixed, scan_avx2_gather, scan_avx2_nibble_points, scan_avx2_one_point,
     scan_avx2_one_range,
 };
-pub(in crate::search::prefilter) use avx512::scan_avx512;
+pub(in crate::search::prefilter) use avx512::{
+    scan_avx512, scan_avx512_one_point, scan_avx512_one_range, scan_avx512_sparse,
+    scan_avx512_sparse_fixed,
+};
 #[cfg(test)]
 pub(in crate::search::prefilter) use sse2::scan_sse2;
 pub(super) use sse2::{scan_sse2_fixed, scan_sse2_generic, scan_sse2_one_point};
@@ -164,4 +167,31 @@ unsafe fn execute_avx2_fixed<O: Offset>(
         };
     }
     unsafe { with_avx2_fixed_shapes!(execute_shape) }
+}
+
+pub(super) unsafe fn execute_avx512_sparse_fixed<O: Offset>(
+    shape: FixedShape,
+    input: ScanInput<'_, O>,
+    out: &mut Vec<usize>,
+) {
+    let ScanInput {
+        codes,
+        row_offsets,
+        cover,
+        ..
+    } = input;
+    macro_rules! call {
+        ($points:literal, $ranges:literal) => {
+            scan_avx512_sparse_fixed::<O, $points, $ranges>(codes, row_offsets, cover, out)
+        };
+    }
+    macro_rules! execute_shape {
+        ($(($points:literal, $ranges:literal),)+) => {
+            match (shape.points, shape.ranges) {
+                $(($points, $ranges) => call!($points, $ranges),)+
+                _ => unreachable!("invalid AVX-512 block fixed shape"),
+            }
+        };
+    }
+    unsafe { with_avx512_sparse_fixed_shapes!(execute_shape) }
 }

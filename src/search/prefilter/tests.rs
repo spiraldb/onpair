@@ -653,6 +653,45 @@ fn x86_kernels_match_scalar() {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn avx512_sparse_fixed_matches_scalar() {
+    if !std::is_x86_feature_detected!("avx512bw") {
+        return;
+    }
+    let mut table = vec![false; 4096];
+    table[7] = true;
+    table[29] = true;
+    table[100..=103].fill(true);
+    table[2000..=2007].fill(true);
+    let pf = ProbeCover::from_membership(table, Some);
+    assert_eq!((pf.points.len(), pf.ranges.len()), (2, 2));
+
+    let mut codes = Vec::with_capacity(16_384);
+    let mut row_offsets = vec![0u32];
+    for row in 0..2_048 {
+        for lane in 0..8 {
+            let index = row * 8 + lane;
+            let code = match index {
+                511 => 7,
+                512 => 29,
+                4_095 => 101,
+                4_096 => 2004,
+                16_383 => 7,
+                _ => 3000,
+            };
+            codes.push(code);
+        }
+        row_offsets.push(codes.len() as u32);
+    }
+
+    let mut actual = Vec::new();
+    super::scan::scan(&codes, &row_offsets, &pf, 5, &mut actual).unwrap();
+    let mut oracle = Vec::new();
+    super::scan::scan_scalar(&codes, &row_offsets, &pf, &mut oracle);
+    assert_eq!(actual, oracle);
+}
+
 #[test]
 fn signed_bias_range_matches_unsigned() {
     fn in_range_biased(c: u16, lo: u16, hi: u16) -> bool {
@@ -705,7 +744,10 @@ fn dense_scans_bail_to_a_sound_superset() {
         super::scan::scan(codes, row_offsets, pf, covered, &mut out).unwrap();
         let mut oracle = Vec::new();
         super::scan::scan_scalar(codes, row_offsets, pf, &mut oracle);
-        assert!(out.windows(2).all(|w| w[0] < w[1]), "ascending, deduplicated");
+        assert!(
+            out.windows(2).all(|w| w[0] < w[1]),
+            "ascending, deduplicated"
+        );
         let set: std::collections::HashSet<usize> = out.iter().copied().collect();
         assert!(oracle.iter().all(|r| set.contains(r)), "superset of exact");
         assert!(out.len() > oracle.len(), "the dense scan bailed");
