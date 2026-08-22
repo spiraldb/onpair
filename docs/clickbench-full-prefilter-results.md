@@ -140,6 +140,28 @@ reported 27.55B to 11.63B instructions, 6.23B to 2.36B branches, and 20.60M to
 1.20M branch misses. These counter ratios include dump loading and frequency
 index construction, so they are conservative; the timed scan values do not.
 
+### Google P3R2 audit
+
+The full URL-column `google` query normalizes to three points and two ranges.
+It previously missed the fixed sparse-shape matrix and entered the dynamic
+AVX-512 kernel. Adding P3R2 to that matrix reduced the production exact
+prefilter from 498.858 ms to 306.079 ms (38.65%) and prefilter plus KMP from
+523.072 ms to 330.971 ms (36.73%).
+
+The fixed prescan assembly uses one ZMM load, three chained mask point-miss
+comparisons, two `vpsubw`, and two unsigned mask range comparisons per 32
+codes. Sixteen vectors are unrolled per 512-code summary bit and finish with
+one `kortestd`; there is no per-vector `kmov` in this pass. Exact refinement
+uses the same intrinsic predicate and transfers only final live masks to scalar
+registers. Row materialization and block-to-row mapping are scalar because they
+walk variable-density masks and row offsets. Token KMP is also scalar: its next
+state depends on the preceding state, so it cannot be auto-vectorized.
+
+A diagnostic localized-window refinement reduced KMP input from 5,129,154 to
+1,229,374 codes (76.03%). Its best 512-code hierarchy was 304.995 ms, narrowly
+behind the direct one-bit-superblock-to-KMP path at 300.703 ms. The exact live
+block rescan, not KMP input volume, is the remaining crossover cost.
+
 ## Conclusion
 
 - Keep one production implementation: explicit AVX-512 intrinsics, 512 codes

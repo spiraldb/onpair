@@ -75,6 +75,7 @@ macro_rules! with_avx512_sparse_fixed_shapes {
             (2, 0),
             (2, 2),
             (3, 1),
+            (3, 2),
             (4, 2),
             (5, 0),
             (10, 3),
