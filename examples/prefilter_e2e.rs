@@ -9,18 +9,21 @@ use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::hint::black_box;
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
+use memchr::memmem::Finder;
 use onpair::search::index::build_token_frequency_index;
 use onpair::search::{
     BytesVerifier, ContainsTable, ProbeCover, analyze_prefilter, contains, prefilter_candidates,
 };
 use onpair::{
-    Column, CompactDictionary, Config, DictionaryView, MAX_TOKEN_SIZE, MaxDictBits,
-    OwnedDictionaryStorage, Threshold, TokenRange, compress,
+    Column, CompactDictionary, CompactDictionaryView, Config, DECODE_PADDING, DictionaryView,
+    MAX_TOKEN_SIZE, MaxDictBits, OwnedDictionaryStorage, Threshold, TokenRange, compress,
+    decode_into,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -760,6 +763,235 @@ fn refine_live_blocks_fixed<const BLOCK_CODES: usize, const POINTS: usize, const
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
+fn refine_live_block_positions_fixed<
+    const BLOCK_CODES: usize,
+    const POINTS: usize,
+    const RANGES: usize,
+>(
+    codes: &[u16],
+    cover: &ProbeCover,
+    summary: &[u64],
+    out: &mut Vec<usize>,
+) {
+    use core::arch::x86_64::{
+        __m512i, _mm512_loadu_si512, _mm512_mask_cmpgt_epu16_mask, _mm512_mask_cmpneq_epu16_mask,
+        _mm512_set1_epi16, _mm512_sub_epi16,
+    };
+
+    out.clear();
+    let points: [__m512i; POINTS] =
+        std::array::from_fn(|i| _mm512_set1_epi16(cover.points()[i] as i16));
+    let ranges: [(__m512i, __m512i); RANGES] = std::array::from_fn(|i| {
+        let range = cover.ranges()[i];
+        (
+            _mm512_set1_epi16(range.begin as i16),
+            _mm512_set1_epi16(range.last.wrapping_sub(range.begin) as i16),
+        )
+    });
+    let base_ptr = codes.as_ptr();
+    for (word_index, &word) in summary.iter().enumerate() {
+        let mut live = word;
+        while live != 0 {
+            let block = word_index * 64 + live.trailing_zeros() as usize;
+            let begin = block * BLOCK_CODES;
+            let end = (begin + BLOCK_CODES).min(codes.len());
+            let mut index = begin;
+            while index + 32 <= end {
+                let value = unsafe { _mm512_loadu_si512(base_ptr.add(index).cast()) };
+                let mut miss = u32::MAX;
+                for &point in &points {
+                    miss = _mm512_mask_cmpneq_epu16_mask(miss, value, point);
+                }
+                for &(lo, span) in &ranges {
+                    miss = _mm512_mask_cmpgt_epu16_mask(miss, _mm512_sub_epi16(value, lo), span);
+                }
+                let mut hits = !miss;
+                while hits != 0 {
+                    out.push(index + hits.trailing_zeros() as usize);
+                    hits &= hits - 1;
+                }
+                index += 32;
+            }
+            for (tail, &code) in codes[index..end].iter().enumerate() {
+                if cover.points().contains(&code)
+                    || cover.ranges().iter().any(|range| range.contains(code))
+                {
+                    out.push(index + tail);
+                }
+            }
+            live &= live - 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+fn refine_live_block_positions<const BLOCK_CODES: usize>(
+    codes: &[u16],
+    cover: &ProbeCover,
+    summary: &[u64],
+    out: &mut Vec<usize>,
+) {
+    use core::arch::x86_64::{
+        __m512i, _mm512_cmpeq_epu16_mask, _mm512_cmple_epu16_mask, _mm512_loadu_si512,
+        _mm512_set1_epi16, _mm512_sub_epi16,
+    };
+
+    out.clear();
+    let points: Vec<__m512i> = cover
+        .points()
+        .iter()
+        .map(|&point| _mm512_set1_epi16(point as i16))
+        .collect();
+    let ranges: Vec<(__m512i, __m512i)> = cover
+        .ranges()
+        .iter()
+        .map(|range| {
+            (
+                _mm512_set1_epi16(range.begin as i16),
+                _mm512_set1_epi16(range.last.wrapping_sub(range.begin) as i16),
+            )
+        })
+        .collect();
+    let base_ptr = codes.as_ptr();
+    for (word_index, &word) in summary.iter().enumerate() {
+        let mut live = word;
+        while live != 0 {
+            let block = word_index * 64 + live.trailing_zeros() as usize;
+            let begin = block * BLOCK_CODES;
+            let end = (begin + BLOCK_CODES).min(codes.len());
+            let mut index = begin;
+            while index + 32 <= end {
+                let value = unsafe { _mm512_loadu_si512(base_ptr.add(index).cast()) };
+                let mut hits = 0u32;
+                for &point in &points {
+                    hits |= _mm512_cmpeq_epu16_mask(value, point);
+                }
+                for &(lo, span) in &ranges {
+                    hits |= _mm512_cmple_epu16_mask(_mm512_sub_epi16(value, lo), span);
+                }
+                while hits != 0 {
+                    out.push(index + hits.trailing_zeros() as usize);
+                    hits &= hits - 1;
+                }
+                index += 32;
+            }
+            for (tail, &code) in codes[index..end].iter().enumerate() {
+                if cover.points().contains(&code)
+                    || cover.ranges().iter().any(|range| range.contains(code))
+                {
+                    out.push(index + tail);
+                }
+            }
+            live &= live - 1;
+        }
+    }
+}
+
+fn localized_kmp(
+    codes: &[u16],
+    row_offsets: &[u64],
+    positions: &[usize],
+    windows: &[(usize, usize)],
+    table: &ContainsTable,
+    out: &mut Vec<usize>,
+) -> usize {
+    out.clear();
+    let mut scanned_codes = 0usize;
+    let mut row = 0usize;
+    let mut position_index = 0usize;
+    while position_index < positions.len() {
+        let position = positions[position_index];
+        row = interpolated_row(position, row, row_offsets);
+        let row_end = row_offsets[row + 1] as usize;
+        let mut matched = false;
+        while position_index < positions.len() && positions[position_index] < row_end {
+            let hit = positions[position_index];
+            if !matched {
+                let (before, after) = windows[codes[hit] as usize];
+                let begin = (row_offsets[row] as usize).max(hit.saturating_sub(before));
+                let end = row_end.min(hit.saturating_add(after).saturating_add(1));
+                scanned_codes += end - begin;
+                matched = contains(&codes[begin..end], table);
+            }
+            position_index += 1;
+        }
+        if matched {
+            out.push(row);
+        }
+    }
+    scanned_codes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn localized_memmem(
+    codes: &[u16],
+    row_offsets: &[u64],
+    dict: CompactDictionaryView<'_>,
+    positions: &[usize],
+    windows: &[(usize, usize)],
+    finder: &Finder<'_>,
+    scratch: &mut Vec<MaybeUninit<u8>>,
+    out: &mut Vec<usize>,
+) -> usize {
+    out.clear();
+    let mut scanned_codes = 0usize;
+    let mut row = 0usize;
+    let mut position_index = 0usize;
+    while position_index < positions.len() {
+        let position = positions[position_index];
+        row = interpolated_row(position, row, row_offsets);
+        let row_end = row_offsets[row + 1] as usize;
+        let mut matched = false;
+        while position_index < positions.len() && positions[position_index] < row_end {
+            let hit = positions[position_index];
+            if !matched {
+                let (before, after) = windows[codes[hit] as usize];
+                let begin = (row_offsets[row] as usize).max(hit.saturating_sub(before));
+                let end = row_end.min(hit.saturating_add(after).saturating_add(1));
+                let window = &codes[begin..end];
+                scanned_codes += window.len();
+                let need = window.len() * MAX_TOKEN_SIZE + DECODE_PADDING;
+                if scratch.len() < need {
+                    scratch.resize(need, MaybeUninit::uninit());
+                }
+                let written = unsafe { decode_into(window, dict, scratch) };
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), written) };
+                matched = finder.find(bytes).is_some();
+            }
+            position_index += 1;
+        }
+        if matched {
+            out.push(row);
+        }
+    }
+    scanned_codes
+}
+
+#[inline]
+fn interpolated_row(position: usize, floor: usize, row_offsets: &[u64]) -> usize {
+    if position < row_offsets[floor + 1] as usize {
+        return floor;
+    }
+    let rows = row_offsets.len() - 1;
+    let base_code = row_offsets[floor] as usize;
+    let remaining_codes = row_offsets[rows] as usize - base_code;
+    let remaining_rows = rows - floor;
+    let delta = position - base_code;
+    let mut row = floor + delta.saturating_mul(remaining_rows) / remaining_codes.max(1);
+    row = row.min(rows - 1);
+    while row > floor && row_offsets[row] as usize > position {
+        row -= 1;
+    }
+    while row + 1 < row_offsets.len() && row_offsets[row + 1] as usize <= position {
+        row += 1;
+    }
+    row
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn refine_live_blocks<const BLOCK_CODES: usize>(
     codes: &[u16],
     row_offsets: &[u64],
@@ -1181,13 +1413,42 @@ fn run(parquet: &Path, dump: &Path) {
     macro_rules! summarize_block {
         ($block:literal, $codes:expr, $cover:expr, $summary:expr) => {
             match ($cover.points().len(), $cover.ranges().len()) {
-                (0, 1) => summarize_superblocks_fixed::<$block, 0, 1>($codes, $cover, $summary),
-                (1, 1) => summarize_superblocks_fixed::<$block, 1, 1>($codes, $cover, $summary),
-                (2, 0) => summarize_superblocks_fixed::<$block, 2, 0>($codes, $cover, $summary),
+                (0, 1) => {
+                    summarize_superblocks_fixed_miss::<$block, 0, 1>($codes, $cover, $summary)
+                }
+                (1, 1) => {
+                    summarize_superblocks_fixed_miss::<$block, 1, 1>($codes, $cover, $summary)
+                }
+                (1, 2) => {
+                    summarize_superblocks_fixed_miss::<$block, 1, 2>($codes, $cover, $summary)
+                }
+                (1, 3) => {
+                    summarize_superblocks_fixed_miss::<$block, 1, 3>($codes, $cover, $summary)
+                }
+                (2, 0) => {
+                    summarize_superblocks_fixed_miss::<$block, 2, 0>($codes, $cover, $summary)
+                }
                 (2, 2) => {
                     summarize_superblocks_fixed_miss::<$block, 2, 2>($codes, $cover, $summary)
                 }
-                (3, 1) => summarize_superblocks_fixed::<$block, 3, 1>($codes, $cover, $summary),
+                (3, 2) => {
+                    summarize_superblocks_fixed_miss::<$block, 3, 2>($codes, $cover, $summary)
+                }
+                (4, 0) => {
+                    summarize_superblocks_fixed_miss::<$block, 4, 0>($codes, $cover, $summary)
+                }
+                (10, 2) => {
+                    summarize_superblocks_fixed_miss::<$block, 10, 2>($codes, $cover, $summary)
+                }
+                (12, 5) => {
+                    summarize_superblocks_fixed_miss::<$block, 12, 5>($codes, $cover, $summary)
+                }
+                (25, 5) => {
+                    summarize_superblocks_fixed_miss::<$block, 25, 5>($codes, $cover, $summary)
+                }
+                (3, 1) => {
+                    summarize_superblocks_fixed_miss::<$block, 3, 1>($codes, $cover, $summary)
+                }
                 (4, 2) => summarize_superblocks_fixed::<$block, 4, 2>($codes, $cover, $summary),
                 (5, 0) => summarize_superblocks_fixed::<$block, 5, 0>($codes, $cover, $summary),
                 (10, 3) => summarize_superblocks_fixed::<$block, 10, 3>($codes, $cover, $summary),
@@ -1457,19 +1718,12 @@ fn run(parquet: &Path, dump: &Path) {
                         let start = Instant::now();
                         match hierarchy_kernel.as_str() {
                             "intrinsics-avx512" => unsafe {
-                                if (cover.points().len(), cover.ranges().len()) == (2, 2) {
-                                    summarize_superblocks_fixed_miss::<$block, 2, 2>(
-                                        black_box(scan_codes),
-                                        black_box(cover),
-                                        black_box(&mut hierarchy_summary),
-                                    )
-                                } else {
-                                    summarize_superblocks::<$block>(
-                                        black_box(scan_codes),
-                                        black_box(cover),
-                                        black_box(&mut hierarchy_summary),
-                                    )
-                                }
+                                summarize_block!(
+                                    $block,
+                                    black_box(scan_codes),
+                                    black_box(cover),
+                                    black_box(&mut hierarchy_summary)
+                                )
                             },
                             "intrinsics-avx2" => unsafe {
                                 summarize_superblocks_avx2_p2r2::<$block>(
@@ -1648,6 +1902,128 @@ fn run(parquet: &Path, dump: &Path) {
                         length_memmem_ns as f64 / 1_000_000.0,
                         (coarse_ns + refine_ns + length_ns + length_memmem_ns) as f64 / 1_000_000.0,
                     );
+                    if named_only {
+                        let mut windows = vec![(query.len(), query.len()); view.dict.num_tokens()];
+                        for window in analysis.probe_windows() {
+                            windows[window.token() as usize] =
+                                (window.before_codes(), window.after_codes());
+                        }
+                        let finder = Finder::new(&query);
+                        let mut positions = Vec::new();
+                        let mut localized_rows = Vec::new();
+                        let mut localized_memmem_rows = Vec::new();
+                        let mut scratch = Vec::new();
+                        let mut localized_samples = Vec::with_capacity(reps);
+                        for _ in 0..reps {
+                            let start = Instant::now();
+                            unsafe {
+                                match (cover.points().len(), cover.ranges().len()) {
+                                    (0, 1) => refine_live_block_positions_fixed::<$block, 0, 1>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (1, 1) => refine_live_block_positions_fixed::<$block, 1, 1>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (1, 2) => refine_live_block_positions_fixed::<$block, 1, 2>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (1, 3) => refine_live_block_positions_fixed::<$block, 1, 3>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (2, 0) => refine_live_block_positions_fixed::<$block, 2, 0>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (2, 2) => refine_live_block_positions_fixed::<$block, 2, 2>(
+                                        black_box(scan_codes),
+                                        black_box(cover),
+                                        black_box(&hierarchy_summary),
+                                        black_box(&mut positions),
+                                    ),
+                                    (3, 2) => refine_live_block_positions_fixed::<$block, 3, 2>(
+                                        black_box(scan_codes),
+                                        black_box(cover),
+                                        black_box(&hierarchy_summary),
+                                        black_box(&mut positions),
+                                    ),
+                                    (3, 1) => refine_live_block_positions_fixed::<$block, 3, 1>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (4, 0) => refine_live_block_positions_fixed::<$block, 4, 0>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (10, 2) => refine_live_block_positions_fixed::<$block, 10, 2>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (12, 5) => refine_live_block_positions_fixed::<$block, 12, 5>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    (25, 5) => refine_live_block_positions_fixed::<$block, 25, 5>(
+                                        black_box(scan_codes), black_box(cover), black_box(&hierarchy_summary), black_box(&mut positions)),
+                                    _ => refine_live_block_positions::<$block>(
+                                        black_box(scan_codes),
+                                        black_box(cover),
+                                        black_box(&hierarchy_summary),
+                                        black_box(&mut positions),
+                                    ),
+                                }
+                            };
+                            let position_ns = start.elapsed().as_nanos();
+
+                            let start = Instant::now();
+                            let kmp_codes = localized_kmp(
+                                black_box(scan_codes),
+                                black_box(scan_offsets),
+                                black_box(&positions),
+                                black_box(&windows),
+                                black_box(&kmp),
+                                black_box(&mut localized_rows),
+                            );
+                            let localized_kmp_ns = start.elapsed().as_nanos();
+
+                            let start = Instant::now();
+                            let memmem_codes = localized_memmem(
+                                black_box(scan_codes),
+                                black_box(scan_offsets),
+                                black_box(view.dict),
+                                black_box(&positions),
+                                black_box(&windows),
+                                black_box(&finder),
+                                black_box(&mut scratch),
+                                black_box(&mut localized_memmem_rows),
+                            );
+                            let localized_memmem_ns = start.elapsed().as_nanos();
+                            assert_eq!(localized_rows, out);
+                            assert_eq!(localized_memmem_rows, out);
+                            localized_samples.push((
+                                position_ns,
+                                localized_kmp_ns,
+                                localized_memmem_ns,
+                                kmp_codes,
+                                memmem_codes,
+                                positions.len(),
+                            ));
+                        }
+                        let position_ns = localized_samples
+                            .iter()
+                            .map(|sample| sample.0)
+                            .min()
+                            .unwrap();
+                        let localized_kmp_ns = localized_samples
+                            .iter()
+                            .map(|sample| sample.1)
+                            .min()
+                            .unwrap();
+                        let localized_memmem_ns = localized_samples
+                            .iter()
+                            .map(|sample| sample.2)
+                            .min()
+                            .unwrap();
+                        println!(
+                            "HIER_MIDCUT{}_{}\thit_positions={}\tkmp_window_codes={}\tmemmem_window_codes={}\tcoarse_ms={:.6}\tposition_refine_ms={:.6}\tlocalized_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tlocalized_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
+                            $block,
+                            label(&query),
+                            localized_samples[0].5,
+                            localized_samples[0].3,
+                            localized_samples[0].4,
+                            coarse_ns as f64 / 1_000_000.0,
+                            position_ns as f64 / 1_000_000.0,
+                            localized_kmp_ns as f64 / 1_000_000.0,
+                            (coarse_ns + position_ns + localized_kmp_ns) as f64 / 1_000_000.0,
+                            localized_memmem_ns as f64 / 1_000_000.0,
+                            (coarse_ns + position_ns + localized_memmem_ns) as f64 / 1_000_000.0,
+                        );
+                    }
                     hierarchy_results.push(($block, coarse_ns + refine_ns + kmp_ns));
                 }};
             }

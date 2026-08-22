@@ -55,6 +55,29 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
+/// A selected cut token and the maximum token-code radius that can participate
+/// in a matching alignment around an occurrence of that token.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ProbeWindow {
+    token: Token,
+    before_codes: usize,
+    after_codes: usize,
+}
+
+impl ProbeWindow {
+    pub fn token(self) -> Token {
+        self.token
+    }
+
+    pub fn before_codes(self) -> usize {
+        self.before_codes
+    }
+
+    pub fn after_codes(self) -> usize {
+        self.after_codes
+    }
+}
+
 /// Reason SIMD prefilter execution could not proceed.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum PrefilterError {
@@ -81,6 +104,7 @@ impl std::error::Error for PrefilterError {}
 #[derive(Debug, Clone)]
 pub struct PrefilterAnalysis {
     probe_cover: ProbeCover,
+    probe_windows: Vec<ProbeWindow>,
     covered_frequency: u32,
     total_frequency: u32,
 }
@@ -89,6 +113,11 @@ impl PrefilterAnalysis {
     /// The normalized checks the SIMD prefilter can execute.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
+    }
+
+    /// Per-token exact-localization windows, sorted by token id.
+    pub fn probe_windows(&self) -> &[ProbeWindow] {
+        &self.probe_windows
     }
 
     /// Number of code positions whose token is covered by the probes.
@@ -190,7 +219,7 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
         "the empty pattern matches every row and needs no prefilter"
     );
     let frequencies_view = frequencies.as_view();
-    let probe_cover = plan::plan(dict, pattern, frequencies_view);
+    let (probe_cover, probe_windows) = plan::plan(dict, pattern, frequencies_view);
     let covered_frequency = probe_cover
         .points
         .iter()
@@ -204,6 +233,7 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
         .sum();
     PrefilterAnalysis {
         probe_cover,
+        probe_windows,
         covered_frequency,
         total_frequency: frequencies.total_frequency(),
     }

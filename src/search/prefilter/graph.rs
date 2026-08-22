@@ -34,6 +34,7 @@
 
 use memchr::memmem::Finder;
 
+use super::ProbeWindow;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::TokenFrequencyIndexView;
@@ -62,6 +63,8 @@ pub(super) enum ProbeSet {
 pub(super) struct AlignmentGraph {
     /// Probe per node, parallel with `weight`.
     probe: Vec<ProbeSet>,
+    /// Maximum code radius around a hit of this probe node.
+    window: Vec<Option<(usize, usize)>>,
     /// Term frequency of each node's probe; zero for structural nodes.
     weight: Vec<u32>,
     /// Every first-token set's ids, back to back.
@@ -115,6 +118,48 @@ impl AlignmentGraph {
             }
         }
         members
+    }
+
+    pub(super) fn localization(&self, cut: &[u32]) -> Vec<ProbeWindow> {
+        let mut bounds = vec![None::<(usize, usize)>; self.num_tokens];
+        let mut merge = |id: Token, before: usize, after: usize| {
+            let slot = &mut bounds[id as usize];
+            *slot = Some(slot.map_or((before, after), |(old_before, old_after)| {
+                (old_before.max(before), old_after.max(after))
+            }));
+        };
+        for &id in &self.contained {
+            merge(id, 0, 0);
+        }
+        for &node in cut {
+            let (before, after) =
+                self.window[node as usize].expect("a selected probe carries localization bounds");
+            match self.probe[node as usize] {
+                ProbeSet::None => unreachable!("a cut cannot select a structural node"),
+                ProbeSet::Point(id) => merge(id, before, after),
+                ProbeSet::Range(range) => {
+                    for id in range.begin..=range.last {
+                        merge(id, before, after);
+                    }
+                }
+                ProbeSet::Set { start, len } => {
+                    for &id in &self.first_set_ids[start as usize..(start + len) as usize] {
+                        merge(id, before, after);
+                    }
+                }
+            }
+        }
+        bounds
+            .into_iter()
+            .enumerate()
+            .filter_map(|(token, bounds)| {
+                bounds.map(|(before_codes, after_codes)| ProbeWindow {
+                    token: token as Token,
+                    before_codes,
+                    after_codes,
+                })
+            })
+            .collect()
     }
 }
 
@@ -193,6 +238,7 @@ struct Builder<'d, 'n, 'f> {
     needle: &'n [u8],
     frequencies: TokenFrequencyIndexView<'f>,
     probe: Vec<ProbeSet>,
+    window: Vec<Option<(usize, usize)>>,
     weight: Vec<u32>,
     first_set_ids: Vec<Token>,
     edges: Vec<(u32, u32)>,
@@ -220,9 +266,10 @@ impl Builder<'_, '_, '_> {
         }
     }
 
-    fn add_node(&mut self, set: ProbeSet) -> u32 {
+    fn add_node(&mut self, set: ProbeSet, window: Option<(usize, usize)>) -> u32 {
         let weight = self.weight_of(set);
         self.probe.push(set);
+        self.window.push(window);
         self.weight.push(weight);
         debug_assert!(self.probe.len() <= u32::MAX as usize, "node id overflow");
         (self.probe.len() - 1) as u32
@@ -277,13 +324,13 @@ impl Builder<'_, '_, '_> {
     }
 
     fn build_state(&mut self, offset: usize) {
-        let state = self.add_node(ProbeSet::None);
+        let state = self.add_node(ProbeSet::None, None);
         self.state_node[offset] = Some(state);
 
         // The occurrence may end inside a longer token starting here.
         let terminal = self.terminal_range(offset);
         if !terminal.is_empty() {
-            let node = self.add_node(ProbeSet::Range(terminal));
+            let node = self.add_node(ProbeSet::Range(terminal), Some((offset, 0)));
             self.add_edge(state, node);
             self.add_edge(node, self.sink);
         }
@@ -291,7 +338,10 @@ impl Builder<'_, '_, '_> {
         let (token, len) = self.greedy_at(offset);
         let next = offset + len;
         if next < self.needle.len() {
-            let node = self.add_node(ProbeSet::Point(token));
+            let node = self.add_node(
+                ProbeSet::Point(token),
+                Some((offset, self.needle.len() - next)),
+            );
             let next_state =
                 self.state_node[next].expect("states are built in reverse chain order");
             self.add_edge(state, node);
@@ -324,6 +374,7 @@ pub(super) fn build_alignment_graph(
         needle,
         frequencies,
         probe: Vec::new(),
+        window: Vec::new(),
         weight: Vec::new(),
         first_set_ids: Vec::new(),
         edges: Vec::new(),
@@ -331,8 +382,8 @@ pub(super) fn build_alignment_graph(
         greedy: vec![None; n],
         state_node: vec![None; n],
     };
-    let source = b.add_node(ProbeSet::None);
-    let sink = b.add_node(ProbeSet::None);
+    let source = b.add_node(ProbeSet::None, None);
+    let sink = b.add_node(ProbeSet::None, None);
     b.sink = sink;
 
     // First-token sets in one dictionary pass: for each alignment k >= 1, how
@@ -379,7 +430,7 @@ pub(super) fn build_alignment_graph(
         if k != 0 && first_count[k] == 0 {
             continue;
         }
-        let alignment = b.add_node(ProbeSet::None);
+        let alignment = b.add_node(ProbeSet::None, None);
         b.add_edge(source, alignment);
         let state = b.ensure_chain(k);
 
@@ -388,10 +439,13 @@ pub(super) fn build_alignment_graph(
             let len = first_count[k];
             b.first_set_ids
                 .extend_from_slice(&first_ids[k * SET_CAP..k * SET_CAP + len]);
-            let node = b.add_node(ProbeSet::Set {
-                start,
-                len: len as u32,
-            });
+            let node = b.add_node(
+                ProbeSet::Set {
+                    start,
+                    len: len as u32,
+                },
+                Some((0, n - k)),
+            );
             b.add_edge(alignment, node);
             b.add_edge(node, state);
         } else {
@@ -401,6 +455,7 @@ pub(super) fn build_alignment_graph(
 
     AlignmentGraph {
         probe: b.probe,
+        window: b.window,
         weight: b.weight,
         first_set_ids: b.first_set_ids,
         edges: b.edges,

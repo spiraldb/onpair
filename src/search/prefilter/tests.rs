@@ -552,7 +552,7 @@ fn assert_kernel_matches_scalar(
         b"zzz",
     ];
     for &pat in patterns {
-        let pf = plan(view.dict, pat, frequencies.as_view());
+        let (pf, _) = plan(view.dict, pat, frequencies.as_view());
         let mut scalar = Vec::new();
         let mut simd = Vec::new();
         super::scan::scan_scalar(view.codes, view.row_offsets, &pf, &mut scalar);
