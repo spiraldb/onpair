@@ -14,13 +14,13 @@ use std::time::Instant;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
+use onpair::search::index::build_token_frequency_index;
 use onpair::search::{
-    BytesVerifier, ContainsTable, ProbeCover, analyze_prefilter, build_token_frequency_index,
-    contains, prefilter_candidates,
+    BytesVerifier, ContainsTable, ProbeCover, analyze_prefilter, contains, prefilter_candidates,
 };
 use onpair::{
-    Column, CompactDictionary, Config, DictionaryView, MaxDictBits, OwnedDictionaryStorage,
-    Threshold, TokenRange, compress,
+    Column, CompactDictionary, Config, DictionaryView, MAX_TOKEN_SIZE, MaxDictBits,
+    OwnedDictionaryStorage, Threshold, TokenRange, compress,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -691,7 +691,7 @@ fn original_avx512_candidates(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-fn refine_live_blocks_p2r2<const BLOCK_CODES: usize>(
+fn refine_live_blocks_fixed<const BLOCK_CODES: usize, const POINTS: usize, const RANGES: usize>(
     codes: &[u16],
     row_offsets: &[u64],
     cover: &ProbeCover,
@@ -703,10 +703,14 @@ fn refine_live_blocks_p2r2<const BLOCK_CODES: usize>(
         _mm512_set1_epi16, _mm512_sub_epi16,
     };
 
-    debug_assert_eq!((cover.points().len(), cover.ranges().len()), (2, 2));
+    debug_assert_eq!(
+        (cover.points().len(), cover.ranges().len()),
+        (POINTS, RANGES)
+    );
     out.clear();
-    let points: [__m512i; 2] = std::array::from_fn(|i| _mm512_set1_epi16(cover.points()[i] as i16));
-    let ranges: [(__m512i, __m512i); 2] = std::array::from_fn(|i| {
+    let points: [__m512i; POINTS] =
+        std::array::from_fn(|i| _mm512_set1_epi16(cover.points()[i] as i16));
+    let ranges: [(__m512i, __m512i); RANGES] = std::array::from_fn(|i| {
         let range = cover.ranges()[i];
         (
             _mm512_set1_epi16(range.begin as i16),
@@ -737,6 +741,76 @@ fn refine_live_blocks_p2r2<const BLOCK_CODES: usize>(
                     miss = _mm512_mask_cmpgt_epu16_mask(miss, _mm512_sub_epi16(value, lo), span);
                 }
                 let hits = !miss;
+                if hits != 0 {
+                    sink.mark_mask(index, u64::from(hits));
+                }
+                index += 32;
+            }
+            for (tail, &code) in codes[index..end].iter().enumerate() {
+                if cover.points().contains(&code)
+                    || cover.ranges().iter().any(|range| range.contains(code))
+                {
+                    sink.hit(index + tail);
+                }
+            }
+            live &= live - 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+fn refine_live_blocks<const BLOCK_CODES: usize>(
+    codes: &[u16],
+    row_offsets: &[u64],
+    cover: &ProbeCover,
+    summary: &[u64],
+    out: &mut Vec<usize>,
+) {
+    use core::arch::x86_64::{
+        __m512i, _mm512_cmpeq_epu16_mask, _mm512_cmple_epu16_mask, _mm512_loadu_si512,
+        _mm512_set1_epi16, _mm512_sub_epi16,
+    };
+
+    out.clear();
+    let points: Vec<__m512i> = cover
+        .points()
+        .iter()
+        .map(|&point| _mm512_set1_epi16(point as i16))
+        .collect();
+    let ranges: Vec<(__m512i, __m512i)> = cover
+        .ranges()
+        .iter()
+        .map(|range| {
+            (
+                _mm512_set1_epi16(range.begin as i16),
+                _mm512_set1_epi16(range.last.wrapping_sub(range.begin) as i16),
+            )
+        })
+        .collect();
+    let base_ptr = codes.as_ptr();
+    let mut sink = OriginalRowSink {
+        row_offsets,
+        out,
+        row: 0,
+        row_end: 0,
+    };
+    for (word_index, &word) in summary.iter().enumerate() {
+        let mut live = word;
+        while live != 0 {
+            let block = word_index * 64 + live.trailing_zeros() as usize;
+            let begin = block * BLOCK_CODES;
+            let end = (begin + BLOCK_CODES).min(codes.len());
+            let mut index = begin;
+            while index + 32 <= end {
+                let value = unsafe { _mm512_loadu_si512(base_ptr.add(index).cast()) };
+                let mut hits = 0u32;
+                for &point in &points {
+                    hits |= _mm512_cmpeq_epu16_mask(value, point);
+                }
+                for &(lo, span) in &ranges {
+                    hits |= _mm512_cmple_epu16_mask(_mm512_sub_epi16(value, lo), span);
+                }
                 if hits != 0 {
                     sink.mark_mask(index, u64::from(hits));
                 }
@@ -1111,7 +1185,7 @@ fn run(parquet: &Path, dump: &Path) {
                 (1, 1) => summarize_superblocks_fixed::<$block, 1, 1>($codes, $cover, $summary),
                 (2, 0) => summarize_superblocks_fixed::<$block, 2, 0>($codes, $cover, $summary),
                 (2, 2) => {
-                    summarize_superblocks_autovec_miss::<$block, 2, 2>($codes, $cover, $summary)
+                    summarize_superblocks_fixed_miss::<$block, 2, 2>($codes, $cover, $summary)
                 }
                 (3, 1) => summarize_superblocks_fixed::<$block, 3, 1>($codes, $cover, $summary),
                 (4, 2) => summarize_superblocks_fixed::<$block, 4, 2>($codes, $cover, $summary),
@@ -1168,6 +1242,7 @@ fn run(parquet: &Path, dump: &Path) {
     let low_selectivity_only = std::env::var_os("ONPAIR_PF_LOW_SELECTIVITY").is_some();
     let measure_original = std::env::var_os("ONPAIR_PF_ORIGINAL_GOOGLE").is_some();
     let measure_original_all = std::env::var_os("ONPAIR_PF_ORIGINAL_ALL").is_some();
+    let named_only = std::env::var_os("ONPAIR_NAMED_ONLY").is_some();
     let hierarchy_kernel =
         std::env::var("ONPAIR_HIER_KERNEL").unwrap_or_else(|_| "intrinsics-avx512".to_string());
     let fixed_query = std::env::var("ONPAIR_ONLY_QUERY").ok();
@@ -1319,7 +1394,7 @@ fn run(parquet: &Path, dump: &Path) {
         assert_eq!(block_kmp, out);
         assert_eq!(block_out, out);
 
-        if (measure_original && query == b"google") || measure_original_all {
+        if (measure_original && query == b"google") || measure_original_all || named_only {
             macro_rules! bench_original {
                 ($name:literal, $scan:ident) => {{
                     let mut original = Vec::new();
@@ -1361,7 +1436,7 @@ fn run(parquet: &Path, dump: &Path) {
                     );
                 }};
             }
-            if measure_original_all {
+            if measure_original_all && !named_only {
                 bench_original!("AVX2", original_avx2_candidates);
             }
             bench_original!("AVX512", original_avx512_candidates);
@@ -1369,7 +1444,7 @@ fn run(parquet: &Path, dump: &Path) {
 
         if (std::env::var_os("ONPAIR_HIER512").is_some()
             || std::env::var_os("ONPAIR_HIER_ALL").is_some())
-            && (cover.points().len(), cover.ranges().len()) == (2, 2)
+            || named_only
         {
             let mut hierarchy_results = Vec::new();
             macro_rules! bench_hierarchy {
@@ -1382,11 +1457,19 @@ fn run(parquet: &Path, dump: &Path) {
                         let start = Instant::now();
                         match hierarchy_kernel.as_str() {
                             "intrinsics-avx512" => unsafe {
-                                summarize_superblocks_fixed_miss::<$block, 2, 2>(
-                                    black_box(scan_codes),
-                                    black_box(cover),
-                                    black_box(&mut hierarchy_summary),
-                                )
+                                if (cover.points().len(), cover.ranges().len()) == (2, 2) {
+                                    summarize_superblocks_fixed_miss::<$block, 2, 2>(
+                                        black_box(scan_codes),
+                                        black_box(cover),
+                                        black_box(&mut hierarchy_summary),
+                                    )
+                                } else {
+                                    summarize_superblocks::<$block>(
+                                        black_box(scan_codes),
+                                        black_box(cover),
+                                        black_box(&mut hierarchy_summary),
+                                    )
+                                }
                             },
                             "intrinsics-avx2" => unsafe {
                                 summarize_superblocks_avx2_p2r2::<$block>(
@@ -1406,13 +1489,23 @@ fn run(parquet: &Path, dump: &Path) {
                         let start = Instant::now();
                         match hierarchy_kernel.as_str() {
                             "intrinsics-avx512" => unsafe {
-                                refine_live_blocks_p2r2::<$block>(
-                                    black_box(scan_codes),
-                                    black_box(scan_offsets),
-                                    black_box(cover),
-                                    black_box(&hierarchy_summary),
-                                    black_box(&mut refined),
-                                )
+                                if (cover.points().len(), cover.ranges().len()) == (2, 2) {
+                                    refine_live_blocks_fixed::<$block, 2, 2>(
+                                        black_box(scan_codes),
+                                        black_box(scan_offsets),
+                                        black_box(cover),
+                                        black_box(&hierarchy_summary),
+                                        black_box(&mut refined),
+                                    )
+                                } else {
+                                    refine_live_blocks::<$block>(
+                                        black_box(scan_codes),
+                                        black_box(scan_offsets),
+                                        black_box(cover),
+                                        black_box(&hierarchy_summary),
+                                        black_box(&mut refined),
+                                    )
+                                }
                             },
                             "intrinsics-avx2" => unsafe {
                                 refine_live_blocks_avx2_p2r2::<$block>(
@@ -1449,12 +1542,59 @@ fn run(parquet: &Path, dump: &Path) {
 
                         assert_eq!(kmp_rows, out);
                         assert_eq!(memmem_rows, out);
+                        let minimum_codes = query.len().div_ceil(MAX_TOKEN_SIZE);
+                        let mut length_rows = refined.clone();
+                        let start = Instant::now();
+                        length_rows.retain(|&row| {
+                            (scan_offsets[row + 1] - scan_offsets[row]) as usize >= minimum_codes
+                        });
+                        let length_ns = start.elapsed().as_nanos();
+                        let length_candidates = length_rows.len();
+                        let mut length_memmem_rows = length_rows.clone();
+                        let start = Instant::now();
+                        length_rows.retain(|&row| {
+                            contains(black_box(view.row_codes(row)), black_box(&kmp))
+                        });
+                        let length_kmp_ns = start.elapsed().as_nanos();
+                        let start = Instant::now();
+                        verifier.retain(black_box(view), black_box(&mut length_memmem_rows));
+                        let length_memmem_ns = start.elapsed().as_nanos();
+                        assert_eq!(length_rows, out);
+                        assert_eq!(length_memmem_rows, out);
+                        let loose_minimum_codes = query.len() / MAX_TOKEN_SIZE;
+                        let mut loose_rows = refined.clone();
+                        let start = Instant::now();
+                        loose_rows.retain(|&row| {
+                            (scan_offsets[row + 1] - scan_offsets[row]) as usize
+                                >= loose_minimum_codes
+                        });
+                        let loose_ns = start.elapsed().as_nanos();
+                        let loose_candidates = loose_rows.len();
+                        let mut loose_memmem_rows = loose_rows.clone();
+                        let start = Instant::now();
+                        loose_rows.retain(|&row| {
+                            contains(black_box(view.row_codes(row)), black_box(&kmp))
+                        });
+                        let loose_kmp_ns = start.elapsed().as_nanos();
+                        let start = Instant::now();
+                        verifier.retain(black_box(view), black_box(&mut loose_memmem_rows));
+                        let loose_memmem_ns = start.elapsed().as_nanos();
+                        assert_eq!(loose_rows, out);
+                        assert_eq!(loose_memmem_rows, out);
                         samples.push((
                             coarse_ns,
                             refine_ns,
                             kmp_ns,
                             memmem_ns,
                             refined_candidates,
+                            length_ns,
+                            length_kmp_ns,
+                            length_memmem_ns,
+                            length_candidates,
+                            loose_ns,
+                            loose_kmp_ns,
+                            loose_memmem_ns,
+                            loose_candidates,
                         ));
                     }
                     let coarse_ns = samples.iter().map(|sample| sample.0).min().unwrap();
@@ -1462,6 +1602,14 @@ fn run(parquet: &Path, dump: &Path) {
                     let kmp_ns = samples.iter().map(|sample| sample.2).min().unwrap();
                     let memmem_ns = samples.iter().map(|sample| sample.3).min().unwrap();
                     let refined_candidates = samples[0].4;
+                    let length_ns = samples.iter().map(|sample| sample.5).min().unwrap();
+                    let length_kmp_ns = samples.iter().map(|sample| sample.6).min().unwrap();
+                    let length_memmem_ns = samples.iter().map(|sample| sample.7).min().unwrap();
+                    let length_candidates = samples[0].8;
+                    let loose_ns = samples.iter().map(|sample| sample.9).min().unwrap();
+                    let loose_kmp_ns = samples.iter().map(|sample| sample.10).min().unwrap();
+                    let loose_memmem_ns = samples.iter().map(|sample| sample.11).min().unwrap();
+                    let loose_candidates = samples[0].12;
                     let live_blocks: usize = hierarchy_summary
                         .iter()
                         .map(|word| word.count_ones() as usize)
@@ -1478,6 +1626,28 @@ fn run(parquet: &Path, dump: &Path) {
                         memmem_ns as f64 / 1_000_000.0,
                         (coarse_ns + refine_ns + memmem_ns) as f64 / 1_000_000.0,
                     );
+                    println!(
+                        "HIER_LEN_LOOSE{}_{}_{}\tcandidates={loose_candidates}\tlength_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
+                        $block,
+                        hierarchy_kernel,
+                        label(&query),
+                        loose_ns as f64 / 1_000_000.0,
+                        loose_kmp_ns as f64 / 1_000_000.0,
+                        (coarse_ns + refine_ns + loose_ns + loose_kmp_ns) as f64 / 1_000_000.0,
+                        loose_memmem_ns as f64 / 1_000_000.0,
+                        (coarse_ns + refine_ns + loose_ns + loose_memmem_ns) as f64 / 1_000_000.0,
+                    );
+                    println!(
+                        "HIER_LEN{}_{}_{}\tcandidates={length_candidates}\tlength_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
+                        $block,
+                        hierarchy_kernel,
+                        label(&query),
+                        length_ns as f64 / 1_000_000.0,
+                        length_kmp_ns as f64 / 1_000_000.0,
+                        (coarse_ns + refine_ns + length_ns + length_kmp_ns) as f64 / 1_000_000.0,
+                        length_memmem_ns as f64 / 1_000_000.0,
+                        (coarse_ns + refine_ns + length_ns + length_memmem_ns) as f64 / 1_000_000.0,
+                    );
                     hierarchy_results.push(($block, coarse_ns + refine_ns + kmp_ns));
                 }};
             }
@@ -1491,33 +1661,77 @@ fn run(parquet: &Path, dump: &Path) {
             } else {
                 bench_hierarchy!(512);
             }
-            let measured = hierarchy_results
-                .iter()
-                .min_by_key(|result| result.1)
-                .unwrap();
-            let measured_block = measured.0;
-            let frequency = analysis.covered_fraction();
-            let predicted_block = if frequency < 0.000_025 {
-                1024
-            } else if frequency < 0.000_150 {
-                512
-            } else {
-                256
-            };
-            let predicted_ns = hierarchy_results
-                .iter()
-                .find(|result| result.0 == predicted_block)
-                .unwrap()
-                .1;
-            println!(
-                "HIER_PREDICT_{}\tcover_frac={frequency:.8}\tpredicted_block={predicted_block}\tmeasured_block={measured_block}\tpredicted_e2e_ms={:.6}\tmeasured_e2e_ms={:.6}",
-                label(&query),
-                predicted_ns as f64 / 1_000_000.0,
-                measured.1 as f64 / 1_000_000.0,
-            );
+            if std::env::var_os("ONPAIR_HIER_ALL").is_some() {
+                let measured = hierarchy_results
+                    .iter()
+                    .min_by_key(|result| result.1)
+                    .unwrap();
+                let measured_block = measured.0;
+                let frequency = analysis.covered_fraction();
+                let predicted_block = if frequency < 0.000_025 {
+                    1024
+                } else if frequency < 0.000_150 {
+                    512
+                } else {
+                    256
+                };
+                let predicted_ns = hierarchy_results
+                    .iter()
+                    .find(|result| result.0 == predicted_block)
+                    .unwrap()
+                    .1;
+                println!(
+                    "HIER_PREDICT_{}\tcover_frac={frequency:.8}\tpredicted_block={predicted_block}\tmeasured_block={measured_block}\tpredicted_e2e_ms={:.6}\tmeasured_e2e_ms={:.6}",
+                    label(&query),
+                    predicted_ns as f64 / 1_000_000.0,
+                    measured.1 as f64 / 1_000_000.0,
+                );
+            }
         }
 
         if std::env::var_os("ONPAIR_HIER_ONLY").is_some() {
+            continue;
+        }
+
+        if named_only {
+            let mut named_samples = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let start = Instant::now();
+                unsafe {
+                    summarize!(
+                        black_box(scan_codes),
+                        black_box(cover),
+                        black_box(&mut summary)
+                    )
+                };
+                let summary_ns = start.elapsed().as_nanos();
+
+                let start = Instant::now();
+                block_candidates!(&summary, scan_offsets, &mut block_out);
+                block_out.retain(|&row| contains(black_box(view.row_codes(row)), black_box(&kmp)));
+                let kmp_ns = start.elapsed().as_nanos();
+                assert_eq!(block_out, out);
+
+                let start = Instant::now();
+                block_candidates!(&summary, scan_offsets, &mut block_out);
+                verifier.retain(black_box(view), black_box(&mut block_out));
+                let memmem_ns = start.elapsed().as_nanos();
+                assert_eq!(block_out, out);
+                named_samples.push((summary_ns, kmp_ns, memmem_ns));
+            }
+            let summary_ns = named_samples.iter().map(|sample| sample.0).min().unwrap();
+            let kmp_ns = named_samples.iter().map(|sample| sample.1).min().unwrap();
+            let memmem_ns = named_samples.iter().map(|sample| sample.2).min().unwrap();
+            println!(
+                "SUPERBLOCK{}_{}\tblock_candidates={block_candidates}\tstage_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
+                summary_codes,
+                label(&query),
+                summary_ns as f64 / 1_000_000.0,
+                kmp_ns as f64 / 1_000_000.0,
+                (summary_ns + kmp_ns) as f64 / 1_000_000.0,
+                memmem_ns as f64 / 1_000_000.0,
+                (summary_ns + memmem_ns) as f64 / 1_000_000.0,
+            );
             continue;
         }
 

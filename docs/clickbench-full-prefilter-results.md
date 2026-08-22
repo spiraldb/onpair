@@ -1,5 +1,47 @@
 # Full ClickBench prefilter comparison
 
+## Named-pipeline rerun after the upstream merge
+
+On 2026-08-22, `origin/feat/search-prefilter` at `5936ffc` was merged into the
+benchmark branch and the named pipelines were rerun over all 99,997,497 rows.
+The corpus contained 49 needles; the table covers all 30 whose cover frequency
+is below 0.1%, the range in which the upstream profitability policy can choose
+a prefilter. Each number is the sum of per-query best-of-five measurements on
+CPU 0. Lower is better.
+
+| Pipeline | KMP total ms | vs Scan Finding Index | memmem + decompress total ms | vs Scan Finding Index |
+|---|---:|---:|---:|---:|
+| Scan Finding Index | 15,500.873 | — | 15,757.893 | — |
+| **Superblock** | **11,427.434** | **-26.28%** | **12,455.945** | **-20.95%** |
+| Superblock Hierarchical | 13,335.665 | -13.97% | 13,564.275 | -13.92% |
+| Hierarchical + loose length bound | 13,384.226 | -13.65% | 13,612.836 | -13.61% |
+| Hierarchical + tight length bound | 13,387.495 | -13.63% | 13,616.105 | -13.59% |
+
+The names mean:
+
+- **Scan Finding Index**: scan all codes, turn exact hit masks directly into row
+  indices, then run the exact verifier.
+- **Superblock**: store one bit per 512 codes and run the exact verifier on all
+  rows touched by a live block.
+- **Superblock Hierarchical**: store one bit per 512 codes, rescan only live
+  blocks to recover exact cover-hit rows, then run the exact verifier.
+
+The tight constant-time length bound is
+`row_codes >= ceil(needle_bytes / MAX_TOKEN_SIZE)`; the loose bound uses floor
+instead of ceil. Neither removed one candidate for any of these needles. Their
+additional candidate pass cost 51.829 ms and 48.561 ms respectively across the
+suite, so they are not useful here. The adjusted totals above use the same exact
+verification cost as the plain hierarchy; separately rerunning the verifier
+after the length pass warms its input and would misleadingly make the bound
+look faster.
+
+In uncompressed URL space, the average prefilter-stage rates were 18.63 GB/s for
+Scan Finding Index, 47.41 GB/s for the Superblock summary, and 21.90 GB/s for
+the complete hierarchical summary plus refinement. Superblock won 28 of 30 KMP
+queries and 21 of 30 `memmem` queries. KMP was faster in aggregate for every
+pipeline; decoding plus `memmem` was 9.00% slower for Superblock because its
+coarse candidate lists are much larger.
+
 ## Result
 
 **Current production winner: the explicit-intrinsic AVX-512 hierarchy with one

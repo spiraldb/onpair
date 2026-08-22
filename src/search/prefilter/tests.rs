@@ -594,7 +594,7 @@ fn avx512_sparse_fixed_matches_scalar() {
     table[29] = true;
     table[100..=103].fill(true);
     table[2000..=2007].fill(true);
-    let pf = ProbeCover::from_membership(table, Some);
+    let pf = ProbeCover::from_membership(table);
     assert_eq!((pf.points.len(), pf.ranges.len()), (2, 2));
 
     let mut codes = Vec::with_capacity(16_384);
@@ -686,7 +686,7 @@ fn dense_scans_bail_to_a_sound_superset() {
     // Small cover: the vector kernel path.
     let mut table = vec![false; 16];
     table[7] = true;
-    let pf = ProbeCover::from_membership(table, Some);
+    let pf = ProbeCover::from_membership(table);
     let (codes, row_offsets) = build(7, 3);
     check(&codes, &row_offsets, &pf);
 
@@ -696,7 +696,7 @@ fn dense_scans_bail_to_a_sound_superset() {
     for id in (0..130).step_by(2) {
         table[id] = true;
     }
-    let pf = ProbeCover::from_membership(table, Some);
+    let pf = ProbeCover::from_membership(table);
     let (codes, row_offsets) = build(4, 1);
     check(&codes, &row_offsets, &pf);
 }
