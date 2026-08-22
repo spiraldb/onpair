@@ -395,6 +395,65 @@ fn summarize_superblocks_autovec_miss<
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn summarize_superblocks_avx2_p2r2<const BLOCK_CODES: usize>(
+    codes: &[u16],
+    cover: &ProbeCover,
+    summary: &mut [u64],
+) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_andnot_si256, _mm256_cmpeq_epi16, _mm256_cmpgt_epi16, _mm256_loadu_si256,
+        _mm256_or_si256, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_testz_si256,
+        _mm256_xor_si256,
+    };
+
+    debug_assert_eq!((cover.points().len(), cover.ranges().len()), (2, 2));
+    debug_assert!(BLOCK_CODES.is_multiple_of(16));
+    let zero = _mm256_setzero_si256();
+    let ones = _mm256_set1_epi16(-1);
+    let bias = _mm256_set1_epi16(i16::MIN);
+    let points: [__m256i; 2] = std::array::from_fn(|i| _mm256_set1_epi16(cover.points()[i] as i16));
+    let ranges: [(__m256i, __m256i); 2] = std::array::from_fn(|i| {
+        let range = cover.ranges()[i];
+        (
+            _mm256_xor_si256(_mm256_set1_epi16(range.begin as i16), bias),
+            _mm256_xor_si256(_mm256_set1_epi16(range.last as i16), bias),
+        )
+    });
+    let base = codes.as_ptr();
+    let full_blocks = codes.len() / BLOCK_CODES;
+    let mut block = 0usize;
+    for slot in summary.iter_mut() {
+        let mut word = 0u64;
+        for bit in 0..(full_blocks - block).min(64) {
+            let mut any = zero;
+            for offset in (0..BLOCK_CODES).step_by(16) {
+                // SAFETY: the loop visits complete vectors inside a full block.
+                let value =
+                    unsafe { _mm256_loadu_si256(base.add(block * BLOCK_CODES + offset).cast()) };
+                let mut hits = zero;
+                for &point in &points {
+                    hits = _mm256_or_si256(hits, _mm256_cmpeq_epi16(value, point));
+                }
+                let biased = _mm256_xor_si256(value, bias);
+                for &(lo, hi) in &ranges {
+                    let outside = _mm256_or_si256(
+                        _mm256_cmpgt_epi16(lo, biased),
+                        _mm256_cmpgt_epi16(biased, hi),
+                    );
+                    hits = _mm256_or_si256(hits, _mm256_andnot_si256(outside, ones));
+                }
+                any = _mm256_or_si256(any, hits);
+            }
+            word |= u64::from(_mm256_testz_si256(any, any) == 0) << bit;
+            block += 1;
+        }
+        *slot = word;
+    }
+    summarize_tail::<BLOCK_CODES>(codes, cover, summary, full_blocks);
+}
+
 fn superblock_candidates<const BLOCK_CODES: usize>(
     summary: &[u64],
     row_offsets: &[u64],
@@ -695,6 +754,148 @@ fn refine_live_blocks_p2r2<const BLOCK_CODES: usize>(
     }
 }
 
+fn refine_live_blocks_autovec_p2r2<const BLOCK_CODES: usize>(
+    codes: &[u16],
+    row_offsets: &[u64],
+    cover: &ProbeCover,
+    summary: &[u64],
+    out: &mut Vec<usize>,
+) {
+    debug_assert_eq!((cover.points().len(), cover.ranges().len()), (2, 2));
+    out.clear();
+    let points: [u16; 2] = std::array::from_fn(|i| cover.points()[i]);
+    let lows: [u16; 2] = std::array::from_fn(|i| cover.ranges()[i].begin);
+    let spans: [u16; 2] = std::array::from_fn(|i| {
+        let range = cover.ranges()[i];
+        range.last.wrapping_sub(range.begin)
+    });
+    let mut sink = OriginalRowSink {
+        row_offsets,
+        out,
+        row: 0,
+        row_end: 0,
+    };
+    for (word_index, &word) in summary.iter().enumerate() {
+        let mut live = word;
+        while live != 0 {
+            let block = word_index * 64 + live.trailing_zeros() as usize;
+            let begin = block * BLOCK_CODES;
+            let end = (begin + BLOCK_CODES).min(codes.len());
+            let mut index = begin;
+            while index + 64 <= end {
+                let mut lanes = 0u64;
+                for lane in 0..64 {
+                    let code = codes[index + lane];
+                    let hit = points.contains(&code)
+                        || (0..2).any(|range| code.wrapping_sub(lows[range]) <= spans[range]);
+                    lanes |= u64::from(hit) << lane;
+                }
+                if lanes != 0 {
+                    sink.mark_mask(index, lanes);
+                }
+                index += 64;
+            }
+            for (tail, &code) in codes[index..end].iter().enumerate() {
+                if points.contains(&code)
+                    || (0..2).any(|range| code.wrapping_sub(lows[range]) <= spans[range])
+                {
+                    sink.hit(index + tail);
+                }
+            }
+            live &= live - 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn refine_live_blocks_avx2_p2r2<const BLOCK_CODES: usize>(
+    codes: &[u16],
+    row_offsets: &[u64],
+    cover: &ProbeCover,
+    summary: &[u64],
+    out: &mut Vec<usize>,
+) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_andnot_si256, _mm256_cmpeq_epi16, _mm256_cmpgt_epi16, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_or_si256, _mm256_packs_epi16, _mm256_permute4x64_epi64,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_xor_si256,
+    };
+
+    debug_assert_eq!((cover.points().len(), cover.ranges().len()), (2, 2));
+    out.clear();
+    let zero = _mm256_setzero_si256();
+    let ones = _mm256_set1_epi16(-1);
+    let bias = _mm256_set1_epi16(i16::MIN);
+    let points: [__m256i; 2] = std::array::from_fn(|i| _mm256_set1_epi16(cover.points()[i] as i16));
+    let ranges: [(__m256i, __m256i); 2] = std::array::from_fn(|i| {
+        let range = cover.ranges()[i];
+        (
+            _mm256_xor_si256(_mm256_set1_epi16(range.begin as i16), bias),
+            _mm256_xor_si256(_mm256_set1_epi16(range.last as i16), bias),
+        )
+    });
+    let matching_mask = |value: __m256i| {
+        let mut hits = zero;
+        for &point in &points {
+            hits = _mm256_or_si256(hits, _mm256_cmpeq_epi16(value, point));
+        }
+        let biased = _mm256_xor_si256(value, bias);
+        for &(lo, hi) in &ranges {
+            let outside = _mm256_or_si256(
+                _mm256_cmpgt_epi16(lo, biased),
+                _mm256_cmpgt_epi16(biased, hi),
+            );
+            hits = _mm256_or_si256(hits, _mm256_andnot_si256(outside, ones));
+        }
+        hits
+    };
+    let base = codes.as_ptr();
+    let mut sink = OriginalRowSink {
+        row_offsets,
+        out,
+        row: 0,
+        row_end: 0,
+    };
+    for (word_index, &word) in summary.iter().enumerate() {
+        let mut live = word;
+        while live != 0 {
+            let block = word_index * 64 + live.trailing_zeros() as usize;
+            let begin = block * BLOCK_CODES;
+            let end = (begin + BLOCK_CODES).min(codes.len());
+            let mut index = begin;
+            while index + 64 <= end {
+                let masks: [__m256i; 4] = std::array::from_fn(|chunk| {
+                    // SAFETY: this loop runs only when all 64 codes are in the
+                    // selected live block.
+                    matching_mask(unsafe {
+                        _mm256_loadu_si256(base.add(index + chunk * 16).cast())
+                    })
+                });
+                let lanes01 = _mm256_movemask_epi8(_mm256_permute4x64_epi64::<0xd8>(
+                    _mm256_packs_epi16(masks[0], masks[1]),
+                )) as u32 as u64;
+                let lanes23 = _mm256_movemask_epi8(_mm256_permute4x64_epi64::<0xd8>(
+                    _mm256_packs_epi16(masks[2], masks[3]),
+                )) as u32 as u64;
+                let lanes = lanes01 | (lanes23 << 32);
+                if lanes != 0 {
+                    sink.mark_mask(index, lanes);
+                }
+                index += 64;
+            }
+            for (tail, &code) in codes[index..end].iter().enumerate() {
+                if cover.points().contains(&code)
+                    || cover.ranges().iter().any(|range| range.contains(code))
+                {
+                    sink.hit(index + tail);
+                }
+            }
+            live &= live - 1;
+        }
+    }
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
     let parquet = PathBuf::from(
@@ -719,7 +920,8 @@ fn perf_summary_google(dump: &Path) {
     let column = load_column(dump);
     let view = column.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let analysis = analyze_prefilter(b"google", view.dict, &frequencies);
+    let query = std::env::var("ONPAIR_PERF_QUERY").unwrap_or_else(|_| "google".to_string());
+    let analysis = analyze_prefilter(query.as_bytes(), view.dict, &frequencies);
     assert_eq!(
         (
             analysis.probe_cover().points().len(),
@@ -745,6 +947,13 @@ fn perf_summary_google(dump: &Path) {
                 match kernel.as_str() {
                     "intrinsics" => unsafe {
                         summarize_superblocks_fixed_miss::<$block, 2, 2>(
+                            black_box(view.codes),
+                            black_box(analysis.probe_cover()),
+                            black_box(&mut summary),
+                        )
+                    },
+                    "intrinsics-avx2" => unsafe {
+                        summarize_superblocks_avx2_p2r2::<$block>(
                             black_box(view.codes),
                             black_box(analysis.probe_cover()),
                             black_box(&mut summary),
@@ -799,7 +1008,8 @@ fn perf_summary_google(dump: &Path) {
         _ => unreachable!(),
     }
     eprintln!(
-        "kernel={} block_codes={} reps={} live_blocks={} candidates={} elapsed_ms={:.3}",
+        "query={} kernel={} block_codes={} reps={} live_blocks={} candidates={} elapsed_ms={:.3}",
+        query,
         kernel,
         block_codes,
         reps,
@@ -817,7 +1027,8 @@ fn perf_google(dump: &Path, original: bool) {
     let column = load_column(dump);
     let view = column.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let analysis = analyze_prefilter(b"google", view.dict, &frequencies);
+    let query = std::env::var("ONPAIR_PERF_QUERY").unwrap_or_else(|_| "google".to_string());
+    let analysis = analyze_prefilter(query.as_bytes(), view.dict, &frequencies);
     let reps = std::env::var("ONPAIR_PERF_REPS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -847,7 +1058,8 @@ fn perf_google(dump: &Path, original: bool) {
         black_box(&out);
     }
     eprintln!(
-        "kernel={} reps={} candidates={} elapsed_ms={:.3}",
+        "query={} kernel={} reps={} candidates={} elapsed_ms={:.3}",
+        query,
         if original { "original" } else { "new" },
         reps,
         out.len(),
@@ -857,12 +1069,14 @@ fn perf_google(dump: &Path, original: bool) {
 
 fn prepare(parquet: &Path, dump: &Path) {
     let rows = read_urls(parquet);
+    let row_count = rows.len();
     let (bytes, offsets) = pack(&rows);
     eprintln!(
         "preparing {} rows, {:.2} MiB decoded",
-        rows.len(),
+        row_count,
         bytes.len() as f64 / 1_048_576.0
     );
+    drop(rows);
     let cfg = Config {
         max_dict_bits: MaxDictBits::new(16).unwrap(),
         threshold: Threshold::new(0.5).unwrap(),
@@ -954,14 +1168,28 @@ fn run(parquet: &Path, dump: &Path) {
     let low_selectivity_only = std::env::var_os("ONPAIR_PF_LOW_SELECTIVITY").is_some();
     let measure_original = std::env::var_os("ONPAIR_PF_ORIGINAL_GOOGLE").is_some();
     let measure_original_all = std::env::var_os("ONPAIR_PF_ORIGINAL_ALL").is_some();
+    let hierarchy_kernel =
+        std::env::var("ONPAIR_HIER_KERNEL").unwrap_or_else(|_| "intrinsics-avx512".to_string());
     let fixed_query = std::env::var("ONPAIR_ONLY_QUERY").ok();
-    let rows = if fixed_query.is_some() && std::env::var_os("ONPAIR_HIER_ONLY").is_some() {
+    let query_file = std::env::var("ONPAIR_QUERY_FILE").ok().map(PathBuf::from);
+    let rows = if query_file.is_some()
+        || (fixed_query.is_some() && std::env::var_os("ONPAIR_HIER_ONLY").is_some())
+    {
         vec![Vec::new()]
     } else {
         read_urls(parquet)
     };
-    let decoded_bytes: usize = rows.iter().map(Vec::len).sum();
-    let mut queries = queries(&rows);
+    let decoded_bytes = view.decoded_len();
+    let mut queries = if let Some(path) = &query_file {
+        fs::read(path)
+            .expect("read query file")
+            .split(|&byte| byte == b'\n')
+            .filter(|query| !query.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    } else {
+        queries(&rows)
+    };
     if std::env::var_os("ONPAIR_MINE_NEEDLES").is_some() {
         let mut candidates = HashSet::new();
         let stride = (rows.len() / 2_048).max(1);
@@ -1019,6 +1247,24 @@ fn run(parquet: &Path, dump: &Path) {
         queries.push(query.into_bytes());
     } else if std::env::var_os("ONPAIR_ONLY_GOOGLE").is_some() {
         queries.retain(|query| query == b"google");
+    }
+    if let Some(path) = std::env::var("ONPAIR_WRITE_QUERIES")
+        .ok()
+        .map(PathBuf::from)
+    {
+        let capacity = queries.iter().map(Vec::len).sum::<usize>() + queries.len();
+        let mut output = Vec::with_capacity(capacity);
+        for query in &queries {
+            output.extend_from_slice(query);
+            output.push(b'\n');
+        }
+        let bytes = output.len();
+        fs::write(&path, output).expect("write query file");
+        eprintln!(
+            "wrote {} queries / {bytes} bytes to {}",
+            queries.len(),
+            path.display()
+        );
     }
     eprintln!(
         "running {} queries over {} codes / {} rows, best-of-{reps}",
@@ -1134,23 +1380,57 @@ fn run(parquet: &Path, dump: &Path) {
                     let mut samples = Vec::with_capacity(reps);
                     for _ in 0..reps {
                         let start = Instant::now();
-                        unsafe {
-                            summarize_superblocks_autovec_miss::<$block, 2, 2>(
+                        match hierarchy_kernel.as_str() {
+                            "intrinsics-avx512" => unsafe {
+                                summarize_superblocks_fixed_miss::<$block, 2, 2>(
+                                    black_box(scan_codes),
+                                    black_box(cover),
+                                    black_box(&mut hierarchy_summary),
+                                )
+                            },
+                            "intrinsics-avx2" => unsafe {
+                                summarize_superblocks_avx2_p2r2::<$block>(
+                                    black_box(scan_codes),
+                                    black_box(cover),
+                                    black_box(&mut hierarchy_summary),
+                                )
+                            },
+                            "autovec" => summarize_superblocks_autovec::<$block, 2, 2>(
                                 black_box(scan_codes),
                                 black_box(cover),
                                 black_box(&mut hierarchy_summary),
-                            );
+                            ),
+                            other => panic!("unknown ONPAIR_HIER_KERNEL={other}"),
                         }
                         let coarse_ns = start.elapsed().as_nanos();
                         let start = Instant::now();
-                        unsafe {
-                            refine_live_blocks_p2r2::<$block>(
+                        match hierarchy_kernel.as_str() {
+                            "intrinsics-avx512" => unsafe {
+                                refine_live_blocks_p2r2::<$block>(
+                                    black_box(scan_codes),
+                                    black_box(scan_offsets),
+                                    black_box(cover),
+                                    black_box(&hierarchy_summary),
+                                    black_box(&mut refined),
+                                )
+                            },
+                            "intrinsics-avx2" => unsafe {
+                                refine_live_blocks_avx2_p2r2::<$block>(
+                                    black_box(scan_codes),
+                                    black_box(scan_offsets),
+                                    black_box(cover),
+                                    black_box(&hierarchy_summary),
+                                    black_box(&mut refined),
+                                )
+                            },
+                            "autovec" => refine_live_blocks_autovec_p2r2::<$block>(
                                 black_box(scan_codes),
                                 black_box(scan_offsets),
                                 black_box(cover),
                                 black_box(&hierarchy_summary),
                                 black_box(&mut refined),
-                            );
+                            ),
+                            _ => unreachable!(),
                         }
                         let refine_ns = start.elapsed().as_nanos();
                         let refined_candidates = refined.len();
@@ -1187,8 +1467,9 @@ fn run(parquet: &Path, dump: &Path) {
                         .map(|word| word.count_ones() as usize)
                         .sum();
                     println!(
-                        "HIER{}_{}\tlive_blocks={live_blocks}\tcandidates={refined_candidates}\tcoarse_ms={:.6}\trefine_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
+                        "HIER{}_{}_{}\tlive_blocks={live_blocks}\tcandidates={refined_candidates}\tcoarse_ms={:.6}\trefine_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
                         $block,
+                        hierarchy_kernel,
                         label(&query),
                         coarse_ns as f64 / 1_000_000.0,
                         refine_ns as f64 / 1_000_000.0,

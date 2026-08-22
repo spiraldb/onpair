@@ -5,6 +5,11 @@ from exact row materialization. It is intended for Ice Lake and Sapphire Rapids,
 where using 512-bit vectors does not carry the large frequency transition cost
 seen on older AVX-512 processors.
 
+The current production choice is the explicit-intrinsic 512-code hierarchy.
+See [the full 99,997,497-row ClickBench rerun](clickbench-full-prefilter-results.md)
+for the original AVX2/AVX-512, autovec, intrinsic, block-size, assembly, and
+counter comparison that validates this choice.
+
 ## Design
 
 The policy selects this path only when the cover occupies less than 0.1% of the
