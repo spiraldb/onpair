@@ -34,9 +34,9 @@
 
 use memchr::memmem::Finder;
 
-use super::frequency::TokenFrequencyIndex;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
+use crate::search::index::TokenFrequencyIndexView;
 use crate::search::prefix_range;
 
 /// Largest first-token set still cheap enough to enumerate as an explicit
@@ -188,10 +188,10 @@ fn contained_by_search(payload: &[u8], offsets: &[u32], needle: &[u8], out: &mut
     }
 }
 
-struct Builder<'a> {
-    dict: CompactDictionaryView<'a>,
-    needle: &'a [u8],
-    frequencies: &'a TokenFrequencyIndex,
+struct Builder<'d, 'n, 'f> {
+    dict: CompactDictionaryView<'d>,
+    needle: &'n [u8],
+    frequencies: TokenFrequencyIndexView<'f>,
     probe: Vec<ProbeSet>,
     weight: Vec<u32>,
     first_set_ids: Vec<Token>,
@@ -204,7 +204,7 @@ struct Builder<'a> {
     state_node: Vec<Option<u32>>,
 }
 
-impl Builder<'_> {
+impl Builder<'_, '_, '_> {
     /// Term frequency of `set`. Summing an explicit set cannot overflow: its
     /// ids are distinct, so the sum is at most the code stream's length.
     fn weight_of(&self, set: ProbeSet) -> u32 {
@@ -310,7 +310,7 @@ impl Builder<'_> {
 pub(super) fn build_alignment_graph(
     dict: CompactDictionaryView<'_>,
     needle: &[u8],
-    frequencies: &TokenFrequencyIndex,
+    frequencies: TokenFrequencyIndexView<'_>,
 ) -> AlignmentGraph {
     debug_assert!(!needle.is_empty());
     debug_assert_eq!(frequencies.num_tokens(), dict.num_tokens());
