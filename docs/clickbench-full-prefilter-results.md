@@ -56,32 +56,40 @@ passes. Across the same 30 needles, best-of-three totals are:
 
 | Pipeline | KMP total ms | Mean ms | memmem total ms | Mean ms |
 |---|---:|---:|---:|---:|
-| Scan Finding Index | 15,406.539 | 513.551 | 15,654.217 | 521.807 |
-| Superblock | 10,812.178 | 360.406 | 11,779.583 | 392.653 |
-| Superblock Hierarchical | 12,531.128 | 417.704 | 12,760.462 | 425.349 |
-| **Superblock Mid-cut** | **7,818.020** | **260.601** | **8,108.764** | **270.292** |
+| Scan Finding Index | 13,110.660 | 437.022 | 13,349.340 | 444.978 |
+| Superblock | 10,862.880 | 362.096 | 11,856.300 | 395.210 |
+| Superblock Hierarchical | 12,331.620 | 411.054 | 12,561.240 | 418.708 |
+| **Superblock Mid-cut** | **7,881.420** | **262.714** | **8,176.380** | **272.546** |
 
-Mid-cut is 49.26% faster than Scan Finding Index, 27.69% faster than
-Superblock, and 37.61% faster than the row-output hierarchy with KMP. The
-corresponding `memmem` reductions are 48.20%, 31.16%, and 36.45%. It wins 22 of
-30 KMP queries and 22 of 30 `memmem` queries; Superblock remains better for the
-smallest hit sets because row localization has a roughly 45 ms floor.
+Mid-cut is 39.89% faster than the now-specialized Scan Finding Index, 27.45%
+faster than Superblock, and 36.09% faster than the row-output hierarchy with
+KMP. The corresponding `memmem` reductions are 38.75%, 31.04%, and 34.91%.
+Superblock remains better for the smallest hit sets because row localization
+has a roughly 45 ms floor.
+
+Mean KMP stage breakdown in milliseconds:
+
+| Pipeline | Full/summary scan | Candidate construction/refinement | Exact verification | End to end |
+|---|---:|---:|---:|---:|
+| Scan Finding Index | 405.049 | — | 31.973 | 437.022 |
+| Superblock | 172.205 | 57.496 row materialization | 132.395 | 362.096 |
+| Superblock Hierarchical | 171.944 | 207.228 exact-row refinement | 31.883 | 411.054 |
+| **Superblock Mid-cut** | **171.944** | **23.626 position refinement** | **67.145 localized** | **262.714** |
 
 Average effective throughput, using 2.228 GB of `u16` codes or 9.039 GB decoded
 bytes per query, is:
 
 | Pipeline | KMP code GB/s | KMP decoded GB/s | memmem code GB/s | memmem decoded GB/s |
 |---|---:|---:|---:|---:|
-| Scan Finding Index | 4.34 | 17.60 | 4.27 | 17.32 |
-| Superblock | 6.18 | 25.08 | 5.67 | 23.02 |
-| Superblock Hierarchical | 5.33 | 21.64 | 5.24 | 21.25 |
-| **Superblock Mid-cut** | **8.55** | **34.68** | **8.24** | **33.44** |
+| Scan Finding Index | 5.10 | 20.68 | 5.01 | 20.31 |
+| Superblock | 6.15 | 24.96 | 5.64 | 22.87 |
+| Superblock Hierarchical | 5.42 | 21.99 | 5.32 | 21.59 |
+| **Superblock Mid-cut** | **8.48** | **34.41** | **8.18** | **33.16** |
 
-For `google` specifically, P3R2-specialized Mid-cut takes 133.42 ms for the
-coarse scan, 16.56 ms to recover 111,769 positions, and 62.61 ms to run KMP on
-472,628 window codes: 212.59 ms end to end. Plain Superblock takes 291.70 ms and
-Scan Finding Index 472.97 ms. Mid-cut's effective KMP bandwidth is 10.48 code
-GB/s or 42.52 decoded GB/s.
+For `google` specifically, P3R2-specialized Mid-cut takes 134.35 ms for the
+coarse scan, 15.99 ms to recover 111,769 positions, and 63.40 ms to run KMP on
+472,628 window codes: 213.74 ms end to end. Plain Superblock takes 291.15 ms,
+the row hierarchy 332.77 ms, and specialized Scan Finding Index 416.96 ms.
 
 ## Result
 

@@ -611,7 +611,7 @@ fn original_avx2_candidates(
 /// omitted (it is disabled for selective covers).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-fn original_avx512_candidates(
+fn original_avx512_candidates_dynamic(
     codes: &[u16],
     row_offsets: &[u64],
     cover: &ProbeCover,
@@ -689,6 +689,113 @@ fn original_avx512_candidates(
         {
             sink.hit(index + tail);
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+fn original_avx512_candidates_fixed<const POINTS: usize, const RANGES: usize>(
+    codes: &[u16],
+    row_offsets: &[u64],
+    cover: &ProbeCover,
+    out: &mut Vec<usize>,
+) {
+    use core::arch::x86_64::{
+        __m512i, _mm512_loadu_si512, _mm512_mask_cmpgt_epu16_mask, _mm512_mask_cmpneq_epu16_mask,
+        _mm512_set1_epi16, _mm512_sub_epi16,
+    };
+
+    const SUPERBLOCK: usize = 512;
+    out.clear();
+    let points: [__m512i; POINTS] =
+        std::array::from_fn(|i| _mm512_set1_epi16(cover.points()[i] as i16));
+    let ranges: [(__m512i, __m512i); RANGES] = std::array::from_fn(|i| {
+        let range = cover.ranges()[i];
+        (
+            _mm512_set1_epi16(range.begin as i16),
+            _mm512_set1_epi16(range.last.wrapping_sub(range.begin) as i16),
+        )
+    });
+    let base = codes.as_ptr();
+    let mask_at = |index: usize| unsafe {
+        let value = _mm512_loadu_si512(base.add(index).cast());
+        let mut miss = u32::MAX;
+        for &point in &points {
+            miss = _mm512_mask_cmpneq_epu16_mask(miss, value, point);
+        }
+        for &(lo, span) in &ranges {
+            miss = _mm512_mask_cmpgt_epu16_mask(miss, _mm512_sub_epi16(value, lo), span);
+        }
+        !miss
+    };
+    let mut sink = OriginalRowSink {
+        row_offsets,
+        out,
+        row: 0,
+        row_end: 0,
+    };
+    let mut index = 0usize;
+    while index + SUPERBLOCK <= codes.len() {
+        let mut lanes = [0u64; 8];
+        let mut any = 0u64;
+        for (chunk, slot) in lanes.iter_mut().enumerate() {
+            let lo = u64::from(mask_at(index + chunk * 64));
+            let hi = u64::from(mask_at(index + chunk * 64 + 32));
+            *slot = lo | (hi << 32);
+            any |= *slot;
+        }
+        if any != 0 {
+            for (chunk, mask) in lanes.into_iter().enumerate() {
+                if mask != 0 {
+                    sink.mark_mask(index + chunk * 64, mask);
+                }
+            }
+        }
+        index += SUPERBLOCK;
+    }
+    while index + 32 <= codes.len() {
+        let mut mask = mask_at(index);
+        while mask != 0 {
+            sink.hit(index + mask.trailing_zeros() as usize);
+            mask &= mask - 1;
+        }
+        index += 32;
+    }
+    for (tail, &code) in codes[index..].iter().enumerate() {
+        if cover.points().contains(&code) || cover.ranges().iter().any(|range| range.contains(code))
+        {
+            sink.hit(index + tail);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+fn original_avx512_candidates(
+    codes: &[u16],
+    row_offsets: &[u64],
+    cover: &ProbeCover,
+    out: &mut Vec<usize>,
+) {
+    macro_rules! fixed {
+        ($p:literal, $r:literal) => {
+            original_avx512_candidates_fixed::<$p, $r>(codes, row_offsets, cover, out)
+        };
+    }
+    match (cover.points().len(), cover.ranges().len()) {
+        (0, 1) => fixed!(0, 1),
+        (1, 1) => fixed!(1, 1),
+        (1, 2) => fixed!(1, 2),
+        (1, 3) => fixed!(1, 3),
+        (2, 0) => fixed!(2, 0),
+        (2, 2) => fixed!(2, 2),
+        (3, 1) => fixed!(3, 1),
+        (3, 2) => fixed!(3, 2),
+        (4, 0) => fixed!(4, 0),
+        (10, 2) => fixed!(10, 2),
+        (12, 5) => fixed!(12, 5),
+        (25, 5) => fixed!(25, 5),
+        _ => original_avx512_candidates_dynamic(codes, row_offsets, cover, out),
     }
 }
 
@@ -1480,6 +1587,49 @@ fn run(parquet: &Path, dump: &Path) {
             }
         };
     }
+    macro_rules! refine_rows_block {
+        ($block:literal, $codes:expr, $offsets:expr, $cover:expr, $summary:expr, $out:expr) => {
+            match ($cover.points().len(), $cover.ranges().len()) {
+                (0, 1) => refine_live_blocks_fixed::<$block, 0, 1>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (1, 1) => refine_live_blocks_fixed::<$block, 1, 1>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (1, 2) => refine_live_blocks_fixed::<$block, 1, 2>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (1, 3) => refine_live_blocks_fixed::<$block, 1, 3>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (2, 0) => refine_live_blocks_fixed::<$block, 2, 0>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (2, 2) => refine_live_blocks_fixed::<$block, 2, 2>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (3, 1) => refine_live_blocks_fixed::<$block, 3, 1>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (3, 2) => refine_live_blocks_fixed::<$block, 3, 2>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (4, 0) => refine_live_blocks_fixed::<$block, 4, 0>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (10, 2) => refine_live_blocks_fixed::<$block, 10, 2>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (12, 5) => refine_live_blocks_fixed::<$block, 12, 5>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                (25, 5) => refine_live_blocks_fixed::<$block, 25, 5>(
+                    $codes, $offsets, $cover, $summary, $out,
+                ),
+                _ => refine_live_blocks::<$block>($codes, $offsets, $cover, $summary, $out),
+            }
+        };
+    }
     let column = load_column(dump);
     let view = column.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
@@ -1743,23 +1893,14 @@ fn run(parquet: &Path, dump: &Path) {
                         let start = Instant::now();
                         match hierarchy_kernel.as_str() {
                             "intrinsics-avx512" => unsafe {
-                                if (cover.points().len(), cover.ranges().len()) == (2, 2) {
-                                    refine_live_blocks_fixed::<$block, 2, 2>(
-                                        black_box(scan_codes),
-                                        black_box(scan_offsets),
-                                        black_box(cover),
-                                        black_box(&hierarchy_summary),
-                                        black_box(&mut refined),
-                                    )
-                                } else {
-                                    refine_live_blocks::<$block>(
-                                        black_box(scan_codes),
-                                        black_box(scan_offsets),
-                                        black_box(cover),
-                                        black_box(&hierarchy_summary),
-                                        black_box(&mut refined),
-                                    )
-                                }
+                                refine_rows_block!(
+                                    $block,
+                                    black_box(scan_codes),
+                                    black_box(scan_offsets),
+                                    black_box(cover),
+                                    black_box(&hierarchy_summary),
+                                    black_box(&mut refined)
+                                )
                             },
                             "intrinsics-avx2" => unsafe {
                                 refine_live_blocks_avx2_p2r2::<$block>(
@@ -2084,29 +2225,35 @@ fn run(parquet: &Path, dump: &Path) {
 
                 let start = Instant::now();
                 block_candidates!(&summary, scan_offsets, &mut block_out);
-                block_out.retain(|&row| contains(black_box(view.row_codes(row)), black_box(&kmp)));
-                let kmp_ns = start.elapsed().as_nanos();
-                assert_eq!(block_out, out);
+                let materialize_ns = start.elapsed().as_nanos();
 
+                let mut kmp_rows = block_out.clone();
                 let start = Instant::now();
-                block_candidates!(&summary, scan_offsets, &mut block_out);
-                verifier.retain(black_box(view), black_box(&mut block_out));
+                kmp_rows.retain(|&row| contains(black_box(view.row_codes(row)), black_box(&kmp)));
+                let kmp_ns = start.elapsed().as_nanos();
+                assert_eq!(kmp_rows, out);
+
+                let mut memmem_rows = block_out.clone();
+                let start = Instant::now();
+                verifier.retain(black_box(view), black_box(&mut memmem_rows));
                 let memmem_ns = start.elapsed().as_nanos();
-                assert_eq!(block_out, out);
-                named_samples.push((summary_ns, kmp_ns, memmem_ns));
+                assert_eq!(memmem_rows, out);
+                named_samples.push((summary_ns, materialize_ns, kmp_ns, memmem_ns));
             }
             let summary_ns = named_samples.iter().map(|sample| sample.0).min().unwrap();
-            let kmp_ns = named_samples.iter().map(|sample| sample.1).min().unwrap();
-            let memmem_ns = named_samples.iter().map(|sample| sample.2).min().unwrap();
+            let materialize_ns = named_samples.iter().map(|sample| sample.1).min().unwrap();
+            let kmp_ns = named_samples.iter().map(|sample| sample.2).min().unwrap();
+            let memmem_ns = named_samples.iter().map(|sample| sample.3).min().unwrap();
             println!(
-                "SUPERBLOCK{}_{}\tblock_candidates={block_candidates}\tstage_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
+                "SUPERBLOCK{}_{}\tblock_candidates={block_candidates}\tstage_ms={:.6}\tmaterialize_rows_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
                 summary_codes,
                 label(&query),
                 summary_ns as f64 / 1_000_000.0,
+                materialize_ns as f64 / 1_000_000.0,
                 kmp_ns as f64 / 1_000_000.0,
-                (summary_ns + kmp_ns) as f64 / 1_000_000.0,
+                (summary_ns + materialize_ns + kmp_ns) as f64 / 1_000_000.0,
                 memmem_ns as f64 / 1_000_000.0,
-                (summary_ns + memmem_ns) as f64 / 1_000_000.0,
+                (summary_ns + materialize_ns + memmem_ns) as f64 / 1_000_000.0,
             );
             continue;
         }
