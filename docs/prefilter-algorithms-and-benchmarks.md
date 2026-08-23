@@ -187,20 +187,18 @@ The dispatcher uses only facts known after query analysis. It never observes
 exact match counts, candidate counts, or measured runtime.
 
 ```text
-comparison_cost = point_count + 2 * range_count
-
-if comparison_cost >= 200:
+if covered_fraction >= 0.06:
     Direct compressed KMP
-else if covered_fraction >= 0.03:
-    if comparison_cost >= 64:
-        Direct compressed KMP
-    else:
-        Scan Finding Index
-else if comparison_cost <= 24:
-    Superblock Hierarchical Mid-cut
 else:
-    Scan Finding Index
+    Fused Superblock Mid-cut
+    (compare-chain probe if point_count + 2 * range_count <= 16,
+     cover-bitmap probe otherwise)
 ```
+
+This is the post-fused-kernel model; the earlier cost-banded model and its
+validation table below are retained as history. See
+[`prefilter-optimization-experiments.md`](prefilter-optimization-experiments.md)
+for the kernels and the 204-case retune (regret 0.07%).
 
 The original exact-row-selectivity gate remains only as a benchmark comparator.
 It is not a usable static model because it depends on scanning the data first.
