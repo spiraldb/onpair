@@ -1,0 +1,13 @@
+.com
+.ru
+/search
+html
+http:%2F%2Fs
+http://
+https://
+index
+lanet.ru
+news
+php
+rodukty%
+yandex

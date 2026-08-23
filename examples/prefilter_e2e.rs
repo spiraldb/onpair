@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::hint::black_box;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, size_of, size_of_val};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -1318,12 +1318,18 @@ fn main() {
         PathBuf::from(std::env::var("ONPAIR_PF_DUMP").unwrap_or_else(|_| DEFAULT_DUMP.to_string()));
     match mode.as_str() {
         "prepare" => prepare(&parquet, &dump),
+        "prepare-lines" => prepare_lines(
+            Path::new(
+                &std::env::var("ONPAIR_BENCH_LINES").expect("ONPAIR_BENCH_LINES is required"),
+            ),
+            &dump,
+        ),
         "run" => run(&parquet, &dump),
         "perf-original-google" => perf_google(&dump, true),
         "perf-new-google" => perf_google(&dump, false),
         "perf-summary-google" => perf_summary_google(&dump),
         _ => panic!(
-            "usage: prefilter_e2e [prepare|run|perf-original-google|perf-new-google|perf-summary-google]"
+            "usage: prefilter_e2e [prepare|prepare-lines|run|perf-original-google|perf-new-google|perf-summary-google]"
         ),
     }
 }
@@ -1482,6 +1488,20 @@ fn perf_google(dump: &Path, original: bool) {
 
 fn prepare(parquet: &Path, dump: &Path) {
     let rows = read_urls(parquet);
+    prepare_rows(rows, dump);
+}
+
+fn prepare_lines(lines: &Path, dump: &Path) {
+    let bytes = fs::read(lines).expect("read line corpus");
+    let rows = bytes
+        .split(|&byte| byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    prepare_rows(rows, dump);
+}
+
+fn prepare_rows(rows: Vec<Vec<u8>>, dump: &Path) {
     let row_count = rows.len();
     let (bytes, offsets) = pack(&rows);
     eprintln!(
@@ -1650,10 +1670,34 @@ fn run(parquet: &Path, dump: &Path) {
     let scan_code_count = view.row_offsets[scan_rows] as usize;
     let scan_codes = &view.codes[..scan_code_count];
     let scan_offsets = &view.row_offsets[..=scan_rows];
+    let segment_bytes = std::env::var("ONPAIR_SEGMENT_BYTES")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("valid ONPAIR_SEGMENT_BYTES"));
+    let segment_algorithm = std::env::var("ONPAIR_SEGMENT_ALGORITHM").ok();
+    let segment_rows = segment_bytes.map(|bytes| {
+        assert!(bytes >= 2, "segments must hold at least one u16 code");
+        let max_codes = bytes / size_of::<u16>();
+        let mut ranges = Vec::new();
+        let mut row_begin = 0usize;
+        while row_begin < scan_rows {
+            let code_begin = scan_offsets[row_begin] as usize;
+            let code_limit = code_begin.saturating_add(max_codes);
+            let mut row_end = scan_offsets.partition_point(|&offset| offset as usize <= code_limit);
+            row_end = row_end.saturating_sub(1).min(scan_rows);
+            if row_end == row_begin {
+                row_end += 1;
+            }
+            ranges.push((row_begin, row_end));
+            row_begin = row_end;
+        }
+        ranges
+    });
     let low_selectivity_only = std::env::var_os("ONPAIR_PF_LOW_SELECTIVITY").is_some();
     let measure_original = std::env::var_os("ONPAIR_PF_ORIGINAL_GOOGLE").is_some();
     let measure_original_all = std::env::var_os("ONPAIR_PF_ORIGINAL_ALL").is_some();
     let named_only = std::env::var_os("ONPAIR_NAMED_ONLY").is_some();
+    let dispatch_only = std::env::var_os("ONPAIR_DISPATCH_ONLY").is_some();
+    let features_only = std::env::var_os("ONPAIR_FEATURES_ONLY").is_some();
     let hierarchy_kernel =
         std::env::var("ONPAIR_HIER_KERNEL").unwrap_or_else(|_| "intrinsics-avx512".to_string());
     let fixed_query = std::env::var("ONPAIR_ONLY_QUERY").ok();
@@ -1780,12 +1824,319 @@ fn run(parquet: &Path, dump: &Path) {
         if low_selectivity_only && analysis.covered_fraction() >= 0.001 {
             continue;
         }
+        if features_only {
+            let model = static_dispatch(
+                analysis.covered_fraction(),
+                cover.points().len(),
+                cover.ranges().len(),
+            );
+            println!(
+                "FEATURES_{}\tneedle_bytes={}\tpoints={}\tranges={}\tcomparison_cost={}\tcover_fraction={:.8}\tmodel_algorithm={}",
+                label(&query),
+                query.len(),
+                cover.points().len(),
+                cover.ranges().len(),
+                analysis.comparison_cost(),
+                analysis.covered_fraction(),
+                model.name(),
+            );
+            continue;
+        }
         let kmp = ContainsTable::new(&query, view.dict);
+
+        if let (Some(segment_bytes), Some(segment_rows)) = (segment_bytes, &segment_rows) {
+            let mut windows = vec![(query.len(), query.len()); view.dict.num_tokens()];
+            for window in analysis.probe_windows() {
+                windows[window.token() as usize] = (window.before_codes(), window.after_codes());
+            }
+            let selected = static_dispatch(
+                analysis.covered_fraction(),
+                cover.points().len(),
+                cover.ranges().len(),
+            );
+            let exact_match_count: usize = segment_rows
+                .iter()
+                .map(|&(row_begin, row_end)| {
+                    (row_begin..row_end)
+                        .filter(|&row| contains(view.row_codes(row), &kmp))
+                        .count()
+                })
+                .sum();
+            let row_match_fraction = exact_match_count as f64 / scan_rows as f64;
+            let gated_algorithm = if row_match_fraction < 0.001 {
+                selected.name()
+            } else {
+                "full-kmp"
+            };
+            let mut run_samples: [Vec<u128>; 8] = std::array::from_fn(|_| Vec::with_capacity(reps));
+            let mut max_segment_code_bytes = 0usize;
+
+            for _ in 0..reps {
+                let mut run_totals = [0u128; 8];
+                for &(row_begin, row_end) in segment_rows {
+                    let code_begin = scan_offsets[row_begin] as usize;
+                    let code_end = scan_offsets[row_end] as usize;
+                    let codes = &scan_codes[code_begin..code_end];
+                    max_segment_code_bytes = max_segment_code_bytes.max(size_of_val(codes));
+                    let offsets: Vec<u64> = scan_offsets[row_begin..=row_end]
+                        .iter()
+                        .map(|&offset| offset - code_begin as u64)
+                        .collect();
+                    let expected: Vec<usize> = (0..row_end - row_begin)
+                        .filter(|&row| {
+                            contains(
+                                &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                &kmp,
+                            )
+                        })
+                        .collect();
+                    let mut super_summary =
+                        vec![0u64; codes.len().div_ceil(summary_codes).div_ceil(64)];
+                    let mut hierarchy_summary = vec![0u64; codes.len().div_ceil(512).div_ceil(64)];
+                    let mut rows = Vec::new();
+                    let mut positions = Vec::new();
+
+                    macro_rules! measure_segment {
+                    ($slot:literal, $name:literal, $body:block) => {{
+                        if segment_algorithm
+                            .as_deref()
+                            .is_none_or(|selected| selected == $name)
+                        {
+                            let start = Instant::now();
+                            $body
+                            let elapsed = start.elapsed().as_nanos();
+                            assert_eq!(rows, expected);
+                            run_totals[$slot] += elapsed;
+                        }
+                    }};
+                }
+
+                    measure_segment!(0, "scan", {
+                        unsafe {
+                            original_avx512_candidates(codes, &offsets, cover, &mut rows);
+                        }
+                        rows.retain(|&row| {
+                            contains(
+                                &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                &kmp,
+                            )
+                        });
+                    });
+                    measure_segment!(1, "superblock", {
+                        unsafe { summarize!(codes, cover, &mut super_summary) };
+                        block_candidates!(&super_summary, &offsets, &mut rows);
+                        rows.retain(|&row| {
+                            contains(
+                                &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                &kmp,
+                            )
+                        });
+                    });
+                    measure_segment!(2, "hierarchical", {
+                        unsafe {
+                            summarize_block!(512, codes, cover, &mut hierarchy_summary);
+                            refine_rows_block!(
+                                512,
+                                codes,
+                                &offsets,
+                                cover,
+                                &hierarchy_summary,
+                                &mut rows
+                            );
+                        }
+                        rows.retain(|&row| {
+                            contains(
+                                &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                &kmp,
+                            )
+                        });
+                    });
+                    measure_segment!(3, "hierarchical-length", {
+                        unsafe {
+                            summarize_block!(512, codes, cover, &mut hierarchy_summary);
+                            refine_rows_block!(
+                                512,
+                                codes,
+                                &offsets,
+                                cover,
+                                &hierarchy_summary,
+                                &mut rows
+                            );
+                        }
+                        let minimum_codes = query.len() / MAX_TOKEN_SIZE;
+                        rows.retain(|&row| {
+                            (offsets[row + 1] - offsets[row]) as usize >= minimum_codes
+                        });
+                        rows.retain(|&row| {
+                            contains(
+                                &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                &kmp,
+                            )
+                        });
+                    });
+                    measure_segment!(4, "midcut", {
+                        unsafe {
+                            summarize_block!(512, codes, cover, &mut hierarchy_summary);
+                            refine_live_block_positions::<512>(
+                                codes,
+                                cover,
+                                &hierarchy_summary,
+                                &mut positions,
+                            );
+                        }
+                        localized_kmp(codes, &offsets, &positions, &windows, &kmp, &mut rows);
+                    });
+                    measure_segment!(5, "dispatch", {
+                        match selected {
+                            StaticDispatch::DirectKmp => {
+                                rows.clear();
+                                rows.extend((0..offsets.len() - 1).filter(|&row| {
+                                    contains(
+                                        &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                        &kmp,
+                                    )
+                                }));
+                            }
+                            StaticDispatch::ScanFindingIndex => unsafe {
+                                original_avx512_candidates(codes, &offsets, cover, &mut rows);
+                                rows.retain(|&row| {
+                                    contains(
+                                        &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                        &kmp,
+                                    )
+                                });
+                            },
+                            StaticDispatch::HierarchicalMidcut => unsafe {
+                                summarize_block!(512, codes, cover, &mut hierarchy_summary);
+                                refine_live_block_positions::<512>(
+                                    codes,
+                                    cover,
+                                    &hierarchy_summary,
+                                    &mut positions,
+                                );
+                                localized_kmp(
+                                    codes, &offsets, &positions, &windows, &kmp, &mut rows,
+                                );
+                            },
+                        }
+                    });
+                    measure_segment!(6, "full-kmp", {
+                        rows.clear();
+                        rows.extend((0..offsets.len() - 1).filter(|&row| {
+                            contains(
+                                &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                &kmp,
+                            )
+                        }));
+                    });
+                    measure_segment!(7, "gated", {
+                        if row_match_fraction >= 0.001 {
+                            rows.clear();
+                            rows.extend((0..offsets.len() - 1).filter(|&row| {
+                                contains(
+                                    &codes[offsets[row] as usize..offsets[row + 1] as usize],
+                                    &kmp,
+                                )
+                            }));
+                        } else {
+                            match selected {
+                                StaticDispatch::DirectKmp => {
+                                    rows.clear();
+                                    rows.extend((0..offsets.len() - 1).filter(|&row| {
+                                        contains(
+                                            &codes
+                                                [offsets[row] as usize..offsets[row + 1] as usize],
+                                            &kmp,
+                                        )
+                                    }));
+                                }
+                                StaticDispatch::ScanFindingIndex => unsafe {
+                                    original_avx512_candidates(codes, &offsets, cover, &mut rows);
+                                    rows.retain(|&row| {
+                                        contains(
+                                            &codes
+                                                [offsets[row] as usize..offsets[row + 1] as usize],
+                                            &kmp,
+                                        )
+                                    });
+                                },
+                                StaticDispatch::HierarchicalMidcut => unsafe {
+                                    summarize_block!(512, codes, cover, &mut hierarchy_summary);
+                                    refine_live_block_positions::<512>(
+                                        codes,
+                                        cover,
+                                        &hierarchy_summary,
+                                        &mut positions,
+                                    );
+                                    localized_kmp(
+                                        codes, &offsets, &positions, &windows, &kmp, &mut rows,
+                                    );
+                                },
+                            }
+                        }
+                    });
+                }
+                for slot in 0..run_samples.len() {
+                    run_samples[slot].push(run_totals[slot]);
+                }
+            }
+            let totals: [u128; 8] = std::array::from_fn(|slot| {
+                *run_samples[slot].iter().min().expect("at least one run")
+            });
+            let oracle = [
+                (totals[0], "scan-finding-index"),
+                (totals[1], "superblock"),
+                (totals[2], "superblock-hierarchical"),
+                (totals[3], "superblock-hierarchical-length"),
+                (totals[4], "superblock-hierarchical-midcut"),
+                (totals[6], "full-kmp"),
+            ]
+            .into_iter()
+            .min_by_key(|&(elapsed, _)| elapsed)
+            .unwrap();
+            let model_slot = match selected {
+                StaticDispatch::DirectKmp => 6,
+                StaticDispatch::ScanFindingIndex => 0,
+                StaticDispatch::HierarchicalMidcut => 4,
+            };
+            let model_ns = totals[model_slot];
+            let model_regret_pct = if oracle.0 == 0 {
+                0.0
+            } else {
+                (model_ns - oracle.0) as f64 * 100.0 / oracle.0 as f64
+            };
+
+            println!(
+                "SEGMENTED_{}_{}\tsegments={}\tmax_code_bytes={}\tsuperblock_codes={}\trow_matches={}\trow_match_fraction={:.8}\tscan_finding_index_ms={:.6}\tsuperblock_ms={:.6}\thierarchical_ms={:.6}\thierarchical_loose_length_ms={:.6}\tmidcut_ms={:.6}\tdispatch_algorithm={}\tdispatch_ms={:.6}\tfull_kmp_ms={:.6}\tgated_algorithm={}\tgated_ms={:.6}\toracle_algorithm={}\toracle_ms={:.6}\tmodel_ms={:.6}\tmodel_regret_pct={:.4}",
+                segment_bytes,
+                label(&query),
+                segment_rows.len(),
+                max_segment_code_bytes,
+                summary_codes,
+                exact_match_count,
+                row_match_fraction,
+                totals[0] as f64 / 1_000_000.0,
+                totals[1] as f64 / 1_000_000.0,
+                totals[2] as f64 / 1_000_000.0,
+                totals[3] as f64 / 1_000_000.0,
+                totals[4] as f64 / 1_000_000.0,
+                selected.name(),
+                totals[5] as f64 / 1_000_000.0,
+                totals[6] as f64 / 1_000_000.0,
+                gated_algorithm,
+                totals[7] as f64 / 1_000_000.0,
+                oracle.1,
+                oracle.0 as f64 / 1_000_000.0,
+                model_ns as f64 / 1_000_000.0,
+                model_regret_pct,
+            );
+            continue;
+        }
+
         let mut verifier = BytesVerifier::new(&query);
         let mut out = Vec::new();
         prefilter_candidates(scan_codes, scan_offsets, &analysis, &mut out).unwrap();
         let candidates = out.len();
-        let exact_cover_rows = out.clone();
         let mut kmp_out = out.clone();
         kmp_out.retain(|&row| contains(view.row_codes(row), &kmp));
         verifier.retain(view, &mut out);
@@ -1805,7 +2156,9 @@ fn run(parquet: &Path, dump: &Path) {
         assert_eq!(block_kmp, out);
         assert_eq!(block_out, out);
 
-        if (measure_original && query == b"google") || measure_original_all || named_only {
+        if ((measure_original && query == b"google") || measure_original_all || named_only)
+            && !dispatch_only
+        {
             macro_rules! bench_original {
                 ($name:literal, $scan:ident) => {{
                     let mut original = Vec::new();
@@ -1815,7 +2168,11 @@ fn run(parquet: &Path, dump: &Path) {
                         unsafe { $scan(scan_codes, scan_offsets, cover, &mut original) };
                         let stage_ns = start.elapsed().as_nanos();
                         let original_candidates = original.len();
-                        assert_eq!(original, exact_cover_rows, "prefilter candidate rows differ");
+                        // The production policy intentionally returns every row when a
+                        // cover is too dense to be profitable.  The named scan still
+                        // materializes only exact cover-hit rows, so candidate lists
+                        // need not be identical for high-selectivity LIKE workloads.
+                        // Correctness is checked after exact verification below.
 
                         let mut kmp_rows = original.clone();
                         let start = Instant::now();
@@ -1853,9 +2210,10 @@ fn run(parquet: &Path, dump: &Path) {
             bench_original!("AVX512", original_avx512_candidates);
         }
 
-        if (std::env::var_os("ONPAIR_HIER512").is_some()
+        if ((std::env::var_os("ONPAIR_HIER512").is_some()
             || std::env::var_os("ONPAIR_HIER_ALL").is_some())
-            || named_only
+            || named_only)
+            && !dispatch_only
         {
             let mut hierarchy_results = Vec::new();
             macro_rules! bench_hierarchy {
@@ -2211,49 +2569,133 @@ fn run(parquet: &Path, dump: &Path) {
         }
 
         if named_only {
-            let mut named_samples = Vec::with_capacity(reps);
+            if !dispatch_only {
+                let mut named_samples = Vec::with_capacity(reps);
+                for _ in 0..reps {
+                    let start = Instant::now();
+                    unsafe {
+                        summarize!(
+                            black_box(scan_codes),
+                            black_box(cover),
+                            black_box(&mut summary)
+                        )
+                    };
+                    let summary_ns = start.elapsed().as_nanos();
+
+                    let start = Instant::now();
+                    block_candidates!(&summary, scan_offsets, &mut block_out);
+                    let materialize_ns = start.elapsed().as_nanos();
+
+                    let mut kmp_rows = block_out.clone();
+                    let start = Instant::now();
+                    kmp_rows
+                        .retain(|&row| contains(black_box(view.row_codes(row)), black_box(&kmp)));
+                    let kmp_ns = start.elapsed().as_nanos();
+                    assert_eq!(kmp_rows, out);
+
+                    let mut memmem_rows = block_out.clone();
+                    let start = Instant::now();
+                    verifier.retain(black_box(view), black_box(&mut memmem_rows));
+                    let memmem_ns = start.elapsed().as_nanos();
+                    assert_eq!(memmem_rows, out);
+                    named_samples.push((summary_ns, materialize_ns, kmp_ns, memmem_ns));
+                }
+                let summary_ns = named_samples.iter().map(|sample| sample.0).min().unwrap();
+                let materialize_ns = named_samples.iter().map(|sample| sample.1).min().unwrap();
+                let kmp_ns = named_samples.iter().map(|sample| sample.2).min().unwrap();
+                let memmem_ns = named_samples.iter().map(|sample| sample.3).min().unwrap();
+                println!(
+                    "SUPERBLOCK{}_{}\tblock_candidates={block_candidates}\tstage_ms={:.6}\tmaterialize_rows_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
+                    summary_codes,
+                    label(&query),
+                    summary_ns as f64 / 1_000_000.0,
+                    materialize_ns as f64 / 1_000_000.0,
+                    kmp_ns as f64 / 1_000_000.0,
+                    (summary_ns + materialize_ns + kmp_ns) as f64 / 1_000_000.0,
+                    memmem_ns as f64 / 1_000_000.0,
+                    (summary_ns + materialize_ns + memmem_ns) as f64 / 1_000_000.0,
+                );
+            }
+
+            // Measure the complete statically-dispatched KMP pipeline.  The
+            // decision uses only the already-computed query cover frequency;
+            // it never observes candidates or matches from a preliminary scan.
+            let mut dispatch_summary = vec![0u64; scan_codes.len().div_ceil(512).div_ceil(64)];
+            let mut dispatch_rows = Vec::new();
+            let mut dispatch_positions = Vec::new();
+            let dispatch_windows = {
+                let mut windows = vec![(query.len(), query.len()); view.dict.num_tokens()];
+                for window in analysis.probe_windows() {
+                    windows[window.token() as usize] =
+                        (window.before_codes(), window.after_codes());
+                }
+                windows
+            };
+            let mut dispatch_samples = Vec::with_capacity(reps);
             for _ in 0..reps {
                 let start = Instant::now();
-                unsafe {
-                    summarize!(
-                        black_box(scan_codes),
-                        black_box(cover),
-                        black_box(&mut summary)
-                    )
-                };
-                let summary_ns = start.elapsed().as_nanos();
-
-                let start = Instant::now();
-                block_candidates!(&summary, scan_offsets, &mut block_out);
-                let materialize_ns = start.elapsed().as_nanos();
-
-                let mut kmp_rows = block_out.clone();
-                let start = Instant::now();
-                kmp_rows.retain(|&row| contains(black_box(view.row_codes(row)), black_box(&kmp)));
-                let kmp_ns = start.elapsed().as_nanos();
-                assert_eq!(kmp_rows, out);
-
-                let mut memmem_rows = block_out.clone();
-                let start = Instant::now();
-                verifier.retain(black_box(view), black_box(&mut memmem_rows));
-                let memmem_ns = start.elapsed().as_nanos();
-                assert_eq!(memmem_rows, out);
-                named_samples.push((summary_ns, materialize_ns, kmp_ns, memmem_ns));
+                let selected = static_dispatch(
+                    black_box(analysis.covered_fraction()),
+                    black_box(cover.points().len()),
+                    black_box(cover.ranges().len()),
+                );
+                match selected {
+                    StaticDispatch::DirectKmp => {
+                        dispatch_rows.clear();
+                        dispatch_rows.extend((0..scan_rows).filter(|&row| {
+                            contains(black_box(view.row_codes(row)), black_box(&kmp))
+                        }));
+                    }
+                    StaticDispatch::ScanFindingIndex => unsafe {
+                        original_avx512_candidates(
+                            black_box(scan_codes),
+                            black_box(scan_offsets),
+                            black_box(cover),
+                            black_box(&mut dispatch_rows),
+                        );
+                        dispatch_rows.retain(|&row| {
+                            contains(black_box(view.row_codes(row)), black_box(&kmp))
+                        });
+                    },
+                    StaticDispatch::HierarchicalMidcut => unsafe {
+                        summarize_block!(
+                            512,
+                            black_box(scan_codes),
+                            black_box(cover),
+                            black_box(&mut dispatch_summary)
+                        );
+                        refine_live_block_positions::<512>(
+                            black_box(scan_codes),
+                            black_box(cover),
+                            black_box(&dispatch_summary),
+                            black_box(&mut dispatch_positions),
+                        );
+                        localized_kmp(
+                            black_box(scan_codes),
+                            black_box(scan_offsets),
+                            black_box(&dispatch_positions),
+                            black_box(&dispatch_windows),
+                            black_box(&kmp),
+                            black_box(&mut dispatch_rows),
+                        );
+                    },
+                }
+                let elapsed_ns = start.elapsed().as_nanos();
+                assert_eq!(dispatch_rows, out);
+                dispatch_samples.push(elapsed_ns);
             }
-            let summary_ns = named_samples.iter().map(|sample| sample.0).min().unwrap();
-            let materialize_ns = named_samples.iter().map(|sample| sample.1).min().unwrap();
-            let kmp_ns = named_samples.iter().map(|sample| sample.2).min().unwrap();
-            let memmem_ns = named_samples.iter().map(|sample| sample.3).min().unwrap();
+            let selected = static_dispatch(
+                analysis.covered_fraction(),
+                cover.points().len(),
+                cover.ranges().len(),
+            );
+            let dispatch_ns = *dispatch_samples.iter().min().unwrap();
             println!(
-                "SUPERBLOCK{}_{}\tblock_candidates={block_candidates}\tstage_ms={:.6}\tmaterialize_rows_ms={:.6}\tprecise_kmp_ms={:.6}\te2e_kmp_ms={:.6}\tprecise_memmem_ms={:.6}\te2e_memmem_ms={:.6}",
-                summary_codes,
+                "STATIC_DISPATCH_{}\talgorithm={}\tcover_frac={:.8}\te2e_kmp_ms={:.6}",
                 label(&query),
-                summary_ns as f64 / 1_000_000.0,
-                materialize_ns as f64 / 1_000_000.0,
-                kmp_ns as f64 / 1_000_000.0,
-                (summary_ns + materialize_ns + kmp_ns) as f64 / 1_000_000.0,
-                memmem_ns as f64 / 1_000_000.0,
-                (summary_ns + materialize_ns + memmem_ns) as f64 / 1_000_000.0,
+                selected.name(),
+                analysis.covered_fraction(),
+                dispatch_ns as f64 / 1_000_000.0,
             );
             continue;
         }
@@ -2402,6 +2844,76 @@ fn selectivity_band(fraction: f64) -> usize {
         2
     } else {
         3
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaticDispatch {
+    DirectKmp,
+    ScanFindingIndex,
+    HierarchicalMidcut,
+}
+
+impl StaticDispatch {
+    fn name(self) -> &'static str {
+        match self {
+            Self::DirectKmp => "full-kmp",
+            Self::ScanFindingIndex => "scan-finding-index",
+            Self::HierarchicalMidcut => "superblock-hierarchical-midcut",
+        }
+    }
+}
+
+/// Choose the complete search pipeline using query analysis only.  The model
+/// deliberately avoids measured row/candidate counts, so dispatch does not
+/// require a data scan.
+fn static_dispatch(
+    covered_fraction: f64,
+    point_count: usize,
+    range_count: usize,
+) -> StaticDispatch {
+    // A point is one SIMD comparison; an inclusive range is subtraction plus
+    // comparison, so price it as two. This matches the analysis API's cost.
+    let comparison_cost = point_count.saturating_add(range_count.saturating_mul(2));
+    if comparison_cost >= 200 {
+        StaticDispatch::DirectKmp
+    } else if covered_fraction >= 0.03 {
+        if comparison_cost >= 64 {
+            StaticDispatch::DirectKmp
+        } else {
+            StaticDispatch::ScanFindingIndex
+        }
+    } else if comparison_cost <= 24 {
+        StaticDispatch::HierarchicalMidcut
+    } else {
+        StaticDispatch::ScanFindingIndex
+    }
+}
+
+#[cfg(test)]
+mod dispatch_model_tests {
+    use super::{StaticDispatch, static_dispatch};
+
+    #[test]
+    fn dense_or_complex_covers_use_direct_kmp() {
+        assert_eq!(static_dispatch(0.03, 64, 0), StaticDispatch::DirectKmp);
+        assert_eq!(static_dispatch(0.001, 100, 50), StaticDispatch::DirectKmp);
+        assert_eq!(
+            static_dispatch(0.03, 20, 0),
+            StaticDispatch::ScanFindingIndex
+        );
+    }
+
+    #[test]
+    fn tiny_cuts_localize_and_moderate_cuts_scan() {
+        assert_eq!(
+            static_dispatch(0.001, 20, 1),
+            StaticDispatch::HierarchicalMidcut
+        );
+        assert_eq!(
+            static_dispatch(0.001, 23, 1),
+            StaticDispatch::ScanFindingIndex
+        );
     }
 }
 

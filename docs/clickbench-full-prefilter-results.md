@@ -1,5 +1,9 @@
 # Full ClickBench prefilter comparison
 
+For the consolidated algorithm definitions, lessons, dispatcher model, and
+copy-paste regression commands, see the
+[prefilter algorithm and benchmark guide](prefilter-algorithms-and-benchmarks.md).
+
 ## Named-pipeline rerun after the upstream merge
 
 On 2026-08-22, `origin/feat/search-prefilter` at `5936ffc` was merged into the
@@ -90,6 +94,45 @@ For `google` specifically, P3R2-specialized Mid-cut takes 134.35 ms for the
 coarse scan, 15.99 ms to recover 111,769 positions, and 63.40 ms to run KMP on
 472,628 window codes: 213.74 ms end to end. Plain Superblock takes 291.15 ms,
 the row hierarchy 332.77 ms, and specialized Scan Finding Index 416.96 ms.
+
+## Static segmented dispatcher model
+
+The segmented benchmark now evaluates a static complete-pipeline dispatcher
+against the per-query oracle.  It uses only two facts produced by prefilter
+analysis: covered code frequency and SIMD comparison cost.  A point costs one
+comparison and an inclusive range costs two.
+
+```text
+if comparison_cost >= 200:
+    full compressed KMP
+else if covered_fraction >= 3%:
+    full compressed KMP when comparison_cost >= 64, otherwise Scan Finding Index
+else if comparison_cost <= 24:
+    Superblock Hierarchical Mid-cut
+else:
+    Scan Finding Index
+```
+
+The model never observes exact matches, candidate counts, or measured runtime.
+Across 218 query/segment-size cases (2 and 4 MiB) it selected the exact oracle
+implementation in 214 cases (98.17%) and the correct algorithm family in 216
+cases (99.08%):
+
+| Corpus | Cases | Exact choices | Family choices |
+|---|---:|---:|---:|
+| ClickBench high-selectivity calibration | 26 | 24 (92.31%) | 25 (96.15%) |
+| Sentiment140 mined holdout | 96 | 96 (100%) | 96 (100%) |
+| News headlines mined holdout | 96 | 94 (97.92%) | 95 (98.96%) |
+| **Combined** | **218** | **214 (98.17%)** | **216 (99.08%)** |
+
+The ClickBench predicted/oracle runtime correlation is 0.99897 and its total
+runtime regret is 0.46%.  The largest remaining miss is the 4 MiB `lanet.ru`
+case: Scan Finding Index takes 1,011 ms while Mid-cut takes 879 ms.  On news,
+the only non-family 4 MiB miss is `php`, where Scan takes 10.56 ms and Mid-cut
+takes 10.31 ms (2.43% regret); this is too small to justify another threshold.
+
+The old exact-row-selectivity gate remains in the benchmark as a comparator,
+not as an input to this model.
 
 ## Result
 
