@@ -493,6 +493,27 @@ fn pf_class_pair_combo(bencher: Bencher, pattern: &str) {
     });
 }
 
+/// The fully-merged dictionary-only pipeline: the sparse-analysis
+/// interesting-run combination prefilter feeding the Hyperflex class-pair
+/// walk — every piece of the study composed, no code-stream sampling at
+/// compile time.
+#[divan::bench(args = PATTERNS, sample_count = 10)]
+fn pf_combo_hyperflex2(bencher: Bencher, pattern: &str) {
+    let (c, p) = (corpus(), prepared(pattern));
+    if !p.class.supports(Walk::HyperflexPair) {
+        return;
+    }
+    bench_scan(bencher, || {
+        p.class
+            .matching_rows(
+                divan::black_box(&c.col.codes),
+                &c.col.code_offsets,
+                Walk::HyperflexPair,
+            )
+            .len()
+    });
+}
+
 fn main() {
     let _ = corpus();
     for p in PATTERNS {
