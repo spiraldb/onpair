@@ -8,7 +8,6 @@ use super::policy::{
     Avx2Kernel, FixedShape, HitMaterialization, Sse2Kernel, with_avx2_fixed_shapes,
     with_sse2_fixed_shapes,
 };
-use super::table;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::prefilter::cover::ProbeCover;
@@ -20,8 +19,7 @@ mod sse2;
 #[cfg(test)]
 pub(in crate::search::prefilter) use avx2::scan_avx2;
 pub(super) use avx2::{
-    scan_avx2_few, scan_avx2_fixed, scan_avx2_gather, scan_avx2_nibble_points, scan_avx2_one_point,
-    scan_avx2_one_range,
+    scan_avx2_few, scan_avx2_fixed, scan_avx2_generic, scan_avx2_one_point, scan_avx2_one_range,
 };
 pub(in crate::search::prefilter) use avx512::scan_avx512;
 #[cfg(test)]
@@ -47,9 +45,6 @@ pub(super) fn execute_sse2<O: Offset>(
         }
         Sse2Kernel::Fixed(shape) => {
             execute_sse2_fixed(shape, codes, row_offsets, cover, sparse_row_mapping, out)
-        }
-        Sse2Kernel::CodesTable => {
-            table::scan_codes(codes, row_offsets, cover, sparse_row_mapping, out)
         }
         Sse2Kernel::Generic => {
             scan_sse2_generic(codes, row_offsets, cover, sparse_row_mapping, out)
@@ -120,17 +115,14 @@ pub(super) unsafe fn execute_avx2<O: Offset>(
             Avx2Kernel::Fixed(shape) => {
                 execute_avx2_fixed(shape, codes, row_offsets, cover, sparse_row_mapping, out)
             }
-            Avx2Kernel::NibblePoints => {
-                scan_avx2_nibble_points(codes, row_offsets, cover, sparse_row_mapping, out)
-            }
             Avx2Kernel::Few {
                 hits: HitMaterialization::CompactMask,
             } => scan_avx2_few::<O, true>(codes, row_offsets, cover, sparse_row_mapping, out),
             Avx2Kernel::Few {
                 hits: HitMaterialization::StoredLanes,
             } => scan_avx2_few::<O, false>(codes, row_offsets, cover, sparse_row_mapping, out),
-            Avx2Kernel::Gather => {
-                scan_avx2_gather(codes, row_offsets, cover, sparse_row_mapping, out)
+            Avx2Kernel::Generic => {
+                scan_avx2_generic(codes, row_offsets, cover, sparse_row_mapping, out)
             }
         }
     }

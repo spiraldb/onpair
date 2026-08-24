@@ -91,7 +91,6 @@ impl CoverShape {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AnalysisFacts {
     pub(super) shape: CoverShape,
-    pub(super) table_len: usize,
     pub(super) covered_codes: usize,
     pub(super) indexed_codes: usize,
 }
@@ -111,16 +110,6 @@ pub(super) struct ScanFacts {
 }
 
 impl ScanFacts {
-    #[cfg(any(target_arch = "x86_64", test))]
-    #[inline]
-    pub(super) const fn average_row_len(self) -> usize {
-        if self.region.row_count == 0 {
-            0
-        } else {
-            self.region.code_count / self.region.row_count
-        }
-    }
-
     /// Expected covered codes in this region.
     ///
     /// This is exact for the indexed population and a policy-only projection
@@ -188,24 +177,7 @@ const COMPACT_ONE_POINT_MIN_COVERAGE: Ratio = Ratio::new(7, 10_000);
 #[cfg(any(target_arch = "x86_64", test))]
 const COMPACT_FEW_HITS_MIN_COVERAGE: Ratio = Ratio::new(1, 2_000);
 #[cfg(any(target_arch = "x86_64", test))]
-const NIBBLE_SIX_MAX_COVERAGE: Ratio = Ratio::new(1, 100);
-#[cfg(any(target_arch = "x86_64", test))]
-const WIDE_COVER_ROW_TABLE_MIN_COVERAGE: Ratio = Ratio::new(1, 20);
-#[cfg(any(target_arch = "x86_64", test))]
-const LONG_ROW_TABLE_MIN_COVERAGE: Ratio = Ratio::new(3, 100);
-
-#[cfg(any(target_arch = "x86_64", test))]
-const SMALL_TABLE_LEN: usize = 1 << 12;
-#[cfg(any(target_arch = "x86_64", test))]
-const SMALL_TABLE_MAX_COMPARE_COST: usize = 10;
-#[cfg(any(target_arch = "x86_64", test))]
-const LARGE_TABLE_MAX_COMPARE_COST: usize = 13;
-#[cfg(any(target_arch = "x86_64", test))]
-const WIDE_COVER_COMPARE_COST: usize = 17;
-#[cfg(any(target_arch = "x86_64", test))]
-const LONG_ROW_CODES: usize = 32;
-#[cfg(any(target_arch = "x86_64", test))]
-const MEDIUM_ROW_CODES: usize = 8;
+const FEW_MAX_COMPARISON_COST: usize = 16;
 
 /// SIMD capabilities relevant to prefilter execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,7 +261,6 @@ pub(super) enum NeonKernel {
 pub(super) enum Sse2Kernel {
     OnePoint,
     Fixed(FixedShape),
-    CodesTable,
     Generic,
 }
 
@@ -299,9 +270,8 @@ pub(super) enum Avx2Kernel {
     OnePoint { hits: HitMaterialization },
     OneRange,
     Fixed(FixedShape),
-    NibblePoints,
     Few { hits: HitMaterialization },
-    Gather,
+    Generic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,8 +283,6 @@ pub(super) enum Avx512Kernel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Kernel {
     Empty,
-    #[cfg(any(target_arch = "x86_64", test))]
-    RowsTable,
     #[cfg(any(target_arch = "aarch64", test))]
     Neon(NeonKernel),
     #[cfg(any(target_arch = "x86_64", test))]
@@ -402,9 +370,7 @@ fn select_x86_64(
     let kernel = if avx512bw {
         Kernel::Avx512(Avx512Kernel::Generic)
     } else if avx2 {
-        select_avx2(facts)
-    } else if use_sse2_rows_table(facts) {
-        Kernel::RowsTable
+        Kernel::Avx2(select_avx2(facts))
     } else {
         Kernel::Sse2(select_sse2(facts.analysis.shape))
     };
@@ -413,33 +379,6 @@ fn select_x86_64(
         row_mapping,
         reserve,
     }
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-fn max_compare_cost(table_len: usize) -> usize {
-    if table_len <= SMALL_TABLE_LEN {
-        SMALL_TABLE_MAX_COMPARE_COST
-    } else {
-        LARGE_TABLE_MAX_COMPARE_COST
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-fn base_rows_table(facts: ScanFacts) -> bool {
-    facts.region.row_count != 0
-        && facts.average_row_len() >= LONG_ROW_CODES
-        && facts.expected_covered_codes() >= facts.region.row_count
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-fn use_sse2_rows_table(facts: ScanFacts) -> bool {
-    let cost = facts.analysis.shape.comparison_cost();
-    (base_rows_table(facts) && cost > max_compare_cost(facts.analysis.table_len))
-        || (cost >= WIDE_COVER_COMPARE_COST
-            && (facts.covered_at_least(WIDE_COVER_ROW_TABLE_MIN_COVERAGE)
-                || (facts.region.row_count != 0
-                    && facts.average_row_len() >= MEDIUM_ROW_CODES
-                    && facts.covered_at_least(LONG_ROW_TABLE_MIN_COVERAGE))))
 }
 
 #[cfg(any(target_arch = "x86_64", test))]
@@ -456,11 +395,7 @@ fn select_sse2(shape: CoverShape) -> Sse2Kernel {
     if is_sse2_fixed(shape) {
         return Sse2Kernel::Fixed(FixedShape::new(shape.points, shape.ranges));
     }
-    if shape.comparison_cost() >= WIDE_COVER_COMPARE_COST {
-        Sse2Kernel::CodesTable
-    } else {
-        Sse2Kernel::Generic
-    }
+    Sse2Kernel::Generic
 }
 
 #[cfg(any(target_arch = "x86_64", test))]
@@ -475,17 +410,9 @@ fn is_sse2_fixed(shape: CoverShape) -> bool {
 
 #[cfg(any(target_arch = "x86_64", test))]
 #[inline]
-fn select_avx2(facts: ScanFacts) -> Kernel {
+fn select_avx2(facts: ScanFacts) -> Avx2Kernel {
     let shape = facts.analysis.shape;
-    if base_rows_table(facts)
-        && shape.comparison_cost() > max_compare_cost(facts.analysis.table_len)
-    {
-        return Kernel::RowsTable;
-    }
-
-    let leaf = match (shape.points, shape.ranges) {
-        (9..=16, 0) if facts.analysis.table_len <= SMALL_TABLE_LEN => Avx2Kernel::NibblePoints,
-        (10..=16, 0) => Avx2Kernel::NibblePoints,
+    match (shape.points, shape.ranges) {
         (1, 0) => Avx2Kernel::OnePoint {
             hits: if facts.covered_at_least(COMPACT_ONE_POINT_MIN_COVERAGE) {
                 HitMaterialization::CompactMask
@@ -494,26 +421,16 @@ fn select_avx2(facts: ScanFacts) -> Kernel {
             },
         },
         (0, 1) => Avx2Kernel::OneRange,
-        (6, 0)
-            if facts.analysis.table_len <= SMALL_TABLE_LEN
-                && facts.covered_below(NIBBLE_SIX_MAX_COVERAGE) =>
-        {
-            Avx2Kernel::NibblePoints
-        }
-        (7..=8, 0) => Avx2Kernel::NibblePoints,
         _ if is_avx2_fixed(shape) => Avx2Kernel::Fixed(FixedShape::new(shape.points, shape.ranges)),
-        _ if shape.comparison_cost() <= max_compare_cost(facts.analysis.table_len) => {
-            Avx2Kernel::Few {
-                hits: if facts.covered_at_least(COMPACT_FEW_HITS_MIN_COVERAGE) {
-                    HitMaterialization::CompactMask
-                } else {
-                    HitMaterialization::StoredLanes
-                },
-            }
-        }
-        _ => Avx2Kernel::Gather,
-    };
-    Kernel::Avx2(leaf)
+        _ if shape.comparison_cost() <= FEW_MAX_COMPARISON_COST => Avx2Kernel::Few {
+            hits: if facts.covered_at_least(COMPACT_FEW_HITS_MIN_COVERAGE) {
+                HitMaterialization::CompactMask
+            } else {
+                HitMaterialization::StoredLanes
+            },
+        },
+        _ => Avx2Kernel::Generic,
+    }
 }
 
 #[cfg(any(target_arch = "x86_64", test))]
@@ -534,7 +451,6 @@ mod tests {
         ScanFacts {
             analysis: AnalysisFacts {
                 shape: CoverShape { points, ranges },
-                table_len: 4096,
                 covered_codes: 1,
                 indexed_codes: 10_000,
             },
@@ -603,46 +519,35 @@ mod tests {
     }
 
     #[test]
-    fn avx2_row_table_boundary_matches_upstream() {
-        let mut input = facts(11, 0);
+    fn wide_x86_covers_stay_on_direct_simd_paths() {
+        let mut input = facts(17, 0);
         input.region = RegionFacts {
             code_count: 32_000,
             row_count: 1_000,
         };
         input.analysis.indexed_codes = 32_000;
-        input.analysis.covered_codes = 999;
-        assert!(matches!(select_avx2(input), Kernel::Avx2(_)));
-        input.analysis.covered_codes = 1_000;
-        assert_eq!(select_avx2(input), Kernel::RowsTable);
+        input.analysis.covered_codes = 32_000;
+        assert_eq!(select_avx2(input), Avx2Kernel::Generic);
+        assert_eq!(
+            select_kernel(
+                TargetCaps::X86_64 {
+                    avx2: false,
+                    avx512bw: false,
+                },
+                input,
+            )
+            .kernel,
+            Kernel::Sse2(Sse2Kernel::Generic)
+        );
     }
 
     #[test]
-    fn sse2_wide_cover_uses_code_or_row_table_at_density_boundaries() {
-        let mut input = facts(17, 0);
-        input.region.row_count = 2_000;
-        input.analysis.covered_codes = 499;
+    fn guard_eligible_avx2_cover_uses_direct_comparisons() {
         assert_eq!(
-            select_kernel(
-                TargetCaps::X86_64 {
-                    avx2: false,
-                    avx512bw: false,
-                },
-                input,
-            )
-            .kernel,
-            Kernel::Sse2(Sse2Kernel::CodesTable)
-        );
-        input.analysis.covered_codes = 500;
-        assert_eq!(
-            select_kernel(
-                TargetCaps::X86_64 {
-                    avx2: false,
-                    avx512bw: false,
-                },
-                input,
-            )
-            .kernel,
-            Kernel::RowsTable
+            select_avx2(facts(12, 0)),
+            Avx2Kernel::Few {
+                hits: HitMaterialization::StoredLanes,
+            }
         );
     }
 
@@ -654,7 +559,6 @@ mod tests {
                     points: 1,
                     ranges: 0,
                 },
-                table_len: 1024,
                 covered_codes: 1_000,
                 indexed_codes: 1_000_000,
             },

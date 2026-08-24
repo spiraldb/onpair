@@ -5,21 +5,17 @@
 //!
 //! The vector kernels walk the flat code stream a vector at a time, OR together
 //! one comparison per point and two per range, and append the rows the surviving
-//! lanes fall in. On x86, wide dense covers may instead use an exact row-centric
-//! membership-table scan with one early exit per row.
+//! lanes fall in. Every supported architecture preserves that point/range work,
+//! including the generic kernels used for wide covers.
 //!
-//! There is no silent full-column fallback when SIMD is unavailable. The x86
-//! row-centric path is an explicit density and row-length policy; other covers
-//! use the detected vector kernel. The scalar routine under `cfg(test)` is the
-//! common correctness oracle.
+//! There is no silent full-column fallback when SIMD is unavailable. The scalar
+//! routine under `cfg(test)` is the common correctness oracle.
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 mod policy;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod sink;
-#[cfg(target_arch = "x86_64")]
-mod table;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
@@ -69,7 +65,6 @@ pub(super) fn plan<O: Offset>(input: ScanInput<'_, O>, analysis: &PrefilterAnaly
                 points: input.cover.points.len(),
                 ranges: input.cover.ranges.len(),
             },
-            table_len: input.cover.table.len(),
             covered_codes: analysis.covered_frequency() as usize,
             indexed_codes: analysis.total_frequency() as usize,
         },
@@ -103,7 +98,6 @@ pub(super) fn scan<O: Offset>(
                 points: cover.points.len(),
                 ranges: cover.ranges.len(),
             },
-            table_len: cover.table.len(),
             covered_codes: covered_frequency,
             indexed_codes: codes.len(),
         },
@@ -133,11 +127,6 @@ pub(super) fn execute<O: Offset>(
         #[cfg(target_arch = "aarch64")]
         Kernel::Neon(kernel) => {
             aarch64::execute(kernel, input, sparse_row_mapping, out);
-            Ok(())
-        }
-        #[cfg(target_arch = "x86_64")]
-        Kernel::RowsTable => {
-            table::scan_rows(input.codes, input.row_offsets, input.cover, out);
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]

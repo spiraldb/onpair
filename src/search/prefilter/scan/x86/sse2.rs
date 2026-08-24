@@ -4,8 +4,6 @@
 //! Baseline x86-64 SSE2 prefilter kernels.
 
 use super::super::sink::{LaneMask, RowSink, scan_tail};
-#[cfg(test)]
-use super::super::table;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::prefilter::cover::ProbeCover;
@@ -190,9 +188,6 @@ pub(in crate::search::prefilter) fn scan_sse2<O: Offset>(
         (3, 2) => scan_sse2_fixed::<O, 3, 2>(codes, row_offsets, pf, sparse_row_mapping, out),
         (1, 3) => scan_sse2_fixed::<O, 1, 3>(codes, row_offsets, pf, sparse_row_mapping, out),
         (4, 2) => scan_sse2_fixed::<O, 4, 2>(codes, row_offsets, pf, sparse_row_mapping, out),
-        (points, ranges) if points + 2 * ranges >= 17 => {
-            table::scan_codes(codes, row_offsets, pf, sparse_row_mapping, out)
-        }
         _ => scan_sse2_generic(codes, row_offsets, pf, sparse_row_mapping, out),
     }
 }
