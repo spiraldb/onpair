@@ -482,6 +482,19 @@ fn scan_hit_positions_chain<const POINTS: usize, const RANGES: usize>(
     }
 }
 
+/// Portable scalar fused scan: per-code cover-bitmap membership, emitting hit
+/// positions. Flat cost in cover size, no ISA requirements — the baseline the
+/// AVX-512 kernels accelerate.
+fn scan_hit_positions_scalar(codes: &[u16], bitmap: &[u32], out: &mut Vec<usize>) {
+    debug_assert_eq!(bitmap.len(), COVER_BITMAP_WORDS);
+    out.clear();
+    for (index, &code) in codes.iter().enumerate() {
+        if bitmap[code as usize >> 5] >> (code as usize & 31) & 1 != 0 {
+            out.push(index);
+        }
+    }
+}
+
 /// Fused coarse+refine for the bitmap membership test: one gather-driven pass
 /// emitting exact hit positions, for covers past the compare-chain crossover.
 #[cfg(target_arch = "x86_64")]
@@ -1204,6 +1217,34 @@ macro_rules! dispatch_pr_noblock {
             _ => $fallback,
         }
     };
+}
+
+/// Mid-cut stage 1 with runtime ISA dispatch: on AVX-512BW hosts, the
+/// compare-chain kernel for covers with `points + 2*ranges <= 16` and the
+/// gathered bitmap kernel above that; otherwise the portable scalar scan.
+/// All paths emit the identical sorted hit-position list.
+fn midcut_hit_positions(codes: &[u16], cover: &ProbeCover, bitmap: &[u32], out: &mut Vec<usize>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512bw") {
+        let (points, ranges) = (cover.points().len(), cover.ranges().len());
+        // Chain up to comparison cost 16 plus the measured (12,5) exception;
+        // flat-cost bitmap gathers beyond that.
+        if points + 2 * ranges <= 16 || (points, ranges) == (12, 5) {
+            unsafe {
+                dispatch_pr_noblock!(
+                    cover.points().len(),
+                    cover.ranges().len(),
+                    scan_hit_positions_chain,
+                    (codes, cover, out),
+                    scan_hit_positions_bitmap(codes, bitmap, out)
+                );
+            }
+        } else {
+            unsafe { scan_hit_positions_bitmap(codes, bitmap, out) };
+        }
+        return;
+    }
+    scan_hit_positions_scalar(codes, bitmap, out);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2120,7 +2161,6 @@ fn run(parquet: &Path, dump: &Path) {
     // shapes up to `points + 2*ranges = 22` and the bitmap beyond, where the
     // chain either spills into the dynamic fallback or exceeds two gathers of
     // cost per vector.
-    let midcut_bitmap_env = std::env::var("ONPAIR_MIDCUT_BITMAP").ok();
     // Diagnostic: per-stage timing of the segmented midcut chain path,
     // accumulated across segments and reps (adds two clock reads per segment).
     let midcut_stage_times = std::env::var_os("ONPAIR_MIDCUT_STAGE_TIMES").is_some();
@@ -2294,14 +2334,6 @@ fn run(parquet: &Path, dump: &Path) {
 
         if let (Some(segment_bytes), Some(segment_rows)) = (segment_bytes, &segment_rows) {
             let cover_bitmap = build_cover_bitmap(cover);
-            let midcut_bitmap = match midcut_bitmap_env.as_deref() {
-                Some("0") => false,
-                Some(_) => true,
-                None => {
-                    let (points, ranges) = (cover.points().len(), cover.ranges().len());
-                    points + 2 * ranges > 16 && (points, ranges) != (12, 5)
-                }
-            };
             let mut windows = vec![(query.len(), query.len()); view.dict.num_tokens()];
             for window in analysis.probe_windows() {
                 windows[window.token() as usize] = (window.before_codes(), window.after_codes());
@@ -2430,21 +2462,7 @@ fn run(parquet: &Path, dump: &Path) {
                     });
                     measure_segment!(4, "midcut", {
                         let stage_start = midcut_stage_times.then(Instant::now);
-                        if midcut_bitmap {
-                            unsafe {
-                                scan_hit_positions_bitmap(codes, &cover_bitmap, &mut positions);
-                            }
-                        } else {
-                            unsafe {
-                                dispatch_pr_noblock!(
-                                    cover.points().len(),
-                                    cover.ranges().len(),
-                                    scan_hit_positions_chain,
-                                    (codes, cover, &mut positions),
-                                    scan_hit_positions_bitmap(codes, &cover_bitmap, &mut positions)
-                                );
-                            }
-                        }
+                        midcut_hit_positions(codes, cover, &cover_bitmap, &mut positions);
                         if let Some(start) = stage_start {
                             stage_totals[1] += start.elapsed().as_nanos();
                         }
@@ -2466,29 +2484,7 @@ fn run(parquet: &Path, dump: &Path) {
                                 }));
                             }
                             StaticDispatch::HierarchicalMidcut => {
-                                if midcut_bitmap {
-                                    unsafe {
-                                        scan_hit_positions_bitmap(
-                                            codes,
-                                            &cover_bitmap,
-                                            &mut positions,
-                                        );
-                                    }
-                                } else {
-                                    unsafe {
-                                        dispatch_pr_noblock!(
-                                            cover.points().len(),
-                                            cover.ranges().len(),
-                                            scan_hit_positions_chain,
-                                            (codes, cover, &mut positions),
-                                            scan_hit_positions_bitmap(
-                                                codes,
-                                                &cover_bitmap,
-                                                &mut positions
-                                            )
-                                        );
-                                    }
-                                }
+                                midcut_hit_positions(codes, cover, &cover_bitmap, &mut positions);
                                 localized_kmp(
                                     codes, &offsets, &positions, &windows, &kmp, &mut rows,
                                 );
@@ -2526,29 +2522,12 @@ fn run(parquet: &Path, dump: &Path) {
                                     }));
                                 }
                                 StaticDispatch::HierarchicalMidcut => {
-                                    if midcut_bitmap {
-                                        unsafe {
-                                            scan_hit_positions_bitmap(
-                                                codes,
-                                                &cover_bitmap,
-                                                &mut positions,
-                                            );
-                                        }
-                                    } else {
-                                        unsafe {
-                                            dispatch_pr_noblock!(
-                                                cover.points().len(),
-                                                cover.ranges().len(),
-                                                scan_hit_positions_chain,
-                                                (codes, cover, &mut positions),
-                                                scan_hit_positions_bitmap(
-                                                    codes,
-                                                    &cover_bitmap,
-                                                    &mut positions
-                                                )
-                                            );
-                                        }
-                                    }
+                                    midcut_hit_positions(
+                                        codes,
+                                        cover,
+                                        &cover_bitmap,
+                                        &mut positions,
+                                    );
                                     localized_kmp(
                                         codes, &offsets, &positions, &windows, &kmp, &mut rows,
                                     );
@@ -3132,30 +3111,13 @@ fn run(parquet: &Path, dump: &Path) {
                             contains(black_box(view.row_codes(row)), black_box(&kmp))
                         }));
                     }
-                    StaticDispatch::HierarchicalMidcut => unsafe {
-                        if cover.points().len() + 2 * cover.ranges().len() > 16 {
-                            scan_hit_positions_bitmap(
-                                black_box(scan_codes),
-                                black_box(&dispatch_bitmap),
-                                black_box(&mut dispatch_positions),
-                            );
-                        } else {
-                            dispatch_pr_noblock!(
-                                cover.points().len(),
-                                cover.ranges().len(),
-                                scan_hit_positions_chain,
-                                (
-                                    black_box(scan_codes),
-                                    black_box(cover),
-                                    black_box(&mut dispatch_positions)
-                                ),
-                                scan_hit_positions_bitmap(
-                                    black_box(scan_codes),
-                                    black_box(&dispatch_bitmap),
-                                    black_box(&mut dispatch_positions)
-                                )
-                            );
-                        }
+                    StaticDispatch::HierarchicalMidcut => {
+                        midcut_hit_positions(
+                            black_box(scan_codes),
+                            black_box(cover),
+                            black_box(&dispatch_bitmap),
+                            black_box(&mut dispatch_positions),
+                        );
                         localized_kmp(
                             black_box(scan_codes),
                             black_box(scan_offsets),
@@ -3164,7 +3126,7 @@ fn run(parquet: &Path, dump: &Path) {
                             black_box(&kmp),
                             black_box(&mut dispatch_rows),
                         );
-                    },
+                    }
                 }
                 let elapsed_ns = start.elapsed().as_nanos();
                 assert_eq!(dispatch_rows, out);
@@ -3359,6 +3321,36 @@ fn static_dispatch(covered_fraction: f64) -> StaticDispatch {
         StaticDispatch::DirectKmp
     } else {
         StaticDispatch::HierarchicalMidcut
+    }
+}
+
+#[cfg(test)]
+mod fused_scan_tests {
+    use super::{COVER_BITMAP_WORDS, scan_hit_positions_scalar};
+
+    /// The scalar baseline and the AVX-512 bitmap kernel must emit identical
+    /// position lists for any codes/bitmap pair (the chain kernel is checked
+    /// against ground truth by every segmented benchmark run).
+    #[test]
+    fn scalar_matches_avx512_bitmap() {
+        if !std::is_x86_feature_detected!("avx512bw") {
+            return;
+        }
+        let mut bitmap = vec![0u32; COVER_BITMAP_WORDS];
+        for token in [0u16, 7, 63, 64, 255, 4096, 65534, 65535] {
+            bitmap[token as usize >> 5] |= 1 << (token as usize & 31);
+        }
+        // 130003 codes: exercises full 128-code blocks, the 32-code loop, and
+        // the scalar tail, with hits scattered pseudo-randomly.
+        let codes: Vec<u16> = (0..130003u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 12) as u16)
+            .collect();
+        let mut scalar = Vec::new();
+        scan_hit_positions_scalar(&codes, &bitmap, &mut scalar);
+        let mut simd = Vec::new();
+        unsafe { super::scan_hit_positions_bitmap(&codes, &bitmap, &mut simd) };
+        assert_eq!(scalar, simd);
+        assert!(!scalar.is_empty(), "test data should contain hits");
     }
 }
 
