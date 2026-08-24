@@ -389,6 +389,19 @@ fn scan_dense_lazy(bencher: Bencher, pattern: &str) {
     });
 }
 
+/// The fused state-0 skip: SIMD interesting-mask + automaton only inside
+/// runs of interesting codes — the compressed analog of memmem's rare-byte
+/// skip, single pass, no row-granularity prefilter.
+#[divan::bench(args = PATTERNS, sample_count = 10)]
+fn scan_skip(bencher: Bencher, pattern: &str) {
+    let (c, p) = (corpus(), prepared(pattern));
+    bench_scan(bencher, || {
+        p.class
+            .matching_rows_skip(divan::black_box(&c.col.codes), &c.col.code_offsets)
+            .len()
+    });
+}
+
 #[divan::bench(args = PATTERNS, sample_count = 10)]
 fn scan_sparse(bencher: Bencher, pattern: &str) {
     let (c, p) = (corpus(), prepared(pattern));

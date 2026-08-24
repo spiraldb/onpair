@@ -338,6 +338,116 @@ impl ClassSearcher {
         }
     }
 
+    /// Rows containing the pattern via the **fused state-0 skip**: one SIMD
+    /// pass marks the interesting codes (class != 0), and the automaton
+    /// walks only the maximal runs of set bits — a boring code maps every
+    /// state to 0, so the walk can teleport between runs. The compressed
+    /// analog of memmem's rare-byte skip, in-line in the scan instead of a
+    /// separate row-granularity prefilter. Exact: matches cannot span rows
+    /// (state resets at row boundaries) and cannot begin on a boring code.
+    ///
+    /// ## Panics
+    ///
+    /// As [`matching_rows_unfiltered`](Self::matching_rows_unfiltered).
+    pub fn matching_rows_skip<O: Offset>(&self, codes: &[u16], code_offsets: &[O]) -> Vec<u64> {
+        let Some(inner) = &self.inner else {
+            return (0..code_offsets.len().saturating_sub(1) as u64).collect();
+        };
+        let nrows = code_offsets.len().saturating_sub(1);
+        if nrows == 0 {
+            return Vec::new();
+        }
+        let off = |r: usize| -> usize {
+            let o = code_offsets[r].to_usize().expect("row offset overflows usize");
+            assert!(o <= codes.len(), "malformed code_offsets");
+            o
+        };
+        let ncodes = off(nrows);
+
+        let mut mask = vec![0u64; codes.len().div_ceil(64)];
+        inner.filter.candidate_mask(codes, &mut mask);
+
+        // Next set bit at or after `from`, or ncodes when none.
+        let next_interesting = |from: usize| -> usize {
+            if from >= ncodes {
+                return ncodes;
+            }
+            let mut w = from / 64;
+            let mut word = mask[w] & (!0u64 << (from % 64));
+            loop {
+                if word != 0 {
+                    return (w * 64 + word.trailing_zeros() as usize).min(ncodes);
+                }
+                w += 1;
+                if w >= mask.len() {
+                    return ncodes;
+                }
+                word = mask[w];
+            }
+        };
+        let bit = |i: usize| mask[i / 64] >> (i % 64) & 1 == 1;
+
+        let accept = inner.accept as usize;
+        let nstates = inner.nstates;
+        let mut out = Vec::new();
+        let (mut row, mut row_end) = (0usize, off(1));
+        let mut p = next_interesting(0);
+        while p < ncodes {
+            // Walk one run of interesting codes; a boring code (class 0)
+            // maps every state to 0 without a table lookup.
+            let mut s = 0usize;
+            loop {
+                if p >= ncodes {
+                    return out;
+                }
+                if p >= row_end {
+                    // Gallop the row cursor to the row containing p; matches
+                    // cannot span rows.
+                    let mut step = 1usize;
+                    let mut lo = row + 1;
+                    while lo + step <= nrows && off(lo + step) <= p {
+                        lo += step;
+                        step <<= 1;
+                    }
+                    let mut hi = (lo + step).min(nrows);
+                    while lo + 1 < hi {
+                        let mid = (lo + hi) / 2;
+                        if off(mid) <= p {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    row = lo;
+                    row_end = off(lo + 1);
+                    s = 0;
+                }
+                if !bit(p) {
+                    if s == 0 {
+                        break; // run over: skip to the next interesting code
+                    }
+                    s = 0; // boring code: state dies, no lookup needed
+                    p += 1;
+                    continue;
+                }
+                // SAFETY: index invariants as `walk_row_class`; p < ncodes.
+                unsafe {
+                    let k = *inner.class_map8.get_unchecked(codes[p] as usize) as usize;
+                    s = *inner.trans.get_unchecked(k * nstates + s) as usize;
+                }
+                if s == accept {
+                    out.push(row as u64);
+                    p = row_end; // nothing more to learn in this row
+                    s = 0;
+                    continue;
+                }
+                p += 1;
+            }
+            p = next_interesting(p + 1);
+        }
+        out
+    }
+
     /// Which of `spans` (as `[a, b)` code ranges) contain the pattern,
     /// walked **four rows at a time** so the four serial state chains hide
     /// each other's table-load latency. No early exit: accept is absorbing
@@ -934,6 +1044,11 @@ mod tests {
                 .collect();
             assert_eq!(ilv, expect, "ilv4 {w:?} disagrees");
         }
+        assert_eq!(
+            s.matching_rows_skip(codes, offsets),
+            expect,
+            "fused skip scan disagrees"
+        );
         expect
     }
 
