@@ -55,3 +55,7 @@ harness = false
 [[bench]]
 name = "contains"
 harness = false
+
+[[bench]]
+name = "variants"
+harness = false
