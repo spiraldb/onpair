@@ -46,6 +46,34 @@ const UNFILLED: u8 = 0xFF;
 /// lazy-fill sentinel.
 pub const MAX_PATTERN_LEN: usize = u8::MAX as usize - 1;
 
+/// KMP matching automaton over the pattern's bytes, state-major:
+/// `delta[s * 256 + b]` is the length of the longest pattern prefix that
+/// suffixes (matched prefix of length `s`) + `b`. The accept state
+/// (`s == pattern.len()`) is absorbing.
+///
+/// Requires `1 <= pattern.len() <= MAX_PATTERN_LEN`.
+pub(super) fn byte_automaton(pattern: &[u8]) -> Vec<u8> {
+    let m = pattern.len();
+    assert!(
+        (1..=MAX_PATTERN_LEN).contains(&m),
+        "pattern length out of range"
+    );
+    let mut delta = vec![0u8; (m + 1) * 256];
+    delta[pattern[0] as usize] = 1;
+    let mut fail = 0usize; // automaton state after reading pattern[1..s]
+    for s in 1..m {
+        let (head, row) = delta.split_at_mut(s * 256);
+        row[..256].copy_from_slice(&head[fail * 256..fail * 256 + 256]);
+        row[pattern[s] as usize] = (s + 1) as u8;
+        fail = head[fail * 256 + pattern[s] as usize] as usize;
+    }
+    // Accept state is absorbing: a row matches if any prefix of it does.
+    for b in 0..256 {
+        delta[m * 256 + b] = m as u8;
+    }
+    delta
+}
+
 impl TokenDfa {
     /// Build the byte automaton for `pattern` over the dictionary described
     /// by `dict_bytes` / `dict_offsets`; the token-level table fills lazily
@@ -55,27 +83,8 @@ impl TokenDfa {
     /// dictionary (see [`crate::Parts::validate_dictionary`]).
     pub(crate) fn build(pattern: &[u8], dict_bytes: &[u8], dict_offsets: &[u32]) -> Self {
         let m = pattern.len();
-        assert!(
-            (1..=MAX_PATTERN_LEN).contains(&m),
-            "pattern length out of range"
-        );
         let ntokens = dict_offsets.len().saturating_sub(1);
-
-        // KMP matching automaton over bytes: delta[s][b] = longest prefix of
-        // the pattern that suffixes (matched prefix of length s) + b.
-        let mut delta = vec![0u8; (m + 1) * 256];
-        delta[pattern[0] as usize] = 1;
-        let mut fail = 0usize; // automaton state after reading pattern[1..s]
-        for s in 1..m {
-            let (head, row) = delta.split_at_mut(s * 256);
-            row[..256].copy_from_slice(&head[fail * 256..fail * 256 + 256]);
-            row[pattern[s] as usize] = (s + 1) as u8;
-            fail = head[fail * 256 + pattern[s] as usize] as usize;
-        }
-        // Accept state is absorbing: a row matches if any prefix of it does.
-        for b in 0..256 {
-            delta[m * 256 + b] = m as u8;
-        }
+        let delta = byte_automaton(pattern);
 
         let table = (0..(m + 1) * ntokens)
             .map(|_| AtomicU8::new(UNFILLED))
