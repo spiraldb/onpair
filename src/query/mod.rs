@@ -23,8 +23,10 @@
 //! let rows = searcher.matching_rows(&col.codes, &col.code_offsets);
 //! ```
 
+mod classdfa;
 mod dfa;
 mod prefilter;
+mod sparse;
 mod stats;
 
 use crate::Offset;
@@ -34,7 +36,12 @@ use dfa::TokenDfa;
 use prefilter::Prefilter;
 use prefilter::ScoreSource;
 
+pub use classdfa::ClassInfo;
+pub use classdfa::ClassSearcher;
+pub use classdfa::Walk;
 pub use dfa::MAX_PATTERN_LEN;
+pub use sparse::SparseInfo;
+pub use sparse::SparseSearcher;
 pub use stats::CodeStats;
 
 /// A `contains` query compiled against one column's dictionary (and tuned on
@@ -183,6 +190,34 @@ impl ContainsSearcher {
         }
     }
 
+    /// Compile the token DFA alone — no prefilter is built, so this is the
+    /// cheapest compile. Only [`matching_rows_unfiltered`] and
+    /// [`row_matches`] do useful work ([`matching_rows`] scans unfiltered).
+    ///
+    /// [`matching_rows_unfiltered`]: Self::matching_rows_unfiltered
+    /// [`row_matches`]: Self::row_matches
+    /// [`matching_rows`]: Self::matching_rows
+    ///
+    /// ## Panics
+    ///
+    /// Panics if the dictionary fails [`Parts::validate_dictionary`] or if
+    /// `pattern.len() > MAX_PATTERN_LEN`.
+    pub fn compile_unfiltered(dict_bytes: &[u8], dict_offsets: &[u32], pattern: &[u8]) -> Self {
+        let parts = Parts {
+            dict_bytes,
+            dict_offsets,
+            bits: 16, // decode metadata only; irrelevant to validation
+            codes: &[],
+        };
+        if let Err(e) = parts.validate_dictionary() {
+            panic!("onpair: {e}");
+        }
+        Self {
+            dfa: (!pattern.is_empty()).then(|| TokenDfa::build(pattern, dict_bytes, dict_offsets)),
+            prefilter: None,
+        }
+    }
+
     fn compile_inner(
         dict_bytes: &[u8],
         dict_offsets: &[u32],
@@ -223,8 +258,50 @@ impl ContainsSearcher {
                 let mut mask = vec![0u64; codes.len().div_ceil(64)];
                 filter.candidate_mask(codes, &mut mask);
                 let mut out = Vec::new();
-                Self::for_each_row(codes, code_offsets, |r, a, b, row| {
-                    if prefilter::any_bit_in_range(&mask, a, b) && dfa.row_matches(row) {
+                for_each_candidate_row(codes, code_offsets, &mask, |r, row| {
+                    if dfa.row_matches(row) {
+                        out.push(r);
+                    }
+                });
+                out
+            }
+        }
+    }
+
+    /// Like [`matching_rows`](Self::matching_rows) but verifying each
+    /// candidate row with `verify` instead of this searcher's own DFA — the
+    /// hook for plugging a faster verify walk (e.g. a
+    /// [`ClassSearcher`](crate::query::ClassSearcher) variant) behind the
+    /// anchor prefilter. `verify` must be exact for the same pattern; it is
+    /// handed `(row, row_codes)` for every candidate.
+    pub fn matching_rows_with<O: Offset>(
+        &self,
+        codes: &[u16],
+        code_offsets: &[O],
+        mut verify: impl FnMut(u64, &[u16]) -> bool,
+    ) -> Vec<u64> {
+        if self.dfa.is_none() {
+            return (0..code_offsets.len().saturating_sub(1) as u64).collect();
+        }
+        match self.prefilter.as_ref().and_then(|pf| pf.resolve(codes)) {
+            None => {
+                let mut out = Vec::new();
+                for (r, w) in code_offsets.windows(2).enumerate() {
+                    let a = w[0].to_usize().expect("row offset overflows usize");
+                    let b = w[1].to_usize().expect("row offset overflows usize");
+                    assert!(a <= b && b <= codes.len(), "malformed code_offsets");
+                    if verify(r as u64, &codes[a..b]) {
+                        out.push(r as u64);
+                    }
+                }
+                out
+            }
+            Some(filter) => {
+                let mut mask = vec![0u64; codes.len().div_ceil(64)];
+                filter.candidate_mask(codes, &mut mask);
+                let mut out = Vec::new();
+                for_each_candidate_row(codes, code_offsets, &mask, |r, row| {
+                    if verify(r, row) {
                         out.push(r);
                     }
                 });
@@ -258,13 +335,26 @@ impl ContainsSearcher {
                 let mut mask = vec![0u64; codes.len().div_ceil(64)];
                 filter.candidate_mask(codes, &mut mask);
                 let mut out = Vec::new();
-                Self::for_each_row(codes, code_offsets, |r, a, b, _| {
-                    if prefilter::any_bit_in_range(&mask, a, b) {
-                        out.push(r);
-                    }
-                });
+                for_each_candidate_row(codes, code_offsets, &mask, |r, _| out.push(r));
                 out
             }
+        }
+    }
+
+    /// Does one row's code slice contain the pattern? The per-row verify
+    /// entry point (the work `matching_rows` does per candidate row),
+    /// exposed so the verify path can be measured in isolation. The empty
+    /// pattern matches every row.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if a code is out of range for the dictionary this searcher
+    /// was compiled against.
+    #[inline]
+    pub fn row_matches(&self, row: &[u16]) -> bool {
+        match &self.dfa {
+            None => true,
+            Some(dfa) => dfa.row_matches(row),
         }
     }
 
@@ -275,22 +365,6 @@ impl ContainsSearcher {
         self.prefilter.as_ref().and_then(|pf| pf.info())
     }
 
-    /// Iterate rows, handing each `(row, code_start, code_end, row_codes)` to
-    /// `f`. Panics on malformed offsets.
-    #[inline]
-    fn for_each_row<O: Offset>(
-        codes: &[u16],
-        code_offsets: &[O],
-        mut f: impl FnMut(u64, usize, usize, &[u16]),
-    ) {
-        for (r, w) in code_offsets.windows(2).enumerate() {
-            let a = w[0].to_usize().expect("row offset overflows usize");
-            let b = w[1].to_usize().expect("row offset overflows usize");
-            assert!(a <= b && b <= codes.len(), "malformed code_offsets");
-            f(r as u64, a, b, &codes[a..b]);
-        }
-    }
-
     /// Collect the rows for which `matches` returns true.
     #[inline]
     fn scan_rows<O: Offset>(
@@ -299,12 +373,99 @@ impl ContainsSearcher {
         mut matches: impl FnMut(&[u16]) -> bool,
     ) -> Vec<u64> {
         let mut out = Vec::new();
-        Self::for_each_row(codes, code_offsets, |r, _, _, row| {
-            if matches(row) {
-                out.push(r);
+        for (r, w) in code_offsets.windows(2).enumerate() {
+            let a = w[0].to_usize().expect("row offset overflows usize");
+            let b = w[1].to_usize().expect("row offset overflows usize");
+            assert!(a <= b && b <= codes.len(), "malformed code_offsets");
+            if matches(&codes[a..b]) {
+                out.push(r as u64);
             }
-        });
+        }
         out
+    }
+}
+
+/// Hand `(row, row_codes)` to `f` for every row whose code span contains a
+/// set bit of `mask` — without touching the rows in between. Bits arrive
+/// ascending, so the row cursor only moves forward; the jump from one
+/// candidate bit to the next is a gallop (exponential probe + binary
+/// search), making the cost `O(candidates × log(row gap))` instead of one
+/// range test per row. All bits of a row are consumed before `f` is called,
+/// so each candidate row is handed over exactly once.
+///
+/// Panics on malformed offsets (non-monotonic or out of bounds).
+pub(super) fn for_each_candidate_row<O: Offset>(
+    codes: &[u16],
+    code_offsets: &[O],
+    mask: &[u64],
+    mut f: impl FnMut(u64, &[u16]),
+) {
+    let nrows = code_offsets.len().saturating_sub(1);
+    if nrows == 0 {
+        return;
+    }
+    let off = |r: usize| -> usize {
+        let o = code_offsets[r].to_usize().expect("row offset overflows usize");
+        assert!(o <= codes.len(), "malformed code_offsets");
+        o
+    };
+    let ncodes = off(nrows);
+    let mut r = 0usize;
+    let mut w = 0usize;
+    while w < mask.len() {
+        let mut word = mask[w];
+        if word == 0 {
+            w += 1;
+            continue;
+        }
+        while word != 0 {
+            let i = w * 64 + word.trailing_zeros() as usize;
+            if i >= ncodes {
+                return; // padding bits past the last row
+            }
+            // Gallop the row cursor forward to the row containing code i.
+            if off(r + 1) <= i {
+                let mut step = 1usize;
+                let mut hi = r + 1;
+                while hi + step <= nrows && off(hi + step) <= i {
+                    hi += step;
+                    step <<= 1;
+                }
+                // Row is in (hi, hi + step]; binary search the offsets.
+                let mut lo = hi;
+                let mut hi = (hi + step).min(nrows);
+                while lo + 1 < hi {
+                    let mid = (lo + hi) / 2;
+                    if off(mid) <= i {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                r = lo;
+            }
+            let (a, b) = (off(r), off(r + 1));
+            debug_assert!(a <= i && i < b);
+            f(r as u64, &codes[a..b]);
+            // Consume every candidate bit inside this row so it is not
+            // handed over again.
+            let last = b - 1;
+            if last / 64 > w {
+                w = last / 64;
+                word = mask[w];
+            }
+            let keep = if last % 64 == 63 {
+                0
+            } else {
+                !0u64 << (last % 64 + 1)
+            };
+            word &= keep;
+            if r + 1 == nrows {
+                return;
+            }
+            r += 1;
+        }
+        w += 1;
     }
 }
 

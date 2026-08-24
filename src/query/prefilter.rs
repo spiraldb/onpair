@@ -86,23 +86,40 @@ fn anchor_candidates(pattern: &[u8], dict_bytes: &[u8], dict_offsets: &[u32]) ->
     let words = ntokens.div_ceil(64);
     let mut sets = vec![vec![0u64; words]; m];
 
+    // Every agreeing alignment pins one byte: for `s > 0` the token's first
+    // byte must equal `pattern[s]`, and for `s <= 0` the token byte at `-s`
+    // must equal `pattern[0]`. Enumerating only those alignments (via the
+    // pattern positions of each byte, and the token positions of
+    // `pattern[0]`) replaces the all-alignments sweep — compile is on the
+    // LIKE-scan path, and this loop over a 64 Ki-token dictionary dominated
+    // it.
+    let mut ppos: Vec<Vec<u8>> = vec![Vec::new(); 256];
+    for (s, &b) in pattern.iter().enumerate().skip(1) {
+        ppos[b as usize].push(s as u8);
+    }
+    let mi = m as isize;
+    let mark = |sets: &mut Vec<Vec<u64>>, tok: &[u8], c: usize, s: isize| {
+        let lo = s.max(0);
+        let hi = (s + tok.len() as isize).min(mi);
+        debug_assert!(lo < hi);
+        let agrees = (lo..hi).all(|j| tok[(j - s) as usize] == pattern[j as usize]);
+        if agrees {
+            for i in lo..hi {
+                sets[i as usize][c / 64] |= 1u64 << (c % 64);
+            }
+        }
+    };
     for c in 0..ntokens {
         let tok = &dict_bytes[dict_offsets[c] as usize..dict_offsets[c + 1] as usize];
-        let len = tok.len() as isize;
-        let mi = m as isize;
-        // Token start at signed offset `s` from the occurrence start; any
-        // alignment with a non-empty, agreeing overlap marks every anchor the
-        // token covers.
-        for s in (1 - len)..mi {
-            let lo = s.max(0); // first overlapping pattern position
-            let hi = (s + len).min(mi); // one past last
-            debug_assert!(lo < hi);
-            let agrees = (lo..hi).all(|j| tok[(j - s) as usize] == pattern[j as usize]);
-            if agrees {
-                for i in lo..hi {
-                    sets[i as usize][c / 64] |= 1u64 << (c % 64);
-                }
+        // s <= 0: pattern position 0 falls on token byte -s.
+        for j in 0..tok.len() {
+            if tok[j] == pattern[0] {
+                mark(&mut sets, tok, c, -(j as isize));
             }
+        }
+        // s in 1..m: token byte 0 falls on pattern position s.
+        for &s in &ppos[tok[0] as usize] {
+            mark(&mut sets, tok, c, s as isize);
         }
     }
     sets
@@ -316,6 +333,26 @@ impl Prefilter {
 }
 
 impl Filter {
+    /// Package an arbitrary candidate bitmap over `ntokens` codes as a
+    /// scannable filter, choosing the interval or bitmap representation by
+    /// the same rule as anchor selection. The hit-rate estimate is the set's
+    /// density (diagnostic only; nothing at runtime reads it).
+    pub(crate) fn from_bitmap(set: &[u64], ntokens: usize) -> Self {
+        let intervals = bitmap_to_intervals(set, ntokens);
+        let kind = if intervals.len() <= MAX_SCAN_INTERVALS {
+            Kind::Intervals(intervals)
+        } else {
+            let mut bm = Box::new([0u64; 1024]);
+            bm[..set.len()].copy_from_slice(set);
+            Kind::Bitmap(bm)
+        };
+        let pop: u32 = set.iter().map(|w| w.count_ones()).sum();
+        Self {
+            kind,
+            expected_hit_rate: f64::from(pop) / ntokens.max(1) as f64,
+        }
+    }
+
     /// Human-readable scan strategy, for diagnostics.
     pub(crate) fn strategy(&self) -> &'static str {
         match self.kind {
@@ -329,16 +366,7 @@ impl Filter {
     pub(crate) fn candidate_mask(&self, codes: &[u16], mask: &mut [u64]) {
         match &self.kind {
             Kind::Intervals(iv) => scan_intervals(codes, iv, mask),
-            Kind::Bitmap(bm) => {
-                for (w, chunk) in codes.chunks(64).enumerate() {
-                    let mut word = 0u64;
-                    for (b, &c) in chunk.iter().enumerate() {
-                        let hit = bm[c as usize / 64] >> (c as usize % 64) & 1;
-                        word |= hit << b;
-                    }
-                    mask[w] = word;
-                }
-            }
+            Kind::Bitmap(bm) => scan_bitmap(codes, bm, mask),
         }
     }
 }
@@ -389,6 +417,36 @@ fn scan_intervals(codes: &[u16], intervals: &Intervals, mask: &mut [u64]) {
     scan_intervals_scalar(codes, intervals, mask);
 }
 
+/// Bitmap-membership scan: one bit test per code against the 8 KiB set,
+/// dispatching to an AVX-512 `VPGATHERDD` kernel when available (the same
+/// `ONPAIR_SIMD` cap as `scan_intervals` applies).
+fn scan_bitmap(codes: &[u16], bm: &[u64; 1024], mask: &mut [u64]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let force = OVERRIDE
+            .get_or_init(|| std::env::var("ONPAIR_SIMD").ok())
+            .as_deref();
+        if force.is_none_or(|f| f == "avx512") && is_x86_feature_detected!("avx512f") {
+            // SAFETY: AVX-512F presence checked at runtime.
+            unsafe { avx512::scan_bitmap(codes, bm, mask) };
+            return;
+        }
+    }
+    scan_bitmap_scalar(codes, bm, mask);
+}
+
+fn scan_bitmap_scalar(codes: &[u16], bm: &[u64; 1024], mask: &mut [u64]) {
+    for (w, chunk) in codes.chunks(64).enumerate() {
+        let mut word = 0u64;
+        for (b, &c) in chunk.iter().enumerate() {
+            let hit = bm[c as usize / 64] >> (c as usize % 64) & 1;
+            word |= hit << b;
+        }
+        mask[w] = word;
+    }
+}
+
 fn scan_intervals_scalar(codes: &[u16], intervals: &[(u16, u16)], mask: &mut [u64]) {
     for (w, chunk) in codes.chunks(64).enumerate() {
         let mut word = 0u64;
@@ -435,6 +493,42 @@ mod avx512 {
         let rem = chunks.remainder();
         if !rem.is_empty() {
             super::scan_intervals_scalar(rem, intervals, &mut mask[word..]);
+        }
+    }
+
+    /// Bitmap membership via `VPGATHERDD`: per 16 codes, gather the 16
+    /// containing `u32` words of the bitmap (index `code >> 5`), variable-
+    /// shift each right by `code & 31`, and test bit 0 straight into a
+    /// `k`-mask. Four iterations fill one output word. This is the only
+    /// vector route into an *arbitrary* candidate set — the interval kernel
+    /// needs the set to cluster.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn scan_bitmap(codes: &[u16], bm: &[u64; 1024], mask: &mut [u64]) {
+        let base = bm.as_ptr().cast::<i32>();
+        let thirty_one = _mm512_set1_epi32(31);
+        let one = _mm512_set1_epi32(1);
+        let mut word = 0usize;
+        let mut chunks = codes.chunks_exact(64);
+        for chunk in &mut chunks {
+            let mut acc = 0u64;
+            for (q, c16) in chunk.chunks_exact(16).enumerate() {
+                // SAFETY: c16 holds 16 u16s = one 256-bit unaligned load.
+                let c = unsafe { _mm256_loadu_si256(c16.as_ptr().cast()) };
+                let c = _mm512_cvtepu16_epi32(c);
+                let widx = _mm512_srli_epi32::<5>(c);
+                // SAFETY: widx lanes are < 2048, the u32 length of `bm`.
+                let words = unsafe { _mm512_i32gather_epi32::<4>(widx, base.cast()) };
+                let sh = _mm512_and_si512(c, thirty_one);
+                let bits = _mm512_srlv_epi32(words, sh);
+                let hits = _mm512_test_epi32_mask(bits, one);
+                acc |= (hits as u64) << (16 * q);
+            }
+            mask[word] = acc;
+            word += 1;
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            super::scan_bitmap_scalar(rem, bm, &mut mask[word..]);
         }
     }
 }
@@ -537,6 +631,31 @@ mod tests {
                 unsafe { avx512::scan(&edge, &intervals, &mut got) };
                 assert_eq!(got, expect, "avx512 kernel diverges from scalar");
             }
+        }
+    }
+
+    #[test]
+    fn bitmap_scan_matches_scalar() {
+        let mut bm = Box::new([0u64; 1024]);
+        for c in [0u16, 1, 31, 32, 63, 64, 100, 999, 32768, 65534, 65535] {
+            bm[c as usize / 64] |= 1 << (c % 64);
+        }
+        let mut codes: Vec<u16> = (0..1500u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u16)
+            .collect();
+        codes.extend([0, 1, 31, 32, 63, 64, 100, 999, 32768, 65534, 65535, 2]);
+        let words = codes.len().div_ceil(64);
+        let mut got = vec![0u64; words];
+        let mut expect = vec![0u64; words];
+        scan_bitmap(&codes, &bm, &mut got);
+        scan_bitmap_scalar(&codes, &bm, &mut expect);
+        assert_eq!(got, expect);
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx512f") {
+            let mut simd = vec![0u64; words];
+            // SAFETY: AVX-512F presence checked above.
+            unsafe { avx512::scan_bitmap(&codes, &bm, &mut simd) };
+            assert_eq!(simd, expect, "gather kernel diverges from scalar");
         }
     }
 
