@@ -48,7 +48,7 @@ noted; ClickBench kernel sweeps use a 1/5-column subset (`ONPAIR_PF_MAX_BLOCKS=8
 | GPR AND-reduction vs `kandd` (summarize) | 62.12 vs 62.09 GB/s | codegen-equivalent |
 | gate group 128 / 256 / 1024 | 512 best (256 −4 % only on P7R1) | smaller groups pay more gate tests; 1024 doubles re-probe waste and saves an already-amortized branch |
 | sub8 (8 accumulators / 512) | first −13 %, then ≈ sub4 −1–3 % after SROA fix | 8 accumulators overflow the 8-entry k-file → `kmov` + GPR per vector; a variable-index array also stack-spilled until rewritten with constant indices |
-| sub4@1024 / sub8@1024 | +8–19 % | a perfect sub8@1024 ≡ two sub4@512 groups minus one ~free branch; merging can only add k-file pressure |
+| sub4@1024 / sub8@1024 | +8–20 % (three implementations: hit-domain, SROA-fixed GPR, miss-domain best-codegen) | a perfect sub8@1024 ≡ two sub4@512 groups minus one ~free branch; eight accumulators overflow the k-file (8 regs, chain needs 2) so ≥2 masks cross to GPRs per group regardless of codegen; ties only where re-probe is already free (dense cheap covers) |
 | two-level bitmap probe (`vpermw` hi-byte live set → masked gathers) | +8–10 % on all bitmap covers | cover tokens scatter across the sorted ID space: most codes' high bytes are live, so level 1 rejects too few lanes to pay its ~5 ops/vector |
 | kortest-carry gate + named-local accumulators (spill elimination) | +5–11 % | the four `kmovd`-to-stack spills sat on idle store ports (free); the rewrite that removed them disturbed LLVM's cross-quarter load/chain interleaving — schedule quality beat instruction count |
 
