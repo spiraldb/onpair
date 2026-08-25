@@ -137,6 +137,56 @@ impl DynamicThresholdController {
 // train()
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Build the randomized row order consumed by training and return the first
+/// selected position. Dynamic training only partially shuffles the row ids: the
+/// selected, randomly permuted rows occupy `order[selected_start..]` and are the
+/// only rows the byte-budgeted scan consumes. If unusually skewed row lengths
+/// leave that selection short of the byte budget, retry with a larger partial
+/// sample instead of falling through into the unshuffled remainder.
+fn make_training_order<O: Offset>(
+    offsets: &[O],
+    threshold: ThresholdSpec,
+    seed: u64,
+) -> (Vec<u32>, usize) {
+    let n = offsets.len() - 1;
+    let total_bytes = offsets[n].to_usize();
+    let (scan_budget, mut shuffle_k) = match threshold {
+        ThresholdSpec::Dynamic(dt) => (
+            Some((total_bytes as f64 * dt.sample_fraction) as usize),
+            (((dt.sample_fraction * 2.0).min(1.0) * n as f64) as usize + 1024).min(n),
+        ),
+        ThresholdSpec::Fixed(_) => (None, n),
+    };
+
+    loop {
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        {
+            // `partial_shuffle` returns the selected, randomly permuted slice
+            // first. rand stores that slice in the final `shuffle_k` positions.
+            let (selected, _) = order.partial_shuffle(&mut rng, shuffle_k);
+            debug_assert_eq!(selected.len(), shuffle_k);
+        }
+        let selected_start = n - shuffle_k;
+
+        let Some(scan_budget) = scan_budget else {
+            return (order, selected_start);
+        };
+        let selected_bytes = order[selected_start..]
+            .iter()
+            .map(|&idx| offsets[idx as usize + 1].to_usize() - offsets[idx as usize].to_usize())
+            .sum::<usize>();
+        if selected_bytes > scan_budget || shuffle_k == n {
+            return (order, selected_start);
+        }
+
+        // Rare guard for highly skewed row sizes. Normal dynamic training
+        // selects roughly twice the expected row count and returns on the first
+        // pass, retaining O(shuffle_k) random-swap work.
+        shuffle_k = shuffle_k.saturating_mul(2).min(n);
+    }
+}
+
 /// Discover merge tokens via frequency-threshold scanning, then sort the
 /// dictionary lexicographically. `offsets` has length `n + 1`; string `i`
 /// occupies `data[offsets[i]..offsets[i + 1]]`. The caller guarantees offsets
@@ -173,22 +223,13 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
         }
     }
 
-    // Shuffle training order. We partial-shuffle only the prefix we are likely
-    // to consume — the dynamic byte budget stops scanning well before the end
-    // on large corpora, and a full Fisher–Yates of `n` is memory-bound.
-    let mut order: Vec<u32> = (0..n as u32).collect();
+    // Select training order. Dynamic training partially shuffles only the rows
+    // it is likely to consume; fixed training still shuffles the entire corpus.
     let seed = cfg.seed.unwrap_or_else(|| {
         use rand::Rng;
         rand::rng().random()
     });
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let shuffle_k = match cfg.threshold {
-        ThresholdSpec::Dynamic(dt) => {
-            (((dt.sample_fraction * 2.0).min(1.0) * n as f64) as usize + 1024).min(n)
-        }
-        ThresholdSpec::Fixed(_) => n,
-    };
-    order.partial_shuffle(&mut rng, shuffle_k);
+    let (order, selected_start) = make_training_order(offsets, cfg.threshold, seed);
 
     // Pair frequency map. Key packs two Token values into a u32.
     let mut freq: HashMap<u32, u8, FxBuildHasher> = HashMap::default();
@@ -196,7 +237,10 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
     let mut full_dictionary = false;
     let mut budget_exhausted = false;
 
-    for idx in order {
+    // `partial_shuffle` places its selected slice at the end. Consume that
+    // random slice directly rather than the mostly original-order remainder at
+    // the beginning of `order`.
+    for &idx in &order[selected_start..] {
         if full_dictionary || budget_exhausted {
             break;
         }
