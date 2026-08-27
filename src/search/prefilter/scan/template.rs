@@ -16,6 +16,11 @@ pub(super) trait Isa {
     /// Codes examined by one call to `block`.
     const BLOCK: usize;
 
+    /// Whether the original walk consumed complete blocks left after its
+    /// grouped loop. NEON's group-one leaves went directly to the scalar tail;
+    /// x86 keeps its existing remainder-block loops.
+    const WALK_REMAINDER: bool = true;
+
     /// Hoisted point and range broadcasts.
     type Point: Copy;
     type Range: Copy;
@@ -91,14 +96,17 @@ pub(super) unsafe fn walk<
         base += stride;
     }
 
-    while base + I::BLOCK <= codes.len() {
-        // SAFETY: the loop bound keeps this complete block in `codes`; the
-        // target-feature wrapper establishes the ISA precondition.
-        let hits = unsafe { I::block::<POINTS, RANGES>(codes.as_ptr().add(base), points, ranges) };
-        if I::any(hits) {
-            I::emit(base, hits, &mut sink);
+    if I::WALK_REMAINDER {
+        while base + I::BLOCK <= codes.len() {
+            // SAFETY: the loop bound keeps this complete block in `codes`; the
+            // target-feature wrapper establishes the ISA precondition.
+            let hits =
+                unsafe { I::block::<POINTS, RANGES>(codes.as_ptr().add(base), points, ranges) };
+            if I::any(hits) {
+                I::emit(base, hits, &mut sink);
+            }
+            base += I::BLOCK;
         }
-        base += I::BLOCK;
     }
 
     scan_tail(codes, cover, base, &mut sink);
