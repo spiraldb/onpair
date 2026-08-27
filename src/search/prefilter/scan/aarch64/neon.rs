@@ -6,7 +6,9 @@
 use super::super::sink::{RowSink, mark_block};
 use super::super::template::{DYN, Isa, scan_dynamic, scan_fixed, walk};
 #[cfg(test)]
-use super::super::{CoverShape, ScanInput, policy};
+use super::super::{
+    AnalysisFacts, CoverShape, RegionFacts, ScanFacts, ScanInput, TargetCaps, policy,
+};
 #[cfg(test)]
 use super::execute as execute_neon;
 use crate::core::offset::Offset;
@@ -490,8 +492,23 @@ pub(in crate::search::prefilter) fn scan_neon<O: Offset>(
         points: pf.points.len(),
         ranges: pf.ranges.len(),
     };
+    let plan = policy::select_kernel(
+        TargetCaps::Aarch64Neon,
+        ScanFacts {
+            analysis: AnalysisFacts {
+                shape,
+                covered_codes: 1,
+                indexed_codes: 1,
+            },
+            region: RegionFacts {
+                code_count: codes.len(),
+                row_count: row_offsets.len().saturating_sub(1),
+            },
+        },
+    );
     execute_neon(
-        policy::select_neon(shape),
+        plan.shape,
+        plan.group,
         ScanInput::full(codes, row_offsets, pf),
         sparse_row_mapping,
         out,

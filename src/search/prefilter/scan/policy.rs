@@ -92,7 +92,13 @@ impl ScanFacts {
     ///
     /// This is exact for the indexed population and a policy-only projection
     /// for a subset. It never affects correctness.
-    #[cfg(any(target_arch = "x86_64", test))]
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", test)),
+        allow(
+            dead_code,
+            reason = "AArch64 reservation remains disabled pending its Phase 5 measurement"
+        )
+    )]
     #[inline]
     pub(super) fn expected_covered_codes(self) -> usize {
         if self.analysis.indexed_codes == self.region.code_count {
@@ -198,57 +204,18 @@ impl FixedShape {
     }
 }
 
+/// Instruction-set family selected for one scan region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(any(target_arch = "aarch64", test))]
-pub(super) enum NeonKernel {
-    FewPoints { points: usize },
-    ManyPoints,
-    OneRange,
-    Fixed(FixedShape),
-    OnePointTwoRanges,
-    FewMixed,
-    Generic { two_vectors: bool },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(any(target_arch = "x86_64", test))]
-pub(super) enum Sse2Kernel {
-    Fixed(FixedShape),
-    Generic,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(any(target_arch = "x86_64", test))]
-pub(super) enum Avx2Group {
-    One,
-    Eight,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(any(target_arch = "x86_64", test))]
-pub(super) enum Avx2Kernel {
-    Fixed { shape: FixedShape, group: Avx2Group },
-    Generic,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(any(target_arch = "x86_64", test))]
-pub(super) enum Avx512Kernel {
-    Fixed(FixedShape),
-    Generic,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Kernel {
+pub(super) enum IsaTag {
     Empty,
     #[cfg(any(target_arch = "aarch64", test))]
-    Neon(NeonKernel),
+    Neon,
     #[cfg(any(target_arch = "x86_64", test))]
-    Sse2(Sse2Kernel),
+    Sse2,
     #[cfg(any(target_arch = "x86_64", test))]
-    Avx2(Avx2Kernel),
+    Avx2,
     #[cfg(any(target_arch = "x86_64", test))]
-    Avx512(Avx512Kernel),
+    Avx512,
     #[cfg(any(not(any(target_arch = "aarch64", target_arch = "x86_64")), test))]
     Unsupported,
 }
@@ -256,7 +223,12 @@ pub(super) enum Kernel {
 /// Complete, ephemeral execution plan for one scan region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::prefilter) struct KernelPlan {
-    pub(super) kernel: Kernel,
+    pub(super) isa: IsaTag,
+    /// A selected specialization. `None` uses the ISA's arbitrary-cover leaf.
+    pub(super) shape: Option<FixedShape>,
+    /// Retained blocks per gate on x86. NEON uses 2 for its legacy paired
+    /// generic schedule and 1 for the single-vector generic schedule.
+    pub(super) group: u8,
     pub(super) row_mapping: RowMapping,
     pub(super) reserve: usize,
 }
@@ -266,7 +238,9 @@ pub(in crate::search::prefilter) struct KernelPlan {
 pub(super) fn select_kernel(caps: TargetCaps, facts: ScanFacts) -> KernelPlan {
     if facts.analysis.shape.is_empty() {
         return KernelPlan {
-            kernel: Kernel::Empty,
+            isa: IsaTag::Empty,
+            shape: None,
+            group: 1,
             row_mapping: RowMapping::Linear,
             reserve: 0,
         };
@@ -281,115 +255,69 @@ pub(super) fn select_kernel(caps: TargetCaps, facts: ScanFacts) -> KernelPlan {
 
     match caps {
         #[cfg(any(target_arch = "aarch64", test))]
-        TargetCaps::Aarch64Neon => KernelPlan {
-            kernel: Kernel::Neon(select_neon(facts.analysis.shape)),
-            row_mapping,
-            reserve: 0,
-        },
+        TargetCaps::Aarch64Neon => {
+            let shape = facts.analysis.shape;
+            let specialized = match (shape.points, shape.ranges) {
+                (0, 1) | (1, 1) | (2, 1) | (1, 2) => {
+                    Some(FixedShape::new(shape.points, shape.ranges))
+                }
+                (points, ranges) if ranges != 0 && points + 2 * ranges <= 16 => {
+                    Some(FixedShape::new(points, ranges))
+                }
+                (1..=16, 0) => Some(FixedShape::new(shape.points, 0)),
+                _ => None,
+            };
+            let paired_generic = specialized.is_none()
+                && ((shape.points == 1 && shape.ranges != 0)
+                    || (shape.points == 2 && shape.ranges == 1));
+            KernelPlan {
+                isa: IsaTag::Neon,
+                shape: specialized,
+                group: if paired_generic { 2 } else { 1 },
+                row_mapping,
+                reserve: 0,
+            }
+        }
         #[cfg(any(target_arch = "x86_64", test))]
-        TargetCaps::X86_64 { avx2, avx512bw } => select_x86_64(facts, row_mapping, avx2, avx512bw),
+        TargetCaps::X86_64 { avx2, avx512bw } => {
+            macro_rules! match_shapes {
+                ($(($points:literal, $ranges:literal),)+) => {
+                    match (facts.analysis.shape.points, facts.analysis.shape.ranges) {
+                        $(($points, $ranges) => Some(FixedShape::new($points, $ranges)),)+
+                        _ => None,
+                    }
+                };
+            }
+
+            let (isa, shape, group) = if avx512bw {
+                (IsaTag::Avx512, with_x86_fixed_shapes!(match_shapes), 8)
+            } else if avx2 {
+                let shape = with_x86_fixed_shapes!(match_shapes);
+                let group = if shape.is_some() && facts.covered_below(AVX2_GROUP8_MAX_COVERAGE) {
+                    8
+                } else {
+                    1
+                };
+                (IsaTag::Avx2, shape, group)
+            } else {
+                (IsaTag::Sse2, with_sse2_fixed_shapes!(match_shapes), 1)
+            };
+            KernelPlan {
+                isa,
+                shape,
+                group,
+                row_mapping,
+                reserve: facts.region.row_count.min(facts.expected_covered_codes()),
+            }
+        }
         #[cfg(any(not(any(target_arch = "aarch64", target_arch = "x86_64")), test))]
         TargetCaps::Unsupported => KernelPlan {
-            kernel: Kernel::Unsupported,
+            isa: IsaTag::Unsupported,
+            shape: None,
+            group: 1,
             row_mapping,
             reserve: 0,
         },
-    }
-}
-
-#[cfg(any(target_arch = "aarch64", test))]
-#[inline]
-pub(super) fn select_neon(shape: CoverShape) -> NeonKernel {
-    match (shape.points, shape.ranges) {
-        (0, 1) => NeonKernel::OneRange,
-        (1, 1) | (2, 1) => NeonKernel::Fixed(FixedShape::new(shape.points, shape.ranges)),
-        (1, 2) => NeonKernel::OnePointTwoRanges,
-        (points, ranges) if ranges != 0 && points + 2 * ranges <= 16 => NeonKernel::FewMixed,
-        (1..=8, 0) => NeonKernel::FewPoints {
-            points: shape.points,
-        },
-        (9..=16, 0) => NeonKernel::ManyPoints,
-        _ => NeonKernel::Generic {
-            two_vectors: (shape.points == 1 && shape.ranges != 0)
-                || (shape.points == 2 && shape.ranges == 1),
-        },
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-#[inline]
-fn select_x86_64(
-    facts: ScanFacts,
-    row_mapping: RowMapping,
-    avx2: bool,
-    avx512bw: bool,
-) -> KernelPlan {
-    let reserve = facts.region.row_count.min(facts.expected_covered_codes());
-    let kernel = if avx512bw {
-        Kernel::Avx512(match fixed_shape(facts.analysis.shape) {
-            Some(shape) => Avx512Kernel::Fixed(shape),
-            None => Avx512Kernel::Generic,
-        })
-    } else if avx2 {
-        Kernel::Avx2(select_avx2(facts))
-    } else {
-        Kernel::Sse2(select_sse2(facts.analysis.shape))
-    };
-    KernelPlan {
-        kernel,
-        row_mapping,
-        reserve,
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-#[inline]
-fn select_sse2(shape: CoverShape) -> Sse2Kernel {
-    match sse2_fixed_shape(shape) {
-        Some(shape) => Sse2Kernel::Fixed(shape),
-        None => Sse2Kernel::Generic,
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-fn sse2_fixed_shape(shape: CoverShape) -> Option<FixedShape> {
-    macro_rules! matches_shape {
-        ($(($points:literal, $ranges:literal),)+) => {
-            match (shape.points, shape.ranges) {
-                $(($points, $ranges) => Some(FixedShape::new($points, $ranges)),)+
-                _ => None,
-            }
-        };
-    }
-    with_sse2_fixed_shapes!(matches_shape)
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-fn fixed_shape(shape: CoverShape) -> Option<FixedShape> {
-    macro_rules! matches_shape {
-        ($(($points:literal, $ranges:literal),)+) => {
-            match (shape.points, shape.ranges) {
-                $(($points, $ranges) => Some(FixedShape::new($points, $ranges)),)+
-                _ => None,
-            }
-        };
-    }
-    with_x86_fixed_shapes!(matches_shape)
-}
-
-#[cfg(any(target_arch = "x86_64", test))]
-#[inline]
-fn select_avx2(facts: ScanFacts) -> Avx2Kernel {
-    match fixed_shape(facts.analysis.shape) {
-        Some(shape) => Avx2Kernel::Fixed {
-            shape,
-            group: if facts.covered_below(AVX2_GROUP8_MAX_COVERAGE) {
-                Avx2Group::Eight
-            } else {
-                Avx2Group::One
-            },
-        },
-        None => Avx2Kernel::Generic,
     }
 }
 
@@ -414,7 +342,8 @@ mod tests {
     #[test]
     fn empty_cover_precedes_target_selection() {
         let plan = select_kernel(TargetCaps::Unsupported, facts(0, 0));
-        assert_eq!(plan.kernel, Kernel::Empty);
+        assert_eq!(plan.isa, IsaTag::Empty);
+        assert_eq!(plan.shape, None);
     }
 
     #[test]
@@ -423,7 +352,7 @@ mod tests {
         below.analysis.covered_codes = 0;
         let plan = select_kernel(TargetCaps::Aarch64Neon, below);
         assert_eq!(plan.row_mapping, RowMapping::AdaptiveSparse);
-        assert_ne!(plan.kernel, Kernel::Empty);
+        assert_eq!(plan.isa, IsaTag::Neon);
         let at = facts(1, 0);
         assert_eq!(
             select_kernel(TargetCaps::Aarch64Neon, at).row_mapping,
@@ -434,18 +363,21 @@ mod tests {
     #[test]
     fn neon_shape_matrix_preserves_specializations() {
         let cases = [
-            ((0, 1), NeonKernel::OneRange),
-            ((1, 1), NeonKernel::Fixed(FixedShape::new(1, 1))),
-            ((2, 1), NeonKernel::Fixed(FixedShape::new(2, 1))),
-            ((1, 2), NeonKernel::OnePointTwoRanges),
-            ((3, 2), NeonKernel::FewMixed),
-            ((3, 0), NeonKernel::FewPoints { points: 3 }),
-            ((12, 0), NeonKernel::ManyPoints),
-            ((1, 8), NeonKernel::Generic { two_vectors: true }),
-            ((17, 0), NeonKernel::Generic { two_vectors: false }),
+            ((0, 1), Some(FixedShape::new(0, 1)), 1),
+            ((1, 1), Some(FixedShape::new(1, 1)), 1),
+            ((2, 1), Some(FixedShape::new(2, 1)), 1),
+            ((1, 2), Some(FixedShape::new(1, 2)), 1),
+            ((3, 2), Some(FixedShape::new(3, 2)), 1),
+            ((3, 0), Some(FixedShape::new(3, 0)), 1),
+            ((12, 0), Some(FixedShape::new(12, 0)), 1),
+            ((1, 8), None, 2),
+            ((17, 0), None, 1),
         ];
-        for ((points, ranges), expected) in cases {
-            assert_eq!(select_neon(CoverShape { points, ranges }), expected);
+        for ((points, ranges), shape, group) in cases {
+            let plan = select_kernel(TargetCaps::Aarch64Neon, facts(points, ranges));
+            assert_eq!(plan.isa, IsaTag::Neon);
+            assert_eq!(plan.shape, shape);
+            assert_eq!(plan.group, group);
         }
     }
 
@@ -454,17 +386,15 @@ mod tests {
         let mut input = facts(20, 0);
         input.analysis.covered_codes = 8_000;
         input.region.row_count = 10;
-        assert_eq!(
-            select_kernel(
-                TargetCaps::X86_64 {
-                    avx2: true,
-                    avx512bw: true,
-                },
-                input,
-            )
-            .kernel,
-            Kernel::Avx512(Avx512Kernel::Generic)
+        let plan = select_kernel(
+            TargetCaps::X86_64 {
+                avx2: true,
+                avx512bw: true,
+            },
+            input,
         );
+        assert_eq!(plan.isa, IsaTag::Avx512);
+        assert_eq!(plan.shape, None);
     }
 
     #[test]
@@ -473,90 +403,105 @@ mod tests {
         for (points, ranges) in fixed {
             let shape = FixedShape::new(points, ranges);
             let input = facts(points, ranges);
-            assert_eq!(select_sse2(input.analysis.shape), Sse2Kernel::Fixed(shape));
-            assert_eq!(
-                select_avx2(input),
-                Avx2Kernel::Fixed {
-                    shape,
-                    group: Avx2Group::One,
-                }
+            let sse2 = select_kernel(
+                TargetCaps::X86_64 {
+                    avx2: false,
+                    avx512bw: false,
+                },
+                input,
             );
             assert_eq!(
-                select_kernel(
-                    TargetCaps::X86_64 {
-                        avx2: true,
-                        avx512bw: true,
-                    },
-                    input,
-                )
-                .kernel,
-                Kernel::Avx512(Avx512Kernel::Fixed(shape))
+                (sse2.isa, sse2.shape, sse2.group),
+                (IsaTag::Sse2, Some(shape), 1)
+            );
+
+            let avx2 = select_kernel(
+                TargetCaps::X86_64 {
+                    avx2: true,
+                    avx512bw: false,
+                },
+                input,
+            );
+            assert_eq!(
+                (avx2.isa, avx2.shape, avx2.group),
+                (IsaTag::Avx2, Some(shape), 1)
+            );
+
+            let avx512 = select_kernel(
+                TargetCaps::X86_64 {
+                    avx2: true,
+                    avx512bw: true,
+                },
+                input,
+            );
+            assert_eq!(
+                (avx512.isa, avx512.shape, avx512.group),
+                (IsaTag::Avx512, Some(shape), 8)
             );
         }
 
         for (points, ranges) in [(4, 0), (0, 2), (3, 1), (2, 2)] {
             let input = facts(points, ranges);
-            assert_eq!(
-                select_sse2(input.analysis.shape),
-                Sse2Kernel::Fixed(FixedShape::new(points, ranges))
+            let sse2 = select_kernel(
+                TargetCaps::X86_64 {
+                    avx2: false,
+                    avx512bw: false,
+                },
+                input,
             );
-            assert_eq!(select_avx2(input), Avx2Kernel::Generic);
-            assert_eq!(
-                select_kernel(
-                    TargetCaps::X86_64 {
-                        avx2: true,
-                        avx512bw: true,
-                    },
-                    input,
-                )
-                .kernel,
-                Kernel::Avx512(Avx512Kernel::Generic)
+            assert_eq!(sse2.shape, Some(FixedShape::new(points, ranges)));
+            let avx2 = select_kernel(
+                TargetCaps::X86_64 {
+                    avx2: true,
+                    avx512bw: false,
+                },
+                input,
             );
+            assert_eq!((avx2.isa, avx2.shape), (IsaTag::Avx2, None));
+            let avx512 = select_kernel(
+                TargetCaps::X86_64 {
+                    avx2: true,
+                    avx512bw: true,
+                },
+                input,
+            );
+            assert_eq!((avx512.isa, avx512.shape), (IsaTag::Avx512, None));
         }
 
-        assert_eq!(select_sse2(facts(8, 0).analysis.shape), Sse2Kernel::Generic);
+        let plan = select_kernel(
+            TargetCaps::X86_64 {
+                avx2: false,
+                avx512bw: false,
+            },
+            facts(8, 0),
+        );
+        assert_eq!((plan.isa, plan.shape), (IsaTag::Sse2, None));
     }
 
     #[test]
     fn avx2_group8_is_strictly_for_coverage_below_one_in_ten_thousand() {
         let mut sparse = facts(1, 0);
         sparse.analysis.covered_codes = 0;
-        assert_eq!(
-            select_avx2(sparse),
-            Avx2Kernel::Fixed {
-                shape: FixedShape::new(1, 0),
-                group: Avx2Group::Eight,
-            }
-        );
+        let avx2_caps = TargetCaps::X86_64 {
+            avx2: true,
+            avx512bw: false,
+        };
+        let plan = select_kernel(avx2_caps, sparse);
+        assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 8));
 
         let mut just_below = facts(1, 0);
         just_below.analysis.indexed_codes = 10_001;
-        assert_eq!(
-            select_avx2(just_below),
-            Avx2Kernel::Fixed {
-                shape: FixedShape::new(1, 0),
-                group: Avx2Group::Eight,
-            }
-        );
+        let plan = select_kernel(avx2_caps, just_below);
+        assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 8));
 
-        assert_eq!(
-            select_avx2(facts(1, 0)),
-            Avx2Kernel::Fixed {
-                shape: FixedShape::new(1, 0),
-                group: Avx2Group::One,
-            }
-        );
+        let plan = select_kernel(avx2_caps, facts(1, 0));
+        assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 1));
 
         let mut empty_population = facts(1, 0);
         empty_population.analysis.covered_codes = 0;
         empty_population.analysis.indexed_codes = 0;
-        assert_eq!(
-            select_avx2(empty_population),
-            Avx2Kernel::Fixed {
-                shape: FixedShape::new(1, 0),
-                group: Avx2Group::One,
-            }
-        );
+        let plan = select_kernel(avx2_caps, empty_population);
+        assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 1));
     }
 
     #[test]
@@ -568,23 +513,34 @@ mod tests {
         };
         input.analysis.indexed_codes = 32_000;
         input.analysis.covered_codes = 32_000;
-        assert_eq!(select_avx2(input), Avx2Kernel::Generic);
-        assert_eq!(
-            select_kernel(
-                TargetCaps::X86_64 {
-                    avx2: false,
-                    avx512bw: false,
-                },
-                input,
-            )
-            .kernel,
-            Kernel::Sse2(Sse2Kernel::Generic)
+        let avx2 = select_kernel(
+            TargetCaps::X86_64 {
+                avx2: true,
+                avx512bw: false,
+            },
+            input,
         );
+        assert_eq!((avx2.isa, avx2.shape), (IsaTag::Avx2, None));
+        let sse2 = select_kernel(
+            TargetCaps::X86_64 {
+                avx2: false,
+                avx512bw: false,
+            },
+            input,
+        );
+        assert_eq!((sse2.isa, sse2.shape), (IsaTag::Sse2, None));
     }
 
     #[test]
     fn non_dominant_small_avx2_cover_uses_generic_fallback() {
-        assert_eq!(select_avx2(facts(12, 0)), Avx2Kernel::Generic);
+        let plan = select_kernel(
+            TargetCaps::X86_64 {
+                avx2: true,
+                avx512bw: false,
+            },
+            facts(12, 0),
+        );
+        assert_eq!((plan.isa, plan.shape, plan.group), (IsaTag::Avx2, None, 1));
     }
 
     #[test]
