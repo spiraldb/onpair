@@ -21,8 +21,6 @@ mod x86;
 
 #[cfg(all(target_arch = "aarch64", test))]
 pub(super) use self::aarch64::scan_neon;
-#[cfg(target_arch = "x86_64")]
-use self::policy::Avx512Kernel;
 use self::policy::{
     AnalysisFacts, CoverShape, Kernel, KernelPlan, RegionFacts, ScanFacts, detect_target_caps,
     select_kernel,
@@ -141,18 +139,10 @@ pub(super) fn execute<O: Offset>(
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
-        Kernel::Avx512(Avx512Kernel::Generic) => {
+        Kernel::Avx512(kernel) => {
             // SAFETY: the plan is created only after runtime AVX-512BW
             // detection, which implies AVX-512F.
-            unsafe {
-                x86::scan_avx512(
-                    input.codes,
-                    input.row_offsets,
-                    input.cover,
-                    sparse_row_mapping,
-                    out,
-                )
-            };
+            unsafe { x86::execute_avx512(kernel, input, sparse_row_mapping, out) };
             Ok(())
         }
         #[cfg(test)]
