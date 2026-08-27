@@ -16,6 +16,8 @@ mod aarch64;
 mod policy;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod sink;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+mod template;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
