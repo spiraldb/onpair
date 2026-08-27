@@ -204,43 +204,33 @@ unsafe fn execute_avx512_fixed<O: Offset>(
 mod tests {
     use super::*;
 
-    fn cover<const POINTS: usize, const RANGES: usize>() -> ProbeCover {
+    const EDGE_POINTS: [Token; 17] = [
+        7, 17, 31, 63, 127, 255, 511, 1_023, 2_047, 4_095, 8_191, 16_383, 24_575, 32_760, 32_772,
+        49_151, 65_527,
+    ];
+    const EDGE_RANGES: [(Token, Token); 3] = [
+        (Token::MIN, 3),
+        (0x7ffe, 0x8001),
+        (Token::MAX - 3, Token::MAX),
+    ];
+
+    fn edge_cover(points: usize, ranges: usize) -> ProbeCover {
+        assert!(points <= EDGE_POINTS.len());
+        assert!(ranges <= EDGE_RANGES.len());
         let mut table = vec![false; usize::from(Token::MAX) + 1];
-        match (POINTS, RANGES) {
-            (1, 0) => table[usize::from(Token::MAX)] = true,
-            (2, 0) => {
-                table[7] = true;
-                table[usize::from(Token::MAX)] = true;
-            }
-            (3, 0) => {
-                table[7] = true;
-                table[32_768] = true;
-                table[usize::from(Token::MAX)] = true;
-            }
-            (0, 1) => table[65_532..=65_535].fill(true),
-            (1, 1) => {
-                table[7] = true;
-                table[65_532..=65_535].fill(true);
-            }
-            (2, 1) => {
-                table[7] = true;
-                table[32_768] = true;
-                table[65_532..=65_535].fill(true);
-            }
-            _ => unreachable!(),
+        for &point in &EDGE_POINTS[..points] {
+            table[usize::from(point)] = true;
+        }
+        for &(begin, last) in &EDGE_RANGES[..ranges] {
+            table[usize::from(begin)..=usize::from(last)].fill(true);
         }
         let cover = ProbeCover::from_membership(table);
-        assert_eq!((cover.points.len(), cover.ranges.len()), (POINTS, RANGES));
-        if RANGES != 0 {
-            assert_eq!(
-                cover.ranges[0],
-                crate::core::types::TokenRange {
-                    begin: 65_532,
-                    last: Token::MAX,
-                }
-            );
-        }
+        assert_eq!((cover.points.len(), cover.ranges.len()), (points, ranges));
         cover
+    }
+
+    fn cover<const POINTS: usize, const RANGES: usize>() -> ProbeCover {
+        edge_cover(POINTS, RANGES)
     }
 
     fn input<O: Offset>() -> (Vec<Token>, Vec<O>) {
@@ -333,6 +323,26 @@ mod tests {
         assert_cover::<O, POINTS, RANGES>(&codes, &row_offsets, &cover::<POINTS, RANGES>());
     }
 
+    fn assert_sse2_shape<O: Offset, const POINTS: usize, const RANGES: usize>() {
+        let (codes, row_offsets) = input::<O>();
+        let cover = cover::<POINTS, RANGES>();
+        let mut expected = Vec::new();
+        super::super::scan_scalar(&codes, &row_offsets, &cover, &mut expected);
+        for sparse_row_mapping in [false, true] {
+            let mut actual = Vec::new();
+            unsafe {
+                sse2::scan_sse2_fixed::<O, POINTS, RANGES>(
+                    &codes,
+                    &row_offsets,
+                    &cover,
+                    sparse_row_mapping,
+                    &mut actual,
+                )
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
     fn assert_full_domain_range<O: Offset>() {
         let (codes, row_offsets) = input::<O>();
         let cover = ProbeCover::from_membership(vec![true; usize::from(Token::MAX) + 1]);
@@ -356,11 +366,136 @@ mod tests {
         assert_shape::<O, 2, 1>();
     }
 
+    fn assert_all_sse2_shapes<O: Offset>() {
+        macro_rules! assert_shapes {
+            ($(($points:literal, $ranges:literal),)+) => {
+                $(assert_sse2_shape::<O, $points, $ranges>();)+
+            };
+        }
+        with_sse2_fixed_shapes!(assert_shapes);
+    }
+
+    fn edge_input<O: Offset>(len: usize, cover: &ProbeCover) -> (Vec<Token>, Vec<O>) {
+        let miss = cover
+            .table
+            .iter()
+            .position(|&covered| !covered)
+            .expect("edge covers leave at least one token uncovered") as Token;
+        let mut live = cover.points.clone();
+        for range in &cover.ranges {
+            live.push(range.begin);
+            live.push(range.begin + (range.last - range.begin) / 2);
+            live.push(range.last);
+        }
+
+        let mut codes = vec![miss; len];
+        let mut positions = (0..live.len()).collect::<Vec<_>>();
+        positions.extend([
+            7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 112, 127, 128, 129, 255, 256, 257, 511,
+            512,
+        ]);
+        positions.sort_unstable();
+        positions.dedup();
+        for (index, position) in positions
+            .into_iter()
+            .filter(|&position| position < len)
+            .enumerate()
+        {
+            codes[position] = live[index % live.len()];
+        }
+
+        let one = len.min(1);
+        let long_row_end = len.min(90);
+        let offsets = [0, 0, one, one, long_row_end, long_row_end, len, len]
+            .map(O::from_usize)
+            .to_vec();
+        (codes, offsets)
+    }
+
+    fn assert_generic_cover<O: Offset>(codes: &[Token], row_offsets: &[O], cover: &ProbeCover) {
+        let mut expected = Vec::new();
+        super::super::scan_scalar(codes, row_offsets, cover, &mut expected);
+        for sparse_row_mapping in [false, true] {
+            let mut sse2 = Vec::new();
+            sse2::scan_sse2_generic(codes, row_offsets, cover, sparse_row_mapping, &mut sse2);
+            assert_eq!(sse2, expected);
+
+            if std::is_x86_feature_detected!("avx2") {
+                let mut avx2 = Vec::new();
+                unsafe {
+                    avx2::scan_avx2_generic(
+                        codes,
+                        row_offsets,
+                        cover,
+                        sparse_row_mapping,
+                        &mut avx2,
+                    )
+                };
+                assert_eq!(avx2, expected);
+            }
+
+            if std::is_x86_feature_detected!("avx512bw") {
+                let mut avx512 = Vec::new();
+                unsafe {
+                    avx512::scan_avx512(codes, row_offsets, cover, sparse_row_mapping, &mut avx512)
+                };
+                assert_eq!(avx512, expected);
+            }
+        }
+    }
+
+    fn assert_edge_matrix<O: Offset>() {
+        const LENGTHS: [usize; 21] = [
+            0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 113, 127, 128, 129, 511, 512, 513,
+        ];
+        const SHAPES: [(usize, usize); 20] = [
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 0),
+            (8, 0),
+            (9, 0),
+            (16, 0),
+            (17, 0),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (1, 2),
+            (2, 2),
+            (3, 2),
+            (4, 2),
+            (0, 3),
+            (1, 3),
+            (8, 2),
+            (17, 3),
+        ];
+        for (points, ranges) in SHAPES {
+            let cover = edge_cover(points, ranges);
+            for len in LENGTHS {
+                let (codes, row_offsets) = edge_input::<O>(len, &cover);
+                assert_generic_cover(&codes, &row_offsets, &cover);
+            }
+        }
+    }
+
     #[test]
     fn fixed_producers_match_scalar_at_u16_boundaries() {
         assert_all_shapes::<u32>();
         assert_all_shapes::<u64>();
         assert_full_domain_range::<u32>();
         assert_full_domain_range::<u64>();
+    }
+
+    #[test]
+    fn all_sse2_fixed_shapes_match_scalar() {
+        assert_all_sse2_shapes::<u32>();
+        assert_all_sse2_shapes::<u64>();
+    }
+
+    #[test]
+    fn x86_edge_matrix_matches_scalar() {
+        assert_edge_matrix::<u32>();
+        assert_edge_matrix::<u64>();
     }
 }
