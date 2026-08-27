@@ -4,10 +4,7 @@
 //! x86-64 scan execution and target-feature boundaries.
 
 use super::ScanInput;
-use super::policy::{
-    Avx2Group, Avx2Kernel, Avx512Kernel, FixedShape, Sse2Kernel, with_sse2_fixed_shapes,
-    with_x86_fixed_shapes,
-};
+use super::policy::{FixedShape, with_sse2_fixed_shapes, with_x86_fixed_shapes};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::prefilter::cover::ProbeCover;
@@ -25,7 +22,7 @@ pub(in crate::search::prefilter) use sse2::scan_sse2;
 
 #[inline]
 pub(super) fn execute_sse2<O: Offset>(
-    kernel: Sse2Kernel,
+    shape: Option<FixedShape>,
     input: ScanInput<'_, O>,
     sparse_row_mapping: bool,
     out: &mut Vec<usize>,
@@ -35,13 +32,11 @@ pub(super) fn execute_sse2<O: Offset>(
         row_offsets,
         cover,
     } = input;
-    match kernel {
-        Sse2Kernel::Fixed(shape) => {
+    match shape {
+        Some(shape) => {
             execute_sse2_fixed(shape, codes, row_offsets, cover, sparse_row_mapping, out)
         }
-        Sse2Kernel::Generic => {
-            sse2::scan_sse2_generic(codes, row_offsets, cover, sparse_row_mapping, out)
-        }
+        None => sse2::scan_sse2_generic(codes, row_offsets, cover, sparse_row_mapping, out),
     }
 }
 
@@ -76,7 +71,8 @@ fn execute_sse2_fixed<O: Offset>(
 }
 
 pub(super) unsafe fn execute_avx2<O: Offset>(
-    kernel: Avx2Kernel,
+    shape: Option<FixedShape>,
+    group: u8,
     input: ScanInput<'_, O>,
     sparse_row_mapping: bool,
     out: &mut Vec<usize>,
@@ -87,11 +83,8 @@ pub(super) unsafe fn execute_avx2<O: Offset>(
         cover,
     } = input;
     unsafe {
-        match kernel {
-            Avx2Kernel::Fixed {
-                shape,
-                group: Avx2Group::One,
-            } => execute_avx2_fixed::<O, 1>(
+        match (shape, group) {
+            (Some(shape), 1) => execute_avx2_fixed::<O, 1>(
                 shape,
                 codes,
                 row_offsets,
@@ -99,10 +92,7 @@ pub(super) unsafe fn execute_avx2<O: Offset>(
                 sparse_row_mapping,
                 out,
             ),
-            Avx2Kernel::Fixed {
-                shape,
-                group: Avx2Group::Eight,
-            } => execute_avx2_fixed::<O, 8>(
+            (Some(shape), 8) => execute_avx2_fixed::<O, 8>(
                 shape,
                 codes,
                 row_offsets,
@@ -110,9 +100,10 @@ pub(super) unsafe fn execute_avx2<O: Offset>(
                 sparse_row_mapping,
                 out,
             ),
-            Avx2Kernel::Generic => {
+            (None, 1) => {
                 avx2::scan_avx2_generic(codes, row_offsets, cover, sparse_row_mapping, out)
             }
+            _ => unreachable!("invalid AVX2 plan"),
         }
     }
 }
@@ -148,7 +139,7 @@ unsafe fn execute_avx2_fixed<O: Offset, const BLOCKS: usize>(
 }
 
 pub(super) unsafe fn execute_avx512<O: Offset>(
-    kernel: Avx512Kernel,
+    shape: Option<FixedShape>,
     input: ScanInput<'_, O>,
     sparse_row_mapping: bool,
     out: &mut Vec<usize>,
@@ -159,13 +150,11 @@ pub(super) unsafe fn execute_avx512<O: Offset>(
         cover,
     } = input;
     unsafe {
-        match kernel {
-            Avx512Kernel::Fixed(shape) => {
+        match shape {
+            Some(shape) => {
                 execute_avx512_fixed(shape, codes, row_offsets, cover, sparse_row_mapping, out)
             }
-            Avx512Kernel::Generic => {
-                avx512::scan_avx512(codes, row_offsets, cover, sparse_row_mapping, out)
-            }
+            None => avx512::scan_avx512(codes, row_offsets, cover, sparse_row_mapping, out),
         }
     }
 }
