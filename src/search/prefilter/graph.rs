@@ -36,6 +36,7 @@ use memchr::memmem::Finder;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
+use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::search::index::TokenFrequencyIndexView;
 use crate::search::prefix_range;
 
@@ -120,7 +121,12 @@ impl AlignmentGraph {
 
 /// Greedy longest in-needle token at `suffix`, capped at [`MAX_TOKEN_SIZE`].
 /// Replicates the encoder's longest-prefix match restricted to the needle.
-fn greedy_in_needle(dict: CompactDictionaryView<'_>, suffix: &[u8]) -> (Token, usize) {
+///
+/// `None` if no token is a prefix of `suffix`: the loop covers `len == 1`, so a
+/// miss means the dictionary has no single-byte token for `suffix[0]`. Reading an
+/// id off the empty range instead would probe for an unrelated token and quietly
+/// cost selectivity, so the caller decides — an escape, or a malformed panic.
+fn greedy_in_needle(dict: CompactDictionaryView<'_>, suffix: &[u8]) -> Option<(Token, usize)> {
     debug_assert!(
         !suffix.is_empty(),
         "greedy_in_needle needs a non-empty suffix"
@@ -128,11 +134,11 @@ fn greedy_in_needle(dict: CompactDictionaryView<'_>, suffix: &[u8]) -> (Token, u
     for len in (1..=suffix.len().min(MAX_TOKEN_SIZE)).rev() {
         let range = prefix_range(dict, &suffix[..len]);
         if !range.is_empty() && dict.token_len(range.begin) == len {
-            return (range.begin, len);
+            return Some((range.begin, len));
         }
     }
-    let range = prefix_range(dict, &suffix[..1]);
-    (range.begin, 1) // Complete dictionaries make this fallback reachable only by a bug.
+
+    None
 }
 
 /// Every token whose bytes contain the whole needle, and so matches it on its
@@ -202,6 +208,8 @@ struct Builder<'d, 'n, 'f> {
     /// merging.
     greedy: Vec<Option<(Token, usize)>>,
     state_node: Vec<Option<u32>>,
+
+    escape_token: Option<Token>,
 }
 
 impl Builder<'_, '_, '_> {
@@ -237,8 +245,17 @@ impl Builder<'_, '_, '_> {
             return hit;
         }
         let hit = greedy_in_needle(self.dict, &self.needle[offset..]);
-        self.greedy[offset] = Some(hit);
-        hit
+        if let Some(hit) = hit {
+            self.greedy[offset] = Some(hit);
+            return hit;
+        }
+
+        if let Some(escape_token) = self.escape_token {
+            return (escape_token, 1);
+        }
+        // if no escape tokens are allowed, the dictionary must guarantee a transition e.g.,
+        // by containing all the individual bytes.
+        panic_malformed(InvalidColumn::IncompleteAlphabet)
     }
 
     /// The tokens the needle suffix at `offset` is a prefix of, or the empty
@@ -313,7 +330,8 @@ pub(super) fn build_alignment_graph(
     frequencies: TokenFrequencyIndexView<'_>,
 ) -> AlignmentGraph {
     debug_assert!(!needle.is_empty());
-    debug_assert_eq!(frequencies.num_tokens(), dict.num_tokens());
+    // for FSST we also have the frequency of escape bytes
+    debug_assert!(frequencies.num_tokens() >= dict.num_tokens());
 
     let n = needle.len();
     let ntok = dict.num_tokens();
@@ -330,6 +348,7 @@ pub(super) fn build_alignment_graph(
         sink: 0,
         greedy: vec![None; n],
         state_node: vec![None; n],
+        escape_token: Some(0xFF)
     };
     let source = b.add_node(ProbeSet::None);
     let sink = b.add_node(ProbeSet::None);
@@ -381,6 +400,7 @@ pub(super) fn build_alignment_graph(
         }
         let alignment = b.add_node(ProbeSet::None);
         b.add_edge(source, alignment);
+        // this builds a chain from the current alignment to the sink
         let state = b.ensure_chain(k);
 
         if k != 0 && first_count[k] <= SET_CAP {
@@ -398,6 +418,13 @@ pub(super) fn build_alignment_graph(
             b.add_edge(alignment, state);
         }
     }
+
+    // The bound the module doc advertises: 3 nodes and 4 edges per needle
+    // offset, plus source, sink and the per-alignment nodes.
+    debug_assert!(
+        b.probe.len() <= 3 * n + 32 && b.edges.len() <= 4 * n + 48,
+        "graph outgrew its documented size bound"
+    );
 
     AlignmentGraph {
         probe: b.probe,

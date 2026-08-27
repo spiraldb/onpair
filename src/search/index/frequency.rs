@@ -273,11 +273,14 @@ impl std::error::Error for TokenFrequencyIndexError {}
 /// The resulting index contains `num_tokens + 1` `u32` entries and represents
 /// code streams of up to `u32::MAX` token occurrences.
 ///
+/// `codes` may be any code width that fits the [`Token`] id domain — `u8` as
+/// well as [`Token`] itself — since the index counts ids rather than bytes.
+///
 /// ```
 /// use onpair::TokenRange;
 /// use onpair::search::index::build_token_frequency_index;
 ///
-/// let index = build_token_frequency_index(&[2, 0, 2, 3, 2, 0], 5)?;
+/// let index = build_token_frequency_index(&[2u16, 0, 2, 3, 2, 0], 5)?;
 /// assert_eq!(index.frequency(2), 3);
 /// assert_eq!(index.range_frequency(TokenRange { begin: 1, last: 3 }), 4);
 /// # Ok::<(), onpair::search::index::TokenFrequencyIndexError>(())
@@ -289,8 +292,8 @@ impl std::error::Error for TokenFrequencyIndexError {}
 /// [`TokenFrequencyIndexError::TooManyTokens`] if `num_tokens` exceeds the
 /// [`Token`] id domain, or [`TokenFrequencyIndexError::CodeOutOfRange`] if any
 /// code is not less than `num_tokens`.
-pub fn build_token_frequency_index(
-    codes: &[Token],
+pub fn build_token_frequency_index<C: Copy + Into<Token>>(
+    codes: &[C],
     num_tokens: usize,
 ) -> Result<TokenFrequencyIndex, TokenFrequencyIndexError> {
     checked_frequency_total(codes.len())?;
@@ -301,7 +304,7 @@ pub fn build_token_frequency_index(
     let mut cumulative = vec![0u32; num_tokens + 1];
     for &code in codes {
         let count = cumulative
-            .get_mut(code as usize + 1)
+            .get_mut(code.into() as usize + 1)
             .ok_or(TokenFrequencyIndexError::CodeOutOfRange)?;
         *count += 1;
     }
@@ -405,11 +408,11 @@ mod tests {
         assert_eq!(index.range_frequency(TokenRange::EMPTY), 0);
         assert_eq!(index.check_correctness(&codes), Ok(()));
         assert_eq!(
-            build_token_frequency_index(&[0, 2], 2),
+            build_token_frequency_index(&[0u16, 2], 2),
             Err(TokenFrequencyIndexError::CodeOutOfRange)
         );
         assert_eq!(
-            build_token_frequency_index(&[], Token::MAX as usize + 2),
+            build_token_frequency_index::<Token>(&[], Token::MAX as usize + 2),
             Err(TokenFrequencyIndexError::TooManyTokens)
         );
         #[cfg(target_pointer_width = "64")]
