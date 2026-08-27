@@ -3,8 +3,9 @@
 
 //! Pure, host-independent scan-kernel selection.
 
-/// Invoke a local macro with the six dominant wide-x86 fixed shapes. Policy
-/// and execution expand this list, keeping selection and dispatch aligned.
+/// Invoke a local macro with every wide-x86 shape of comparison cost at most
+/// four. Policy and execution expand this list, keeping selection and dispatch
+/// aligned.
 #[cfg(any(target_arch = "x86_64", test))]
 macro_rules! with_x86_fixed_shapes {
     ($apply:ident) => {
@@ -15,6 +16,8 @@ macro_rules! with_x86_fixed_shapes {
             (0, 1),
             (1, 1),
             (2, 1),
+            (4, 0),
+            (0, 2),
         }
     };
 }
@@ -398,8 +401,17 @@ mod tests {
     }
 
     #[test]
-    fn wide_x86_isas_specialize_exactly_the_six_dominant_shapes() {
-        let fixed = [(1, 0), (2, 0), (3, 0), (0, 1), (1, 1), (2, 1)];
+    fn wide_x86_isas_specialize_exactly_the_cost_four_shapes() {
+        let fixed = [
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (4, 0),
+            (0, 2),
+        ];
         for (points, ranges) in fixed {
             let shape = FixedShape::new(points, ranges);
             let input = facts(points, ranges);
@@ -440,7 +452,7 @@ mod tests {
             );
         }
 
-        for (points, ranges) in [(4, 0), (0, 2), (3, 1), (2, 2)] {
+        for (points, ranges) in [(3, 1), (2, 2)] {
             let input = facts(points, ranges);
             let sse2 = select_kernel(
                 TargetCaps::X86_64 {
