@@ -3,22 +3,30 @@
 
 //! Baseline x86-64 SSE2 prefilter kernels.
 
-use super::super::sink::{LaneMask, RowSink, scan_tail};
+use super::super::sink::{LaneMask, RowSink};
+use super::super::template::{DYN, Isa, scan_dynamic, scan_fixed};
 use crate::core::offset::Offset;
 use crate::core::types::{Token, TokenRange};
 use crate::search::prefilter::cover::ProbeCover;
+
+use core::arch::x86_64::{
+    __m128i, _mm_cmpeq_epi16, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_packs_epi16,
+    _mm_set1_epi16, _mm_setzero_si128, _mm_sub_epi16, _mm_subs_epu16,
+};
 
 #[inline(always)]
 fn fixed_mask32<const POINTS: usize, const RANGES: usize>(
     ptr: *const Token,
     base: usize,
-    points: &[core::arch::x86_64::__m128i; POINTS],
-    ranges: &[(core::arch::x86_64::__m128i, core::arch::x86_64::__m128i); RANGES],
+    points: &[__m128i],
+    ranges: &[(__m128i, __m128i)],
 ) -> u32 {
-    use core::arch::x86_64::{
-        __m128i, _mm_cmpeq_epi16, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128,
-        _mm_packs_epi16, _mm_setzero_si128, _mm_sub_epi16, _mm_subs_epu16,
-    };
+    debug_assert_eq!(points.len(), POINTS);
+    debug_assert_eq!(ranges.len(), RANGES);
+    // SAFETY: the fixed-shape prologue creates exactly these probe counts.
+    let points = unsafe { points.get_unchecked(..POINTS) };
+    // SAFETY: the fixed-shape prologue creates exactly these probe counts.
+    let ranges = unsafe { ranges.get_unchecked(..RANGES) };
 
     let zero = unsafe { _mm_setzero_si128() };
     let matching = |offset: usize| unsafe {
@@ -42,6 +50,100 @@ fn fixed_mask32<const POINTS: usize, const RANGES: usize>(
     u32::from(lo) | (u32::from(hi) << 16)
 }
 
+/// Preserve the arbitrary-shape fallback's probe ordering and 32-code early
+/// gate while sharing the outer 64-code walk.
+#[inline(always)]
+fn dynamic_mask32(ptr: *const Token, points: &[__m128i], ranges: &[(__m128i, __m128i)]) -> u32 {
+    unsafe {
+        let zero = _mm_setzero_si128();
+        let values = [
+            _mm_loadu_si128(ptr.cast()),
+            _mm_loadu_si128(ptr.add(8).cast()),
+            _mm_loadu_si128(ptr.add(16).cast()),
+            _mm_loadu_si128(ptr.add(24).cast()),
+        ];
+        let mut masks = [zero; 4];
+        for &point in points {
+            for (mask, &value) in masks.iter_mut().zip(&values) {
+                *mask = _mm_or_si128(*mask, _mm_cmpeq_epi16(value, point));
+            }
+        }
+        for &(begin, span) in ranges {
+            for (mask, &value) in masks.iter_mut().zip(&values) {
+                let excess = _mm_subs_epu16(_mm_sub_epi16(value, begin), span);
+                *mask = _mm_or_si128(*mask, _mm_cmpeq_epi16(excess, zero));
+            }
+        }
+        let any = _mm_or_si128(
+            _mm_or_si128(masks[0], masks[1]),
+            _mm_or_si128(masks[2], masks[3]),
+        );
+        if _mm_movemask_epi8(any) == 0 {
+            return 0;
+        }
+        let lo = _mm_movemask_epi8(_mm_packs_epi16(masks[0], masks[1])) as u16;
+        let hi = _mm_movemask_epi8(_mm_packs_epi16(masks[2], masks[3])) as u16;
+        u32::from(lo) | (u32::from(hi) << 16)
+    }
+}
+
+struct Sse2;
+
+impl Isa for Sse2 {
+    const BLOCK: usize = 64;
+
+    type Point = __m128i;
+    type Range = (__m128i, __m128i);
+    type Hits = u64;
+    const NO_HITS: Self::Hits = 0;
+
+    #[inline(always)]
+    fn point(token: Token) -> Self::Point {
+        unsafe { _mm_set1_epi16(token as i16) }
+    }
+
+    #[inline(always)]
+    fn range(range: TokenRange) -> Self::Range {
+        unsafe {
+            (
+                _mm_set1_epi16(range.begin as i16),
+                _mm_set1_epi16(range.last.wrapping_sub(range.begin) as i16),
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn block<const POINTS: usize, const RANGES: usize>(
+        codes: *const Token,
+        points: &[Self::Point],
+        ranges: &[Self::Range],
+    ) -> Self::Hits {
+        let (lo, hi) = if POINTS == DYN {
+            debug_assert_eq!(RANGES, DYN);
+            (
+                dynamic_mask32(codes, points, ranges),
+                dynamic_mask32(unsafe { codes.add(32) }, points, ranges),
+            )
+        } else {
+            (
+                fixed_mask32::<POINTS, RANGES>(codes, 0, points, ranges),
+                fixed_mask32::<POINTS, RANGES>(codes, 32, points, ranges),
+            )
+        };
+        u64::from(lo) | (u64::from(hi) << 32)
+    }
+
+    #[inline(always)]
+    fn any(hits: Self::Hits) -> bool {
+        hits != Self::NO_HITS
+    }
+
+    #[inline(always)]
+    fn emit<O: Offset>(base: usize, hits: Self::Hits, sink: &mut RowSink<'_, O>) {
+        sink.mark_mask(base, LaneMask::from_bits(hits));
+    }
+}
+
 /// Eager compact-mask SSE2 leaf for the selected small cover shapes.
 #[target_feature(enable = "sse2")]
 #[inline(never)]
@@ -56,82 +158,9 @@ pub(in crate::search::prefilter::scan) fn scan_sse2_fixed<
     sparse_row_mapping: bool,
     out: &mut Vec<usize>,
 ) {
-    use core::arch::x86_64::{__m128i, _mm_set1_epi16};
-
-    debug_assert_eq!((cover.points.len(), cover.ranges.len()), (POINTS, RANGES));
-    let points: [__m128i; POINTS] =
-        std::array::from_fn(|index| _mm_set1_epi16(cover.points[index] as i16));
-    let ranges: [(__m128i, __m128i); RANGES] = std::array::from_fn(|index| {
-        let TokenRange { begin, last } = cover.ranges[index];
-        (
-            _mm_set1_epi16(begin as i16),
-            _mm_set1_epi16(last.wrapping_sub(begin) as i16),
-        )
-    });
-
-    let mut sink = RowSink::new(row_offsets, out, sparse_row_mapping);
-    let ptr = codes.as_ptr();
-    let mut base = 0;
-    while base + 64 <= codes.len() {
-        let lo = u64::from(fixed_mask32(ptr, base, &points, &ranges));
-        let hi = u64::from(fixed_mask32(ptr, base + 32, &points, &ranges));
-        let mask = lo | (hi << 32);
-        if mask != 0 {
-            sink.mark_mask(base, LaneMask::from_bits(mask));
-        }
-        base += 64;
+    unsafe {
+        scan_fixed::<Sse2, O, POINTS, RANGES, 1>(codes, row_offsets, cover, sparse_row_mapping, out)
     }
-    while base + 32 <= codes.len() {
-        let mask = u64::from(fixed_mask32(ptr, base, &points, &ranges));
-        if mask != 0 {
-            sink.mark_mask(base, LaneMask::from_bits(mask));
-        }
-        base += 32;
-    }
-    scan_tail(codes, cover, base, &mut sink);
-}
-
-/// Shared four-vector walk retained by the arbitrary-shape fallback.
-#[inline(always)]
-fn scan_four_vectors<O: Offset>(
-    codes: &[Token],
-    sink: &mut RowSink<'_, O>,
-    mut matching_masks: impl FnMut(
-        core::arch::x86_64::__m128i,
-        core::arch::x86_64::__m128i,
-        core::arch::x86_64::__m128i,
-        core::arch::x86_64::__m128i,
-    ) -> [core::arch::x86_64::__m128i; 4],
-) -> usize {
-    use core::arch::x86_64::{
-        __m128i, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_packs_epi16,
-    };
-
-    let ptr = codes.as_ptr();
-    let mut base = 0;
-    while base + 32 <= codes.len() {
-        let [m0, m1, m2, m3] = unsafe {
-            matching_masks(
-                _mm_loadu_si128(ptr.add(base).cast::<__m128i>()),
-                _mm_loadu_si128(ptr.add(base + 8).cast::<__m128i>()),
-                _mm_loadu_si128(ptr.add(base + 16).cast::<__m128i>()),
-                _mm_loadu_si128(ptr.add(base + 24).cast::<__m128i>()),
-            )
-        };
-        unsafe {
-            let any = _mm_or_si128(_mm_or_si128(m0, m1), _mm_or_si128(m2, m3));
-            if _mm_movemask_epi8(any) != 0 {
-                let lo = _mm_movemask_epi8(_mm_packs_epi16(m0, m1)) as u16;
-                let hi = _mm_movemask_epi8(_mm_packs_epi16(m2, m3)) as u16;
-                sink.mark_mask(
-                    base,
-                    LaneMask::from_bits(u64::from(lo) | (u64::from(hi) << 16)),
-                );
-            }
-        }
-        base += 32;
-    }
-    base
 }
 
 /// SSE2 fallback for arbitrary cover shapes, processing eight lanes at a time.
@@ -142,46 +171,8 @@ pub(in crate::search::prefilter::scan) fn scan_sse2_generic<O: Offset>(
     sparse_row_mapping: bool,
     out: &mut Vec<usize>,
 ) {
-    use core::arch::x86_64::{
-        __m128i, _mm_cmpeq_epi16, _mm_or_si128, _mm_set1_epi16, _mm_setzero_si128, _mm_sub_epi16,
-        _mm_subs_epu16,
-    };
-
-    let zero = unsafe { _mm_setzero_si128() };
-    let points: Vec<__m128i> = cover
-        .points
-        .iter()
-        .map(|&point| unsafe { _mm_set1_epi16(point as i16) })
-        .collect();
-    let ranges: Vec<(__m128i, __m128i)> = cover
-        .ranges
-        .iter()
-        .map(|range| unsafe {
-            (
-                _mm_set1_epi16(range.begin as i16),
-                _mm_set1_epi16((range.last - range.begin) as i16),
-            )
-        })
-        .collect();
-
-    let mut sink = RowSink::new(row_offsets, out, sparse_row_mapping);
-    let base = scan_four_vectors(codes, &mut sink, |v0, v1, v2, v3| unsafe {
-        let values = [v0, v1, v2, v3];
-        let mut masks = [zero; 4];
-        for &point in &points {
-            for (mask, &value) in masks.iter_mut().zip(&values) {
-                *mask = _mm_or_si128(*mask, _mm_cmpeq_epi16(value, point));
-            }
-        }
-        for &(begin, span) in &ranges {
-            for (mask, &value) in masks.iter_mut().zip(&values) {
-                let excess = _mm_subs_epu16(_mm_sub_epi16(value, begin), span);
-                *mask = _mm_or_si128(*mask, _mm_cmpeq_epi16(excess, zero));
-            }
-        }
-        masks
-    });
-    scan_tail(codes, cover, base, &mut sink);
+    // SAFETY: SSE2 is part of the x86-64 baseline ISA.
+    unsafe { scan_dynamic::<Sse2, O>(codes, row_offsets, cover, sparse_row_mapping, out) };
 }
 
 /// Direct generic-kernel entry retained for architecture correctness tests.
