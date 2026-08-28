@@ -184,13 +184,14 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
     pattern: &[u8],
     dict: CompactDictionaryView<'_>,
     frequencies: &TokenFrequencyIndex<S>,
+    escape_token: Option<Token>,
 ) -> PrefilterAnalysis {
     assert!(
         !pattern.is_empty(),
         "the empty pattern matches every row and needs no prefilter"
     );
     let frequencies_view = frequencies.as_view();
-    let probe_cover = plan::plan(dict, pattern, frequencies_view);
+    let probe_cover = plan::plan(dict, pattern, frequencies_view, escape_token);
     let covered_frequency = probe_cover
         .points
         .iter()

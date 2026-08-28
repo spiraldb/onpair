@@ -26,7 +26,7 @@ fn candidates<S: TokenFrequencyIndexStorage>(
         return (0..view.num_rows()).collect();
     }
     let mut out = Vec::new();
-    let analysis = analyze_prefilter(pattern, dict, frequencies);
+    let analysis = analyze_prefilter(pattern, dict, frequencies, None);
     prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut out).unwrap();
     out
 }
@@ -124,7 +124,7 @@ fn covers_every_match(
     selection: &[&Edge],
     want: &[usize],
 ) -> bool {
-    let members = graph.membership(selection);
+    let members = graph.membership(selection, None);
     want.iter()
         .all(|&row| view.row_codes(row).iter().any(|&c| members[c as usize]))
 }
@@ -140,7 +140,7 @@ fn check_graph(
     pat: &[u8],
     want: &[usize],
 ) {
-    let graph = build_alignment_graph(view.dict, pat, frequencies.as_view());
+    let graph = build_alignment_graph(view.dict, pat, frequencies.as_view(), None);
     let probes: Vec<&Edge> = graph
         .edges
         .iter()
@@ -156,7 +156,7 @@ fn check_graph(
     // number of codes the probe would actually match. Nothing downstream can
     // notice the cut optimizing a wrong number.
     for &edge in &probes {
-        let covered = graph.membership(&[edge]);
+        let covered = graph.membership(&[edge], None);
         let matched = view.codes.iter().filter(|&&c| covered[c as usize]).count();
         assert_eq!(
             probe_weight(edge) as usize,
@@ -384,7 +384,7 @@ fn prefilter_accepts_pattern_over_255_bytes() {
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     let pat = vec![b'a'; 256];
     let mut candidates = Vec::new();
-    let analysis = analyze_prefilter(&pat, view.dict, &frequencies);
+    let analysis = analyze_prefilter(&pat, view.dict, &frequencies, None);
     prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut candidates).unwrap();
 
     assert!(candidates.contains(&0));
@@ -395,7 +395,7 @@ fn analysis_reports_normalized_cover_frequency() {
     let col = compress_rows(&[b"alpha", b"beta"]);
     let view = col.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let analysis = analyze_prefilter(b"a", view.dict, &frequencies);
+    let analysis = analyze_prefilter(b"a", view.dict, &frequencies, None);
     let cover = analysis.probe_cover();
     let expected: u32 = cover
         .points()
@@ -430,8 +430,8 @@ fn external_storage_matches_owned_prefilter_analysis_and_results() {
     .unwrap();
 
     let pattern = b"alpha";
-    let owned_analysis = analyze_prefilter(pattern, view.dict, &owned);
-    let external_analysis = analyze_prefilter(pattern, view.dict, &external);
+    let owned_analysis = analyze_prefilter(pattern, view.dict, &owned, None);
+    let external_analysis = analyze_prefilter(pattern, view.dict, &external, None);
     assert_eq!(
         external_analysis.probe_cover().points(),
         owned_analysis.probe_cover().points()
@@ -497,7 +497,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
     )
     .unwrap();
     let pattern = b"alpha";
-    let analysis = analyze_prefilter(pattern, view.dict, &frequencies);
+    let analysis = analyze_prefilter(pattern, view.dict, &frequencies, None);
     assert!(!analysis.probe_cover().is_empty());
     assert_eq!(analysis.covered_frequency(), 0);
 
@@ -581,7 +581,7 @@ fn assert_kernel_matches_scalar(
         b"zzz",
     ];
     for &pat in patterns {
-        let pf = plan(view.dict, pat, frequencies.as_view());
+        let pf = plan(view.dict, pat, frequencies.as_view(), None);
         let mut scalar = Vec::new();
         let mut simd = Vec::new();
         super::scan::scan_scalar(view.codes, view.row_offsets, &pf, &mut scalar);

@@ -144,8 +144,10 @@ pub(super) struct AlignmentGraph {
 impl AlignmentGraph {
     /// The token ids `cut`'s probes cover, as a membership table over the
     /// dictionary.
-    pub(super) fn membership(&self, cut: &[&Edge]) -> Vec<bool> {
-        let mut members = vec![false; self.num_tokens.max(256)];
+    pub(super) fn membership(&self, cut: &[&Edge], escape_token: Option<Token>) -> Vec<bool> {
+        let escape_byte_range = escape_token.unwrap_or(0) as usize + 1;
+        let members_size = self.num_tokens.max(escape_byte_range);
+        let mut members = vec![false; members_size];
         for edge in cut {
             match edge.probe {
                 ProbeSet::SetTooBig => debug_assert!(false, "cut selected an unprobed step"),
@@ -248,9 +250,9 @@ struct Builder<'d, 'n, 'f> {
     set_ids: Vec<Token>,
     edges: Vec<Edge>,
     nodes: Nodes,
-    /// `greedy[o]`: the greedy parse at needle offset `o`, computed at most
-    /// once. Every alignment reaching `o` reuses it — the memo *is* the state
-    /// merging.
+    /// `greedy[o]`: the greedy parse at needle offset `o`, computed once when
+    /// there is one. Every alignment reaching `o` reuses it — the memo *is* the
+    /// state merging.
     greedy: Vec<Option<(Token, usize)>>,
     /// `built[o]`: whether the steps out of offset `o` have been emitted. Node
     /// ids are offsets, so this is all the builder has left to track.
@@ -297,22 +299,15 @@ impl Builder<'_, '_, '_> {
     }
 
     /// The greedy step out of `offset`, or `None` when the dictionary holds no
-    /// token that is a prefix of what remains — see [`build_state`](Self::build_state).
-    fn greedy_at(&mut self, offset: usize) -> (Token, usize) {
-        if let Some(hit) = self.greedy[offset] {
-            return hit;
+    /// token that is a prefix of what remains.
+    fn greedy_at(&mut self, offset: usize) -> Option<(Token, usize)> {
+        // A `None` result is not memoized: no token is a prefix of the rest of
+        // the needle, so the lane dead-ends here and the offset is not
+        // revisited.
+        if self.greedy[offset].is_none() {
+            self.greedy[offset] = greedy_in_needle(self.dict, &self.needle[offset..]);
         }
-        if let Some(hit) = greedy_in_needle(self.dict, &self.needle[offset..]) {
-            self.greedy[offset] = Some(hit);
-            return hit;
-        }
-
-        if let Some(escape_token) = self.escape_token {
-            return (escape_token, 1);
-        }
-        // if no escape tokens are allowed, the dictionary must guarantee a transition e.g.,
-        // by containing all the individual bytes.
-        panic_malformed(InvalidColumn::IncompleteAlphabet)
+        self.greedy[offset]
     }
 
     /// The tokens the needle suffix at `offset` is a prefix of, or the empty
@@ -349,41 +344,52 @@ impl Builder<'_, '_, '_> {
     /// chain run forwards.
     ///
     /// # Dead ends
-    /// No token being a prefix of `needle[offset..]` is not malformed input: it
-    /// says no tokenization of any row can have a boundary here with the needle
-    /// running past it. A token starting at `offset` either ends inside the needle
-    /// — then its bytes *are* such a prefix — or covers the rest of it, and that
-    /// case is the terminal range emitted above. So the lane simply ends, and
-    /// since the state can no longer reach the accept node, no layout runs through
-    /// it and the cut owes nothing for it.
-    ///
-    /// A complete alphabet makes this unreachable, since every byte is then a
-    /// token of its own. An FSST table is the case that reaches it.
+    /// No token being a prefix of `needle[offset..]` can happen if the dictionary does not
+    /// contain all 0x00 to 0xFF bytes as tokens, like in the case of FSST. In this case, there
+    /// needs to be an escape byte to allow the parse to continue. For simplicity, if we need
+    /// an escape byte, we directly go to the sink instead of tracing the remaining chain.
+    /// If we don't have an escape byte, we will panic.
     fn build_state(&mut self, offset: usize) -> usize {
         let state = offset as u32;
 
         // The occurrence may end inside a longer token starting here.
-        let terminal = self.terminal_range(offset);
-        if !terminal.is_empty() {
-            self.add_edge(state, self.nodes.sink(), ProbeSet::Range(terminal));
+        //
+        // Not at offset 0, though: every token the whole needle is a prefix of
+        // also contains it, so the contained step already probes for them. A
+        // parallel edge would make the cut pay twice for one path — and the two
+        // are drawn as two cards naming the same token.
+        let terminal_token_range = self.terminal_range(offset);
+        if !terminal_token_range.is_empty() && offset != 0 {
+            self.add_edge(state, self.nodes.sink(), ProbeSet::Range(terminal_token_range));
         }
 
-        let (token, len) = self.greedy_at(offset);
-        let next = offset + len;
-        if next < self.needle.len() {
-            self.add_edge(state, next as u32, ProbeSet::Point(token));
+        let next_token = self.greedy_at(offset);
+
+        if let Some((token, token_length)) = next_token {
+            let next_offset = offset + token_length;
+            if next_offset < self.needle.len() {
+                self.add_edge(state, next_offset as u32, ProbeSet::Point(token));
+            } else {
+                // A greedy step that reaches the needle's end consumed
+                // `needle[offset..]` exactly, so that token should appear in the
+                // terminal range.
+                debug_assert!(
+                    terminal_token_range.contains(token),
+                    "the exact final token belongs to its own prefix range"
+                );
+            }
+            next_offset
         } else {
-            // A greedy step that reaches the needle's end consumed
-            // `needle[offset..]` exactly, so that token is in its own prefix
-            // range: this step is `offset -> sink`, already probed above by a
-            // range containing it. A parallel point probe would only make the
-            // cut pay twice for one step.
-            debug_assert!(
-                terminal.contains(token),
-                "the exact final token belongs to its own prefix range"
-            );
+            if let Some(escape_token) = self.escape_token {
+                // if we find an escape token, we add an edge to the sink with the escape token
+                self.add_edge(state, self.nodes.sink(), ProbeSet::Point(escape_token));
+                self.needle.len()
+            } else {
+                // if no escape tokens are allowed, the dictionary must guarantee a transition e.g.,
+                // by containing all the individual bytes.
+                panic_malformed(InvalidColumn::IncompleteAlphabet)
+            }
         }
-        next
     }
 }
 
@@ -393,6 +399,7 @@ pub(super) fn build_alignment_graph(
     dict: CompactDictionaryView<'_>,
     needle: &[u8],
     frequencies: TokenFrequencyIndexView<'_>,
+    escape_token: Option<Token>,
 ) -> AlignmentGraph {
     debug_assert!(!needle.is_empty());
     // for FSST we also have the frequency of escape bytes
@@ -411,7 +418,7 @@ pub(super) fn build_alignment_graph(
         nodes: Nodes::new(n),
         greedy: vec![None; n],
         built: vec![false; n],
-        escape_token: Some(0xFF),
+        escape_token
     };
 
     // First-token sets in one dictionary pass: for each alignment k >= 1, how
