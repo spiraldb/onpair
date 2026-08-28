@@ -4,7 +4,7 @@
 //! Pure, host-independent scan-kernel selection.
 
 /// Invoke a local macro with every wide-x86 shape of comparison cost at most
-/// six. Policy and execution expand this list, keeping selection and dispatch
+/// eight. Policy and execution expand this list, keeping selection and dispatch
 /// aligned.
 #[cfg(any(target_arch = "x86_64", test))]
 macro_rules! with_x86_fixed_shapes {
@@ -25,6 +25,15 @@ macro_rules! with_x86_fixed_shapes {
             (4, 1),
             (2, 2),
             (0, 3),
+            (7, 0),
+            (5, 1),
+            (3, 2),
+            (1, 3),
+            (8, 0),
+            (6, 1),
+            (4, 2),
+            (2, 3),
+            (0, 4),
         }
     };
 }
@@ -408,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_x86_isas_specialize_exactly_the_cost_six_shapes() {
+    fn wide_x86_isas_specialize_exactly_the_cost_eight_shapes() {
         let fixed = [
             (1, 0),
             (2, 0),
@@ -425,6 +434,15 @@ mod tests {
             (4, 1),
             (2, 2),
             (0, 3),
+            (7, 0),
+            (5, 1),
+            (3, 2),
+            (1, 3),
+            (8, 0),
+            (6, 1),
+            (4, 2),
+            (2, 3),
+            (0, 4),
         ];
         for (points, ranges) in fixed {
             let shape = FixedShape::new(points, ranges);
@@ -436,9 +454,31 @@ mod tests {
                 },
                 input,
             );
+            let sse2_shape = matches!(
+                (points, ranges),
+                (1, 0)
+                    | (0, 1)
+                    | (2, 0)
+                    | (3, 0)
+                    | (1, 1)
+                    | (4, 0)
+                    | (2, 1)
+                    | (5, 0)
+                    | (0, 2)
+                    | (1, 2)
+                    | (3, 1)
+                    | (6, 0)
+                    | (4, 1)
+                    | (2, 2)
+                    | (0, 3)
+                    | (3, 2)
+                    | (1, 3)
+                    | (4, 2)
+            )
+            .then_some(shape);
             assert_eq!(
                 (sse2.isa, sse2.shape, sse2.group),
-                (IsaTag::Sse2, Some(shape), 1)
+                (IsaTag::Sse2, sse2_shape, 1)
             );
 
             let avx2 = select_kernel(
@@ -466,16 +506,8 @@ mod tests {
             );
         }
 
-        for (points, ranges) in [(3, 2), (1, 3), (4, 2)] {
+        for (points, ranges) in [(9, 0), (7, 1), (5, 2), (3, 3), (1, 4)] {
             let input = facts(points, ranges);
-            let sse2 = select_kernel(
-                TargetCaps::X86_64 {
-                    avx2: false,
-                    avx512bw: false,
-                },
-                input,
-            );
-            assert_eq!(sse2.shape, Some(FixedShape::new(points, ranges)));
             let avx2 = select_kernel(
                 TargetCaps::X86_64 {
                     avx2: true,
