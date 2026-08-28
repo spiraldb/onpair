@@ -61,17 +61,21 @@ impl<'a, O: Offset> RowSink<'a, O> {
         if code_index < self.row_end {
             return;
         }
-        // A sparse cover can jump across hundreds of thousands of rows between
-        // hits. Walking every intervening offset makes candidate materialization
-        // O(rows), even when the SIMD scan found only a handful of codes. Use a
-        // lower-bound search for large code-space gaps; keep the linear cursor
-        // for nearby hits, where its predictable sequential loads are cheaper.
-        const BINARY_SEARCH_CODE_GAP: usize = 128;
-        if self.binary_search_sparse_gaps
-            && code_index.saturating_sub(self.row_end) >= BINARY_SEARCH_CODE_GAP
-        {
-            let suffix = &self.row_offsets[self.row + 1..];
-            self.row += suffix.partition_point(|offset| offset.to_usize() <= code_index);
+        // Gallop from the cursor, then binary search the bracket that overshoots:
+        // the walk costs log(gap) rather than log(rows), so a sparse cover pays
+        // for its own gap and not for the column behind it.
+        if self.binary_search_sparse_gaps {
+            let base = self.row;
+            let mut step = 1;
+            while base + step < self.row_offsets.len()
+                && self.row_offsets[base + step].to_usize() <= code_index
+            {
+                step *= 2;
+            }
+            let lo = base + step / 2;
+            let hi = (base + step).min(self.row_offsets.len());
+            let bracket = &self.row_offsets[lo + 1..hi];
+            self.row = lo + bracket.partition_point(|offset| offset.to_usize() <= code_index);
         } else {
             // Empty rows end at or before `code_index`, so this skips them too.
             while self.row + 1 < self.row_offsets.len()
@@ -80,8 +84,7 @@ impl<'a, O: Offset> RowSink<'a, O> {
                 self.row += 1;
             }
         }
-        // `code_index` is a valid code index, so it lies below the last row
-        // offset and the loop above always stops with `row + 1` in bounds.
+        // `code_index` lies below the last row offset, so `row + 1` stays in bounds.
         self.out.push(self.row);
         self.row_end = self.row_offsets[self.row + 1].to_usize();
     }
@@ -104,14 +107,40 @@ impl<'a, O: Offset> RowSink<'a, O> {
             self.hit(base + lanes.trailing_zeros() as usize);
         }
     }
+
+    /// Record the hit rows named by a NEON block's nibble mask: four bits per
+    /// lane, all set when the lane hit.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub(super) fn mark_nibbles(&mut self, base: usize, mask: u64) {
+        const LANES: usize = 16;
+        let mut lanes = mask;
+        loop {
+            // A previous hit may have emitted a row extending into this block.
+            let consumed = self.row_end.saturating_sub(base);
+            if consumed >= LANES {
+                return;
+            }
+            lanes &= u64::MAX << (4 * consumed);
+            if lanes == 0 {
+                return;
+            }
+            self.hit(base + lanes.trailing_zeros() as usize / 4);
+        }
+    }
 }
 
 /// Map a SIMD block's non-zero hit lanes to rows.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-pub(super) fn mark_block<O: Offset>(base: usize, hits: &[u16], sink: &mut RowSink<'_, O>) {
+pub(super) fn mark_block<O: Offset, T: Copy + Default + PartialEq>(
+    base: usize,
+    hits: &[T],
+    sink: &mut RowSink<'_, O>,
+) {
+    let zero = T::default();
     for (lane, &hit) in hits.iter().enumerate() {
-        if hit != 0 {
+        if hit != zero {
             sink.hit(base + lane);
         }
     }

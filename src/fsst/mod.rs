@@ -5,7 +5,7 @@
 //! compresses with FSST into an onpair [`Column`](crate::Column)
 pub mod encode;
 
-pub use crate::fsst::encode::transcode_onpair;
+pub use crate::fsst::encode::transcode_fsst_to_onpair;
 
 #[cfg(test)]
 mod tests;

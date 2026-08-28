@@ -49,6 +49,7 @@ mod scan;
 mod tests;
 
 pub use cover::ProbeCover;
+pub use scan::{Codes, GenericToken};
 
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
@@ -232,8 +233,8 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
 /// # Errors
 /// Returns [`PrefilterError::UnsupportedArchitecture`] when no SIMD kernel is
 /// available for a non-empty cover.
-pub fn prefilter_candidates<O: Offset>(
-    codes: &[Token],
+pub fn prefilter_candidates<O: Offset, C: GenericToken>(
+    codes: &[C],
     row_offsets: &[O],
     analysis: &PrefilterAnalysis,
     out: &mut Vec<usize>,

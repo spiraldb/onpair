@@ -11,9 +11,9 @@
 use super::cover::ProbeCover;
 use super::graph::build_alignment_graph;
 use super::mincut::min_cut;
+use crate::Token;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::search::index::TokenFrequencyIndexView;
-use crate::Token;
 
 /// Compile a sound probe cover for `pattern` over `dict`, cheapest by term
 /// frequency according to the advisory `frequencies` weights.
@@ -21,7 +21,7 @@ pub(super) fn plan(
     dict: CompactDictionaryView<'_>,
     pattern: &[u8],
     frequencies: TokenFrequencyIndexView<'_>,
-    escape_token: Option<Token>
+    escape_token: Option<Token>,
 ) -> ProbeCover {
     let graph = build_alignment_graph(dict, pattern, frequencies, escape_token);
     let cut = min_cut(&graph.edges, graph.nodes);

@@ -360,7 +360,11 @@ impl Builder<'_, '_, '_> {
         // are drawn as two cards naming the same token.
         let terminal_token_range = self.terminal_range(offset);
         if !terminal_token_range.is_empty() && offset != 0 {
-            self.add_edge(state, self.nodes.sink(), ProbeSet::Range(terminal_token_range));
+            self.add_edge(
+                state,
+                self.nodes.sink(),
+                ProbeSet::Range(terminal_token_range),
+            );
         }
 
         let next_token = self.greedy_at(offset);
@@ -379,16 +383,14 @@ impl Builder<'_, '_, '_> {
                 );
             }
             next_offset
+        } else if let Some(escape_token) = self.escape_token {
+            // if we find an escape token, we add an edge to the sink with the escape token
+            self.add_edge(state, self.nodes.sink(), ProbeSet::Point(escape_token));
+            self.needle.len()
         } else {
-            if let Some(escape_token) = self.escape_token {
-                // if we find an escape token, we add an edge to the sink with the escape token
-                self.add_edge(state, self.nodes.sink(), ProbeSet::Point(escape_token));
-                self.needle.len()
-            } else {
-                // if no escape tokens are allowed, the dictionary must guarantee a transition e.g.,
-                // by containing all the individual bytes.
-                panic_malformed(InvalidColumn::IncompleteAlphabet)
-            }
+            // if no escape tokens are allowed, the dictionary must guarantee a transition e.g.,
+            // by containing all the individual bytes.
+            panic_malformed(InvalidColumn::IncompleteAlphabet)
         }
     }
 }
@@ -418,7 +420,7 @@ pub(super) fn build_alignment_graph(
         nodes: Nodes::new(n),
         greedy: vec![None; n],
         built: vec![false; n],
-        escape_token
+        escape_token,
     };
 
     // First-token sets in one dictionary pass: for each alignment k >= 1, how

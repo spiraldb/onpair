@@ -44,7 +44,7 @@ fn remap_codes(codes: &[u8], code_map: &[u8]) -> Result<Vec<u8>, InvalidColumn> 
 
 /// Sort an FSST symbol table into a safety-validated dictionary and rewrite `codes`
 /// to index it. `codes` must come from `compressor`.
-pub fn transcode_onpair(
+pub fn transcode_fsst_to_onpair(
     compressor: &Compressor,
     codes: &[u8],
 ) -> Result<(CompactDictionary, Vec<u8>), InvalidColumn> {
