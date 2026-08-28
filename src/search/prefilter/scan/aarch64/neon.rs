@@ -7,7 +7,8 @@ use super::super::sink::{RowSink, mark_block};
 use super::super::template::{DYN, Isa, scan_dynamic, scan_fixed, walk};
 #[cfg(test)]
 use super::super::{
-    AnalysisFacts, CoverShape, RegionFacts, ScanFacts, ScanInput, TargetCaps, policy,
+    AnalysisFacts, CoverShape, RegionFacts, ScanFacts, ScanInput,
+    policy::{self, TargetCaps},
 };
 #[cfg(test)]
 use super::execute as execute_neon;
