@@ -117,19 +117,14 @@ fn selected(selection: &[&Edge], edge: &Edge) -> bool {
 }
 
 /// Whether every row that really contains the pattern holds a token one of
-/// `selection`'s probes covers — what a cover exists to guarantee. The mandatory
-/// [`contained`](AlignmentGraph::contained) tokens join the selection here, since
-/// the graph deliberately leaves them out of a cut.
+/// `selection`'s probes covers — what a cover exists to guarantee.
 fn covers_every_match(
     view: ColumnView<'_, u32>,
     graph: &AlignmentGraph,
     selection: &[&Edge],
     want: &[usize],
 ) -> bool {
-    let mut members = graph.membership(selection);
-    for &id in &graph.contained {
-        members[id as usize] = true;
-    }
+    let members = graph.membership(selection);
     want.iter()
         .all(|&row| view.row_codes(row).iter().any(|&c| members[c as usize]))
 }
@@ -286,11 +281,9 @@ fn contained_tokens_survive_a_match_spanning_two_tokens() {
         "corpus did not train the `aa` token this test is about"
     );
 
-    let frequencies = build_token_frequency_index(view.codes, ntok).unwrap();
     for pat in [b"aa".as_slice(), b"aaa", b"aaaa"] {
-        let graph = build_alignment_graph(dict, pat, frequencies.as_view());
         assert_eq!(
-            graph.contained,
+            contained_tokens(dict, pat),
             contained_tokens_by_scan(dict, pat),
             "contained tokens for {pat:?} disagree with a per-token scan"
         );

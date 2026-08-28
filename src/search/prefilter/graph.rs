@@ -37,10 +37,8 @@
 //! escape; one without has to supply a transition for every byte itself, so a
 //! needle that finds none is a malformed column rather than a shorter graph.
 //!
-//! Tokens whose bytes contain the *whole* needle are mandatory and join the
-//! cover unconditionally, since such an occurrence crosses no boundary. The cut
-//! never chooses them: the one edge that probes a subset of them, `0 -> n`, is
-//! a source-to-sink path on its own, so every cut pays it alike.
+//! A token whose bytes contain the *whole* needle is represented as an edge going
+//! straight from source to sink. It will always be a part of the min cut.
 //!
 //! # Size
 //! Exactly `n + 1` nodes and at most `2n + 16` edges for a needle of `n` bytes,
@@ -68,7 +66,7 @@ pub(super) enum ProbeSet {
     Point(Token),
     /// Every token a needle suffix is a prefix of.
     Range(TokenRange),
-    /// A first-token set, as `first_set_ids[start..start + len]`.
+    /// An explicit token set, as `set_ids[start..start + len]`.
     Set { start: u32, len: u32 },
     /// Would have been a [`Set`](ProbeSet::Set), but more than [`SET_CAP`] tokens qualified.
     SetTooBig,
@@ -135,12 +133,10 @@ impl Nodes {
 
 /// The alignment DAG for one needle over one dictionary.
 pub(super) struct AlignmentGraph {
-    /// Every first-token set's ids, back to back.
-    first_set_ids: Vec<Token>,
+    /// Every explicit probe set's ids, back to back.
+    set_ids: Vec<Token>,
     /// The parse steps, each carrying its probe and that probe's weight.
     pub(super) edges: Vec<Edge>,
-    /// Tokens whose bytes contain the whole needle: mandatory, outside the cut.
-    pub(super) contained: Vec<Token>,
     pub(super) nodes: Nodes,
     pub(super) num_tokens: usize,
 }
@@ -148,10 +144,6 @@ pub(super) struct AlignmentGraph {
 impl AlignmentGraph {
     /// The token ids `cut`'s probes cover, as a membership table over the
     /// dictionary.
-    ///
-    /// The [`contained`](Self::contained) tokens are *not* included: they are
-    /// mandatory rather than chosen, so unioning them in is the caller's job
-    /// when it assembles the cover.
     pub(super) fn membership(&self, cut: &[&Edge]) -> Vec<bool> {
         let mut members = vec![false; self.num_tokens.max(256)];
         for edge in cut {
@@ -164,7 +156,7 @@ impl AlignmentGraph {
                     }
                 }
                 ProbeSet::Set { start, len } => {
-                    for &id in &self.first_set_ids[start as usize..(start + len) as usize] {
+                    for &id in &self.set_ids[start as usize..(start + len) as usize] {
                         members[id as usize] = true;
                     }
                 }
@@ -253,7 +245,7 @@ struct Builder<'d, 'n, 'f> {
     dict: CompactDictionaryView<'d>,
     needle: &'n [u8],
     frequencies: TokenFrequencyIndexView<'f>,
-    first_set_ids: Vec<Token>,
+    set_ids: Vec<Token>,
     edges: Vec<Edge>,
     nodes: Nodes,
     /// `greedy[o]`: the greedy parse at needle offset `o`, computed at most
@@ -276,16 +268,24 @@ impl Builder<'_, '_, '_> {
             ProbeSet::SetTooBig => 0,
             ProbeSet::Point(id) => self.frequencies.frequency(id),
             ProbeSet::Range(range) => self.frequencies.range_frequency(range),
-            ProbeSet::Set { start, len } => self.first_set_ids
-                [start as usize..(start + len) as usize]
+            ProbeSet::Set { start, len } => self.set_ids[start as usize..(start + len) as usize]
                 .iter()
                 .map(|&id| self.frequencies.frequency(id))
                 .sum(),
         }
     }
 
-    /// Add the step `from -> to`, probed by `probe`. Any [`ProbeSet::Set`] must
-    /// already have its ids in `first_set_ids`, since the weight is summed here.
+    /// Intern `ids` as an explicit probe set, which is what makes it weighable.
+    fn create_probe_set(&mut self, ids: &[Token]) -> ProbeSet {
+        let start = self.set_ids.len() as u32;
+        self.set_ids.extend_from_slice(ids);
+        ProbeSet::Set {
+            start,
+            len: ids.len() as u32,
+        }
+    }
+
+    /// Add the step `from -> to`, which can be stepped by `probe`.
     fn add_edge(&mut self, from: u32, to: u32, probe: ProbeSet) {
         let weight = self.weight_of(probe);
         self.edges.push(Edge {
@@ -401,13 +401,12 @@ pub(super) fn build_alignment_graph(
     let n = needle.len();
     debug_assert!(n < u32::MAX as usize, "needle outgrew u32 node ids");
     let ntok = dict.num_tokens();
-    let contained = contained_tokens(dict, needle);
 
     let mut b = Builder {
         dict,
         needle,
         frequencies,
-        first_set_ids: Vec::new(),
+        set_ids: Vec::new(),
         edges: Vec::new(),
         nodes: Nodes::new(n),
         greedy: vec![None; n],
@@ -469,14 +468,7 @@ pub(super) fn build_alignment_graph(
         // probes that step — when the pass kept them.
         if k != 0 {
             let probe = if first_count[k] <= SET_CAP {
-                let start = b.first_set_ids.len() as u32;
-                let len = first_count[k];
-                b.first_set_ids
-                    .extend_from_slice(&first_ids[k * SET_CAP..k * SET_CAP + len]);
-                ProbeSet::Set {
-                    start,
-                    len: len as u32,
-                }
+                b.create_probe_set(&first_ids[k * SET_CAP..k * SET_CAP + first_count[k]])
             } else {
                 ProbeSet::SetTooBig
             };
@@ -484,17 +476,24 @@ pub(super) fn build_alignment_graph(
         }
     }
 
+    // A token holding the whole needle needs no boundary, going from source to sink
+    let contained = contained_tokens(dict, needle);
+    if !contained.is_empty() {
+        let probe = b.create_probe_set(&contained);
+        b.add_edge(b.nodes.source(), b.nodes.sink(), probe);
+    }
+
     // The bound the module doc advertises: two edges per needle offset, plus
-    // one per alignment. The node count is not a bound but an identity.
+    // one per alignment and one for the contained set. The node count is not a
+    // bound but an identity.
     debug_assert!(
         b.edges.len() <= 2 * n + 16,
         "graph outgrew its documented size bound"
     );
 
     AlignmentGraph {
-        first_set_ids: b.first_set_ids,
+        set_ids: b.set_ids,
         edges: b.edges,
-        contained,
         nodes: b.nodes,
         num_tokens: ntok,
     }
