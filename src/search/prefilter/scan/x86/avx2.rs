@@ -10,10 +10,9 @@ use crate::core::types::{Token, TokenRange};
 use crate::search::prefilter::cover::ProbeCover;
 
 use core::arch::x86_64::{
-    __m256i, _mm256_andnot_si256, _mm256_cmpeq_epi16, _mm256_cmpgt_epi16, _mm256_loadu_si256,
-    _mm256_movemask_epi8, _mm256_or_si256, _mm256_packs_epi16, _mm256_permute4x64_epi64,
-    _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sub_epi16, _mm256_testz_si256,
-    _mm256_xor_si256,
+    __m256i, _mm256_cmpeq_epi16, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256,
+    _mm256_packs_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16, _mm256_setzero_si256,
+    _mm256_sub_epi16, _mm256_subs_epu16, _mm256_testz_si256,
 };
 
 const BLOCK_CODES: usize = 64;
@@ -50,18 +49,15 @@ unsafe fn fixed_mask64<const POINTS: usize, const RANGES: usize>(
     let ranges = unsafe { ranges.get_unchecked(..RANGES) };
 
     let zero = _mm256_setzero_si256();
-    let ones = _mm256_set1_epi16(-1);
-    let bias = _mm256_set1_epi16(i16::MIN);
     let mut masks = [zero; 4];
     for (lane, mask) in masks.iter_mut().enumerate() {
         let code = unsafe { _mm256_loadu_si256(codes.add(lane * 16).cast()) };
         for &point in points {
             *mask = _mm256_or_si256(*mask, _mm256_cmpeq_epi16(code, point));
         }
-        for &(begin, span_biased) in ranges {
-            let delta = _mm256_sub_epi16(code, begin);
-            let outside = _mm256_cmpgt_epi16(_mm256_xor_si256(delta, bias), span_biased);
-            *mask = _mm256_or_si256(*mask, _mm256_andnot_si256(outside, ones));
+        for &(begin, span) in ranges {
+            let excess = _mm256_subs_epu16(_mm256_sub_epi16(code, begin), span);
+            *mask = _mm256_or_si256(*mask, _mm256_cmpeq_epi16(excess, zero));
         }
     }
     let any = _mm256_or_si256(
@@ -87,28 +83,22 @@ unsafe fn dynamic_mask64(
     ranges: &[(__m256i, __m256i)],
 ) -> u64 {
     let zero = _mm256_setzero_si256();
-    let ones = _mm256_set1_epi16(-1);
-    let bias = _mm256_set1_epi16(i16::MIN);
     let values = [
         unsafe { _mm256_loadu_si256(codes.cast()) },
         unsafe { _mm256_loadu_si256(codes.add(16).cast()) },
         unsafe { _mm256_loadu_si256(codes.add(32).cast()) },
         unsafe { _mm256_loadu_si256(codes.add(48).cast()) },
     ];
-    let biased = values.map(|value| _mm256_xor_si256(value, bias));
     let mut masks = [zero; 4];
     for &point in points {
         for (mask, &value) in masks.iter_mut().zip(&values) {
             *mask = _mm256_or_si256(*mask, _mm256_cmpeq_epi16(value, point));
         }
     }
-    for &(lo_biased, hi_biased) in ranges {
-        for (mask, &value) in masks.iter_mut().zip(&biased) {
-            let outside = _mm256_or_si256(
-                _mm256_cmpgt_epi16(lo_biased, value),
-                _mm256_cmpgt_epi16(value, hi_biased),
-            );
-            *mask = _mm256_or_si256(*mask, _mm256_andnot_si256(outside, ones));
+    for &(begin, span) in ranges {
+        for (mask, &value) in masks.iter_mut().zip(&values) {
+            let excess = _mm256_subs_epu16(_mm256_sub_epi16(value, begin), span);
+            *mask = _mm256_or_si256(*mask, _mm256_cmpeq_epi16(excess, zero));
         }
     }
     let any = _mm256_or_si256(
@@ -146,19 +136,10 @@ impl<const DYNAMIC: bool> Isa for Avx2<DYNAMIC> {
     fn range(range: TokenRange) -> Self::Range {
         // SAFETY: every caller is in the AVX2 target-feature leaf.
         unsafe {
-            if DYNAMIC {
-                let bias = _mm256_set1_epi16(i16::MIN);
-                (
-                    _mm256_xor_si256(_mm256_set1_epi16(range.begin as i16), bias),
-                    _mm256_xor_si256(_mm256_set1_epi16(range.last as i16), bias),
-                )
-            } else {
-                let span = range.last.wrapping_sub(range.begin);
-                (
-                    _mm256_set1_epi16(range.begin as i16),
-                    _mm256_set1_epi16((span ^ 0x8000) as i16),
-                )
-            }
+            (
+                _mm256_set1_epi16(range.begin as i16),
+                _mm256_set1_epi16(range.last.wrapping_sub(range.begin) as i16),
+            )
         }
     }
 
