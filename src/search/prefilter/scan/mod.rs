@@ -13,6 +13,7 @@
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+mod byte;
 mod policy;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod sink;
@@ -21,8 +22,6 @@ mod x86;
 
 #[cfg(all(target_arch = "aarch64", test))]
 pub(super) use self::aarch64::scan_neon;
-#[cfg(target_arch = "x86_64")]
-use self::policy::Avx512Kernel;
 use self::policy::{
     AnalysisFacts, CoverShape, Kernel, KernelPlan, RegionFacts, ScanFacts, detect_target_caps,
     select_kernel,
@@ -34,20 +33,17 @@ use super::{PrefilterAnalysis, PrefilterError};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 
-/// Borrowed buffers for one scan region.
+/// Borrowed buffers for one scan region. `C` is the code width of the stream;
+/// it defaults to [`Token`], the width every kernel currently accepts.
 #[derive(Clone, Copy)]
-pub(super) struct ScanInput<'a, O> {
-    pub(super) codes: &'a [Token],
+pub(super) struct ScanInput<'a, O, C = Token> {
+    pub(super) codes: &'a [C],
     pub(super) row_offsets: &'a [O],
     pub(super) cover: &'a ProbeCover,
 }
 
-impl<'a, O> ScanInput<'a, O> {
-    pub(super) const fn full(
-        codes: &'a [Token],
-        row_offsets: &'a [O],
-        cover: &'a ProbeCover,
-    ) -> Self {
+impl<'a, O, C> ScanInput<'a, O, C> {
+    pub(super) const fn full(codes: &'a [C], row_offsets: &'a [O], cover: &'a ProbeCover) -> Self {
         Self {
             codes,
             row_offsets,
@@ -58,7 +54,10 @@ impl<'a, O> ScanInput<'a, O> {
 
 /// Derive an ephemeral kernel plan without inspecting code values.
 #[inline]
-pub(super) fn plan<O: Offset>(input: ScanInput<'_, O>, analysis: &PrefilterAnalysis) -> KernelPlan {
+pub(super) fn plan<O: Offset, C>(
+    input: ScanInput<'_, O, C>,
+    analysis: &PrefilterAnalysis,
+) -> KernelPlan {
     let facts = ScanFacts {
         analysis: AnalysisFacts {
             shape: CoverShape {
@@ -111,10 +110,58 @@ pub(super) fn scan<O: Offset>(
     execute(plan, input, out)
 }
 
+/// A code stream at its physical width.
+pub enum Codes<'a> {
+    /// Byte-wide codes.
+    U8(&'a [u8]),
+    /// [`Token`]-wide codes.
+    U16(&'a [Token]),
+}
+
+/// A code width over the token-id domain: `u8` or [`Token`].
+pub trait GenericToken: Copy {
+    /// The stream at its physical width.
+    fn codes(codes: &[Self]) -> Codes<'_>;
+}
+
+impl GenericToken for u8 {
+    fn codes(codes: &[Self]) -> Codes<'_> {
+        Codes::U8(codes)
+    }
+}
+
+impl GenericToken for Token {
+    fn codes(codes: &[Self]) -> Codes<'_> {
+        Codes::U16(codes)
+    }
+}
+
 /// Execute a previously selected plan. This is the first stage that inspects
 /// code values.
 #[inline]
-pub(super) fn execute<O: Offset>(
+pub(super) fn execute<O: Offset, C: GenericToken>(
+    plan: KernelPlan,
+    input: ScanInput<'_, O, C>,
+    out: &mut Vec<usize>,
+) -> Result<(), PrefilterError> {
+    match C::codes(input.codes) {
+        Codes::U16(codes) => execute_tokens(
+            plan,
+            ScanInput::full(codes, input.row_offsets, input.cover),
+            out,
+        ),
+        Codes::U8(codes) => {
+            byte::scan(
+                ScanInput::full(codes, input.row_offsets, input.cover),
+                plan.row_mapping.uses_sparse_gaps(),
+                out,
+            );
+            Ok(())
+        }
+    }
+}
+
+fn execute_tokens<O: Offset>(
     plan: KernelPlan,
     input: ScanInput<'_, O>,
     out: &mut Vec<usize>,
@@ -141,18 +188,10 @@ pub(super) fn execute<O: Offset>(
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
-        Kernel::Avx512(Avx512Kernel::Generic) => {
+        Kernel::Avx512(kernel) => {
             // SAFETY: the plan is created only after runtime AVX-512BW
             // detection, which implies AVX-512F.
-            unsafe {
-                x86::scan_avx512(
-                    input.codes,
-                    input.row_offsets,
-                    input.cover,
-                    sparse_row_mapping,
-                    out,
-                )
-            };
+            unsafe { x86::execute_avx512(kernel, input, sparse_row_mapping, out) };
             Ok(())
         }
         #[cfg(test)]

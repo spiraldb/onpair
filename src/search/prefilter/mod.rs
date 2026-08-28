@@ -49,6 +49,7 @@ mod scan;
 mod tests;
 
 pub use cover::ProbeCover;
+pub use scan::{Codes, GenericToken};
 
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
@@ -184,13 +185,14 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
     pattern: &[u8],
     dict: CompactDictionaryView<'_>,
     frequencies: &TokenFrequencyIndex<S>,
+    escape_token: Option<Token>,
 ) -> PrefilterAnalysis {
     assert!(
         !pattern.is_empty(),
         "the empty pattern matches every row and needs no prefilter"
     );
     let frequencies_view = frequencies.as_view();
-    let probe_cover = plan::plan(dict, pattern, frequencies_view);
+    let probe_cover = plan::plan(dict, pattern, frequencies_view, escape_token);
     let covered_frequency = probe_cover
         .points
         .iter()
@@ -231,8 +233,8 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
 /// # Errors
 /// Returns [`PrefilterError::UnsupportedArchitecture`] when no SIMD kernel is
 /// available for a non-empty cover.
-pub fn prefilter_candidates<O: Offset>(
-    codes: &[Token],
+pub fn prefilter_candidates<O: Offset, C: GenericToken>(
+    codes: &[C],
     row_offsets: &[O],
     analysis: &PrefilterAnalysis,
     out: &mut Vec<usize>,

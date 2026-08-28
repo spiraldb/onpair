@@ -277,7 +277,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
             out.extend(0..self.num_rows());
             return Ok(());
         }
-        let analysis = analyze_prefilter(pattern, self.dict, frequencies);
+        let analysis = analyze_prefilter(pattern, self.dict, frequencies, None);
         prefilter_candidates(self.codes, self.row_offsets, &analysis, out)
     }
 

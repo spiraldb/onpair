@@ -67,8 +67,8 @@ mod column;
 mod core;
 mod decoding;
 mod encoding;
+pub mod fsst;
 pub mod search;
-
 #[cfg(test)]
 mod test_corpus;
 

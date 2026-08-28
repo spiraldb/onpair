@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Minimum-weight vertex cut of the alignment DAG: the cheapest sound cover.
+//! Minimum-weight cut of the alignment DAG: the cheapest sound cover.
 //!
-//! Every source-to-sink path in [`AlignmentGraph`] is one layout of the pattern
-//! across token boundaries, and a set of probes meeting every path is a cover
-//! the scan can trust. Picking the cheapest such set is a minimum-weight *vertex*
-//! cut, which max-flow solves once every node is split into an `in -> out` edge
-//! carrying that node's weight: cutting the edge is cutting the node, and giving
-//! the DAG's own arcs a capacity no finite cut can reach keeps the minimum cut on
-//! split edges where it means something.
+//! Every source-to-sink path in [`AlignmentGraph`](super::graph::AlignmentGraph)
+//! is one layout of the pattern across token boundaries, and a set of probes
+//! meeting every path is a cover the scan can trust. Probes are edges, so
+//! picking the cheapest such set is a minimum cut of the edge weights, which is
+//! max-flow directly. The steps no
+//! probe stands for get a capacity no finite cut can reach, which keeps the
+//! minimum cut on the edges where it means something.
 //!
 //! The point of cutting the *merged* DAG rather than choosing per alignment is
 //! that alignments converging on a shared suffix are paid for once, at the join,
@@ -18,18 +18,19 @@
 //! # Cost
 //! Dinic is `O(V^2 E)` in the abstract, but the DAG it runs on here is small and
 //! narrow. Greedy parsing crosses the pattern a whole token at a time, so the
-//! state chain is `n / token_len` rather than `n`, and every path leaves the
-//! source through one of at most `MAX_TOKEN_SIZE` alignments — which caps how
+//! state chain is `n / token_len` rather than `n` — the node array is indexed by
+//! needle offset, so the offsets between are isolated — and every path leaves
+//! the source through one of at most `MAX_TOKEN_SIZE` alignments, which caps how
 //! many augmenting paths there are to find, independently of `n`. A 66-byte
-//! pattern over a 12k-token dictionary builds a 33-node DAG and cuts it in ~3us,
-//! two orders of magnitude under the dictionary pass in
+//! pattern over a 12k-token dictionary cuts in ~3us, two orders of magnitude
+//! under the dictionary pass in
 //! [`build_alignment_graph`](super::graph::build_alignment_graph) that produced
 //! it; even a synthetic worst case of one state per byte over 1024 bytes stays
 //! near 150us. The solve is not what a plan waits on, and needs no length guard.
 
 use std::collections::VecDeque;
 
-use super::graph::AlignmentGraph;
+use super::graph::{Edge, Nodes};
 
 /// The residual graph, in CSR: one allocation per array rather than one per
 /// node, since the whole arc set is known before the first push.
@@ -114,7 +115,7 @@ impl Dinic {
     /// of the longest source-to-sink path on the call stack. Nothing in this
     /// solver bounds that length, and it costs nothing to not depend on it.
     fn blocking_flow(&mut self, source: usize, sink: usize) -> u64 {
-        debug_assert_ne!(source, sink, "the split graph separates source from sink");
+        debug_assert_ne!(source, sink, "the source and sink are distinct nodes");
         self.next.copy_from_slice(&self.head[..self.level.len()]);
 
         let mut total = 0u64;
@@ -182,45 +183,38 @@ impl Dinic {
     }
 }
 
-/// The cheapest set of cuttable nodes whose removal disconnects `source` from
-/// `sink`, in ascending node order.
+/// The cheapest set of cuttable edges whose removal disconnects `source` from
+/// `sink`, in ascending edge order.
 ///
-/// `capacity[v]` is what cutting `v` costs, or `None` for a node no cut may
-/// select. `edges` are the arcs as `(from, to)`.
+/// `edges[i]` is `(from, to, cost)`, where `cost` is what cutting that edge costs
+/// or `None` for an edge no cut may select.
 ///
 /// # Panics
-/// Panics if some source-to-sink path runs entirely through uncuttable nodes,
+/// Panics if some source-to-sink path runs entirely through uncuttable edges,
 /// which no cut can block. Returning a set that fails to disconnect them would
 /// hand back an unsound cover instead.
-fn min_cut(capacity: &[Option<u32>], edges: &[(u32, u32)], source: u32, sink: u32) -> Vec<u32> {
-    let num_nodes = capacity.len();
+pub(super) fn min_cut(edges: &[Edge], nodes: Nodes) -> Vec<&Edge> {
     debug_assert!(
-        num_nodes * 2 <= u32::MAX as usize,
-        "the split graph outgrew u32 node ids"
+        edges.len() * 2 <= u32::MAX as usize,
+        "the residual graph outgrew u32 arc ids"
     );
-    let entry = |node: u32| node * 2;
-    let exit = |node: u32| node * 2 + 1;
 
-    // One more than every finite cut, so a minimum cut never prefers an arc or
-    // an uncuttable node over the split edges that stand for real probes.
-    let finite_sum = capacity
+    // One more than every finite cut, so a minimum cut never prefers an
+    // uncuttable step over the edges that stand for real probes.
+    let finite_sum = edges
         .iter()
-        .flatten()
-        .try_fold(0u64, |acc, &weight| acc.checked_add(u64::from(weight)))
+        .filter_map(Edge::cost)
+        .try_fold(0u64, |acc, cost| acc.checked_add(u64::from(cost)))
         .expect("sum of probe weights overflowed u64");
     let infinite = finite_sum + 1;
 
-    let mut arcs = Vec::with_capacity(num_nodes + edges.len());
-    for (node, &weight) in capacity.iter().enumerate() {
-        let node = node as u32;
-        arcs.push((entry(node), exit(node), weight.map_or(infinite, u64::from)));
-    }
-    for &(from, to) in edges {
-        arcs.push((exit(from), entry(to), infinite));
-    }
+    let residual: Vec<(u32, u32, u64)> = edges
+        .iter()
+        .map(|edge| (edge.from, edge.to, edge.cost().map_or(infinite, u64::from)))
+        .collect();
 
-    let mut flow = Dinic::new(num_nodes * 2, &arcs);
-    let value = flow.max_flow(exit(source) as usize, entry(sink) as usize);
+    let mut flow = Dinic::new(nodes.count(), &residual);
+    let value = flow.max_flow(nodes.source() as usize, nodes.sink() as usize);
     assert!(
         value < infinite,
         "the alignment DAG has a source-to-sink path with no probe on it"
@@ -228,51 +222,58 @@ fn min_cut(capacity: &[Option<u32>], edges: &[(u32, u32)], source: u32, sink: u3
 
     // `max_flow` stops on the level pass that failed to reach the sink, and that
     // pass is exactly a BFS of the residual graph from the source — so `level`
-    // already marks the source side, and no second traversal is needed. A node
-    // is cut when its split edge straddles the two sides.
-    (0..num_nodes as u32)
-        .filter(|&node| {
-            capacity[node as usize].is_some()
-                && flow.level[entry(node) as usize] >= 0
-                && flow.level[exit(node) as usize] < 0
+    // already marks the source side, and no second traversal is needed. An edge
+    // is cut when it straddles the two sides, which also means it is saturated:
+    // an unsaturated edge would have carried the BFS across.
+    edges
+        .iter()
+        .filter(|edge| {
+            edge.cost().is_some()
+                && flow.level[edge.from as usize] >= 0
+                && flow.level[edge.to as usize] < 0
         })
         .collect()
-}
-
-/// The cheapest set of probe nodes covering every layout of the pattern.
-///
-/// See [`min_cut`] for what "cheapest" is solved against; the
-/// [`contained`](AlignmentGraph::contained) tokens are not part of it, being
-/// mandatory rather than chosen.
-pub(super) fn minimum_vertex_cut(graph: &AlignmentGraph) -> Vec<u32> {
-    let capacity: Vec<Option<u32>> = (0..graph.num_nodes() as u32)
-        .map(|node| graph.is_probe(node).then_some(graph.weight(node)))
-        .collect();
-    min_cut(&capacity, &graph.edges, graph.source, graph.sink)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The endpoints of a cut, which is what a caller reads off it. Comparing
+    /// those rather than positions says which steps were chosen without
+    /// depending on the order they were built in.
+    fn steps(cut: &[&Edge]) -> Vec<(u32, u32)> {
+        cut.iter().map(|edge| (edge.from, edge.to)).collect()
+    }
+
     /// The property the merged DAG exists for: two alignments converging on one
     /// shared suffix are cut once at the join for 6, not once each for 4 + 4.
     #[test]
     fn shared_suffix_beats_two_local_choices() {
-        // 0 -> 1(4) -> 3(6) -> 4  and  0 -> 2(4) -> 3(6) -> 4
-        let capacity = [None, Some(4), Some(4), Some(6), None];
-        let edges = [(0, 1), (0, 2), (1, 3), (2, 3), (3, 4)];
-        assert_eq!(min_cut(&capacity, &edges, 0, 4), vec![3]);
+        // 0 -> 1 -(4)-> 3 -(6)-> 4  and  0 -> 2 -(4)-> 3 -(6)-> 4
+        let edges = [
+            Edge::synthetic(0, 1, None),
+            Edge::synthetic(0, 2, None),
+            Edge::synthetic(1, 3, Some(4)),
+            Edge::synthetic(2, 3, Some(4)),
+            Edge::synthetic(3, 4, Some(6)),
+        ];
+        assert_eq!(steps(&min_cut(&edges, Nodes::new(4))), vec![(3, 4)]);
     }
 
     /// Two disjoint paths have to be cut on both, and a zero-weight probe is
     /// always worth taking.
     #[test]
     fn disjoint_paths_are_cut_separately() {
-        // 0 -> 1(5) -> 4  and  0 -> 2(9) -> 3(0) -> 4
-        let capacity = [None, Some(5), Some(9), Some(0), None];
-        let edges = [(0, 1), (1, 4), (0, 2), (2, 3), (3, 4)];
-        assert_eq!(min_cut(&capacity, &edges, 0, 4), vec![1, 3]);
+        // 0 -> 1 -(5)-> 4  and  0 -> 2 -(9)-> 3 -(0)-> 4
+        let edges = [
+            Edge::synthetic(0, 1, None),
+            Edge::synthetic(1, 4, Some(5)),
+            Edge::synthetic(0, 2, None),
+            Edge::synthetic(2, 3, Some(9)),
+            Edge::synthetic(3, 4, Some(0)),
+        ];
+        assert_eq!(steps(&min_cut(&edges, Nodes::new(4))), vec![(1, 4), (3, 4)]);
     }
 
     /// Depth is a property of the graph, not of any pattern length this solver
@@ -281,12 +282,15 @@ mod tests {
     #[test]
     fn deep_chain_does_not_exhaust_the_stack() {
         const LEN: u32 = 100_000;
-        let mut capacity = vec![Some(7u32); LEN as usize];
-        capacity[0] = None;
-        capacity[LEN as usize - 1] = None;
-        capacity[LEN as usize / 2] = Some(3);
-        let edges: Vec<(u32, u32)> = (0..LEN - 1).map(|v| (v, v + 1)).collect();
+        let mut edges: Vec<Edge> = (0..LEN - 1)
+            .map(|v| Edge::synthetic(v, v + 1, Some(7)))
+            .collect();
+        let cheapest = LEN / 2;
+        edges[cheapest as usize] = Edge::synthetic(cheapest, cheapest + 1, Some(3));
 
-        assert_eq!(min_cut(&capacity, &edges, 0, LEN - 1), vec![LEN / 2]);
+        assert_eq!(
+            steps(&min_cut(&edges, Nodes::new(LEN as usize - 1))),
+            vec![(cheapest, cheapest + 1)]
+        );
     }
 }

@@ -58,8 +58,8 @@ pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefilter::{
-    PrefilterAnalysis, PrefilterError, ProbeCover, analyze_prefilter, prefilter_candidates,
-    prefilter_is_likely_profitable,
+    Codes, GenericToken, PrefilterAnalysis, PrefilterError, ProbeCover, analyze_prefilter,
+    prefilter_candidates, prefilter_is_likely_profitable,
 };
 pub use prefix::{PrefixQuery, starts_with};
 pub use tokenize::tokenize;
