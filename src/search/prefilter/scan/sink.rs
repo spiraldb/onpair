@@ -107,11 +107,12 @@ impl<'a, O: Offset> RowSink<'a, O> {
 }
 
 /// Map a SIMD block's non-zero hit lanes to rows.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 pub(super) fn mark_block<O: Offset>(base: usize, hits: &[u16], sink: &mut RowSink<'_, O>) {
-    for (j, &hit) in hits.iter().enumerate() {
+    for (lane, &hit) in hits.iter().enumerate() {
         if hit != 0 {
-            sink.hit(base + j);
+            sink.hit(base + lane);
         }
     }
 }
