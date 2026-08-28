@@ -4,8 +4,8 @@
 //! End-to-end soundness, graph invariants, and SIMD/scalar agreement.
 
 use super::cover::ProbeCover;
-use super::graph::{AlignmentGraph, build_alignment_graph, contained_tokens};
-use super::mincut::minimum_probe_cut;
+use super::graph::{AlignmentGraph, Edge, build_alignment_graph, contained_tokens};
+use super::mincut::min_cut;
 use super::plan::plan;
 use super::{analyze_prefilter, prefilter_candidates};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -76,24 +76,21 @@ fn decode_row(view: ColumnView<'_, u32>, k: usize) -> Vec<u8> {
 }
 
 /// What the cut pays for `edge`, which must be one of the graph's probe edges.
-fn probe_weight(graph: &AlignmentGraph, edge: u32) -> u64 {
-    u64::from(
-        graph.edges[edge as usize]
-            .cost()
-            .expect("only probe edges are ever selected"),
-    )
+fn probe_weight(edge: &Edge) -> u64 {
+    u64::from(edge.cost().expect("only probe edges are ever selected"))
 }
 
-/// Whether the sink is reachable from the source without taking a blocked edge.
+/// Whether the sink is reachable from the source without taking an edge
+/// `blocked` rejects.
 ///
 /// Blocking every probe asks the DAG's central invariant — that no layout of
 /// the pattern escapes unprobed — and blocking a cut asks whether that cut
 /// covers the DAG. Both are properties of the edge set, so this walks `edges`
 /// rather than re-deriving anything the builder computed.
-fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: &[bool]) -> bool {
+fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: impl Fn(&Edge) -> bool) -> bool {
     let mut adjacency = vec![Vec::new(); graph.nodes.count()];
-    for (id, edge) in graph.edges.iter().enumerate() {
-        adjacency[edge.from as usize].push((id, edge.to as usize));
+    for edge in &graph.edges {
+        adjacency[edge.from as usize].push(edge);
     }
     let mut seen = vec![false; graph.nodes.count()];
     let mut stack = vec![graph.nodes.source() as usize];
@@ -102,14 +99,21 @@ fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: &[bool]) -> bool {
         if node == graph.nodes.sink() as usize {
             return true;
         }
-        for &(id, next) in &adjacency[node] {
-            if !seen[next] && !blocked[id] {
+        for edge in &adjacency[node] {
+            let next = edge.to as usize;
+            if !seen[next] && !blocked(edge) {
                 seen[next] = true;
                 stack.push(next);
             }
         }
     }
     false
+}
+
+/// Whether `edge` is one of `selection`'s edges. Both borrow the same graph, so
+/// identity is the address — which is what a selection of references means.
+fn selected(selection: &[&Edge], edge: &Edge) -> bool {
+    selection.iter().any(|&picked| std::ptr::eq(picked, edge))
 }
 
 /// Whether every row that really contains the pattern holds a token one of
@@ -119,7 +123,7 @@ fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: &[bool]) -> bool {
 fn covers_every_match(
     view: ColumnView<'_, u32>,
     graph: &AlignmentGraph,
-    selection: &[u32],
+    selection: &[&Edge],
     want: &[usize],
 ) -> bool {
     let mut members = graph.membership(selection);
@@ -142,16 +146,14 @@ fn check_graph(
     want: &[usize],
 ) {
     let graph = build_alignment_graph(view.dict, pat, frequencies.as_view());
-    let probes: Vec<u32> = (0..graph.edges.len() as u32)
-        .filter(|&edge| graph.edges[edge as usize].cost().is_some())
+    let probes: Vec<&Edge> = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.cost().is_some())
         .collect();
 
-    let mut blocked = vec![false; graph.edges.len()];
-    for &edge in &probes {
-        blocked[edge as usize] = true;
-    }
     assert!(
-        !sink_reachable_avoiding(&graph, &blocked),
+        !sink_reachable_avoiding(&graph, |edge| edge.cost().is_some()),
         "a source-to-sink path carries no probe for {pat:?}"
     );
 
@@ -162,9 +164,9 @@ fn check_graph(
         let covered = graph.membership(&[edge]);
         let matched = view.codes.iter().filter(|&&c| covered[c as usize]).count();
         assert_eq!(
-            probe_weight(&graph, edge) as usize,
+            probe_weight(edge) as usize,
             matched,
-            "probe on edge {edge} misreports its term frequency for {pat:?}"
+            "probe {edge:?} misreports its term frequency for {pat:?}"
         );
     }
 
@@ -188,13 +190,9 @@ fn check_graph(
 
     // The cut is what the plan will actually scan for, so it has to block the
     // DAG on its own and still catch every matching row.
-    let cut = minimum_probe_cut(&graph);
-    blocked.fill(false);
-    for &edge in &cut {
-        blocked[edge as usize] = true;
-    }
+    let cut = min_cut(&graph.edges, graph.nodes);
     assert!(
-        !sink_reachable_avoiding(&graph, &blocked),
+        !sink_reachable_avoiding(&graph, |edge| selected(&cut, edge)),
         "the minimum cut leaves a source-to-sink path open for {pat:?}"
     );
     assert!(
@@ -207,19 +205,18 @@ fn check_graph(
     // that separates one cut of the merged graph from the per-alignment local
     // choice it replaces, and max-flow is not the kind of code that fails loudly.
     if probes.len() <= 12 {
-        let best: u64 = cut.iter().map(|&edge| probe_weight(&graph, edge)).sum();
+        let best: u64 = cut.iter().copied().map(probe_weight).sum();
         for mask in 0u32..(1 << probes.len()) {
-            let mut weight = 0u64;
-            blocked.fill(false);
-            for (bit, &edge) in probes.iter().enumerate() {
-                if (mask >> bit) & 1 == 1 {
-                    weight += probe_weight(&graph, edge);
-                    blocked[edge as usize] = true;
-                }
-            }
+            let subset: Vec<&Edge> = probes
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| (mask >> bit) & 1 == 1)
+                .map(|(_, &edge)| edge)
+                .collect();
+            let weight: u64 = subset.iter().copied().map(probe_weight).sum();
             if weight < best {
                 assert!(
-                    sink_reachable_avoiding(&graph, &blocked),
+                    sink_reachable_avoiding(&graph, |edge| selected(&subset, edge)),
                     "a cover of weight {weight} beats the minimum cut's {best} for {pat:?}"
                 );
             }

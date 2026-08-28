@@ -28,7 +28,7 @@
 //! Between states, [`ProbeSet::Point`] for a token of the greedy parse; into the
 //! sink, [`ProbeSet::Range`] for the tokens a needle suffix is a prefix of, the
 //! occurrence ending inside a longer token. Probes are weighted by term
-//! frequency. [`ProbeSet::TooBigSet`] is the one step a cut may not select: its
+//! frequency. [`ProbeSet::SetTooBig`] is the one step a cut may not select: its
 //! probe was never materialized, so it is entered free and the cut pays further
 //! along the chain.
 //!
@@ -60,18 +60,18 @@ use crate::search::prefix_range;
 /// and the cut has to pay for it further along the chain.
 pub(super) const SET_CAP: usize = 16;
 
-/// The token set an edge probes for, or [`ProbeSet::TooBigSet`] for the one
+/// The token set an edge probes for, or [`ProbeSet::SetTooBig`] for the one
 /// step a cut may not select.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ProbeSet {
-    /// Would have been a [`Set`](ProbeSet::Set), but more than [`SET_CAP`] tokens qualified.
-    TooBigSet,
     /// A single token: an interior token of the greedy parse.
     Point(Token),
     /// Every token a needle suffix is a prefix of.
     Range(TokenRange),
     /// A first-token set, as `first_set_ids[start..start + len]`.
     Set { start: u32, len: u32 },
+    /// Would have been a [`Set`](ProbeSet::Set), but more than [`SET_CAP`] tokens qualified.
+    SetTooBig,
 }
 
 /// One parse step, and the probe that catches every layout crossing it.
@@ -89,8 +89,19 @@ impl Edge {
     /// What cutting this edge costs, or `None` if no cut may select it.
     pub(super) fn cost(&self) -> Option<u32> {
         match self.probe {
-            ProbeSet::TooBigSet => None,
+            ProbeSet::SetTooBig => None,
             _ => Some(self.weight),
+        }
+    }
+
+    /// Used for testing
+    #[cfg(test)]
+    pub(super) fn synthetic(from: u32, to: u32, cost: Option<u32>) -> Self {
+        Self {
+            from,
+            to,
+            probe: cost.map_or(ProbeSet::SetTooBig, |_| ProbeSet::Point(Token::MAX)),
+            weight: cost.unwrap_or(0),
         }
     }
 }
@@ -103,6 +114,10 @@ pub(super) struct Nodes {
 }
 
 impl Nodes {
+    pub(super) fn new(needle_len: usize) -> Self {
+        Self { needle_len }
+    }
+
     pub(super) fn count(self) -> usize {
         self.needle_len + 1
     }
@@ -137,11 +152,11 @@ impl AlignmentGraph {
     /// The [`contained`](Self::contained) tokens are *not* included: they are
     /// mandatory rather than chosen, so unioning them in is the caller's job
     /// when it assembles the cover.
-    pub(super) fn membership(&self, cut: &[u32]) -> Vec<bool> {
+    pub(super) fn membership(&self, cut: &[&Edge]) -> Vec<bool> {
         let mut members = vec![false; self.num_tokens.max(256)];
-        for &edge in cut {
-            match self.edges[edge as usize].probe {
-                ProbeSet::TooBigSet => debug_assert!(false, "cut selected an unprobed step"),
+        for edge in cut {
+            match edge.probe {
+                ProbeSet::SetTooBig => debug_assert!(false, "cut selected an unprobed step"),
                 ProbeSet::Point(id) => members[id as usize] = true,
                 ProbeSet::Range(range) => {
                     for id in range.begin..=range.last {
@@ -258,7 +273,7 @@ impl Builder<'_, '_, '_> {
     /// ids are distinct, so the sum is at most the code stream's length.
     fn weight_of(&self, set: ProbeSet) -> u32 {
         match set {
-            ProbeSet::TooBigSet => 0,
+            ProbeSet::SetTooBig => 0,
             ProbeSet::Point(id) => self.frequencies.frequency(id),
             ProbeSet::Range(range) => self.frequencies.range_frequency(range),
             ProbeSet::Set { start, len } => self.first_set_ids
@@ -394,7 +409,7 @@ pub(super) fn build_alignment_graph(
         frequencies,
         first_set_ids: Vec::new(),
         edges: Vec::new(),
-        nodes: Nodes { needle_len: n },
+        nodes: Nodes::new(n),
         greedy: vec![None; n],
         built: vec![false; n],
         escape_token: Some(0xFF),
@@ -463,7 +478,7 @@ pub(super) fn build_alignment_graph(
                     len: len as u32,
                 }
             } else {
-                ProbeSet::TooBigSet
+                ProbeSet::SetTooBig
             };
             b.add_edge(b.nodes.source(), k as u32, probe);
         }

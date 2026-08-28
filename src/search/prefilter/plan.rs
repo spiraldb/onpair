@@ -10,7 +10,7 @@
 
 use super::cover::ProbeCover;
 use super::graph::build_alignment_graph;
-use super::mincut::minimum_probe_cut;
+use super::mincut::min_cut;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::search::index::TokenFrequencyIndexView;
 
@@ -22,7 +22,7 @@ pub(super) fn plan(
     frequencies: TokenFrequencyIndexView<'_>,
 ) -> ProbeCover {
     let graph = build_alignment_graph(dict, pattern, frequencies);
-    let mut members = graph.membership(&minimum_probe_cut(&graph));
+    let mut members = graph.membership(&min_cut(&graph.edges, graph.nodes));
     // Mandatory, and outside the graph by construction: a token containing the
     // whole pattern matches without crossing a boundary, so no path stands for
     // it and no cut could have selected it.
