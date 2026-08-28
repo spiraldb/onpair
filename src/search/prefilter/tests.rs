@@ -5,11 +5,11 @@
 
 use super::cover::ProbeCover;
 use super::graph::{AlignmentGraph, build_alignment_graph, contained_tokens};
-use super::mincut::minimum_vertex_cut;
+use super::mincut::minimum_probe_cut;
 use super::plan::plan;
 use super::{analyze_prefilter, prefilter_candidates};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
-use crate::core::types::{Token, TokenRange};
+use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::{
     TokenFrequencyIndex, TokenFrequencyIndexStorage, build_token_frequency_index,
 };
@@ -75,27 +75,35 @@ fn decode_row(view: ColumnView<'_, u32>, k: usize) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) }.to_vec()
 }
 
-/// Whether the sink is reachable from the source without entering a blocked
-/// node.
+/// What the cut pays for `edge`, which must be one of the graph's probe edges.
+fn probe_weight(graph: &AlignmentGraph, edge: u32) -> u64 {
+    u64::from(
+        graph.edges[edge as usize]
+            .cost()
+            .expect("only probe edges are ever selected"),
+    )
+}
+
+/// Whether the sink is reachable from the source without taking a blocked edge.
 ///
 /// Blocking every probe asks the DAG's central invariant — that no layout of
 /// the pattern escapes unprobed — and blocking a cut asks whether that cut
 /// covers the DAG. Both are properties of the edge set, so this walks `edges`
 /// rather than re-deriving anything the builder computed.
 fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: &[bool]) -> bool {
-    let mut adjacency = vec![Vec::new(); graph.num_nodes()];
-    for &(from, to) in &graph.edges {
-        adjacency[from as usize].push(to as usize);
+    let mut adjacency = vec![Vec::new(); graph.nodes.count()];
+    for (id, edge) in graph.edges.iter().enumerate() {
+        adjacency[edge.from as usize].push((id, edge.to as usize));
     }
-    let mut seen = vec![false; graph.num_nodes()];
-    let mut stack = vec![graph.source as usize];
-    seen[graph.source as usize] = true;
+    let mut seen = vec![false; graph.nodes.count()];
+    let mut stack = vec![graph.nodes.source() as usize];
+    seen[graph.nodes.source() as usize] = true;
     while let Some(node) = stack.pop() {
-        if node == graph.sink as usize {
+        if node == graph.nodes.sink() as usize {
             return true;
         }
-        for &next in &adjacency[node] {
-            if !seen[next] && !blocked[next] {
+        for &(id, next) in &adjacency[node] {
+            if !seen[next] && !blocked[id] {
                 seen[next] = true;
                 stack.push(next);
             }
@@ -134,13 +142,13 @@ fn check_graph(
     want: &[usize],
 ) {
     let graph = build_alignment_graph(view.dict, pat, frequencies.as_view());
-    let probes: Vec<u32> = (0..graph.num_nodes() as u32)
-        .filter(|&node| graph.is_probe(node))
+    let probes: Vec<u32> = (0..graph.edges.len() as u32)
+        .filter(|&edge| graph.edges[edge as usize].cost().is_some())
         .collect();
 
-    let mut blocked = vec![false; graph.num_nodes()];
-    for &node in &probes {
-        blocked[node as usize] = true;
+    let mut blocked = vec![false; graph.edges.len()];
+    for &edge in &probes {
+        blocked[edge as usize] = true;
     }
     assert!(
         !sink_reachable_avoiding(&graph, &blocked),
@@ -150,13 +158,13 @@ fn check_graph(
     // A probe's weight is the objective the cut minimizes, so it has to be the
     // number of codes the probe would actually match. Nothing downstream can
     // notice the cut optimizing a wrong number.
-    for &node in &probes {
-        let covered = graph.membership(&[node]);
+    for &edge in &probes {
+        let covered = graph.membership(&[edge]);
         let matched = view.codes.iter().filter(|&&c| covered[c as usize]).count();
         assert_eq!(
-            graph.weight(node) as usize,
+            probe_weight(&graph, edge) as usize,
             matched,
-            "probe {node} misreports its term frequency for {pat:?}"
+            "probe on edge {edge} misreports its term frequency for {pat:?}"
         );
     }
 
@@ -167,22 +175,23 @@ fn check_graph(
         "some row matching {pat:?} holds no probe token at all"
     );
 
-    // Source, sink, up to 16 alignments and 15 first-token sets, then one
-    // state, one range probe and one point probe per needle offset. Per
-    // alignment chains instead of merged states would be ~16n.
+    // Node ids are needle offsets, so merged states are structural rather than
+    // checkable — but per alignment chains would still show up as duplicated
+    // steps. Two edges per offset, plus one per alignment, is the bound that
+    // holds only while every alignment shares one chain.
     assert!(
-        graph.num_nodes() <= 3 * pat.len() + 33,
-        "{} nodes for a {}-byte needle: states are not being merged",
-        graph.num_nodes(),
+        graph.edges.len() <= 2 * pat.len() + 16,
+        "{} edges for a {}-byte needle: states are not being merged",
+        graph.edges.len(),
         pat.len()
     );
 
     // The cut is what the plan will actually scan for, so it has to block the
     // DAG on its own and still catch every matching row.
-    let cut = minimum_vertex_cut(&graph);
+    let cut = minimum_probe_cut(&graph);
     blocked.fill(false);
-    for &node in &cut {
-        blocked[node as usize] = true;
+    for &edge in &cut {
+        blocked[edge as usize] = true;
     }
     assert!(
         !sink_reachable_avoiding(&graph, &blocked),
@@ -198,14 +207,14 @@ fn check_graph(
     // that separates one cut of the merged graph from the per-alignment local
     // choice it replaces, and max-flow is not the kind of code that fails loudly.
     if probes.len() <= 12 {
-        let best: u64 = cut.iter().map(|&node| u64::from(graph.weight(node))).sum();
+        let best: u64 = cut.iter().map(|&edge| probe_weight(&graph, edge)).sum();
         for mask in 0u32..(1 << probes.len()) {
             let mut weight = 0u64;
             blocked.fill(false);
-            for (bit, &node) in probes.iter().enumerate() {
+            for (bit, &edge) in probes.iter().enumerate() {
                 if (mask >> bit) & 1 == 1 {
-                    weight += u64::from(graph.weight(node));
-                    blocked[node as usize] = true;
+                    weight += probe_weight(&graph, edge);
+                    blocked[edge as usize] = true;
                 }
             }
             if weight < best {
@@ -289,6 +298,38 @@ fn contained_tokens_survive_a_match_spanning_two_tokens() {
             "contained tokens for {pat:?} disagree with a per-token scan"
         );
     }
+}
+
+/// A needle whose greedy first token is a full [`MAX_TOKEN_SIZE`], with more
+/// needle left over.
+///
+/// Alignment `k` usually doubles as the boundary-aligned layout: `first_count[k]`
+/// counts tokens that *equal* `needle[..k]`, not only ones ending with it, so a
+/// first token of length `L` is a member of alignment `L`'s set. That stand-in
+/// runs out at `L == MAX_TOKEN_SIZE`, which `ks_ending_in` never enumerates — so
+/// this is the one shape where the source's own chain is the sole representation
+/// of a match starting at a token boundary.
+#[test]
+fn boundary_layout_with_a_maximal_first_token_is_covered() {
+    let rows: Vec<Vec<u8>> = (0..40)
+        .map(|i| {
+            let mut row = b"abcdefghijklmnop".repeat(4);
+            row.extend_from_slice(format!("{i:03}").as_bytes());
+            row
+        })
+        .collect();
+    let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+    let needle = b"klmnopabcdefghijklmnop";
+
+    // Without a maximal first token the test would pass vacuously.
+    let col = compress_rows(&refs);
+    let dict = col.view().dict;
+    assert!(
+        (0..dict.num_tokens() as Token).any(|id| dict.token(id) == &needle[..MAX_TOKEN_SIZE]),
+        "corpus did not train the {MAX_TOKEN_SIZE}-byte first token this test is about"
+    );
+
+    check(&refs, &[needle.as_slice()]);
 }
 
 #[test]

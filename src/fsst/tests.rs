@@ -25,7 +25,7 @@ fn test_fsst_prefilter() {
     use crate::search::index::build_token_frequency_index;
 
     let lines: Vec<&[u8]> = CORPUS.iter().map(|s| s.as_bytes()).collect();
-    let lines = (0..10).flat_map(|_| lines.clone()).collect();
+    let lines = (0..1).flat_map(|_| lines.clone()).collect();
     let compressor = Compressor::train(&lines);
     let codes: Vec<u8> = compressor.compress_bulk(&lines).concat();
 
@@ -45,9 +45,13 @@ fn test_fsst_prefilter() {
     );
     let token_frequencies = build_token_frequency_index(&tokens, 256).unwrap();
 
-    let pat = b"static";
+    let pat = b",/";
     let analysis = analyze_prefilter(pat, dictionary_view, &token_frequencies);
     let cover = analysis.probe_cover();
+
+    // let pat = b"static";
+    // let analysis = analyze_prefilter(pat, dictionary_view, &token_frequencies);
+    // let cover = analysis.probe_cover();
 
     println!("  points:");
     for &id in cover.points() {

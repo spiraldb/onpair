@@ -4,32 +4,47 @@
 //! The merged alignment DAG: every way the pattern can lie across token
 //! boundaries, as one graph.
 //!
-//! A source-to-sink path is one such layout, and the probe nodes along it are
+//! A source-to-sink path is one such layout, and the probes on its edges are
 //! token sets a scan could look for to catch it. A set of probes meeting every
 //! path is therefore a sound cover, and the cheapest one is a minimum-weight
-//! vertex cut — which is what this graph exists to be handed to.
+//! cut — which is what this graph exists to be handed to.
 //!
-//! # Nodes
-//! * **Source and sink** — no probe.
-//! * **Alignment** — one per feasible `k`, meaning the occurrence's first token
-//!   ends with `needle[..k]`. No probe.
-//! * **State** — one per reachable needle byte offset. No probe. Two alignments
-//!   that reach the same offset face an identical remaining parse, so they share
-//!   one state; that merge is what lets a single cut reason about every
-//!   alignment at once, and it is also why the greedy parse can be memoized.
-//! * **Probe** — [`ProbeSet::Point`] for an interior token of the greedy parse,
-//!   [`ProbeSet::Range`] for the tokens a suffix of the needle is a prefix of
-//!   (the occurrence ends inside a longer token), [`ProbeSet::Set`] for an
-//!   enumerated first-token set. Weighted by term frequency; the only nodes a
-//!   cut may select.
+//! # Nodes and edges
+//! A node is a parse position, an edge is a parse step, and probing is a
+//! property of a step — so probes ride on the edges and a cut selects edges.
 //!
-//! Tokens whose bytes contain the *whole* needle are not in the graph at all.
-//! They are mandatory — such an occurrence crosses no boundary, so no path
-//! represents it — and go into the cover unconditionally.
+//! A node id *is* a needle offset: node `o` is the position at `needle[o..]`,
+//! node `0` the source and node `n` the sink with every byte consumed, and an
+//! edge `o -> o'` means one token covered `needle[o..o']`. Two alignments
+//! reaching the same offset therefore land on the same node facing an identical
+//! remaining parse: state merging is what the numbering means rather than
+//! something the builder arranges, and it is why the greedy parse can be
+//! memoized. Offsets the parse never reaches are isolated nodes.
+//!
+//! Out of the source, one edge per feasible alignment `k >= 1`, whose first
+//! token ends with `needle[..k]` and so covered those bytes as its tail, probed
+//! by [`ProbeSet::Set`] — the tokens that token can be. Alignment `0` needs no
+//! edge: nothing precedes its first token, so its layouts begin at the source.
+//! Between states, [`ProbeSet::Point`] for a token of the greedy parse; into the
+//! sink, [`ProbeSet::Range`] for the tokens a needle suffix is a prefix of, the
+//! occurrence ending inside a longer token. Probes are weighted by term
+//! frequency. [`ProbeSet::TooBigSet`] is the one step a cut may not select: its
+//! probe was never materialized, so it is entered free and the cut pays further
+//! along the chain.
+//!
+//! An offset out of which no token is a prefix of the remaining needle has no
+//! parse step of its own. A dictionary with an escape code answers that with the
+//! escape; one without has to supply a transition for every byte itself, so a
+//! needle that finds none is a malformed column rather than a shorter graph.
+//!
+//! Tokens whose bytes contain the *whole* needle are mandatory and join the
+//! cover unconditionally, since such an occurrence crosses no boundary. The cut
+//! never chooses them: the one edge that probes a subset of them, `0 -> n`, is
+//! a source-to-sink path on its own, so every cut pays it alike.
 //!
 //! # Size
-//! At most `3n + 32` nodes and `4n + 48` edges for a needle of `n` bytes, all in
-//! flat arrays with no per-node allocation. Building it is dominated by the one
+//! Exactly `n + 1` nodes and at most `2n + 16` edges for a needle of `n` bytes,
+//! all in flat arrays with no per-node allocation. Building it is dominated by the one
 //! dictionary pass it shares with every other approach, not by the graph.
 
 use memchr::memmem::Finder;
@@ -45,12 +60,12 @@ use crate::search::prefix_range;
 /// and the cut has to pay for it further along the chain.
 pub(super) const SET_CAP: usize = 16;
 
-/// The token set a node probes for, or [`ProbeSet::None`] for the structural
-/// nodes a cut may not select.
+/// The token set an edge probes for, or [`ProbeSet::TooBigSet`] for the one
+/// step a cut may not select.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ProbeSet {
-    /// Source, sink, alignment and state nodes.
-    None,
+    /// Would have been a [`Set`](ProbeSet::Set), but more than [`SET_CAP`] tokens qualified.
+    TooBigSet,
     /// A single token: an interior token of the greedy parse.
     Point(Token),
     /// Every token a needle suffix is a prefix of.
@@ -59,38 +74,63 @@ pub(super) enum ProbeSet {
     Set { start: u32, len: u32 },
 }
 
+/// One parse step, and the probe that catches every layout crossing it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Edge {
+    pub(super) from: u32,
+    pub(super) to: u32,
+    /// The token set a scan looks for to catch this step.
+    probe: ProbeSet,
+    /// Term frequency of `probe`; zero when it carries none.
+    weight: u32,
+}
+
+impl Edge {
+    /// What cutting this edge costs, or `None` if no cut may select it.
+    pub(super) fn cost(&self) -> Option<u32> {
+        match self.probe {
+            ProbeSet::TooBigSet => None,
+            _ => Some(self.weight),
+        }
+    }
+}
+
+/// The node numbering, which the needle's length fixes entirely: ids are needle
+/// offsets, so there is nothing else to know about the node set.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Nodes {
+    needle_len: usize,
+}
+
+impl Nodes {
+    pub(super) fn count(self) -> usize {
+        self.needle_len + 1
+    }
+
+    /// Where every layout begins: no needle byte consumed yet.
+    pub(super) fn source(self) -> u32 {
+        0
+    }
+
+    /// Where every layout ends: every needle byte consumed.
+    pub(super) fn sink(self) -> u32 {
+        self.needle_len as u32
+    }
+}
+
 /// The alignment DAG for one needle over one dictionary.
 pub(super) struct AlignmentGraph {
-    /// Probe per node, parallel with `weight`.
-    probe: Vec<ProbeSet>,
-    /// Term frequency of each node's probe; zero for structural nodes.
-    weight: Vec<u32>,
     /// Every first-token set's ids, back to back.
     first_set_ids: Vec<Token>,
-    /// Arcs as `(from, to)` node ids.
-    pub(super) edges: Vec<(u32, u32)>,
+    /// The parse steps, each carrying its probe and that probe's weight.
+    pub(super) edges: Vec<Edge>,
     /// Tokens whose bytes contain the whole needle: mandatory, outside the cut.
     pub(super) contained: Vec<Token>,
-    pub(super) source: u32,
-    pub(super) sink: u32,
+    pub(super) nodes: Nodes,
     pub(super) num_tokens: usize,
 }
 
 impl AlignmentGraph {
-    pub(super) fn num_nodes(&self) -> usize {
-        self.probe.len()
-    }
-
-    /// Term frequency of `node`'s probe, or zero if it carries none.
-    pub(super) fn weight(&self, node: u32) -> u32 {
-        self.weight[node as usize]
-    }
-
-    /// Whether a cut may select `node`.
-    pub(super) fn is_probe(&self, node: u32) -> bool {
-        !matches!(self.probe[node as usize], ProbeSet::None)
-    }
-
     /// The token ids `cut`'s probes cover, as a membership table over the
     /// dictionary.
     ///
@@ -98,10 +138,10 @@ impl AlignmentGraph {
     /// mandatory rather than chosen, so unioning them in is the caller's job
     /// when it assembles the cover.
     pub(super) fn membership(&self, cut: &[u32]) -> Vec<bool> {
-        let mut members = vec![false; self.num_tokens];
-        for &node in cut {
-            match self.probe[node as usize] {
-                ProbeSet::None => debug_assert!(false, "cut selected a structural node"),
+        let mut members = vec![false; self.num_tokens.max(256)];
+        for &edge in cut {
+            match self.edges[edge as usize].probe {
+                ProbeSet::TooBigSet => debug_assert!(false, "cut selected an unprobed step"),
                 ProbeSet::Point(id) => members[id as usize] = true,
                 ProbeSet::Range(range) => {
                     for id in range.begin..=range.last {
@@ -198,17 +238,18 @@ struct Builder<'d, 'n, 'f> {
     dict: CompactDictionaryView<'d>,
     needle: &'n [u8],
     frequencies: TokenFrequencyIndexView<'f>,
-    probe: Vec<ProbeSet>,
-    weight: Vec<u32>,
     first_set_ids: Vec<Token>,
-    edges: Vec<(u32, u32)>,
-    sink: u32,
+    edges: Vec<Edge>,
+    nodes: Nodes,
     /// `greedy[o]`: the greedy parse at needle offset `o`, computed at most
     /// once. Every alignment reaching `o` reuses it — the memo *is* the state
     /// merging.
     greedy: Vec<Option<(Token, usize)>>,
-    state_node: Vec<Option<u32>>,
-
+    /// `built[o]`: whether the steps out of offset `o` have been emitted. Node
+    /// ids are offsets, so this is all the builder has left to track.
+    built: Vec<bool>,
+    /// The code standing in for a byte no token covers, or `None` when the
+    /// dictionary has to supply a transition for every byte itself.
     escape_token: Option<Token>,
 }
 
@@ -217,7 +258,7 @@ impl Builder<'_, '_, '_> {
     /// ids are distinct, so the sum is at most the code stream's length.
     fn weight_of(&self, set: ProbeSet) -> u32 {
         match set {
-            ProbeSet::None => 0,
+            ProbeSet::TooBigSet => 0,
             ProbeSet::Point(id) => self.frequencies.frequency(id),
             ProbeSet::Range(range) => self.frequencies.range_frequency(range),
             ProbeSet::Set { start, len } => self.first_set_ids
@@ -228,24 +269,25 @@ impl Builder<'_, '_, '_> {
         }
     }
 
-    fn add_node(&mut self, set: ProbeSet) -> u32 {
-        let weight = self.weight_of(set);
-        self.probe.push(set);
-        self.weight.push(weight);
-        debug_assert!(self.probe.len() <= u32::MAX as usize, "node id overflow");
-        (self.probe.len() - 1) as u32
+    /// Add the step `from -> to`, probed by `probe`. Any [`ProbeSet::Set`] must
+    /// already have its ids in `first_set_ids`, since the weight is summed here.
+    fn add_edge(&mut self, from: u32, to: u32, probe: ProbeSet) {
+        let weight = self.weight_of(probe);
+        self.edges.push(Edge {
+            from,
+            to,
+            probe,
+            weight,
+        });
     }
 
-    fn add_edge(&mut self, from: u32, to: u32) {
-        self.edges.push((from, to));
-    }
-
+    /// The greedy step out of `offset`, or `None` when the dictionary holds no
+    /// token that is a prefix of what remains — see [`build_state`](Self::build_state).
     fn greedy_at(&mut self, offset: usize) -> (Token, usize) {
         if let Some(hit) = self.greedy[offset] {
             return hit;
         }
-        let hit = greedy_in_needle(self.dict, &self.needle[offset..]);
-        if let Some(hit) = hit {
+        if let Some(hit) = greedy_in_needle(self.dict, &self.needle[offset..]) {
             self.greedy[offset] = Some(hit);
             return hit;
         }
@@ -269,56 +311,64 @@ impl Builder<'_, '_, '_> {
         prefix_range(self.dict, suffix)
     }
 
-    /// Materialize the state at `start` and every state its greedy chain
-    /// reaches, stopping at the first offset already built. Iterative on
+    /// Emit the steps out of `start` and out of every offset its greedy chain
+    /// reaches, stopping at the first offset already emitted. Iterative on
     /// purpose: `memmem` accepts needles of any length, so a recursive walk
     /// would put needle length on the stack.
-    fn ensure_chain(&mut self, start: usize) -> u32 {
+    fn ensure_chain(&mut self, start: usize) {
         let n = self.needle.len();
-        let mut chain = Vec::new();
         let mut offset = start;
-        while self.state_node[offset].is_none() {
-            chain.push(offset);
-            let (_, len) = self.greedy_at(offset);
-            let next = offset + len;
+        while !self.built[offset] {
+            self.built[offset] = true;
+            let next = self.build_state(offset);
             if next >= n {
                 break;
             }
             offset = next;
         }
-        // Reverse order, so each point probe's successor state already exists.
-        for &offset in chain.iter().rev() {
-            self.build_state(offset);
-        }
-        self.state_node[start].expect("the chain built the requested state")
     }
 
-    fn build_state(&mut self, offset: usize) {
-        let state = self.add_node(ProbeSet::None);
-        self.state_node[offset] = Some(state);
+    /// Emit the steps out of the state at `offset` and return where its greedy
+    /// step lands, or `None` when there is no step to take. A successor is named
+    /// by its offset, so it needs no node to exist yet — which is what lets the
+    /// chain run forwards.
+    ///
+    /// # Dead ends
+    /// No token being a prefix of `needle[offset..]` is not malformed input: it
+    /// says no tokenization of any row can have a boundary here with the needle
+    /// running past it. A token starting at `offset` either ends inside the needle
+    /// — then its bytes *are* such a prefix — or covers the rest of it, and that
+    /// case is the terminal range emitted above. So the lane simply ends, and
+    /// since the state can no longer reach the accept node, no layout runs through
+    /// it and the cut owes nothing for it.
+    ///
+    /// A complete alphabet makes this unreachable, since every byte is then a
+    /// token of its own. An FSST table is the case that reaches it.
+    fn build_state(&mut self, offset: usize) -> usize {
+        let state = offset as u32;
 
         // The occurrence may end inside a longer token starting here.
         let terminal = self.terminal_range(offset);
         if !terminal.is_empty() {
-            let node = self.add_node(ProbeSet::Range(terminal));
-            self.add_edge(state, node);
-            self.add_edge(node, self.sink);
+            self.add_edge(state, self.nodes.sink(), ProbeSet::Range(terminal));
         }
 
         let (token, len) = self.greedy_at(offset);
         let next = offset + len;
         if next < self.needle.len() {
-            let node = self.add_node(ProbeSet::Point(token));
-            let next_state =
-                self.state_node[next].expect("states are built in reverse chain order");
-            self.add_edge(state, node);
-            self.add_edge(node, next_state);
+            self.add_edge(state, next as u32, ProbeSet::Point(token));
         } else {
+            // A greedy step that reaches the needle's end consumed
+            // `needle[offset..]` exactly, so that token is in its own prefix
+            // range: this step is `offset -> sink`, already probed above by a
+            // range containing it. A parallel point probe would only make the
+            // cut pay twice for one step.
             debug_assert!(
-                !terminal.is_empty(),
+                terminal.contains(token),
                 "the exact final token belongs to its own prefix range"
             );
         }
+        next
     }
 }
 
@@ -334,6 +384,7 @@ pub(super) fn build_alignment_graph(
     debug_assert!(frequencies.num_tokens() >= dict.num_tokens());
 
     let n = needle.len();
+    debug_assert!(n < u32::MAX as usize, "needle outgrew u32 node ids");
     let ntok = dict.num_tokens();
     let contained = contained_tokens(dict, needle);
 
@@ -341,18 +392,13 @@ pub(super) fn build_alignment_graph(
         dict,
         needle,
         frequencies,
-        probe: Vec::new(),
-        weight: Vec::new(),
         first_set_ids: Vec::new(),
         edges: Vec::new(),
-        sink: 0,
+        nodes: Nodes { needle_len: n },
         greedy: vec![None; n],
-        state_node: vec![None; n],
-        escape_token: Some(0xFF)
+        built: vec![false; n],
+        escape_token: Some(0xFF),
     };
-    let source = b.add_node(ProbeSet::None);
-    let sink = b.add_node(ProbeSet::None);
-    b.sink = sink;
 
     // First-token sets in one dictionary pass: for each alignment k >= 1, how
     // many tokens end with needle[..k] and — while the set stays small enough to
@@ -398,42 +444,43 @@ pub(super) fn build_alignment_graph(
         if k != 0 && first_count[k] == 0 {
             continue;
         }
-        let alignment = b.add_node(ProbeSet::None);
-        b.add_edge(source, alignment);
-        // this builds a chain from the current alignment to the sink
-        let state = b.ensure_chain(k);
+        // Emits the chain of steps from this alignment's entry to the sink.
+        b.ensure_chain(k);
 
-        if k != 0 && first_count[k] <= SET_CAP {
-            let start = b.first_set_ids.len() as u32;
-            let len = first_count[k];
-            b.first_set_ids
-                .extend_from_slice(&first_ids[k * SET_CAP..k * SET_CAP + len]);
-            let node = b.add_node(ProbeSet::Set {
-                start,
-                len: len as u32,
-            });
-            b.add_edge(alignment, node);
-            b.add_edge(node, state);
-        } else {
-            b.add_edge(alignment, state);
+        // Alignment 0 begins at the source node itself, with nothing consumed
+        // before its first token, so it needs no entry step at all. At `k > 0`
+        // the occurrence starts inside its first token, which covered
+        // `needle[..k]` as its tail; the set of tokens it could be is what
+        // probes that step — when the pass kept them.
+        if k != 0 {
+            let probe = if first_count[k] <= SET_CAP {
+                let start = b.first_set_ids.len() as u32;
+                let len = first_count[k];
+                b.first_set_ids
+                    .extend_from_slice(&first_ids[k * SET_CAP..k * SET_CAP + len]);
+                ProbeSet::Set {
+                    start,
+                    len: len as u32,
+                }
+            } else {
+                ProbeSet::TooBigSet
+            };
+            b.add_edge(b.nodes.source(), k as u32, probe);
         }
     }
 
-    // The bound the module doc advertises: 3 nodes and 4 edges per needle
-    // offset, plus source, sink and the per-alignment nodes.
+    // The bound the module doc advertises: two edges per needle offset, plus
+    // one per alignment. The node count is not a bound but an identity.
     debug_assert!(
-        b.probe.len() <= 3 * n + 32 && b.edges.len() <= 4 * n + 48,
+        b.edges.len() <= 2 * n + 16,
         "graph outgrew its documented size bound"
     );
 
     AlignmentGraph {
-        probe: b.probe,
-        weight: b.weight,
         first_set_ids: b.first_set_ids,
         edges: b.edges,
         contained,
-        source,
-        sink,
+        nodes: b.nodes,
         num_tokens: ntok,
     }
 }
