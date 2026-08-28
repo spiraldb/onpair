@@ -72,7 +72,6 @@ fn execute_sse2_fixed<O: Offset>(
 
 pub(super) unsafe fn execute_avx2<O: Offset>(
     shape: Option<FixedShape>,
-    group: u8,
     input: ScanInput<'_, O>,
     sparse_row_mapping: bool,
     out: &mut Vec<usize>,
@@ -83,32 +82,16 @@ pub(super) unsafe fn execute_avx2<O: Offset>(
         cover,
     } = input;
     unsafe {
-        match (shape, group) {
-            (Some(shape), 1) => execute_avx2_fixed::<O, 1>(
-                shape,
-                codes,
-                row_offsets,
-                cover,
-                sparse_row_mapping,
-                out,
-            ),
-            (Some(shape), 8) => execute_avx2_fixed::<O, 8>(
-                shape,
-                codes,
-                row_offsets,
-                cover,
-                sparse_row_mapping,
-                out,
-            ),
-            (None, 1) => {
-                avx2::scan_avx2_generic(codes, row_offsets, cover, sparse_row_mapping, out)
+        match shape {
+            Some(shape) => {
+                execute_avx2_fixed::<O>(shape, codes, row_offsets, cover, sparse_row_mapping, out)
             }
-            _ => unreachable!("invalid AVX2 plan"),
+            None => avx2::scan_avx2_generic(codes, row_offsets, cover, sparse_row_mapping, out),
         }
     }
 }
 
-unsafe fn execute_avx2_fixed<O: Offset, const BLOCKS: usize>(
+unsafe fn execute_avx2_fixed<O: Offset>(
     shape: FixedShape,
     codes: &[Token],
     row_offsets: &[O],
@@ -118,7 +101,7 @@ unsafe fn execute_avx2_fixed<O: Offset, const BLOCKS: usize>(
 ) {
     macro_rules! call {
         ($points:literal, $ranges:literal) => {
-            avx2::scan_avx2_fixed::<O, $points, $ranges, BLOCKS>(
+            avx2::scan_avx2_fixed::<O, $points, $ranges, 1>(
                 codes,
                 row_offsets,
                 cover,
