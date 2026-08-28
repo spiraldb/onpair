@@ -66,7 +66,7 @@ impl<'a, O: Offset> RowSink<'a, O> {
         // O(rows), even when the SIMD scan found only a handful of codes. Use a
         // lower-bound search for large code-space gaps; keep the linear cursor
         // for nearby hits, where its predictable sequential loads are cheaper.
-        const BINARY_SEARCH_CODE_GAP: usize = 128;
+        const BINARY_SEARCH_CODE_GAP: usize = 256;
         if self.binary_search_sparse_gaps
             && code_index.saturating_sub(self.row_end) >= BINARY_SEARCH_CODE_GAP
         {
