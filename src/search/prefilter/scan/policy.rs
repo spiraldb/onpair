@@ -284,9 +284,7 @@ pub(super) fn select_kernel(caps: TargetCaps, facts: ScanFacts) -> KernelPlan {
                 (1..=16, 0) => Some(FixedShape::new(shape.points, 0)),
                 _ => None,
             };
-            let paired_generic = specialized.is_none()
-                && ((shape.points == 1 && shape.ranges != 0)
-                    || (shape.points == 2 && shape.ranges == 1));
+            let paired_generic = specialized.is_none() && shape.points == 1 && shape.ranges != 0;
             KernelPlan {
                 isa: IsaTag::Neon,
                 shape: specialized,
