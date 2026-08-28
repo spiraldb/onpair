@@ -162,8 +162,6 @@ impl Ratio {
 }
 
 const SPARSE_ROW_MAPPING_MAX_COVERAGE: Ratio = Ratio::new(1, 10_000);
-#[cfg(any(target_arch = "x86_64", test))]
-const AVX2_GROUP8_MAX_COVERAGE: Ratio = Ratio::new(1, 10_000);
 
 /// SIMD capabilities relevant to prefilter execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,12 +310,7 @@ pub(super) fn select_kernel(caps: TargetCaps, facts: ScanFacts) -> KernelPlan {
                 (IsaTag::Avx512, with_x86_fixed_shapes!(match_shapes), 8)
             } else if avx2 {
                 let shape = with_x86_fixed_shapes!(match_shapes);
-                let group = if shape.is_some() && facts.covered_below(AVX2_GROUP8_MAX_COVERAGE) {
-                    8
-                } else {
-                    1
-                };
-                (IsaTag::Avx2, shape, group)
+                (IsaTag::Avx2, shape, 1)
             } else {
                 (IsaTag::Sse2, with_sse2_fixed_shapes!(match_shapes), 1)
             };
@@ -537,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn avx2_group8_is_strictly_for_coverage_below_one_in_ten_thousand() {
+    fn avx2_fixed_shapes_always_use_group_one() {
         let mut sparse = facts(1, 0);
         sparse.analysis.covered_codes = 0;
         let avx2_caps = TargetCaps::X86_64 {
@@ -545,12 +538,12 @@ mod tests {
             avx512bw: false,
         };
         let plan = select_kernel(avx2_caps, sparse);
-        assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 8));
+        assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 1));
 
         let mut just_below = facts(1, 0);
         just_below.analysis.indexed_codes = 10_001;
         let plan = select_kernel(avx2_caps, just_below);
-        assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 8));
+        assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 1));
 
         let plan = select_kernel(avx2_caps, facts(1, 0));
         assert_eq!((plan.shape, plan.group), (Some(FixedShape::new(1, 0)), 1));

@@ -137,7 +137,7 @@ pub(super) fn execute<O: Offset>(
         #[cfg(target_arch = "x86_64")]
         IsaTag::Avx2 => {
             // SAFETY: the plan is created only after runtime AVX2 detection.
-            unsafe { x86::execute_avx2(plan.shape, plan.group, input, sparse_row_mapping, out) };
+            unsafe { x86::execute_avx2(plan.shape, input, sparse_row_mapping, out) };
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
