@@ -7,18 +7,18 @@ use super::ScanInput;
 use super::policy::{FixedShape, with_sse2_fixed_shapes, with_x86_fixed_shapes};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-use crate::search::prefilter::cover::ProbeCover;
+use crate::search::substring::prefilter::cover::ProbeCover;
 
 mod avx2;
 mod avx512;
 mod sse2;
 
 #[cfg(test)]
-pub(in crate::search::prefilter) use avx2::scan_avx2;
+pub(in crate::search::substring::prefilter) use avx2::scan_avx2;
 #[cfg(test)]
-pub(in crate::search::prefilter) use avx512::scan_avx512;
+pub(in crate::search::substring::prefilter) use avx512::scan_avx512;
 #[cfg(test)]
-pub(in crate::search::prefilter) use sse2::scan_sse2;
+pub(in crate::search::substring::prefilter) use sse2::scan_sse2;
 
 #[inline]
 pub(super) fn execute_sse2<O: Offset>(

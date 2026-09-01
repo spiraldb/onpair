@@ -10,7 +10,7 @@ use crate::core::offset::Offset;
 mod neon;
 
 #[cfg(test)]
-pub(in crate::search::prefilter) use neon::scan_neon;
+pub(in crate::search::substring::prefilter) use neon::scan_neon;
 pub(super) use neon::{
     scan_neon_few_mixed, scan_neon_fixed_mixed, scan_neon_generic, scan_neon_one_point_two_ranges,
     scan_neon_one_range, scan_neon_points, scan_neon_points_many,

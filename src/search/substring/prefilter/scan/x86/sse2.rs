@@ -7,7 +7,7 @@ use super::super::sink::{LaneMask, RowSink};
 use super::super::template::{DYN, Isa, scan_dynamic, scan_fixed};
 use crate::core::offset::Offset;
 use crate::core::types::{Token, TokenRange};
-use crate::search::prefilter::cover::ProbeCover;
+use crate::search::substring::prefilter::cover::ProbeCover;
 
 use core::arch::x86_64::{
     __m128i, _mm_cmpeq_epi16, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_packs_epi16,
@@ -147,7 +147,7 @@ impl Isa for Sse2 {
 /// Eager compact-mask SSE2 leaf for the selected small cover shapes.
 #[target_feature(enable = "sse2")]
 #[inline(never)]
-pub(in crate::search::prefilter::scan) fn scan_sse2_fixed<
+pub(in crate::search::substring::prefilter::scan) fn scan_sse2_fixed<
     O: Offset,
     const POINTS: usize,
     const RANGES: usize,
@@ -164,7 +164,7 @@ pub(in crate::search::prefilter::scan) fn scan_sse2_fixed<
 }
 
 /// SSE2 fallback for arbitrary cover shapes, processing eight lanes at a time.
-pub(in crate::search::prefilter::scan) fn scan_sse2_generic<O: Offset>(
+pub(in crate::search::substring::prefilter::scan) fn scan_sse2_generic<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     cover: &ProbeCover,
@@ -177,7 +177,7 @@ pub(in crate::search::prefilter::scan) fn scan_sse2_generic<O: Offset>(
 
 /// Direct generic-kernel entry retained for architecture correctness tests.
 #[cfg(test)]
-pub(in crate::search::prefilter) fn scan_sse2<O: Offset>(
+pub(in crate::search::substring::prefilter) fn scan_sse2<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     cover: &ProbeCover,
