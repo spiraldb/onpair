@@ -239,7 +239,7 @@ pub(super) enum IsaTag {
 
 /// Complete, ephemeral execution plan for one scan region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::prefilter) struct KernelPlan {
+pub(in crate::search::substring::prefilter) struct KernelPlan {
     pub(super) isa: IsaTag,
     /// A selected specialization. `None` uses the ISA's arbitrary-cover leaf.
     pub(super) shape: Option<FixedShape>,

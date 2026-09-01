@@ -16,9 +16,9 @@
 //! per-state exceptions. A full `(states × tokens)` matrix would store the same
 //! function densely; the sparse form matches the data and stays small.
 
-use super::lookup::prefix_range;
 use crate::core::dictionary::DictionaryView;
 use crate::core::types::{Token, TokenRange};
+use crate::search::lookup::prefix_range;
 
 /// A KMP state: the number of leading pattern bytes matched, `0..=pattern.len()`.
 /// `u8`, so the pattern is limited to 255 bytes.

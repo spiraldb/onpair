@@ -14,7 +14,7 @@ use super::super::{
 use super::execute as execute_neon;
 use crate::core::offset::Offset;
 use crate::core::types::{Token, TokenRange};
-use crate::search::prefilter::cover::ProbeCover;
+use crate::search::substring::prefilter::cover::ProbeCover;
 
 use core::arch::aarch64::{
     uint16x8_t, vceqq_u16, vcleq_u16, vdupq_n_u16, vld1q_u16, vmaxvq_u16, vorrq_u16, vst1q_u16,
@@ -346,7 +346,7 @@ fn scan_neon_many_points<O: Offset>(
 }
 
 #[inline(never)]
-pub(in crate::search::prefilter::scan) fn scan_neon_one_range<O: Offset>(
+pub(in crate::search::substring::prefilter::scan) fn scan_neon_one_range<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pf: &ProbeCover,
@@ -357,7 +357,7 @@ pub(in crate::search::prefilter::scan) fn scan_neon_one_range<O: Offset>(
 }
 
 #[inline(never)]
-pub(in crate::search::prefilter::scan) fn scan_neon_fixed_mixed<
+pub(in crate::search::substring::prefilter::scan) fn scan_neon_fixed_mixed<
     O: Offset,
     const POINTS: usize,
     const RANGES: usize,
@@ -381,7 +381,7 @@ pub(in crate::search::prefilter::scan) fn scan_neon_fixed_mixed<
 
 /// Preserve the explicit reduction tree used by this uncommon mixed shape.
 #[inline(never)]
-pub(in crate::search::prefilter::scan) fn scan_neon_one_point_two_ranges<O: Offset>(
+pub(in crate::search::substring::prefilter::scan) fn scan_neon_one_point_two_ranges<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pf: &ProbeCover,
@@ -402,7 +402,7 @@ pub(in crate::search::prefilter::scan) fn scan_neon_one_point_two_ranges<O: Offs
 /// Compact fallback for small mixed covers. Broadcasts remain in fixed-size
 /// stack arrays while the compare loops retain runtime probe counts.
 #[inline(never)]
-pub(in crate::search::prefilter::scan) fn scan_neon_few_mixed<O: Offset>(
+pub(in crate::search::substring::prefilter::scan) fn scan_neon_few_mixed<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pf: &ProbeCover,
@@ -434,7 +434,7 @@ pub(in crate::search::prefilter::scan) fn scan_neon_few_mixed<O: Offset>(
 }
 
 #[inline]
-pub(in crate::search::prefilter::scan) fn scan_neon_points<O: Offset>(
+pub(in crate::search::substring::prefilter::scan) fn scan_neon_points<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pf: &ProbeCover,
@@ -451,7 +451,7 @@ pub(in crate::search::prefilter::scan) fn scan_neon_points<O: Offset>(
 }
 
 #[inline]
-pub(in crate::search::prefilter::scan) fn scan_neon_points_many<O: Offset>(
+pub(in crate::search::substring::prefilter::scan) fn scan_neon_points_many<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pf: &ProbeCover,
@@ -463,7 +463,7 @@ pub(in crate::search::prefilter::scan) fn scan_neon_points_many<O: Offset>(
 
 /// Arbitrary covers retain the existing one- or two-vector policy while both
 /// schedules share the template walk and prepared probe vectors.
-pub(in crate::search::prefilter::scan) fn scan_neon_generic<O: Offset>(
+pub(in crate::search::substring::prefilter::scan) fn scan_neon_generic<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pf: &ProbeCover,
@@ -482,7 +482,7 @@ pub(in crate::search::prefilter::scan) fn scan_neon_generic<O: Offset>(
 
 /// Direct kernel entry retained for architecture correctness tests.
 #[cfg(test)]
-pub(in crate::search::prefilter) fn scan_neon<O: Offset>(
+pub(in crate::search::substring::prefilter) fn scan_neon<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pf: &ProbeCover,

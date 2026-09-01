@@ -6,7 +6,7 @@
 use super::sink::{RowSink, scan_tail};
 use crate::core::offset::Offset;
 use crate::core::types::{Token, TokenRange};
-use crate::search::prefilter::cover::ProbeCover;
+use crate::search::substring::prefilter::cover::ProbeCover;
 
 /// Probe count known only at run time.
 pub(super) const DYN: usize = usize::MAX;

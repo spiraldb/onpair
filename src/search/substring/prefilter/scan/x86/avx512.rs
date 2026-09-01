@@ -7,7 +7,7 @@ use super::super::sink::{LaneMask, RowSink, scan_tail};
 use super::super::template::{DYN, Isa, scan_fixed};
 use crate::core::offset::Offset;
 use crate::core::types::{Token, TokenRange};
-use crate::search::prefilter::cover::ProbeCover;
+use crate::search::substring::prefilter::cover::ProbeCover;
 
 use core::arch::x86_64::{
     __m512i, _mm512_cmpeq_epu16_mask, _mm512_cmpge_epu16_mask, _mm512_cmple_epu16_mask,
@@ -120,7 +120,7 @@ impl Isa for Avx512 {
 /// broadcast vectors for arbitrary shapes was measured and rejected; only the
 /// selected fixed shapes use the shared retained-mask template.
 #[target_feature(enable = "avx512f,avx512bw")]
-pub(in crate::search::prefilter) fn scan_avx512<O: Offset>(
+pub(in crate::search::substring::prefilter) fn scan_avx512<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     pf: &ProbeCover,
@@ -159,7 +159,7 @@ pub(in crate::search::prefilter) fn scan_avx512<O: Offset>(
 /// Const-shape leaf for the six cover shapes that dominate the workload.
 #[target_feature(enable = "avx512f,avx512bw")]
 #[inline(never)]
-pub(in crate::search::prefilter::scan) fn scan_avx512_fixed<
+pub(in crate::search::substring::prefilter::scan) fn scan_avx512_fixed<
     O: Offset,
     const POINTS: usize,
     const RANGES: usize,

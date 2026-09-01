@@ -45,22 +45,18 @@
 //!   verifies, and the one without a pattern-length cap.
 //! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
 
-mod contains;
 mod equals;
 pub mod index;
 mod lookup;
-mod prefilter;
 mod prefix;
+mod substring;
 mod tokenize;
-mod verify;
 
-pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
-pub use prefilter::{
-    PrefilterAnalysis, PrefilterError, ProbeCover, analyze_prefilter, prefilter_candidates,
-    prefilter_is_likely_profitable,
-};
 pub use prefix::{PrefixQuery, starts_with};
+pub use substring::{
+    BytesVerifier, ContainsTable, PrefilterAnalysis, PrefilterError, ProbeCover, analyze_prefilter,
+    contains, prefilter_candidates, prefilter_is_likely_profitable,
+};
 pub use tokenize::tokenize;
-pub use verify::BytesVerifier;
