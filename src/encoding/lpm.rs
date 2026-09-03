@@ -11,12 +11,10 @@
 //!   * **long map** — tokens of length `9..=16` bucketed by their 8-byte prefix.
 //!     Each bucket holds the `(suffix, length, token)` triples sharing that
 //!     prefix and is searched for the longest matching suffix. A bucket starts
-//!     as a sorted vector and is promoted to a byte-trie once it grows past
-//!     `PROMOTE_THRESHOLD`.
+//!     as a vector and switches to length-grouped binary search once it grows.
 //!
-//! [`find_longest_match`](LongestPrefixMatcher::find_longest_match) issues a
-//! single hash probe on the 8-byte prefix to reach the long bucket, then falls
-//! through to the short map probing lengths `min(max_len, 8)..1`.
+//! Matching loads up to 16 bytes once, probes the long-token bucket, then checks
+//! short tokens from longest to shortest.
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
@@ -26,9 +24,38 @@ use crate::encoding::hash::{Map, map, map_with_capacity};
 /// bucketed by their first `BUCKET_PREFIX_LEN` bytes.
 const BUCKET_PREFIX_LEN: usize = 8;
 
-/// A long bucket is promoted from a linear vector to a trie once it holds more
-/// than this many entries, bounding worst-case suffix search.
-const PROMOTE_THRESHOLD: usize = 128;
+const MAX_SUFFIX_LEN: usize = MAX_TOKEN_SIZE - BUCKET_PREFIX_LEN;
+const PROMOTE_THRESHOLD: usize = 48;
+
+#[inline]
+fn load_window(data: &[u8]) -> (u64, u64) {
+    let n = data.len();
+    if n >= MAX_TOKEN_SIZE {
+        return (
+            u64::from_le_bytes(data[..8].try_into().unwrap()),
+            u64::from_le_bytes(data[8..16].try_into().unwrap()),
+        );
+    }
+    if n >= 8 {
+        let lo = u64::from_le_bytes(data[..8].try_into().unwrap());
+        let hi = if n > 8 {
+            u64::from_le_bytes(data[n - 8..].try_into().unwrap()) >> ((MAX_TOKEN_SIZE - n) * 8)
+        } else {
+            0
+        };
+        return (lo, hi);
+    }
+    let lo = if n >= 4 {
+        u32::from_le_bytes(data[..4].try_into().unwrap()) as u64
+            | (u32::from_le_bytes(data[n - 4..].try_into().unwrap()) as u64) << ((n - 4) * 8)
+    } else if n >= 2 {
+        u16::from_le_bytes(data[..2].try_into().unwrap()) as u64
+            | (u16::from_le_bytes(data[n - 2..].try_into().unwrap()) as u64) << ((n - 2) * 8)
+    } else {
+        data[0] as u64
+    };
+    (lo, 0)
+}
 
 /// Pack the low `min(len, data.len(), 8)` bytes of `data` into a little-endian
 /// `u64`; higher bytes read as zero. The full-8-byte case is a single load.
@@ -54,7 +81,8 @@ fn mask_u64(len: usize) -> u64 {
 }
 
 /// One long-token entry within a bucket: the suffix bytes after the shared
-/// 8-byte prefix (`slen` of them, packed little-endian) and the token id.
+/// 8-byte prefix (`slen` of them, packed little-endian and masked to that
+/// length) and the token id.
 #[derive(Copy, Clone, Debug)]
 struct LongEntry {
     suffix: u64,
@@ -62,25 +90,13 @@ struct LongEntry {
     token: Token,
 }
 
-/// A node in the shared trie pool. `children` is a small linear-scanned
-/// association list of `(byte, node_index)`.
-#[derive(Default, Debug, Clone)]
-struct TrieNode {
-    token: Option<Token>,
-    children: Vec<(u8, u32)>,
-}
-
-/// A long bucket: entries sharing an 8-byte prefix. Starts linear (sorted by
-/// descending suffix length so the first match is the longest) and is promoted
-/// to a trie rooted at a pool index once it grows large.
+/// Long tokens with the same 8-byte prefix.
 #[derive(Debug, Clone)]
 enum Bucket {
     Linear(Vec<LongEntry>),
-    Trie(u32),
+    Grouped(Box<GroupedBucket>),
 }
 
-/// Search a sorted-descending linear bucket for the longest suffix that matches
-/// the low bytes of `val` (the input suffix, `<= max_slen` bytes).
 #[inline]
 fn search_linear(entries: &[LongEntry], val: u64, max_slen: usize) -> Option<(Token, usize)> {
     for e in entries {
@@ -93,63 +109,65 @@ fn search_linear(entries: &[LongEntry], val: u64, max_slen: usize) -> Option<(To
     None
 }
 
-/// Walk the trie at `root` against `suf`, returning the deepest node that
-/// carries a token id together with the matched suffix length.
-#[inline]
-fn search_trie(pool: &[TrieNode], root: u32, suf: &[u8]) -> Option<(Token, usize)> {
-    let mut best = None;
-    let mut cur = root;
-    for (pos, &b) in suf.iter().enumerate() {
-        match trie_find_child(pool, cur, b) {
-            Some(child) => {
-                cur = child;
-                if let Some(t) = pool[cur as usize].token {
-                    best = Some((t, pos + 1));
-                }
-            }
-            None => break,
+/// Entries grouped by suffix length and sorted by suffix within each group.
+#[derive(Debug, Clone)]
+struct GroupedBucket {
+    entries: Vec<LongEntry>,
+    ends: [u32; MAX_SUFFIX_LEN + 2],
+    present: u16,
+}
+
+impl GroupedBucket {
+    fn build(entries: &[LongEntry]) -> Self {
+        let mut sorted = entries.to_vec();
+        sorted.sort_unstable_by(|a, b| b.slen.cmp(&a.slen).then(a.suffix.cmp(&b.suffix)));
+
+        let mut ends = [0u32; MAX_SUFFIX_LEN + 2];
+        let mut present = 0u16;
+        let mut counts = [0u32; MAX_SUFFIX_LEN + 1];
+        for e in &sorted {
+            counts[e.slen as usize] += 1;
+            present |= 1u16 << e.slen;
+        }
+        let mut acc = 0u32;
+        for slen in (1..=MAX_SUFFIX_LEN).rev() {
+            acc += counts[slen];
+            ends[slen] = acc;
+        }
+        Self {
+            entries: sorted,
+            ends,
+            present,
         }
     }
-    best
-}
 
-#[inline]
-fn trie_find_child(pool: &[TrieNode], node: u32, byte: u8) -> Option<u32> {
-    pool[node as usize]
-        .children
-        .iter()
-        .find_map(|&(b, idx)| (b == byte).then_some(idx))
-}
+    fn insert(&mut self, entry: LongEntry) {
+        let slen = entry.slen as usize;
+        let start = self.ends[slen + 1] as usize;
+        let end = self.ends[slen] as usize;
+        let pos = start + self.entries[start..end].partition_point(|e| e.suffix < entry.suffix);
+        self.entries.insert(pos, entry);
+        for e in &mut self.ends[1..=slen] {
+            *e += 1;
+        }
+        self.present |= 1u16 << slen;
+    }
 
-fn trie_alloc(pool: &mut Vec<TrieNode>) -> u32 {
-    let idx = pool.len() as u32;
-    pool.push(TrieNode::default());
-    idx
-}
+    #[inline]
+    fn find(&self, val: u64, max_slen: usize) -> Option<(Token, usize)> {
+        let mut lens = self.present & ((1u16 << (max_slen + 1)) - 1);
+        while lens != 0 {
+            let slen = (u16::BITS - 1 - lens.leading_zeros()) as usize;
+            lens &= !(1u16 << slen);
 
-fn trie_insert(pool: &mut Vec<TrieNode>, root: u32, suf: &[u8], token: Token) {
-    let mut cur = root;
-    for &b in suf {
-        match trie_find_child(pool, cur, b) {
-            Some(child) => cur = child,
-            None => {
-                let new_idx = trie_alloc(pool);
-                pool[cur as usize].children.push((b, new_idx));
-                cur = new_idx;
+            let group = &self.entries[self.ends[slen + 1] as usize..self.ends[slen] as usize];
+            let target = val & mask_u64(slen);
+            if let Ok(i) = group.binary_search_by_key(&target, |e| e.suffix) {
+                return Some((group[i].token, slen));
             }
         }
+        None
     }
-    pool[cur as usize].token = Some(token);
-}
-
-/// Build a trie bucket from the entries of a linear bucket.
-fn build_trie(pool: &mut Vec<TrieNode>, entries: &[LongEntry]) -> Bucket {
-    let root = trie_alloc(pool);
-    for e in entries {
-        let buf = e.suffix.to_le_bytes();
-        trie_insert(pool, root, &buf[..e.slen as usize], e.token);
-    }
-    Bucket::Trie(root)
 }
 
 /// Maps byte sequences (`1..=MAX_TOKEN_SIZE` bytes) to [`Token`] ids. Always
@@ -161,8 +179,6 @@ pub(crate) struct LongestPrefixMatcher {
     short_map: Map<(u64, u8), Token>,
     /// Length `9..=16` tokens bucketed by their 8-byte prefix.
     long_map: Map<u64, Bucket>,
-    /// Trie node arena shared by every promoted long bucket.
-    pool: Vec<TrieNode>,
     /// Longest short-map token length present (`1..=8`).
     max_short_len: u8,
     /// Next id to assign. `u32` so the full 16-bit token space (65 536 entries)
@@ -180,7 +196,6 @@ impl LongestPrefixMatcher {
         Self {
             short_map,
             long_map: map(),
-            pool: Vec::new(),
             max_short_len: 1,
             next_id: 256,
         }
@@ -194,7 +209,6 @@ impl LongestPrefixMatcher {
         let mut me = Self {
             short_map: map_with_capacity(n.min(BUCKET_PREFIX_LEN * 256)),
             long_map: map(),
-            pool: Vec::new(),
             max_short_len: 1,
             next_id: n as u32,
         };
@@ -229,29 +243,24 @@ impl LongestPrefixMatcher {
         let prefix = load_le_u64(data, BUCKET_PREFIX_LEN);
         let slen = len - BUCKET_PREFIX_LEN;
         let suffix = load_le_u64(&data[BUCKET_PREFIX_LEN..], slen);
-        // Split borrows: `pool` and `long_map` are disjoint fields.
-        let pool = &mut self.pool;
+        let entry = LongEntry {
+            suffix,
+            slen: slen as u8,
+            token: id,
+        };
         let bucket = self
             .long_map
             .entry(prefix)
             .or_insert_with(|| Bucket::Linear(Vec::new()));
         match bucket {
             Bucket::Linear(entries) => {
-                entries.push(LongEntry {
-                    suffix,
-                    slen: slen as u8,
-                    token: id,
-                });
-                // Keep descending-by-length order so the first match wins.
-                entries.sort_by(|a, b| b.slen.cmp(&a.slen));
+                let pos = entries.partition_point(|e| e.slen > entry.slen);
+                entries.insert(pos, entry);
                 if entries.len() > PROMOTE_THRESHOLD {
-                    *bucket = build_trie(pool, entries);
+                    *bucket = Bucket::Grouped(Box::new(GroupedBucket::build(entries)));
                 }
             }
-            Bucket::Trie(root) => {
-                let buf = suffix.to_le_bytes();
-                trie_insert(pool, *root, &buf[..slen], id);
-            }
+            Bucket::Grouped(grouped) => grouped.insert(entry),
         }
     }
 
@@ -263,32 +272,28 @@ impl LongestPrefixMatcher {
     /// [`from_dictionary`](Self::from_dictionary) with a complete dictionary).
     #[inline]
     pub(crate) fn find_longest_match(&self, data: &[u8]) -> (Token, usize) {
-        let max_len = data.len().min(MAX_TOKEN_SIZE);
-        // The first up-to-8 bytes serve as both the long-bucket prefix key and
-        // the short-map probe window, so load them once.
-        let low64 = load_le_u64(data, max_len.min(BUCKET_PREFIX_LEN));
-        // Long bucket: a single prefix probe, only when >= 9 input bytes exist.
-        if max_len > BUCKET_PREFIX_LEN
+        let (lo64, hi64) = load_window(data);
+        let win = data.len().min(MAX_TOKEN_SIZE);
+
+        if win > BUCKET_PREFIX_LEN
             && !self.long_map.is_empty()
-            && let Some(bucket) = self.long_map.get(&low64)
+            && let Some(bucket) = self.long_map.get(&lo64)
         {
-            let suf = &data[BUCKET_PREFIX_LEN..max_len];
+            let max_slen = win - BUCKET_PREFIX_LEN;
             let hit = match bucket {
                 Bucket::Linear(entries) => {
-                    search_linear(entries, load_le_u64(suf, suf.len()), suf.len())
+                    search_linear(entries, hi64 & mask_u64(max_slen), max_slen)
                 }
-                Bucket::Trie(root) => search_trie(&self.pool, *root, suf),
+                Bucket::Grouped(grouped) => grouped.find(hi64, max_slen),
             };
             if let Some((t, slen)) = hit {
                 return (t, BUCKET_PREFIX_LEN + slen);
             }
         }
-        // Short map: probe from the longest short token that exists (<= the
-        // input window) down to length 1.
-        let short_max = max_len.min(self.max_short_len as usize);
+
+        let short_max = win.min(self.max_short_len as usize);
         for len in (1..=short_max).rev() {
-            let key = low64 & mask_u64(len);
-            if let Some(&t) = self.short_map.get(&(key, len as u8)) {
+            if let Some(&t) = self.short_map.get(&(lo64 & mask_u64(len), len as u8)) {
                 return (t, len);
             }
         }

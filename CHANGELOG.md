@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded decoding and tokenization checks without requiring full semantic
   validation.
 
+### Changed
+
+- Speed up matching for large dictionaries.
+
 ### Removed
 
 - Remove the obsolete cross-implementation benchmark harness and standalone
