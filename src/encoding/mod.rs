@@ -11,4 +11,5 @@ pub(crate) mod config;
 pub(crate) mod hash;
 pub(crate) mod lpm;
 pub(crate) mod parser;
+pub(crate) mod rows;
 pub(crate) mod trainer;
