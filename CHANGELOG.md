@@ -9,11 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add row-based training and compression without flattening input first.
+- Add encoding into reusable caller-owned buffers.
+- Allow rebuilding a parser from an existing dictionary.
 - Make `CompactDictionary` storage-backed, allowing validated dictionary bytes
   and offsets to be borrowed or shared without copying.
 - Separate dictionary safety validation from correctness validation, allowing
   bounded decoding and tokenization checks without requiring full semantic
   validation.
+
+### Changed
+
+- Scan dynamic training samples sequentially without changing their contents or
+  order.
 
 ### Removed
 
