@@ -153,10 +153,11 @@ fn scan_budget(threshold: ThresholdSpec, total_bytes: usize) -> Option<usize> {
 fn make_training_order<R: Rows + ?Sized>(
     rows: &R,
     threshold: ThresholdSpec,
+    total_bytes: usize,
     seed: u64,
 ) -> (Vec<u32>, usize) {
     let n = rows.num_rows();
-    let scan_budget = scan_budget(threshold, rows.total_bytes());
+    let scan_budget = scan_budget(threshold, total_bytes);
     let mut shuffle_k = match threshold {
         ThresholdSpec::Dynamic(dt) => {
             (((dt.sample_fraction * 2.0).min(1.0) * n as f64) as usize + 1024).min(n)
@@ -262,17 +263,17 @@ fn gather_sample<S: ScanRows + ?Sized>(rows: &S, budget: usize) -> Option<Gather
 /// dictionary lexicographically. The caller guarantees `cfg.max_dict_bits` is in
 /// `9..=16`.
 pub(crate) fn train<R: Rows + ?Sized>(rows: &R, cfg: &TrainingConfig) -> TrainResult {
+    let total_bytes = rows.total_bytes();
     let seed = cfg.seed.unwrap_or_else(|| {
         use rand::Rng;
         rand::rng().random()
     });
-    let (order, selected_start) = make_training_order(rows, cfg.threshold, seed);
+    let (order, selected_start) = make_training_order(rows, cfg.threshold, total_bytes, seed);
     let selected = SelectedRows {
         rows,
         order: &order[selected_start..],
     };
 
-    let total_bytes = rows.total_bytes();
     let gathered = scan_budget(cfg.threshold, total_bytes)
         .filter(|&budget| budget <= total_bytes / 2)
         .and_then(|budget| gather_sample(&selected, budget));
@@ -660,7 +661,7 @@ pub(crate) mod tests {
                         }),
                         seed: Some(42),
                     };
-                    let (order, start) = make_training_order(&rows, cfg.threshold, 42);
+                    let (order, start) = make_training_order(&rows, cfg.threshold, total_bytes, 42);
                     let selected = SelectedRows {
                         rows: &rows,
                         order: &order[start..],
