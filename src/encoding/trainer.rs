@@ -194,26 +194,11 @@ fn make_training_order<R: Rows + ?Sized>(
     }
 }
 
-trait ScanRows {
-    fn num_rows(&self) -> usize;
-    fn row(&self, i: usize) -> &[u8];
-}
-
-struct SelectedRows<'a, R: Rows + ?Sized> {
+fn selected_rows<'a, R: Rows + ?Sized>(
     rows: &'a R,
     order: &'a [u32],
-}
-
-impl<R: Rows + ?Sized> ScanRows for SelectedRows<'_, R> {
-    #[inline]
-    fn num_rows(&self) -> usize {
-        self.order.len()
-    }
-
-    #[inline]
-    fn row(&self, i: usize) -> &[u8] {
-        self.rows.row(self.order[i] as usize)
-    }
+) -> impl ExactSizeIterator<Item = &'a [u8]> + 'a {
+    order.iter().map(move |&idx| rows.row(idx as usize))
 }
 
 struct GatheredSample {
@@ -221,30 +206,26 @@ struct GatheredSample {
     offsets: Vec<usize>,
 }
 
-impl ScanRows for GatheredSample {
-    #[inline]
-    fn num_rows(&self) -> usize {
-        self.offsets.len() - 1
-    }
-
-    #[inline]
-    fn row(&self, i: usize) -> &[u8] {
-        let start = self.offsets[i];
-        let end = self.offsets[i + 1];
-        &self.bytes[start..end]
+impl GatheredSample {
+    fn rows(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.offsets
+            .windows(2)
+            .map(|bounds| &self.bytes[bounds[0]..bounds[1]])
     }
 }
 
 /// Copy a budgeted random sample into scan order for sequential access.
-fn gather_sample<S: ScanRows + ?Sized>(rows: &S, budget: usize) -> GatheredSample {
+fn gather_sample<'a>(
+    rows: impl ExactSizeIterator<Item = &'a [u8]>,
+    budget: usize,
+) -> GatheredSample {
     let mut bytes = Vec::with_capacity(budget);
-    let mut offsets = Vec::with_capacity(rows.num_rows().min(1024) + 1);
+    let mut offsets = Vec::with_capacity(rows.len().min(1024) + 1);
     offsets.push(0);
-    for i in 0..rows.num_rows() {
+    for row in rows {
         if bytes.len() > budget {
             break;
         }
-        let row = rows.row(i);
         let len = row.len();
         if bytes.len() + len > bytes.capacity() {
             bytes.reserve_exact(len);
@@ -265,22 +246,20 @@ pub(crate) fn train<R: Rows + ?Sized>(rows: &R, cfg: &TrainingConfig) -> TrainRe
         rand::rng().random()
     });
     let (order, selected_start) = make_training_order(rows, cfg.threshold, total_bytes, seed);
-    let selected = SelectedRows {
-        rows,
-        order: &order[selected_start..],
-    };
+    let selected_order = &order[selected_start..];
 
-    let gathered = scan_budget(cfg.threshold, total_bytes)
-        .filter(|&budget| budget <= total_bytes / 2)
-        .map(|budget| gather_sample(&selected, budget));
-    match gathered {
-        Some(sample) => discover_tokens(&sample, cfg, total_bytes),
-        None => discover_tokens(&selected, cfg, total_bytes),
+    if let Some(budget) =
+        scan_budget(cfg.threshold, total_bytes).filter(|&budget| budget <= total_bytes / 2)
+    {
+        let sample = gather_sample(selected_rows(rows, selected_order), budget);
+        discover_tokens(sample.rows(), cfg, total_bytes)
+    } else {
+        discover_tokens(selected_rows(rows, selected_order), cfg, total_bytes)
     }
 }
 
-fn discover_tokens<S: ScanRows + ?Sized>(
-    rows: &S,
+fn discover_tokens<'a>(
+    rows: impl Iterator<Item = &'a [u8]>,
     cfg: &TrainingConfig,
     total_bytes: usize,
 ) -> TrainResult {
@@ -318,12 +297,11 @@ fn discover_tokens<S: ScanRows + ?Sized>(
     let mut full_dictionary = false;
     let mut budget_exhausted = false;
 
-    for i in 0..rows.num_rows() {
+    for row in rows {
         if full_dictionary || budget_exhausted {
             break;
         }
 
-        let row = rows.row(i);
         if row.is_empty() {
             continue;
         }
@@ -658,15 +636,13 @@ pub(crate) mod tests {
                         seed: Some(42),
                     };
                     let (order, start) = make_training_order(&rows, cfg.threshold, total_bytes, 42);
-                    let selected = SelectedRows {
-                        rows: &rows,
-                        order: &order[start..],
-                    };
+                    let selected_order = &order[start..];
                     let budget = scan_budget(cfg.threshold, total_bytes).unwrap();
-                    let gathered = gather_sample(&selected, budget);
+                    let gathered = gather_sample(selected_rows(&rows, selected_order), budget);
 
-                    let in_place = discover_tokens(&selected, &cfg, total_bytes);
-                    let copied = discover_tokens(&gathered, &cfg, total_bytes);
+                    let in_place =
+                        discover_tokens(selected_rows(&rows, selected_order), &cfg, total_bytes);
+                    let copied = discover_tokens(gathered.rows(), &cfg, total_bytes);
                     assert_eq!(in_place.dict.bytes(), copied.dict.bytes());
                     assert_eq!(in_place.dict.offsets(), copied.dict.offsets());
                 }
