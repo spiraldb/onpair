@@ -218,7 +218,7 @@ impl<R: Rows + ?Sized> ScanRows for SelectedRows<'_, R> {
 
 struct GatheredSample {
     bytes: Vec<u8>,
-    offsets: Vec<u32>,
+    offsets: Vec<usize>,
 }
 
 impl ScanRows for GatheredSample {
@@ -229,18 +229,14 @@ impl ScanRows for GatheredSample {
 
     #[inline]
     fn row(&self, i: usize) -> &[u8] {
-        let start = self.offsets[i] as usize;
-        let end = self.offsets[i + 1] as usize;
+        let start = self.offsets[i];
+        let end = self.offsets[i + 1];
         &self.bytes[start..end]
     }
 }
 
 /// Copy a budgeted random sample into scan order for sequential access.
-fn gather_sample<S: ScanRows + ?Sized>(rows: &S, budget: usize) -> Option<GatheredSample> {
-    if budget > u32::MAX as usize {
-        return None;
-    }
-
+fn gather_sample<S: ScanRows + ?Sized>(rows: &S, budget: usize) -> GatheredSample {
     let mut bytes = Vec::with_capacity(budget);
     let mut offsets = Vec::with_capacity(rows.num_rows().min(1024) + 1);
     offsets.push(0);
@@ -254,9 +250,9 @@ fn gather_sample<S: ScanRows + ?Sized>(rows: &S, budget: usize) -> Option<Gather
             bytes.reserve_exact(len);
         }
         bytes.extend_from_slice(row);
-        offsets.push(bytes.len() as u32);
+        offsets.push(bytes.len());
     }
-    Some(GatheredSample { bytes, offsets })
+    GatheredSample { bytes, offsets }
 }
 
 /// Discover merge tokens via frequency-threshold scanning, then sort the
@@ -276,7 +272,7 @@ pub(crate) fn train<R: Rows + ?Sized>(rows: &R, cfg: &TrainingConfig) -> TrainRe
 
     let gathered = scan_budget(cfg.threshold, total_bytes)
         .filter(|&budget| budget <= total_bytes / 2)
-        .and_then(|budget| gather_sample(&selected, budget));
+        .map(|budget| gather_sample(&selected, budget));
     match gathered {
         Some(sample) => discover_tokens(&sample, cfg, total_bytes),
         None => discover_tokens(&selected, cfg, total_bytes),
@@ -667,7 +663,7 @@ pub(crate) mod tests {
                         order: &order[start..],
                     };
                     let budget = scan_budget(cfg.threshold, total_bytes).unwrap();
-                    let gathered = gather_sample(&selected, budget).unwrap();
+                    let gathered = gather_sample(&selected, budget);
 
                     let in_place = discover_tokens(&selected, &cfg, total_bytes);
                     let copied = discover_tokens(&gathered, &cfg, total_bytes);
