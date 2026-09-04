@@ -26,7 +26,8 @@ pub struct Parser {
 
 impl Parser {
     /// Train a dictionary against `bytes` / `offsets` and build the matching
-    /// matcher. `offsets` has length `n + 1`.
+    /// matcher. `offsets` has length `n + 1`. Its first entry may be non-zero;
+    /// bytes outside `offsets[0]..offsets[n]` are ignored.
     ///
     /// # Errors
     /// [`Error::InvalidArg`] if `offsets` is empty or its last entry exceeds
@@ -66,7 +67,8 @@ impl Parser {
 
     /// Encode `bytes` / `offsets` using this parser. The dictionary is cloned
     /// into the returned [`Column`], so the column is self-contained — the
-    /// strings need not be the corpus the parser was trained on.
+    /// strings need not be the corpus the parser was trained on. The first
+    /// offset may be non-zero; bytes outside the covered range are ignored.
     ///
     /// # Errors
     /// [`Error::InvalidArg`] if `offsets` is empty or its last entry exceeds
@@ -367,6 +369,23 @@ mod tests {
         assert_eq!(validate_offsets::<u32>(b"abc", &[]), Err(Error::InvalidArg));
         assert_eq!(validate_offsets(b"abc", &[0u32, 4]), Err(Error::InvalidArg));
         assert_eq!(validate_offsets(b"abc", &[0u32, 3]), Ok(()));
+    }
+
+    #[test]
+    fn nonzero_start_offset_roundtrips() {
+        let bytes = b"skipalphabetaunused";
+        let offsets = [4u32, 9, 13];
+        let column = crate::compress(bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let dict = column.dict.as_view();
+
+        assert_eq!(
+            decode_row(&column.codes, &column.row_offsets, dict, 0),
+            b"alpha"
+        );
+        assert_eq!(
+            decode_row(&column.codes, &column.row_offsets, dict, 1),
+            b"beta"
+        );
     }
 
     #[test]

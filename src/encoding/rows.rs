@@ -36,7 +36,9 @@ impl<O: Offset> Rows for ArrowRows<'_, O> {
 
     #[inline]
     fn total_bytes(&self) -> usize {
-        self.offsets[self.offsets.len() - 1].to_usize()
+        let first = self.offsets[0].to_usize();
+        let last = self.offsets[self.offsets.len() - 1].to_usize();
+        last - first
     }
 
     #[inline]
@@ -92,6 +94,12 @@ mod tests {
         assert_eq!(rows.total_bytes(), 9);
         assert_eq!(rows.row(0), b"alpha");
         assert_eq!(rows.row(1), b"beta");
+    }
+
+    #[test]
+    fn arrow_rows_support_nonzero_first_offset() {
+        let rows = ArrowRows::new(b"_row_", &[1u32, 4]);
+        assert_eq!((rows.total_bytes(), rows.row(0)), (3, b"row".as_slice()));
     }
 
     #[test]
