@@ -110,11 +110,10 @@ impl Parser {
         row_offsets.push(O::from_usize(0));
 
         for i in 0..n {
-            let (window, len) = rows.row(i);
-            debug_assert!(len <= window.len(), "row {i} is longer than its window");
+            let row = rows.row(i);
             let mut pos = 0;
-            while pos < len {
-                let (tok, mlen) = self.lpm.find_longest_match(&window[pos..], len - pos);
+            while pos < row.len() {
+                let (tok, mlen) = self.lpm.find_longest_match(&row[pos..]);
                 codes.push(tok);
                 pos += mlen;
             }
@@ -171,10 +170,10 @@ mod tests {
         let mut codes = Vec::new();
         let mut row_offsets = vec![O::from_usize(0)];
         for i in 0..rows.num_rows() {
-            let (window, len) = rows.row(i);
+            let row = rows.row(i);
             let mut pos = 0;
-            while pos < len {
-                let (tok, mlen) = lpm.find_longest_match(&window[pos..], len - pos);
+            while pos < row.len() {
+                let (tok, mlen) = lpm.find_longest_match(&row[pos..]);
                 codes.push(tok);
                 pos += mlen;
             }

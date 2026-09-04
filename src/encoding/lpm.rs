@@ -255,14 +255,15 @@ impl LongestPrefixMatcher {
         }
     }
 
-    /// Longest token prefixed by `data[..max_len]`, with its length.
+    /// Longest token whose bytes are a prefix of `data`, with that prefix's
+    /// length.
     ///
-    /// `data` may include bytes after the current row; `max_len` bounds matching
-    /// to that row. Requires `1 <= max_len <= data.len()`.
+    /// Precondition: `!data.is_empty()` and the matcher contains every
+    /// single-byte token (always true after [`new`](Self::new) or
+    /// [`from_dictionary`](Self::from_dictionary) with a complete dictionary).
     #[inline]
-    pub(crate) fn find_longest_match(&self, data: &[u8], max_len: usize) -> (Token, usize) {
-        debug_assert!(max_len >= 1 && max_len <= data.len());
-        let max_len = max_len.min(MAX_TOKEN_SIZE);
+    pub(crate) fn find_longest_match(&self, data: &[u8]) -> (Token, usize) {
+        let max_len = data.len().min(MAX_TOKEN_SIZE);
         // The first up-to-8 bytes serve as both the long-bucket prefix key and
         // the short-map probe window, so load them once.
         let low64 = load_le_u64(data, max_len.min(BUCKET_PREFIX_LEN));
@@ -311,7 +312,7 @@ mod tests {
     }
 
     fn find_str(lpm: &LongestPrefixMatcher, s: &str) -> (Token, usize) {
-        lpm.find_longest_match(s.as_bytes(), s.len())
+        lpm.find_longest_match(s.as_bytes())
     }
 
     fn make_test_dictionary(extra: &[&str]) -> CompactDictionary {
@@ -340,7 +341,7 @@ mod tests {
         let lpm = LongestPrefixMatcher::new();
         for i in 0u16..=255 {
             let b = [i as u8];
-            let (tok, len) = lpm.find_longest_match(&b, b.len());
+            let (tok, len) = lpm.find_longest_match(&b);
             assert_eq!(tok, i, "wrong token for byte {i}");
             assert_eq!(len, 1, "wrong length for byte {i}");
         }
@@ -384,7 +385,7 @@ mod tests {
         let pat = "0123456789abcdef";
         assert_eq!(pat.len(), MAX_TOKEN_SIZE);
         let id = lpm.insert(pat.as_bytes());
-        let (tok, len) = lpm.find_longest_match(pat.as_bytes(), pat.len());
+        let (tok, len) = lpm.find_longest_match(pat.as_bytes());
         assert_eq!((tok, len), (id, MAX_TOKEN_SIZE));
     }
 
@@ -438,7 +439,7 @@ mod tests {
         let mut lpm = LongestPrefixMatcher::new();
         let data = [0u8; 10];
         let id = lpm.insert(&data);
-        assert_eq!(lpm.find_longest_match(&data, data.len()), (id, 10));
+        assert_eq!(lpm.find_longest_match(&data), (id, 10));
     }
 
     // ── trie promotion (>128 entries in one bucket) ───────────────────────────
@@ -457,7 +458,7 @@ mod tests {
             let mut buf = prefix.clone();
             buf.push(i as u8);
             buf.push(0xFF);
-            let (tok, len) = lpm.find_longest_match(&buf, buf.len());
+            let (tok, len) = lpm.find_longest_match(&buf);
             assert_eq!((tok, len), (inserted[i as usize], 9), "token index {i}");
         }
     }
@@ -478,7 +479,7 @@ mod tests {
             buf.push(0x00);
             buf.push(i as u8);
             buf.push(0xFF);
-            let (tok, len) = lpm.find_longest_match(&buf, buf.len());
+            let (tok, len) = lpm.find_longest_match(&buf);
             assert_eq!((tok, len), (inserted[i as usize], 10), "token index {i}");
         }
     }

@@ -180,7 +180,7 @@ fn make_training_order<R: Rows + ?Sized>(
         };
         let selected_bytes = order[selected_start..]
             .iter()
-            .map(|&idx| rows.row(idx as usize).1)
+            .map(|&idx| rows.row(idx as usize).len())
             .sum::<usize>();
         if selected_bytes > scan_budget || shuffle_k == n {
             return (order, selected_start);
@@ -195,7 +195,7 @@ fn make_training_order<R: Rows + ?Sized>(
 
 trait ScanRows {
     fn num_rows(&self) -> usize;
-    fn row(&self, i: usize) -> (&[u8], usize);
+    fn row(&self, i: usize) -> &[u8];
 }
 
 struct SelectedRows<'a, R: Rows + ?Sized> {
@@ -210,7 +210,7 @@ impl<R: Rows + ?Sized> ScanRows for SelectedRows<'_, R> {
     }
 
     #[inline]
-    fn row(&self, i: usize) -> (&[u8], usize) {
+    fn row(&self, i: usize) -> &[u8] {
         self.rows.row(self.order[i] as usize)
     }
 }
@@ -227,10 +227,10 @@ impl ScanRows for GatheredSample {
     }
 
     #[inline]
-    fn row(&self, i: usize) -> (&[u8], usize) {
+    fn row(&self, i: usize) -> &[u8] {
         let start = self.offsets[i] as usize;
         let end = self.offsets[i + 1] as usize;
-        (&self.bytes[start..], end - start)
+        &self.bytes[start..end]
     }
 }
 
@@ -247,12 +247,12 @@ fn gather_sample<S: ScanRows + ?Sized>(rows: &S, budget: usize) -> Option<Gather
         if bytes.len() > budget {
             break;
         }
-        let (window, len) = rows.row(i);
-        debug_assert!(len <= window.len(), "row is longer than its window");
+        let row = rows.row(i);
+        let len = row.len();
         if bytes.len() + len > bytes.capacity() {
             bytes.reserve_exact(len);
         }
-        bytes.extend_from_slice(&window[..len]);
+        bytes.extend_from_slice(row);
         offsets.push(bytes.len() as u32);
     }
     Some(GatheredSample { bytes, offsets })
@@ -326,13 +326,12 @@ fn discover_tokens<S: ScanRows + ?Sized>(
             break;
         }
 
-        let (window, len) = rows.row(i);
-        debug_assert!(len <= window.len(), "row is longer than its window");
-        if len == 0 {
+        let row = rows.row(i);
+        if row.is_empty() {
             continue;
         }
 
-        let (mut prev_id, mut prev_len) = lpm.find_longest_match(window, len);
+        let (mut prev_id, mut prev_len) = lpm.find_longest_match(row);
         let mut pos = prev_len;
 
         if let Some(ref mut dyn_) = dyn_ctrl {
@@ -343,8 +342,8 @@ fn discover_tokens<S: ScanRows + ?Sized>(
             }
         }
 
-        while pos < len {
-            let (curr_id, curr_len) = lpm.find_longest_match(&window[pos..], len - pos);
+        while pos < row.len() {
+            let (curr_id, curr_len) = lpm.find_longest_match(&row[pos..]);
 
             if let Some(ref mut dyn_) = dyn_ctrl {
                 dyn_.on_bytes_scanned(curr_len);
@@ -361,7 +360,7 @@ fn discover_tokens<S: ScanRows + ?Sized>(
                 let f_slot = freq.entry(key).or_insert(0);
                 *f_slot = f_slot.saturating_add(1);
                 if *f_slot >= threshold {
-                    let pair = &window[pos - prev_len..pos + curr_len];
+                    let pair = &row[pos - prev_len..pos + curr_len];
                     let new_id = lpm.insert(pair);
                     dict_bytes.extend_from_slice(pair);
                     dict_offsets.push(dict_bytes.len() as u32);
@@ -553,7 +552,7 @@ pub(crate) mod tests {
         let n = view.num_tokens();
         for id in 0..n {
             let bytes = view.token(id as Token);
-            let (tok, len) = result.lpm.find_longest_match(bytes, bytes.len());
+            let (tok, len) = result.lpm.find_longest_match(bytes);
             assert_eq!(tok, id as Token, "id mismatch for token {id}");
             assert_eq!(len, bytes.len(), "length mismatch for token {id}");
         }
@@ -679,7 +678,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn gathering_is_independent_of_lookahead() {
+    fn contiguous_and_separate_rows_train_identically() {
         let corpus: Vec<Vec<u8>> = make_user_strings(300)
             .into_iter()
             .map(String::into_bytes)

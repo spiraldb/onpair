@@ -11,9 +11,8 @@ pub trait Rows {
     /// Total bytes across every row.
     fn total_bytes(&self) -> usize;
 
-    /// Return row `i` as `(window, len)`. The row is `window[..len]`; remaining
-    /// bytes are optional lookahead for the matcher.
-    fn row(&self, i: usize) -> (&[u8], usize);
+    /// Return row `i`.
+    fn row(&self, i: usize) -> &[u8];
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -41,10 +40,10 @@ impl<O: Offset> Rows for ArrowRows<'_, O> {
     }
 
     #[inline]
-    fn row(&self, i: usize) -> (&[u8], usize) {
+    fn row(&self, i: usize) -> &[u8] {
         let start = self.offsets[i].to_usize();
         let end = self.offsets[i + 1].to_usize();
-        (&self.bytes[start..], end - start)
+        &self.bytes[start..end]
     }
 }
 
@@ -60,9 +59,8 @@ impl<T: AsRef<[u8]>> Rows for [T] {
     }
 
     #[inline]
-    fn row(&self, i: usize) -> (&[u8], usize) {
-        let row = self[i].as_ref();
-        (row, row.len())
+    fn row(&self, i: usize) -> &[u8] {
+        self[i].as_ref()
     }
 }
 
@@ -78,7 +76,7 @@ impl<R: Rows + ?Sized> Rows for &R {
     }
 
     #[inline]
-    fn row(&self, i: usize) -> (&[u8], usize) {
+    fn row(&self, i: usize) -> &[u8] {
         (**self).row(i)
     }
 }
@@ -88,28 +86,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arrow_rows_include_lookahead() {
+    fn arrow_rows_are_exact_slices() {
         let rows = ArrowRows::new(b"alphabeta", &[0u32, 5, 9]);
         assert_eq!(rows.num_rows(), 2);
         assert_eq!(rows.total_bytes(), 9);
-        assert_eq!(rows.row(0), (b"alphabeta".as_slice(), 5));
-        assert_eq!(rows.row(1), (b"beta".as_slice(), 4));
+        assert_eq!(rows.row(0), b"alpha");
+        assert_eq!(rows.row(1), b"beta");
     }
 
     #[test]
-    fn slice_rows_have_no_lookahead() {
+    fn slice_rows_are_exact_slices() {
         let rows: &[&[u8]] = &[b"alpha", b"", b"beta"];
         assert_eq!(rows.num_rows(), 3);
         assert_eq!(rows.total_bytes(), 9);
-        for i in 0..rows.num_rows() {
-            let (window, len) = rows.row(i);
-            assert_eq!(window.len(), len);
-        }
+        assert_eq!(rows.row(0), b"alpha");
+        assert_eq!(rows.row(1), b"");
+        assert_eq!(rows.row(2), b"beta");
     }
 
     #[test]
     fn owned_rows_are_supported() {
         let rows = [b"one".to_vec(), b"two".to_vec()];
-        assert_eq!(rows.as_slice().row(1).0, b"two");
+        assert_eq!(rows.as_slice().row(1), b"two");
     }
 }
