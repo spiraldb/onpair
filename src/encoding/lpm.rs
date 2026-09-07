@@ -81,6 +81,54 @@ fn mask_u64(len: usize) -> u64 {
     }
 }
 
+/// Immutable blocked Bloom front-end for an existing hashbrown map.
+/// Reuses the map's own hash, including its randomized builder.
+#[derive(Debug, Clone)]
+struct MapFilter {
+    words: Box<[u64]>,
+}
+impl MapFilter {
+    fn from_map<K: std::hash::Hash, V>(map: &HashMap<K, V>) -> Self {
+        use std::hash::BuildHasher;
+        let count = map
+            .len()
+            .saturating_mul(16)
+            .div_ceil(64)
+            .max(1)
+            .next_power_of_two();
+        let mut me = Self {
+            words: vec![0; count].into_boxed_slice(),
+        };
+        for key in map.keys() {
+            let hash = map.hasher().hash_one(key);
+            let word = ((hash >> 8) as usize) & (count - 1);
+            me.words[word] |= Self::bits(hash);
+        }
+        me
+    }
+    #[inline]
+    fn bits(hash: u64) -> u64 {
+        (1 << (hash & 63)) | (1 << ((hash >> 32) & 63)) | (1 << ((hash >> 48) & 63))
+    }
+    #[inline]
+    fn get<'a, K: std::hash::Hash + Eq, V>(
+        &self,
+        map: &'a HashMap<K, V>,
+        key: &K,
+    ) -> Option<&'a V> {
+        use std::hash::BuildHasher;
+        let hash = map.hasher().hash_one(key);
+        let word = ((hash >> 8) as usize) & (self.words.len() - 1);
+        let mask = Self::bits(hash);
+        if self.words[word] & mask != mask {
+            return None;
+        }
+        map.raw_entry()
+            .from_key_hashed_nocheck(hash, key)
+            .map(|(_, value)| value)
+    }
+}
+
 /// One long-token entry within a bucket: the suffix bytes after the shared
 /// 8-byte prefix (`slen` of them, packed little-endian and masked to that
 /// length) and the token id.
@@ -176,6 +224,8 @@ impl GroupedBucket {
 /// [`find_longest_match`](Self::find_longest_match) is total.
 #[derive(Default, Debug, Clone)]
 pub(crate) struct LongestPrefixMatcher {
+    short_filter: Option<MapFilter>,
+
     /// Length `1..=8` tokens keyed by (low-`len`-byte u64, length).
     short_map: HashMap<(u64, u8), Token>,
     /// Length `9..=16` tokens bucketed by their 8-byte prefix.
@@ -197,6 +247,7 @@ impl LongestPrefixMatcher {
         Self {
             short_map,
             long_map: HashMap::new(),
+            short_filter: None,
             max_short_len: 1,
             next_id: 256,
         }
@@ -219,12 +270,17 @@ impl LongestPrefixMatcher {
         let mut me = Self {
             short_map: HashMap::with_capacity(n.min(BUCKET_PREFIX_LEN * 256)),
             long_map: HashMap::new(),
+            short_filter: None,
             max_short_len: 1,
             next_id: n as u32,
         };
         for i in 0..n {
             let id = i as Token;
             me.insert_internal(dict.token(id), id);
+        }
+        // Skip small maps to avoid adding a filter check to cheap lookups.
+        if me.short_map.len() >= 512 {
+            me.short_filter = Some(MapFilter::from_map(&me.short_map));
         }
         me
     }
@@ -233,6 +289,7 @@ impl LongestPrefixMatcher {
     ///
     /// Precondition: `1 <= data.len() <= MAX_TOKEN_SIZE` and `size() < 65_536`.
     pub(crate) fn insert(&mut self, data: &[u8]) -> Token {
+        self.short_filter = None;
         let id = self.next_id as Token;
         self.next_id += 1;
         self.insert_internal(data, id);
@@ -282,6 +339,14 @@ impl LongestPrefixMatcher {
     /// [`from_dictionary`](Self::from_dictionary) with a complete dictionary).
     #[inline]
     pub(crate) fn find_longest_match(&self, data: &[u8]) -> (Token, usize) {
+        self.find_with::<true>(data)
+    }
+    #[inline]
+    pub(crate) fn find_longest_match_training(&self, data: &[u8]) -> (Token, usize) {
+        self.find_with::<false>(data)
+    }
+    #[inline]
+    fn find_with<const FROZEN: bool>(&self, data: &[u8]) -> (Token, usize) {
         let (lo64, hi64) = load_window(data);
         let win = data.len().min(MAX_TOKEN_SIZE);
 
@@ -303,7 +368,11 @@ impl LongestPrefixMatcher {
 
         let short_max = win.min(self.max_short_len as usize);
         for len in (1..=short_max).rev() {
-            if let Some(&t) = self.short_map.get(&(lo64 & mask_u64(len), len as u8)) {
+            if let Some(&t) = if FROZEN && let Some(filter) = &self.short_filter {
+                filter.get(&self.short_map, &(lo64 & mask_u64(len), len as u8))
+            } else {
+                self.short_map.get(&(lo64 & mask_u64(len), len as u8))
+            } {
                 return (t, len);
             }
         }
@@ -321,6 +390,90 @@ impl LongestPrefixMatcher {
 mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary};
+
+    #[test]
+    fn short_filter_matches_unfiltered_lookup_and_invalidates_on_insert() {
+        let mut state = 42u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut tokens = std::collections::BTreeSet::new();
+        for i in 0u16..=255 {
+            tokens.insert(vec![i as u8]);
+        }
+        for _ in 0..8000 {
+            let len = 2 + random() as usize % 15;
+            let mut key: Vec<u8> = (0..len).map(|_| random() as u8).collect();
+            if len >= 8 {
+                key[..4].copy_from_slice(b"abcd");
+            }
+            tokens.insert(key);
+        }
+        for take in [300, 4000, tokens.len()] {
+            let mut bytes = Vec::new();
+            let mut offsets = vec![0u32];
+            // Preserve completeness independently of sorted token truncation.
+            for i in 0u16..=255 {
+                bytes.push(i as u8);
+                offsets.push(bytes.len() as u32);
+            }
+            for token in tokens.iter().filter(|x| x.len() > 1).take(take) {
+                bytes.extend_from_slice(token);
+                offsets.push(bytes.len() as u32);
+            }
+            let dict = CompactDictionary::from_raw(bytes, offsets);
+            let frozen = LongestPrefixMatcher::from_dictionary(dict.as_view());
+            for token in tokens.iter().filter(|x| !x.is_empty()) {
+                for len in 1..=token.len() {
+                    assert_eq!(
+                        frozen.find_longest_match(&token[..len]),
+                        frozen.find_longest_match_training(&token[..len])
+                    );
+                }
+            }
+            for _ in 0..10000 {
+                let len = 1 + random() as usize % 32;
+                let row: Vec<u8> = (0..len).map(|_| random() as u8).collect();
+                assert_eq!(
+                    frozen.find_longest_match(&row),
+                    frozen.find_longest_match_training(&row)
+                );
+            }
+            let mut thawed = frozen.clone();
+            let id = thawed.insert(b"new_token_123456");
+            assert_eq!(
+                thawed.find_longest_match(b"new_token_123456"),
+                (id, b"new_token_123456".len())
+            );
+        }
+    }
+
+    #[test]
+    fn short_filter_skips_small_dictionaries() {
+        let mut bytes: Vec<u8> = (0u16..=255).map(|i| i as u8).collect();
+        let mut offsets: Vec<u32> = (0..=256).collect();
+        for i in 0u16..256 {
+            bytes.extend_from_slice(&[0, i as u8]);
+            offsets.push(bytes.len() as u32);
+        }
+        let full = CompactDictionary::from_raw(bytes.clone(), offsets.clone());
+        assert!(
+            LongestPrefixMatcher::from_dictionary(full.as_view())
+                .short_filter
+                .is_some()
+        );
+        offsets.pop();
+        bytes.truncate(*offsets.last().unwrap() as usize);
+        let small = CompactDictionary::from_raw(bytes, offsets);
+        assert!(
+            LongestPrefixMatcher::from_dictionary(small.as_view())
+                .short_filter
+                .is_none()
+        );
+    }
 
     fn insert_str(lpm: &mut LongestPrefixMatcher, s: &str) -> Token {
         lpm.insert(s.as_bytes())

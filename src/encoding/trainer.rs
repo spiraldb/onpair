@@ -358,7 +358,7 @@ fn discover_tokens<'a>(
             continue;
         }
 
-        let (mut prev_id, mut prev_len) = lpm.find_longest_match(row);
+        let (mut prev_id, mut prev_len) = lpm.find_longest_match_training(row);
         let mut pos = prev_len;
 
         if let Some(ref mut dyn_) = dyn_ctrl {
@@ -370,7 +370,7 @@ fn discover_tokens<'a>(
         }
 
         while pos < row.len() {
-            let (curr_id, curr_len) = lpm.find_longest_match(&row[pos..]);
+            let (curr_id, curr_len) = lpm.find_longest_match_training(&row[pos..]);
 
             if let Some(ref mut dyn_) = dyn_ctrl {
                 dyn_.on_bytes_scanned(curr_len);
@@ -578,7 +578,7 @@ pub(crate) mod tests {
         let n = view.num_tokens();
         for id in 0..n {
             let bytes = view.token(id as Token);
-            let (tok, len) = result.lpm.find_longest_match(bytes);
+            let (tok, len) = result.lpm.find_longest_match_training(bytes);
             assert_eq!(tok, id as Token, "id mismatch for token {id}");
             assert_eq!(len, bytes.len(), "length mismatch for token {id}");
         }

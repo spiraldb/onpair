@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speed up matching for large dictionaries.
 - Speed up token-pair frequency counting and reserve capacity for training tables
   and matcher maps.
+- Skip absent short-token map lookups with a Bloom filter during encoding.
 
 ### Fixed
 
