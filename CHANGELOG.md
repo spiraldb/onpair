@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded decoding and tokenization checks without requiring full semantic
   validation.
 
+### Changed
+
+- Encode with a fixed-cost longest-prefix matcher and eight interleaved row
+  cursors. Each lookup is exactly four hash probes chosen by a binary search
+  over token lengths (with markers, after Waldvogel et al.), with no
+  data-dependent branches, so independent rows overlap their lookup latency
+  instead of serializing on it. Encoding is 1.5-1.7x faster on TPC-H text
+  columns and end-to-end compression about 20% faster. Output is byte-identical
+  on those corpora; in general a 40-bit fingerprint collision (about one probe
+  in a trillion) can select a shorter valid token, never an invalid one. The
+  exact incremental matcher still drives training and serves as the encoder's
+  fallback.
+- Add a `compress_trained` TPC-H benchmark that times encoding alone.
+
 ### Removed
 
 - Remove the obsolete cross-implementation benchmark harness and standalone

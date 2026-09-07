@@ -19,7 +19,8 @@
 //
 // Run with: cargo bench --bench tpch
 //
-// Targets the slim public API (`compress` + `ColumnView::decompress_into`).
+// Targets the slim public API (`compress`, `Parser::parse` and
+// `ColumnView::decompress_into`).
 
 use std::collections::HashMap;
 use std::env;
@@ -36,6 +37,7 @@ use onpair::Column;
 use onpair::Config;
 use onpair::DECODE_PADDING;
 use onpair::MaxDictBits;
+use onpair::Parser;
 use onpair::Threshold;
 use onpair::compress;
 use tpchgen::generators::CustomerGenerator;
@@ -230,6 +232,26 @@ fn train_and_compress(bencher: Bencher, param: (&'static str, u8)) {
                 cfg,
             )
             .unwrap()
+        });
+}
+
+/// Encoding alone, against a dictionary trained once up front.
+#[divan::bench(args = PARAMS)]
+fn compress_trained(bencher: Bencher, param: (&'static str, u8)) {
+    let (col, bits) = param;
+    let c = corpus_for(col);
+    let cfg = Config {
+        max_dict_bits: MaxDictBits::new(bits).unwrap(),
+        threshold: Threshold::new(0.2).unwrap(),
+        seed: Some(42),
+    };
+    let parser = Parser::train(&c.bytes, &c.offsets, cfg).unwrap();
+    bencher
+        .counter(divan::counter::BytesCount::new(c.total_bytes))
+        .bench(|| {
+            parser
+                .parse(divan::black_box(&c.bytes), divan::black_box(&c.offsets))
+                .unwrap()
         });
 }
 

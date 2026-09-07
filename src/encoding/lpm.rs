@@ -17,6 +17,12 @@
 //! [`find_longest_match`](LongestPrefixMatcher::find_longest_match) issues a
 //! single hash probe on the 8-byte prefix to reach the long bucket, then falls
 //! through to the short map probing lengths `min(max_len, 8)..1`.
+//!
+//! This matcher supports incremental insertion, which training needs. Its
+//! lookup cost is data-dependent (a bucket scan or trie walk, then a variable
+//! number of probes), so the encode loop uses the fixed-cost
+//! [`FlatMatcher`](crate::encoding::flat::FlatMatcher) built from the final
+//! dictionary and keeps this one as its exact fallback.
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
