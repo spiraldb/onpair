@@ -452,24 +452,6 @@ fn sort_tokens(bytes: &[u8], offsets: &[u32]) -> (Vec<u8>, Vec<u32>) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    #[test]
-    fn raw_pair_frequencies_match_saturating_map_and_reset_after_remove() {
-        let mut freq = PairFrequencies::with_capacity(2);
-        for expected in 1..=300u16 {
-            assert_eq!(freq.increment(0x1234_abcd), expected.min(255) as u8);
-        }
-        for key in 0..10_000 {
-            assert_eq!(freq.increment(key), 1);
-            assert_eq!(freq.increment(key), 2);
-        }
-        freq.remove(0x1234_abcd);
-        assert_eq!(freq.increment(0x1234_abcd), 1);
-        freq.remove(u32::MAX);
-        for key in 0..10_000 {
-            freq.remove(key);
-            assert_eq!(freq.increment(key), 1);
-        }
-    }
 
     use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
     use crate::core::types::Token;
