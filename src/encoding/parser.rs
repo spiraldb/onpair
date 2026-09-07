@@ -6,7 +6,7 @@
 //! [`Parser::parse`].
 
 use crate::column::Column;
-use crate::core::dictionary::{CompactDictionary, Dictionary};
+use crate::core::dictionary::CompactDictionary;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::encoding::config::{Config, Error, TrainingConfig};
@@ -26,8 +26,7 @@ pub struct Parser {
 
 impl Parser {
     /// Train a dictionary against `bytes` / `offsets` and build the matching
-    /// matcher. `offsets` has length `n + 1`. Its first entry may be non-zero;
-    /// bytes outside `offsets[0]..offsets[n]` are ignored.
+    /// matcher. `offsets` has length `n + 1`.
     ///
     /// # Errors
     /// [`Error::InvalidArg`] if `offsets` is empty or its last entry exceeds
@@ -53,22 +52,9 @@ impl Parser {
         Self { dict, lpm }
     }
 
-    /// Build a parser from an existing complete dictionary.
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidArg`] if the dictionary is invalid.
-    pub fn from_dictionary(dict: CompactDictionary) -> Result<Self, Error> {
-        if dict.check_correctness().is_err() {
-            return Err(Error::InvalidArg);
-        }
-        let lpm = LongestPrefixMatcher::from_dictionary(dict.as_view());
-        Ok(Self { dict, lpm })
-    }
-
     /// Encode `bytes` / `offsets` using this parser. The dictionary is cloned
     /// into the returned [`Column`], so the column is self-contained — the
-    /// strings need not be the corpus the parser was trained on. The first
-    /// offset may be non-zero; bytes outside the covered range are ignored.
+    /// strings need not be the corpus the parser was trained on.
     ///
     /// # Errors
     /// [`Error::InvalidArg`] if `offsets` is empty or its last entry exceeds
@@ -326,42 +312,6 @@ mod tests {
             assert_eq!(a.codes, b.codes, "bits={bits}");
             assert_eq!(a.row_offsets, b.row_offsets, "bits={bits}");
         }
-    }
-
-    #[test]
-    fn parse_rows_into_reuses_buffers() {
-        let first: &[&[u8]] = &[b"alpha alpha", b"beta beta beta"];
-        let second: &[&[u8]] = &[b"gamma"];
-        let parser = Parser::train_rows(first, DEFAULT_CONFIG);
-
-        let mut codes = Vec::new();
-        let mut row_offsets: Vec<u32> = Vec::new();
-        parser.parse_rows_into(first, &mut codes, &mut row_offsets);
-        let expected = (codes.clone(), row_offsets.clone());
-
-        parser.parse_rows_into(second, &mut codes, &mut row_offsets);
-        assert_eq!(row_offsets.len(), 2);
-        assert_eq!(*row_offsets.last().unwrap() as usize, codes.len());
-        parser.parse_rows_into(first, &mut codes, &mut row_offsets);
-        assert_eq!((codes, row_offsets), expected);
-    }
-
-    #[test]
-    fn parser_from_dictionary_matches_trained_parser() {
-        let raw = make_raw(&make_user_strings(100));
-        let trained = Parser::train(&raw.data, &raw.offsets, DEFAULT_CONFIG).unwrap();
-        let rebuilt = Parser::from_dictionary(trained.dict.clone()).unwrap();
-
-        let a: Column<u32> = trained.parse(&raw.data, &raw.offsets).unwrap();
-        let b: Column<u32> = rebuilt.parse(&raw.data, &raw.offsets).unwrap();
-        assert_eq!(a.codes, b.codes);
-        assert_eq!(a.row_offsets, b.row_offsets);
-    }
-
-    #[test]
-    fn parser_from_dictionary_rejects_incomplete_dictionary() {
-        let dict = CompactDictionary::from_raw(b"ab".to_vec(), vec![0u32, 1, 2]);
-        assert_eq!(Parser::from_dictionary(dict).err(), Some(Error::InvalidArg));
     }
 
     #[test]

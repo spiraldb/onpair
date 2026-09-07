@@ -38,8 +38,7 @@ pub struct Column<O: Offset> {
 impl<O: Offset> Column<O> {
     /// Compress an Arrow `(bytes, offsets)` value pair end-to-end (train a
     /// dictionary, then encode). `offsets` has `n + 1` entries; string `i` is
-    /// `bytes[offsets[i]..offsets[i + 1]]`. The first offset may be non-zero;
-    /// bytes outside the covered range are ignored.
+    /// `bytes[offsets[i]..offsets[i + 1]]`.
     ///
     /// # Errors
     /// [`Error::InvalidArg`](crate::Error::InvalidArg) if `offsets` is empty or
