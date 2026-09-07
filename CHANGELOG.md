@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Scan dynamic training samples sequentially without changing their contents or
   order.
+- Speed up matching for large dictionaries.
 
 ### Removed
 
