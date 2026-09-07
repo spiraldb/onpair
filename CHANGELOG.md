@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact incremental matcher still drives training and serves as the encoder's
   fallback.
 - Add a `compress_trained` TPC-H benchmark that times encoding alone.
+- Train 1.5-1.6x faster on TPC-H text columns, with identical dictionaries:
+  prefetch the randomly ordered rows a few rows ahead of the scan (half the
+  scan time was DRAM latency), consult a per-2-byte-prefix table of present
+  token lengths so the exact matcher probes only lengths that can exist,
+  insert long-bucket entries in sorted position instead of re-sorting the
+  bucket, sort the final dictionary by integer keys, and build the encode
+  table by direct insertion.
+- Cut the encode loop's instruction count by a tenth: fold the probe length
+  into the table key so a probe compares one field, and derive both cuckoo
+  buckets from the fingerprint's bits with no multiply.
 
 ### Removed
 

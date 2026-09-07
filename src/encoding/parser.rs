@@ -47,7 +47,7 @@ impl Parser {
         let TrainResult { dict, lpm } = train(bytes, offsets, &internal_cfg);
         // `train` returns a dictionary that is sorted and read-padded by
         // construction — nothing left to do here.
-        let flat = FlatMatcher::from_dictionary(dict.as_view());
+        let flat = FlatMatcher::from_dictionary(dict.as_view(), &lpm);
         Self { dict, lpm, flat }
     }
 
@@ -451,7 +451,7 @@ mod tests {
             seed: Some(seed),
         };
         let TrainResult { dict, lpm } = train(&raw.data, &raw.offsets, &cfg);
-        let flat = FlatMatcher::from_dictionary(dict.as_view());
+        let flat = FlatMatcher::from_dictionary(dict.as_view(), &lpm);
         let want = encode_strings(&raw.data, &raw.offsets, &lpm);
         fn check<const K: usize>(
             raw: &crate::test_corpus::Raw,

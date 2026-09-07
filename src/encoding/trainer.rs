@@ -29,6 +29,32 @@ pub(crate) struct TrainResult {
     pub(crate) lpm: LongestPrefixMatcher,
 }
 
+/// Hint the cache to fetch the line holding `p`. Training visits rows in random
+/// order, so without this every row costs a DRAM round trip for its offsets and
+/// another for its bytes, and the scan loop is too branchy for the core to run
+/// far enough ahead to overlap them on its own.
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is a hint with no architectural effect; any address is
+    // permitted, even one that is not mapped.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast::<i8>());
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above; `prfm` never faults.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
+/// How many rows ahead of the scan to prefetch row offsets, and how many ahead
+/// to prefetch row bytes (which needs the offsets to have arrived first).
+const PREFETCH_OFFSETS_AHEAD: usize = 24;
+const PREFETCH_BYTES_AHEAD: usize = 12;
+
 /// Largest dictionary size for a training budget: `2^max_dict_bits`.
 ///
 /// `max_dict_bits` is validated as `9..=16` at the public boundary by
@@ -231,8 +257,10 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
     });
     let (order, selected_start) = make_training_order(offsets, cfg.threshold, seed);
 
-    // Pair frequency map. Key packs two Token values into a u32.
-    let mut freq: HashMap<u32, u8, FxBuildHasher> = HashMap::default();
+    // Pair frequency map. Key packs two Token values into a u32. Pre-sized so
+    // the early growth steps do not rehash; it rarely outgrows this.
+    let mut freq: HashMap<u32, u8, FxBuildHasher> =
+        HashMap::with_capacity_and_hasher(1 << 16, FxBuildHasher::default());
 
     let mut full_dictionary = false;
     let mut budget_exhausted = false;
@@ -240,9 +268,23 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
     // `partial_shuffle` places its selected slice at the end. Consume that
     // random slice directly rather than the mostly original-order remainder at
     // the beginning of `order`.
-    for &idx in &order[selected_start..] {
+    let selected = &order[selected_start..];
+    for (i, &idx) in selected.iter().enumerate() {
         if full_dictionary || budget_exhausted {
             break;
+        }
+
+        // Two-stage prefetch: a row's offsets first, then, once those have had
+        // time to land, its bytes.
+        if let Some(&far) = selected.get(i + PREFETCH_OFFSETS_AHEAD) {
+            prefetch(offsets.as_ptr().wrapping_add(far as usize).cast::<u8>());
+        }
+        if let Some(&near) = selected.get(i + PREFETCH_BYTES_AHEAD) {
+            let s = offsets[near as usize].to_usize();
+            let e = offsets[near as usize + 1].to_usize();
+            let base = data.as_ptr();
+            prefetch(base.wrapping_add(s));
+            prefetch(base.wrapping_add(e.saturating_sub(1)));
         }
 
         let s_start = offsets[idx as usize].to_usize();
@@ -253,7 +295,7 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
         let str_bytes = &data[s_start..s_end];
         let len = str_bytes.len();
 
-        let (mut prev_id, mut prev_len) = lpm.find_longest_match(str_bytes);
+        let (mut prev_id, mut prev_len) = lpm.find_longest_match_in(data, s_start, s_end);
         let mut pos = prev_len;
 
         if let Some(ref mut dyn_) = dyn_ctrl {
@@ -265,7 +307,7 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
         }
 
         while pos < len {
-            let (curr_id, curr_len) = lpm.find_longest_match(&str_bytes[pos..]);
+            let (curr_id, curr_len) = lpm.find_longest_match_in(data, s_start + pos, s_end);
 
             if let Some(ref mut dyn_) = dyn_ctrl {
                 dyn_.on_bytes_scanned(curr_len);
@@ -330,8 +372,21 @@ fn sort_tokens(bytes: &[u8], offsets: &[u32]) -> (Vec<u8>, Vec<u32>) {
     let n = offsets.len() - 1;
     let token = |id: usize| -> &[u8] { &bytes[offsets[id] as usize..offsets[id + 1] as usize] };
 
-    let mut perm: Vec<usize> = (0..n).collect();
-    perm.sort_by(|&a, &b| token(a).cmp(token(b)));
+    // Bytewise-lexicographic order equals order by (big-endian zero-padded
+    // bytes, length): padding with zeros ranks a token before any extension of
+    // it, and equal padded keys can only come from a token and its zero-byte
+    // extensions, which the length then orders. Integer keys sort several times
+    // faster than slice comparisons.
+    let mut keyed: Vec<(u128, u8, u32)> = (0..n)
+        .map(|id| {
+            let t = token(id);
+            let mut buf = [0u8; MAX_TOKEN_SIZE];
+            buf[..t.len()].copy_from_slice(t);
+            (u128::from_be_bytes(buf), t.len() as u8, id as u32)
+        })
+        .collect();
+    keyed.sort_unstable();
+    let perm: Vec<usize> = keyed.iter().map(|&(_, _, id)| id as usize).collect();
 
     let mut out_bytes: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut out_offsets: Vec<u32> = Vec::with_capacity(n + 1);

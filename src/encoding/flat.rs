@@ -24,14 +24,15 @@
 //! Each probe checks one 8-byte slot in each of two candidate buckets (cuckoo
 //! placement), so a lookup is a fixed sequence of loads, compares and selects
 //! with no data-dependent control flow, and short enough that several row
-//! cursors can run it in lockstep. Entries longer than 5 bytes are keyed by a 40-bit
-//! fingerprint rather than their bytes, so the final answer is verified against
-//! the token's bytes; a fingerprint collision is rare (about one in a trillion
-//! probes), and the caller falls back to the exact matcher when it happens.
+//! cursors can run it in lockstep. Entries are keyed by a 44-bit fingerprint of
+//! their bytes and length rather than the bytes themselves, so the final answer
+//! is verified against the token's bytes; a fingerprint collision is rare
+//! (about one probe in ten trillion), and the caller falls back to the exact
+//! matcher when it happens.
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
-use crate::encoding::hash::{Map, map_with_capacity};
+use crate::encoding::lpm::LongestPrefixMatcher;
 
 /// Root of the binary search over lengths `2..=16`.
 const ROOT_LEN: usize = 9;
@@ -45,8 +46,6 @@ const LOAD_FACTOR: f64 = if BUCKET_SLOTS == 1 { 0.45 } else { 0.75 };
 /// Cuckoo displacement budget before the table is grown.
 const MAX_KICKS: usize = 512;
 
-const M1: u64 = 0xC2B2_AE3D_27D4_EB4F;
-const M2: u64 = 0x1656_67B1_9E37_79F9;
 const FP1: u64 = 0xD6E8_FEB8_6659_FD93;
 const FP2: u64 = 0xA0B4_28DB_4A8F_6E05;
 
@@ -54,34 +53,23 @@ const FP2: u64 = 0xA0B4_28DB_4A8F_6E05;
 /// followed by register arithmetic only:
 ///
 /// ```text
-/// bits   0..40   key: exact bytes (`qlen <= 5`) or fingerprint (`qlen >= 6`)
-/// bits  40..44   qlen - 1: length of the entry's bytes, the length it is probed at
+/// bits   0..44   key: fingerprint of the entry's bytes and their length
 /// bits  44..60   bmp: longest real token that is a prefix of the entry's bytes
 /// bits  60..64   bmp_len - 1: length of `bmp`
 /// ```
 ///
-/// Zero is the empty slot; every entry has `qlen >= 2`, so its `qlen - 1` field
-/// is non-zero.
+/// Zero is the empty slot. An entry's key is never zero: the fingerprint has
+/// its lowest bit forced on.
 type Slot = u64;
-const KEY_BITS: u32 = 40;
+const KEY_BITS: u32 = 44;
 const SLOT_PAYLOAD: u32 = 44;
-/// The key and qlen fields: what a probe compares.
-const SLOT_CMP_MASK: u64 = (1u64 << SLOT_PAYLOAD) - 1;
-/// Longest key stored exactly; longer keys are fingerprinted.
-const EXACT_LEN: usize = 5;
+/// The key field: what a probe compares.
+const SLOT_CMP_MASK: u64 = (1u64 << KEY_BITS) - 1;
 
 #[inline(always)]
-fn pack_slot(key: u64, bmp: Token, bmp_len: u8, qlen: u8) -> Slot {
-    debug_assert!(key >> KEY_BITS == 0 && (2..=16).contains(&qlen) && (1..=16).contains(&bmp_len));
-    key | (((qlen - 1) as u64) << KEY_BITS)
-        | ((bmp as u64) << SLOT_PAYLOAD)
-        | (((bmp_len - 1) as u64) << 60)
-}
-
-/// What a probe of `(key, l)` must equal after masking with [`SLOT_CMP_MASK`].
-#[inline(always)]
-fn slot_want(key: u64, l: usize) -> u64 {
-    key | (((l - 1) as u64) << KEY_BITS)
+fn pack_slot(key: u64, bmp: Token, bmp_len: u8) -> Slot {
+    debug_assert!(key >> KEY_BITS == 0 && key != 0 && (1..=16).contains(&bmp_len));
+    key | ((bmp as u64) << SLOT_PAYLOAD) | (((bmp_len - 1) as u64) << 60)
 }
 
 /// A payload: `bmp | (bmp_len - 1) << 16`.
@@ -95,12 +83,13 @@ fn payload_len(p: u32) -> usize {
 }
 
 /// Mask of the low `n` bytes of a `u128`, `n` in `0..=16`.
-#[inline(always)]
-pub(crate) fn mask128(n: usize) -> u128 {
+#[cfg(test)]
+fn mask128(n: usize) -> u128 {
     MASK128[n.min(16)]
 }
 
 /// `MASK128[n]` is the mask of the low `n` bytes of a `u128`.
+#[cfg(test)]
 static MASK128: [u128; 17] = {
     let mut t = [0u128; 17];
     let mut n = 1;
@@ -140,43 +129,34 @@ pub(crate) static KEY_MASKS: [[u64; 2]; 17] = {
     t
 };
 
-/// Select `a` if `cond` else `b`. The condition is a hit/miss on a hash
-/// probe, which is close to a coin flip, so tell the compiler not to turn this
-/// into a branch.
-#[inline(always)]
-fn sel(cond: bool, a: u64, b: u64) -> u64 {
-    std::hint::select_unpredictable(cond, a, b)
-}
-
-/// 40-bit fingerprint of a masked window: `lo` is its first 8 bytes, `hi` the
-/// rest, zero-extended. A folded 64x64-bit multiply (one `mul` on x86) mixes
-/// every bit of both words into every output bit; a plain 64-bit multiply
-/// would let the high bytes of `hi` influence only the high bits of the
-/// product, and keys differing only in their last bytes would collide.
-#[inline(always)]
-fn fingerprint(lo: u64, hi: u64) -> u64 {
-    let p = ((lo ^ FP1) as u128).wrapping_mul((hi ^ FP2) as u128);
-    let x = (p as u64) ^ ((p >> 64) as u64);
-    x >> (64 - KEY_BITS)
-}
-
-/// Table key for the first `l` bytes of the window `(lo, hi)`, `l` in `2..=16`:
-/// the bytes themselves when they fit in the key, else their fingerprint.
+/// Key for the first `l` bytes of the window `(lo, hi)`, `l` in `2..=16`: a
+/// 44-bit fingerprint of those bytes and of `l`, so the same bytes probed at
+/// two lengths (a token and its zero-byte extension) get distinct keys and no
+/// separate length compare is needed. Never zero, so it cannot match an empty
+/// slot.
+///
+/// A folded 64x64-bit multiply (one `mul` on x86) mixes every bit of both
+/// words into every output bit; a plain 64-bit multiply would let the high
+/// bytes of `hi` influence only the high bits of the product, and keys
+/// differing only in their last bytes would collide.
 #[inline(always)]
 fn key_for(lo: u64, hi: u64, l: usize) -> u64 {
     // SAFETY: `l <= 16` by contract; the table has 17 entries.
     let [mlo, mhi] = unsafe { *KEY_MASKS.get_unchecked(l) };
-    let lo = lo & mlo;
-    sel(l > EXACT_LEN, fingerprint(lo, hi & mhi), lo)
+    let p = ((lo & mlo) ^ FP1 ^ (l as u64)) as u128 * ((hi & mhi) ^ FP2) as u128;
+    let x = (p as u64) ^ ((p >> 64) as u64);
+    (x >> (64 - KEY_BITS)) | 1
 }
 
-/// The two candidate buckets for a key, as hashes to be shifted down. Keys
-/// probed at different lengths may share a bucket; the qlen field tells them
-/// apart.
+/// The two candidate bucket indices for a key in a table of `mask + 1`
+/// buckets, `shift = 44 - log2(mask + 1)`. The key is already a fingerprint,
+/// so its top bits index the first bucket directly and a slice of its low bits
+/// displaces the second (cuckoo-filter style); neither costs a multiply.
 #[inline(always)]
-fn hashes(key: u64) -> (u64, u64) {
-    let x = key ^ (key >> 20);
-    (x.wrapping_mul(M1), x.wrapping_mul(M2))
+fn buckets(key: u64, shift: u32, mask: usize) -> (usize, usize) {
+    let b1 = (key >> shift) as usize;
+    let b2 = b1 ^ ((key as usize & mask) | 1);
+    (b1, b2)
 }
 
 /// Verification word of a token: its bytes, zero-extended, with the length
@@ -209,8 +189,10 @@ pub(crate) struct Search {
 #[derive(Debug, Clone)]
 pub(crate) struct FlatMatcher {
     slots: Vec<Slot>,
-    /// `hash >> shift` is a bucket index.
+    /// `key >> shift` is a bucket index: `shift = 44 - log2(buckets)`.
     shift: u32,
+    /// `buckets - 1`.
+    mask: usize,
     /// Id of each single-byte token.
     byte_tok: Vec<Token>,
     /// [`verify_word`] of every token.
@@ -218,94 +200,99 @@ pub(crate) struct FlatMatcher {
 }
 
 impl FlatMatcher {
-    /// Build from a dictionary that contains every single-byte token.
-    pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
+    /// Build from a dictionary that contains every single-byte token, using
+    /// the exact matcher over the same dictionary (with the same token ids) to
+    /// find each marker's best real prefix.
+    pub(crate) fn from_dictionary(
+        dict: CompactDictionaryView<'_>,
+        lpm: &LongestPrefixMatcher,
+    ) -> Self {
         let n = dict.num_tokens();
         let mut byte_tok = vec![0 as Token; 256];
-        let mut tok_bytes = Vec::with_capacity(n);
-        let mut tok_len = Vec::with_capacity(n);
         let mut tok_verify = Vec::with_capacity(n);
-        // Exact set of real tokens, for computing each marker's best prefix.
-        let mut real: Map<(u128, u8), Token> = map_with_capacity(n);
         for i in 0..n {
-            let id = i as Token;
-            let b = dict.token(id);
+            let b = dict.token(i as Token);
             debug_assert!(!b.is_empty() && b.len() <= MAX_TOKEN_SIZE);
-            let w = load_le_u128(b);
-            tok_bytes.push(w);
-            tok_len.push(b.len() as u8);
-            tok_verify.push(verify_word(w, b.len()));
-            real.insert((w, b.len() as u8), id);
+            tok_verify.push(verify_word(load_le_u128(b), b.len()));
             if b.len() == 1 {
-                byte_tok[b[0] as usize] = id;
+                byte_tok[b[0] as usize] = i as Token;
             }
         }
 
-        // Entries keyed by (table key, probe length): real tokens first, then
-        // markers along each token's search path, which never displace a real
-        // token at the same position.
-        let mut entries: Map<(u64, u8), (Token, u8)> = map_with_capacity(n * 2);
-        for i in 0..n {
-            let l = tok_len[i] as usize;
-            if l < 2 {
-                continue;
-            }
-            let w = tok_bytes[i];
-            let (lo, hi) = (w as u64, (w >> 64) as u64);
-            entries.insert((key_for(lo, hi, l), l as u8), (i as Token, l as u8));
-        }
-        for i in 0..n {
-            let l = tok_len[i] as usize;
-            if l < 2 {
-                continue;
-            }
-            let w = tok_bytes[i];
-            let (lo, hi) = (w as u64, (w >> 64) as u64);
-            let mut m = ROOT_LEN;
-            for step in STEPS {
-                if m == l {
-                    break;
-                }
-                if l > m {
-                    // The search must hit here to keep looking for `l`.
-                    entries
-                        .entry((key_for(lo, hi, m), m as u8))
-                        .or_insert_with(|| best_real_prefix(&real, w, m, &byte_tok));
-                    m += step;
-                } else {
-                    m -= step;
-                }
-            }
-            debug_assert_eq!(m, l);
-        }
-
-        // Place the entries; grow and retry if cuckoo insertion fails.
-        let mut buckets = ((entries.len() as f64 / (BUCKET_SLOTS as f64 * LOAD_FACTOR)).ceil()
-            as usize)
-            .next_power_of_two()
-            // At least two buckets keeps `shift < 64`.
-            .max(2);
+        // Real tokens first, then markers along each token's search path; a
+        // marker never displaces a real token at the same key. Everything goes
+        // straight into the table; if placement fails the table doubles and
+        // the pass restarts.
+        // Markers add about half again as many entries as there are tokens.
+        let buckets = ((n + n / 2) as f64 / (BUCKET_SLOTS as f64 * LOAD_FACTOR)).ceil() as usize;
+        let mut buckets = buckets.next_power_of_two().max(2);
         let slots = loop {
-            let shift = 64 - buckets.trailing_zeros();
-            let mut slots = vec![0 as Slot; buckets * BUCKET_SLOTS];
-            let mut rng = 0x2545_F491_4F6C_DD1Du64;
-            let ok = entries.iter().all(|(&(key, qlen), &(bmp, bmp_len))| {
-                insert(
-                    &mut slots,
-                    shift,
-                    pack_slot(key, bmp, bmp_len, qlen),
-                    &mut rng,
-                )
-            });
-            if ok {
-                break slots;
+            debug_assert!(buckets.trailing_zeros() < KEY_BITS);
+            let shift = KEY_BITS - buckets.trailing_zeros();
+            let mask = buckets - 1;
+            let mut table = Table {
+                slots: vec![0 as Slot; buckets * BUCKET_SLOTS],
+                shift,
+                mask,
+                rng: 0x2545_F491_4F6C_DD1Du64,
+            };
+            let placed = (|| {
+                for i in 0..n {
+                    let b = dict.token(i as Token);
+                    let l = b.len();
+                    if l < 2 {
+                        continue;
+                    }
+                    let w = load_le_u128(b);
+                    let key = key_for(w as u64, (w >> 64) as u64, l);
+                    if !table.insert(pack_slot(key, i as Token, l as u8)) {
+                        return false;
+                    }
+                }
+                for i in 0..n {
+                    let b = dict.token(i as Token);
+                    let l = b.len();
+                    if l < 2 {
+                        continue;
+                    }
+                    let w = load_le_u128(b);
+                    let (lo, hi) = (w as u64, (w >> 64) as u64);
+                    let mut m = ROOT_LEN;
+                    for step in STEPS {
+                        if m == l {
+                            break;
+                        }
+                        if l > m {
+                            // The search must hit here to keep looking for `l`.
+                            // The marker's answer is the longest real token that
+                            // is a prefix of its bytes, which the exact matcher
+                            // finds.
+                            let key = key_for(lo, hi, m);
+                            if !table.contains(key) {
+                                let (t, tl) = lpm.find_longest_match(&b[..m]);
+                                if !table.insert(pack_slot(key, t, tl as u8)) {
+                                    return false;
+                                }
+                            }
+                            m += step;
+                        } else {
+                            m -= step;
+                        }
+                    }
+                    debug_assert_eq!(m, l);
+                }
+                true
+            })();
+            if placed {
+                break table.slots;
             }
             buckets *= 2;
         };
-        let shift = 64 - buckets.trailing_zeros();
+        let shift = KEY_BITS - buckets.trailing_zeros();
         Self {
             slots,
             shift,
+            mask: buckets - 1,
             byte_tok,
             tok_verify,
         }
@@ -318,10 +305,9 @@ impl FlatMatcher {
     #[inline(always)]
     fn probe(&self, lo: u64, hi: u64, l: usize, avail: usize) -> (bool, u32) {
         let key = key_for(lo, hi, l);
-        let (h1, h2) = hashes(key);
-        let b1 = (h1 >> self.shift) as usize * BUCKET_SLOTS;
-        let b2 = (h2 >> self.shift) as usize * BUCKET_SLOTS;
-        let want = slot_want(key, l);
+        let (b1, b2) = buckets(key, self.shift, self.mask);
+        let (b1, b2) = (b1 * BUCKET_SLOTS, b2 * BUCKET_SLOTS);
+        let want = key;
         // SAFETY: `hash >> shift < buckets`, so both bucket bases plus
         // `BUCKET_SLOTS - 1` index within `slots`.
         let (s0, s2) = unsafe { (*self.slots.get_unchecked(b1), *self.slots.get_unchecked(b2)) };
@@ -411,52 +397,54 @@ impl FlatMatcher {
     }
 }
 
-/// Longest real token that is a prefix of the first `m` bytes of `w`.
-fn best_real_prefix(
-    real: &Map<(u128, u8), Token>,
-    w: u128,
-    m: usize,
-    byte_tok: &[Token],
-) -> (Token, u8) {
-    for k in (2..m).rev() {
-        if let Some(&t) = real.get(&(w & mask128(k), k as u8)) {
-            return (t, k as u8);
-        }
-    }
-    (byte_tok[w as u8 as usize], 1)
+/// The slot table while it is being filled.
+struct Table {
+    slots: Vec<Slot>,
+    shift: u32,
+    mask: usize,
+    rng: u64,
 }
 
-/// Cuckoo-insert `slot`, displacing existing entries as needed. Returns false
-/// if the displacement budget runs out.
-fn insert(slots: &mut [Slot], shift: u32, mut slot: Slot, rng: &mut u64) -> bool {
-    for _ in 0..MAX_KICKS {
-        let (h1, h2) = hashes(slot & ((1 << KEY_BITS) - 1));
-        let b1 = (h1 >> shift) as usize * BUCKET_SLOTS;
-        let b2 = (h2 >> shift) as usize * BUCKET_SLOTS;
-        for idx in [b1, b2] {
-            for j in 0..BUCKET_SLOTS {
-                if slots[idx + j] == 0 {
-                    slots[idx + j] = slot;
-                    return true;
+impl Table {
+    /// Whether `key` is already placed.
+    fn contains(&self, key: u64) -> bool {
+        let (b1, b2) = buckets(key, self.shift, self.mask);
+        (0..BUCKET_SLOTS).any(|j| {
+            self.slots[b1 * BUCKET_SLOTS + j] & SLOT_CMP_MASK == key
+                || self.slots[b2 * BUCKET_SLOTS + j] & SLOT_CMP_MASK == key
+        })
+    }
+
+    /// Cuckoo-insert `slot`, displacing existing entries as needed. Returns
+    /// false if the displacement budget runs out.
+    fn insert(&mut self, mut slot: Slot) -> bool {
+        for _ in 0..MAX_KICKS {
+            let (b1, b2) = buckets(slot & SLOT_CMP_MASK, self.shift, self.mask);
+            let (b1, b2) = (b1 * BUCKET_SLOTS, b2 * BUCKET_SLOTS);
+            for idx in [b1, b2] {
+                for j in 0..BUCKET_SLOTS {
+                    if self.slots[idx + j] == 0 {
+                        self.slots[idx + j] = slot;
+                        return true;
+                    }
                 }
             }
+            // xorshift64
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 7;
+            self.rng ^= self.rng << 17;
+            let r = (self.rng % (2 * BUCKET_SLOTS as u64)) as usize;
+            let victim = [b1, b2][r / BUCKET_SLOTS] + (r - (r / BUCKET_SLOTS) * BUCKET_SLOTS);
+            std::mem::swap(&mut slot, &mut self.slots[victim]);
         }
-        // xorshift64
-        *rng ^= *rng << 13;
-        *rng ^= *rng >> 7;
-        *rng ^= *rng << 17;
-        let r = (*rng % (2 * BUCKET_SLOTS as u64)) as usize;
-        let victim = [b1, b2][r / BUCKET_SLOTS] + (r - (r / BUCKET_SLOTS) * BUCKET_SLOTS);
-        std::mem::swap(&mut slot, &mut slots[victim]);
+        false
     }
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary};
-    use crate::encoding::lpm::LongestPrefixMatcher;
 
     fn make_dict(extra: &[&[u8]]) -> CompactDictionary {
         let mut toks: Vec<Vec<u8>> = (0u16..=255).map(|i| vec![i as u8]).collect();
@@ -476,7 +464,7 @@ mod tests {
 
     fn check_agrees(dict: &CompactDictionary, inputs: &[&[u8]]) {
         let lpm = LongestPrefixMatcher::from_dictionary(dict.as_view());
-        let flat = FlatMatcher::from_dictionary(dict.as_view());
+        let flat = FlatMatcher::from_dictionary(dict.as_view(), &lpm);
         for &s in inputs {
             for start in 0..s.len() {
                 let d = &s[start..];

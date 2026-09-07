@@ -14,9 +14,13 @@
 //!     as a sorted vector and is promoted to a byte-trie once it grows past
 //!     `PROMOTE_THRESHOLD`.
 //!
-//! [`find_longest_match`](LongestPrefixMatcher::find_longest_match) issues a
-//! single hash probe on the 8-byte prefix to reach the long bucket, then falls
-//! through to the short map probing lengths `min(max_len, 8)..1`.
+//! A 65 536-entry table keyed by the first two input bytes records which token
+//! lengths `2..=16` begin with those bytes.
+//! [`find_longest_match`](LongestPrefixMatcher::find_longest_match) consults it
+//! first, issues the long-bucket probe only if a length `>= 9` is present, and
+//! then probes the short map at the present lengths only, longest first, instead
+//! of every length from 8 down to 1. Most positions have few present lengths, so
+//! this removes most probes and the mispredicted branch behind each of them.
 //!
 //! This matcher supports incremental insertion, which training needs. Its
 //! lookup cost is data-dependent (a bucket scan or trie walk, then a variable
@@ -49,14 +53,18 @@ fn load_le_u64(data: &[u8], len: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Mask of the low `len * 8` bits in a `u64`.
+/// Index into the 2-byte-prefix table for `data` (`data.len() >= 2`).
+#[inline]
+fn prefix2(data: &[u8]) -> usize {
+    data[0] as usize | (data[1] as usize) << 8
+}
+
+/// Mask of the low `len * 8` bits in a `u64`, `len` in `1..=8` (larger values
+/// saturate). Branch-free.
 #[inline]
 fn mask_u64(len: usize) -> u64 {
-    if len >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (len * 8)) - 1
-    }
+    debug_assert!(len >= 1);
+    u64::MAX >> ((BUCKET_PREFIX_LEN - len.min(BUCKET_PREFIX_LEN)) * 8)
 }
 
 /// One long-token entry within a bucket: the suffix bytes after the shared
@@ -169,8 +177,9 @@ pub(crate) struct LongestPrefixMatcher {
     long_map: Map<u64, Bucket>,
     /// Trie node arena shared by every promoted long bucket.
     pool: Vec<TrieNode>,
-    /// Longest short-map token length present (`1..=8`).
-    max_short_len: u8,
+    /// For each 2-byte prefix, bit `l - 1` is set if a token of length `l`
+    /// (`2..=16`) starts with those bytes.
+    len_bits: Vec<u16>,
     /// Next id to assign. `u32` so the full 16-bit token space (65 536 entries)
     /// is representable without overflow.
     next_id: u32,
@@ -187,7 +196,7 @@ impl LongestPrefixMatcher {
             short_map,
             long_map: map(),
             pool: Vec::new(),
-            max_short_len: 1,
+            len_bits: vec![0; 1 << 16],
             next_id: 256,
         }
     }
@@ -201,7 +210,7 @@ impl LongestPrefixMatcher {
             short_map: map_with_capacity(n.min(BUCKET_PREFIX_LEN * 256)),
             long_map: map(),
             pool: Vec::new(),
-            max_short_len: 1,
+            len_bits: vec![0; 1 << 16],
             next_id: n as u32,
         };
         for i in 0..n {
@@ -225,10 +234,12 @@ impl LongestPrefixMatcher {
     fn insert_internal(&mut self, data: &[u8], id: Token) {
         debug_assert!(!data.is_empty() && data.len() <= MAX_TOKEN_SIZE);
         let len = data.len();
+        if len >= 2 {
+            self.len_bits[prefix2(data)] |= 1 << (len - 1);
+        }
         if len <= BUCKET_PREFIX_LEN {
             let key = load_le_u64(data, len);
             self.short_map.insert((key, len as u8), id);
-            self.max_short_len = self.max_short_len.max(len as u8);
             return;
         }
 
@@ -243,13 +254,17 @@ impl LongestPrefixMatcher {
             .or_insert_with(|| Bucket::Linear(Vec::new()));
         match bucket {
             Bucket::Linear(entries) => {
-                entries.push(LongEntry {
-                    suffix,
-                    slen: slen as u8,
-                    token: id,
-                });
-                // Keep descending-by-length order so the first match wins.
-                entries.sort_by(|a, b| b.slen.cmp(&a.slen));
+                // Keep descending-by-length order so the first match wins:
+                // insert after the last entry at least as long.
+                let at = entries.partition_point(|e| e.slen as usize >= slen);
+                entries.insert(
+                    at,
+                    LongEntry {
+                        suffix,
+                        slen: slen as u8,
+                        token: id,
+                    },
+                );
                 if entries.len() > PROMOTE_THRESHOLD {
                     *bucket = build_trie(pool, entries);
                 }
@@ -273,9 +288,54 @@ impl LongestPrefixMatcher {
         // The first up-to-8 bytes serve as both the long-bucket prefix key and
         // the short-map probe window, so load them once.
         let low64 = load_le_u64(data, max_len.min(BUCKET_PREFIX_LEN));
-        // Long bucket: a single prefix probe, only when >= 9 input bytes exist.
-        if max_len > BUCKET_PREFIX_LEN
-            && !self.long_map.is_empty()
+        self.find_longest_match_with(low64, data)
+    }
+
+    /// Longest token that is a prefix of `bytes[pos..end]`, with its length.
+    ///
+    /// Same result as [`find_longest_match`](Self::find_longest_match) on
+    /// `&bytes[pos..end]`, but the probe window is one unaligned load from the
+    /// enclosing buffer whenever 8 bytes exist beyond `pos`, masked to the row,
+    /// so the load does not branch on the (short, variable) row tail.
+    ///
+    /// Precondition: `pos < end <= bytes.len()`.
+    #[inline]
+    pub(crate) fn find_longest_match_in(
+        &self,
+        bytes: &[u8],
+        pos: usize,
+        end: usize,
+    ) -> (Token, usize) {
+        debug_assert!(pos < end && end <= bytes.len());
+        let data = &bytes[pos..end];
+        let window = data.len().min(BUCKET_PREFIX_LEN);
+        // Only the last few positions of the whole buffer take the slow path,
+        // so this branch is predictable.
+        let low64 = if pos + BUCKET_PREFIX_LEN <= bytes.len() {
+            // SAFETY: `pos + 8 <= bytes.len()` was just checked.
+            let word = unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(pos).cast::<u64>()) };
+            word & mask_u64(window)
+        } else {
+            load_le_u64(data, window)
+        };
+        self.find_longest_match_with(low64, data)
+    }
+
+    /// Shared body of the lookups: `low64` holds the low `min(data.len(), 8)`
+    /// bytes of `data`, zero-extended.
+    #[inline]
+    fn find_longest_match_with(&self, low64: u64, data: &[u8]) -> (Token, usize) {
+        let max_len = data.len().min(MAX_TOKEN_SIZE);
+        // Lengths `2..=max_len` that some token starting with these two bytes
+        // has, as bits `l - 1`. Nothing longer than one byte can match a
+        // one-byte input.
+        let present = if max_len >= 2 {
+            self.len_bits[prefix2(data)] & (u16::MAX >> (16 - max_len))
+        } else {
+            0
+        };
+        // Long bucket: a single prefix probe, only if a length `>= 9` exists.
+        if present >> BUCKET_PREFIX_LEN != 0
             && let Some(bucket) = self.long_map.get(&low64)
         {
             let suf = &data[BUCKET_PREFIX_LEN..max_len];
@@ -289,16 +349,21 @@ impl LongestPrefixMatcher {
                 return (t, BUCKET_PREFIX_LEN + slen);
             }
         }
-        // Short map: probe from the longest short token that exists (<= the
-        // input window) down to length 1.
-        let short_max = max_len.min(self.max_short_len as usize);
-        for len in (1..=short_max).rev() {
+        // Short map: probe the present lengths `2..=8`, longest first.
+        let mut short = present & 0xFF;
+        while short != 0 {
+            let len = 16 - short.leading_zeros() as usize;
             let key = low64 & mask_u64(len);
             if let Some(&t) = self.short_map.get(&(key, len as u8)) {
                 return (t, len);
             }
+            short &= !(1 << (len - 1));
         }
-        unreachable!("LPM precondition: every single-byte token must be present")
+        // Every single byte is a token.
+        match self.short_map.get(&(low64 & 0xFF, 1)) {
+            Some(&t) => (t, 1),
+            None => unreachable!("LPM precondition: every single-byte token must be present"),
+        }
     }
 
     /// Number of tokens currently in the matcher.
