@@ -9,16 +9,64 @@
 //! scan. The result is sorted by token byte sequence with ids reassigned to
 //! match — see the [dictionary invariants](crate::CompactDictionary).
 
-use hashbrown::HashMap;
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
 use crate::core::types::MAX_TOKEN_SIZE;
 use crate::encoding::config::{ThresholdSpec, TrainingConfig};
-use crate::encoding::hash::FxBuildHasher;
 use crate::encoding::lpm::LongestPrefixMatcher;
 use crate::encoding::rows::Rows;
+
+#[inline(always)]
+fn hash_pair(key: u32) -> u64 {
+    let hash = u64::from(key).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    hash ^ (hash >> 32)
+}
+
+struct PairFrequencies {
+    table: HashTable<(u32, u8)>,
+}
+
+impl PairFrequencies {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            table: HashTable::with_capacity(capacity),
+        }
+    }
+
+    #[inline(always)]
+    fn increment(&mut self, key: u32) -> u8 {
+        let hash = hash_pair(key);
+        match self.table.entry(
+            hash,
+            |(candidate, _)| *candidate == key,
+            |(candidate, _)| hash_pair(*candidate),
+        ) {
+            Entry::Occupied(entry) => {
+                let frequency = &mut entry.into_mut().1;
+                *frequency = frequency.saturating_add(1);
+                *frequency
+            }
+            Entry::Vacant(entry) => {
+                entry.insert((key, 1));
+                1
+            }
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, key: u32) {
+        if let Ok(entry) = self
+            .table
+            .find_entry(hash_pair(key), |(candidate, _)| *candidate == key)
+        {
+            entry.remove();
+        }
+    }
+}
 
 /// Result of [`train`]: a sorted dictionary and a matching matcher whose token
 /// ids correspond to the dictionary's sorted order. The dictionary is **not**
@@ -276,6 +324,7 @@ fn discover_tokens<'a>(
         dict_offsets.push(dict_bytes.len() as u32);
     }
     let mut lpm = LongestPrefixMatcher::new();
+    lpm.reserve(dict_capacity);
 
     let mut threshold: u8;
     let mut dyn_ctrl: Option<DynamicThresholdController> = None;
@@ -292,7 +341,10 @@ fn discover_tokens<'a>(
     }
 
     // Pair frequency map. Key packs two Token values into a u32.
-    let mut freq: HashMap<u32, u8, FxBuildHasher> = HashMap::default();
+    let pair_capacity = (dict_capacity * 8)
+        .max(1024)
+        .min((total_bytes / 2).max(1024));
+    let mut freq = PairFrequencies::with_capacity(pair_capacity);
 
     let mut full_dictionary = false;
     let mut budget_exhausted = false;
@@ -332,9 +384,7 @@ fn discover_tokens<'a>(
 
             if pair_len <= MAX_TOKEN_SIZE {
                 let key = ((prev_id as u32) << 16) | (curr_id as u32);
-                let f_slot = freq.entry(key).or_insert(0);
-                *f_slot = f_slot.saturating_add(1);
-                if *f_slot >= threshold {
+                if freq.increment(key) >= threshold {
                     let pair = &row[pos - prev_len..pos + curr_len];
                     let new_id = lpm.insert(pair);
                     dict_bytes.extend_from_slice(pair);
@@ -350,7 +400,7 @@ fn discover_tokens<'a>(
                         threshold = dyn_.get();
                     }
 
-                    freq.remove(&key);
+                    freq.remove(key);
                     prev_id = new_id;
                     prev_len = pair_len;
                     pos += curr_len;
@@ -402,6 +452,7 @@ fn sort_tokens(bytes: &[u8], offsets: &[u32]) -> (Vec<u8>, Vec<u32>) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
     use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
     use crate::core::types::Token;
     use crate::encoding::config::{DynamicThreshold, FixedThreshold};

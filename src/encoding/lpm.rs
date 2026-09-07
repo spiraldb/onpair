@@ -16,9 +16,10 @@
 //! Matching loads up to 16 bytes once, probes the long-token bucket, then checks
 //! short tokens from longest to shortest.
 
+use hashbrown::HashMap;
+
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
-use crate::encoding::hash::{Map, map, map_with_capacity};
 
 /// Tokens of this length or shorter live in the short map; longer tokens are
 /// bucketed by their first `BUCKET_PREFIX_LEN` bytes.
@@ -176,9 +177,9 @@ impl GroupedBucket {
 #[derive(Default, Debug, Clone)]
 pub(crate) struct LongestPrefixMatcher {
     /// Length `1..=8` tokens keyed by (low-`len`-byte u64, length).
-    short_map: Map<(u64, u8), Token>,
+    short_map: HashMap<(u64, u8), Token>,
     /// Length `9..=16` tokens bucketed by their 8-byte prefix.
-    long_map: Map<u64, Bucket>,
+    long_map: HashMap<u64, Bucket>,
     /// Longest short-map token length present (`1..=8`).
     max_short_len: u8,
     /// Next id to assign. `u32` so the full 16-bit token space (65 536 entries)
@@ -189,16 +190,25 @@ pub(crate) struct LongestPrefixMatcher {
 impl LongestPrefixMatcher {
     /// Pre-inserts the 256 single-byte tokens with ids `0..=255`.
     pub(crate) fn new() -> Self {
-        let mut short_map = map_with_capacity(256);
+        let mut short_map = HashMap::with_capacity(256);
         for i in 0u16..=255 {
             short_map.insert((i as u64, 1u8), i);
         }
         Self {
             short_map,
-            long_map: map(),
+            long_map: HashMap::new(),
             max_short_len: 1,
             next_id: 256,
         }
+    }
+
+    /// Reserve training-time maps for the configured dictionary budget.
+    pub(crate) fn reserve(&mut self, token_capacity: usize) {
+        self.short_map
+            .reserve(token_capacity.saturating_sub(self.short_map.len()));
+        let long_capacity = (token_capacity / 4).max(16);
+        self.long_map
+            .reserve(long_capacity.saturating_sub(self.long_map.len()));
     }
 
     /// Build a matcher from a complete dictionary: token at index `i` receives
@@ -207,8 +217,8 @@ impl LongestPrefixMatcher {
     pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
         let n = dict.num_tokens();
         let mut me = Self {
-            short_map: map_with_capacity(n.min(BUCKET_PREFIX_LEN * 256)),
-            long_map: map(),
+            short_map: HashMap::with_capacity(n.min(BUCKET_PREFIX_LEN * 256)),
+            long_map: HashMap::new(),
             max_short_len: 1,
             next_id: n as u32,
         };
