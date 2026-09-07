@@ -14,11 +14,11 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
-use crate::core::offset::Offset;
 use crate::core::types::MAX_TOKEN_SIZE;
 use crate::encoding::config::{ThresholdSpec, TrainingConfig};
 use crate::encoding::hash::FxBuildHasher;
 use crate::encoding::lpm::LongestPrefixMatcher;
+use crate::encoding::rows::Rows;
 
 /// Result of [`train`]: a sorted dictionary and a matching matcher whose token
 /// ids correspond to the dictionary's sorted order. The dictionary is **not**
@@ -137,25 +137,32 @@ impl DynamicThresholdController {
 // train()
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn scan_budget(threshold: ThresholdSpec, total_bytes: usize) -> Option<usize> {
+    match threshold {
+        ThresholdSpec::Dynamic(dt) => Some((total_bytes as f64 * dt.sample_fraction) as usize),
+        ThresholdSpec::Fixed(_) => None,
+    }
+}
+
 /// Build the randomized row order consumed by training and return the first
 /// selected position. Dynamic training only partially shuffles the row ids: the
 /// selected, randomly permuted rows occupy `order[selected_start..]` and are the
 /// only rows the byte-budgeted scan consumes. If unusually skewed row lengths
 /// leave that selection short of the byte budget, retry with a larger partial
 /// sample instead of falling through into the unshuffled remainder.
-fn make_training_order<O: Offset>(
-    offsets: &[O],
+fn make_training_order<R: Rows + ?Sized>(
+    rows: &R,
     threshold: ThresholdSpec,
+    total_bytes: usize,
     seed: u64,
 ) -> (Vec<u32>, usize) {
-    let n = offsets.len() - 1;
-    let total_bytes = offsets[n].to_usize();
-    let (scan_budget, mut shuffle_k) = match threshold {
-        ThresholdSpec::Dynamic(dt) => (
-            Some((total_bytes as f64 * dt.sample_fraction) as usize),
-            (((dt.sample_fraction * 2.0).min(1.0) * n as f64) as usize + 1024).min(n),
-        ),
-        ThresholdSpec::Fixed(_) => (None, n),
+    let n = rows.num_rows();
+    let scan_budget = scan_budget(threshold, total_bytes);
+    let mut shuffle_k = match threshold {
+        ThresholdSpec::Dynamic(dt) => {
+            (((dt.sample_fraction * 2.0).min(1.0) * n as f64) as usize + 1024).min(n)
+        }
+        ThresholdSpec::Fixed(_) => n,
     };
 
     loop {
@@ -174,7 +181,7 @@ fn make_training_order<O: Offset>(
         };
         let selected_bytes = order[selected_start..]
             .iter()
-            .map(|&idx| offsets[idx as usize + 1].to_usize() - offsets[idx as usize].to_usize())
+            .map(|&idx| rows.row(idx as usize).len())
             .sum::<usize>();
         if selected_bytes > scan_budget || shuffle_k == n {
             return (order, selected_start);
@@ -187,13 +194,75 @@ fn make_training_order<O: Offset>(
     }
 }
 
+fn selected_rows<'a, R: Rows + ?Sized>(
+    rows: &'a R,
+    order: &'a [u32],
+) -> impl ExactSizeIterator<Item = &'a [u8]> + 'a {
+    order.iter().map(move |&idx| rows.row(idx as usize))
+}
+
+struct GatheredSample {
+    bytes: Vec<u8>,
+    offsets: Vec<usize>,
+}
+
+impl GatheredSample {
+    fn rows(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.offsets
+            .windows(2)
+            .map(|bounds| &self.bytes[bounds[0]..bounds[1]])
+    }
+}
+
+/// Copy a budgeted random sample into scan order for sequential access.
+fn gather_sample<'a>(
+    rows: impl ExactSizeIterator<Item = &'a [u8]>,
+    budget: usize,
+) -> GatheredSample {
+    let mut bytes = Vec::with_capacity(budget);
+    let mut offsets = Vec::with_capacity(rows.len().min(1024) + 1);
+    offsets.push(0);
+    for row in rows {
+        if bytes.len() > budget {
+            break;
+        }
+        let len = row.len();
+        if bytes.len() + len > bytes.capacity() {
+            bytes.reserve_exact(len);
+        }
+        bytes.extend_from_slice(row);
+        offsets.push(bytes.len());
+    }
+    GatheredSample { bytes, offsets }
+}
+
 /// Discover merge tokens via frequency-threshold scanning, then sort the
-/// dictionary lexicographically. `offsets` has length `n + 1`; string `i`
-/// occupies `data[offsets[i]..offsets[i + 1]]`. The caller guarantees offsets
-/// fit in `usize` and `cfg.max_dict_bits` is in `9..=16`.
-pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig) -> TrainResult {
-    debug_assert!(!offsets.is_empty());
-    let n = offsets.len() - 1;
+/// dictionary lexicographically. The caller guarantees `cfg.max_dict_bits` is in
+/// `9..=16`.
+pub(crate) fn train<R: Rows + ?Sized>(rows: &R, cfg: &TrainingConfig) -> TrainResult {
+    let total_bytes = rows.total_bytes();
+    let seed = cfg.seed.unwrap_or_else(|| {
+        use rand::Rng;
+        rand::rng().random()
+    });
+    let (order, selected_start) = make_training_order(rows, cfg.threshold, total_bytes, seed);
+    let selected_order = &order[selected_start..];
+
+    if let Some(budget) =
+        scan_budget(cfg.threshold, total_bytes).filter(|&budget| budget <= total_bytes / 2)
+    {
+        let sample = gather_sample(selected_rows(rows, selected_order), budget);
+        discover_tokens(sample.rows(), cfg, total_bytes)
+    } else {
+        discover_tokens(selected_rows(rows, selected_order), cfg, total_bytes)
+    }
+}
+
+fn discover_tokens<'a>(
+    rows: impl Iterator<Item = &'a [u8]>,
+    cfg: &TrainingConfig,
+    total_bytes: usize,
+) -> TrainResult {
     let dict_capacity = max_dict_size(cfg.max_dict_bits);
 
     // Accumulate into local buffers, then seal once into a trusted dictionary at
@@ -215,7 +284,6 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
             threshold = ft.value;
         }
         ThresholdSpec::Dynamic(dt) => {
-            let total_bytes = if n == 0 { 0 } else { offsets[n].to_usize() };
             let capacity = dict_capacity - 256;
             let ctrl = DynamicThresholdController::new(capacity, total_bytes, dt.sample_fraction);
             threshold = ctrl.get();
@@ -223,37 +291,22 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
         }
     }
 
-    // Select training order. Dynamic training partially shuffles only the rows
-    // it is likely to consume; fixed training still shuffles the entire corpus.
-    let seed = cfg.seed.unwrap_or_else(|| {
-        use rand::Rng;
-        rand::rng().random()
-    });
-    let (order, selected_start) = make_training_order(offsets, cfg.threshold, seed);
-
     // Pair frequency map. Key packs two Token values into a u32.
     let mut freq: HashMap<u32, u8, FxBuildHasher> = HashMap::default();
 
     let mut full_dictionary = false;
     let mut budget_exhausted = false;
 
-    // `partial_shuffle` places its selected slice at the end. Consume that
-    // random slice directly rather than the mostly original-order remainder at
-    // the beginning of `order`.
-    for &idx in &order[selected_start..] {
+    for row in rows {
         if full_dictionary || budget_exhausted {
             break;
         }
 
-        let s_start = offsets[idx as usize].to_usize();
-        let s_end = offsets[idx as usize + 1].to_usize();
-        if s_end == s_start {
+        if row.is_empty() {
             continue;
         }
-        let str_bytes = &data[s_start..s_end];
-        let len = str_bytes.len();
 
-        let (mut prev_id, mut prev_len) = lpm.find_longest_match(str_bytes);
+        let (mut prev_id, mut prev_len) = lpm.find_longest_match(row);
         let mut pos = prev_len;
 
         if let Some(ref mut dyn_) = dyn_ctrl {
@@ -264,8 +317,8 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
             }
         }
 
-        while pos < len {
-            let (curr_id, curr_len) = lpm.find_longest_match(&str_bytes[pos..]);
+        while pos < row.len() {
+            let (curr_id, curr_len) = lpm.find_longest_match(&row[pos..]);
 
             if let Some(ref mut dyn_) = dyn_ctrl {
                 dyn_.on_bytes_scanned(curr_len);
@@ -282,10 +335,9 @@ pub(crate) fn train<O: Offset>(data: &[u8], offsets: &[O], cfg: &TrainingConfig)
                 let f_slot = freq.entry(key).or_insert(0);
                 *f_slot = f_slot.saturating_add(1);
                 if *f_slot >= threshold {
-                    let pair_start = pos - prev_len;
-                    let pair_end = pos + curr_len;
-                    let new_id = lpm.insert(&str_bytes[pair_start..pair_end]);
-                    dict_bytes.extend_from_slice(&str_bytes[pair_start..pair_end]);
+                    let pair = &row[pos - prev_len..pos + curr_len];
+                    let new_id = lpm.insert(pair);
+                    dict_bytes.extend_from_slice(pair);
                     dict_offsets.push(dict_bytes.len() as u32);
 
                     if lpm.size() == dict_capacity {
@@ -353,6 +405,7 @@ pub(crate) mod tests {
     use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
     use crate::core::types::Token;
     use crate::encoding::config::{DynamicThreshold, FixedThreshold};
+    use crate::encoding::rows::ArrowRows;
     use crate::test_corpus::{
         alternating_strings as make_alternating_strings, binary_strings as make_binary_strings,
         fixed_length_strings as make_fixed_length_strings,
@@ -363,7 +416,7 @@ pub(crate) mod tests {
 
     fn train_strings<S: AsRef<[u8]>>(strings: &[S], cfg: &TrainingConfig) -> TrainResult {
         let raw = make_raw(strings);
-        train(&raw.data, &raw.offsets, cfg)
+        train(&ArrowRows::new(&raw.data, &raw.offsets), cfg)
     }
 
     fn check_base_tokens(d: CompactDictionaryView<'_>) {
@@ -392,14 +445,14 @@ pub(crate) mod tests {
 
     #[test]
     fn base_tokens_on_empty_input() {
-        let result = train(&[], &[0u32], &TrainingConfig::default());
+        let result = train(&ArrowRows::new(&[], &[0u32]), &TrainingConfig::default());
         check_base_tokens(result.dict.as_view());
         assert_eq!(result.dict.num_tokens(), 256);
     }
 
     #[test]
     fn base_tokens_on_single_empty_string() {
-        let result = train(&[], &[0u32, 0], &TrainingConfig::default());
+        let result = train(&ArrowRows::new(&[], &[0u32, 0]), &TrainingConfig::default());
         check_base_tokens(result.dict.as_view());
         assert_eq!(result.dict.num_tokens(), 256);
     }
@@ -554,6 +607,66 @@ pub(crate) mod tests {
         };
         let result = train_strings(&make_user_strings(500), &cfg);
         assert!(result.dict.num_tokens() <= max_dict_size(cfg.max_dict_bits));
+    }
+
+    #[test]
+    fn gathered_and_in_place_scans_agree() {
+        let corpora: Vec<Vec<Vec<u8>>> = vec![
+            make_user_strings(400)
+                .into_iter()
+                .map(String::into_bytes)
+                .collect(),
+            make_random_strings(400, 60, 7),
+            make_binary_strings(300, 40, 99),
+            make_mixed_length_strings(400, 120, 5),
+        ];
+
+        for corpus in &corpora {
+            let raw = make_raw(corpus);
+            let rows = ArrowRows::new(&raw.data, &raw.offsets);
+            let total_bytes = rows.total_bytes();
+
+            for bits in [9u8, 12, 16] {
+                for fraction in [0.15, 0.5, 1.0] {
+                    let cfg = TrainingConfig {
+                        max_dict_bits: bits,
+                        threshold: ThresholdSpec::Dynamic(DynamicThreshold {
+                            sample_fraction: fraction,
+                        }),
+                        seed: Some(42),
+                    };
+                    let (order, start) = make_training_order(&rows, cfg.threshold, total_bytes, 42);
+                    let selected_order = &order[start..];
+                    let budget = scan_budget(cfg.threshold, total_bytes).unwrap();
+                    let gathered = gather_sample(selected_rows(&rows, selected_order), budget);
+
+                    let in_place =
+                        discover_tokens(selected_rows(&rows, selected_order), &cfg, total_bytes);
+                    let copied = discover_tokens(gathered.rows(), &cfg, total_bytes);
+                    assert_eq!(in_place.dict.bytes(), copied.dict.bytes());
+                    assert_eq!(in_place.dict.offsets(), copied.dict.offsets());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_and_separate_rows_train_identically() {
+        let corpus: Vec<Vec<u8>> = make_user_strings(300)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        let raw = make_raw(&corpus);
+        let slices: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+        let cfg = TrainingConfig {
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let contiguous = train(&ArrowRows::new(&raw.data, &raw.offsets), &cfg);
+        let by_rows = train(slices.as_slice(), &cfg);
+        assert_eq!(contiguous.dict.bytes(), by_rows.dict.bytes());
+        assert_eq!(contiguous.dict.offsets(), by_rows.dict.offsets());
     }
 
     #[test]

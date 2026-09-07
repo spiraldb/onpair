@@ -85,10 +85,12 @@ pub use crate::decoding::{
 };
 pub use crate::encoding::config::{Config, DEFAULT_CONFIG, Error, MaxDictBits, Threshold};
 pub use crate::encoding::parser::Parser;
+pub use crate::encoding::rows::Rows;
 
 /// Compress an Arrow `(bytes, offsets)` value pair end-to-end. Equivalent to
 /// `Parser::train(..)?.parse(..)`, but validates the offsets once instead of in
-/// both the train and parse steps. `offsets` has `n + 1` entries.
+/// both the train and parse steps. `offsets` has `n + 1` entries. Its first
+/// entry may be non-zero; bytes outside `offsets[0]..offsets[n]` are ignored.
 ///
 /// # Errors
 /// [`Error::InvalidArg`] if `offsets` is empty or its last entry exceeds
@@ -97,4 +99,9 @@ pub fn compress<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<C
     encoding::parser::validate_offsets(bytes, offsets)?;
     let parser = Parser::train_unchecked(bytes, offsets, cfg);
     Ok(parser.parse_unchecked(bytes, offsets))
+}
+
+/// Compress a [`Rows`] input without first copying it into a contiguous buffer.
+pub fn compress_rows<R: Rows + ?Sized, O: Offset>(rows: &R, cfg: Config) -> Column<O> {
+    Parser::train_rows(rows, cfg).parse_rows(rows)
 }

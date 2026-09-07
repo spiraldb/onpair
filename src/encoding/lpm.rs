@@ -99,7 +99,14 @@ fn search_linear(entries: &[LongEntry], val: u64, max_slen: usize) -> Option<(To
 fn search_trie(pool: &[TrieNode], root: u32, suf: &[u8]) -> Option<(Token, usize)> {
     let mut best = None;
     let mut cur = root;
-    for (pos, &b) in suf.iter().enumerate() {
+    // A long token has an 8-byte prefix and is at most 16 bytes long, so this
+    // walk can take at most eight steps. Express that bound directly instead
+    // of leaving the optimizer with a dynamically sized slice iteration.
+    for pos in 0..(MAX_TOKEN_SIZE - BUCKET_PREFIX_LEN) {
+        if pos >= suf.len() {
+            break;
+        }
+        let b = suf[pos];
         match trie_find_child(pool, cur, b) {
             Some(child) => {
                 cur = child;
