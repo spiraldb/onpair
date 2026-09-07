@@ -201,6 +201,15 @@ impl LongestPrefixMatcher {
         }
     }
 
+    /// Reserve training-time maps for the configured dictionary budget.
+    pub(crate) fn reserve(&mut self, token_capacity: usize) {
+        self.short_map
+            .reserve(token_capacity.saturating_sub(self.short_map.len()));
+        let long_capacity = (token_capacity / 4).max(16);
+        self.long_map
+            .reserve(long_capacity.saturating_sub(self.long_map.len()));
+    }
+
     /// Build a matcher from a complete dictionary: token at index `i` receives
     /// id `i`. The caller guarantees the dictionary contains every single-byte
     /// token so [`find_longest_match`](Self::find_longest_match) stays total.

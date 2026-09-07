@@ -324,6 +324,7 @@ fn discover_tokens<'a>(
         dict_offsets.push(dict_bytes.len() as u32);
     }
     let mut lpm = LongestPrefixMatcher::new();
+    lpm.reserve(dict_capacity);
 
     let mut threshold: u8;
     let mut dyn_ctrl: Option<DynamicThresholdController> = None;
@@ -340,7 +341,10 @@ fn discover_tokens<'a>(
     }
 
     // Pair frequency map. Key packs two Token values into a u32.
-    let mut freq = PairFrequencies::with_capacity(0);
+    let pair_capacity = (dict_capacity * 8)
+        .max(1024)
+        .min((total_bytes / 2).max(1024));
+    let mut freq = PairFrequencies::with_capacity(pair_capacity);
 
     let mut full_dictionary = false;
     let mut budget_exhausted = false;
