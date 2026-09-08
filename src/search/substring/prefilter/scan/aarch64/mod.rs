@@ -15,7 +15,7 @@ pub(in crate::search::substring::prefilter) use neon::scan_neon;
 #[inline]
 pub(super) fn execute<O: Offset>(
     shape: Option<FixedShape>,
-    group: u8,
+    two_vectors: bool,
     input: ScanInput<'_, O>,
     sparse_row_mapping: bool,
     out: &mut Vec<usize>,
@@ -35,7 +35,7 @@ pub(super) fn execute<O: Offset>(
             row_offsets,
             cover,
             sparse_row_mapping,
-            group == 2,
+            two_vectors,
             out,
         ),
     }

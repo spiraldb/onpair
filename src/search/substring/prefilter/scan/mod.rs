@@ -24,7 +24,7 @@ mod x86;
 #[cfg(all(target_arch = "aarch64", test))]
 pub(super) use self::aarch64::scan_neon;
 use self::policy::{
-    AnalysisFacts, CoverShape, IsaTag, KernelPlan, RegionFacts, ScanFacts, detect_target_caps,
+    AnalysisFacts, CoverShape, Kernel, KernelPlan, RegionFacts, ScanFacts, detect_target_caps,
     select_kernel,
 };
 #[cfg(all(target_arch = "x86_64", test))]
@@ -120,31 +120,31 @@ pub(super) fn execute<O: Offset>(
     out: &mut Vec<usize>,
 ) -> Result<(), PrefilterError> {
     let sparse_row_mapping = plan.row_mapping.uses_sparse_gaps();
-    match plan.isa {
-        IsaTag::Empty => Ok(()),
+    match plan.kernel {
+        Kernel::Empty => Ok(()),
         #[cfg(any(not(any(target_arch = "aarch64", target_arch = "x86_64")), test))]
-        IsaTag::Unsupported => Err(PrefilterError::UnsupportedArchitecture),
+        Kernel::Unsupported => Err(PrefilterError::UnsupportedArchitecture),
         #[cfg(target_arch = "aarch64")]
-        IsaTag::Neon => {
-            aarch64::execute(plan.shape, plan.group, input, sparse_row_mapping, out);
+        Kernel::Neon { fixed, two_vectors } => {
+            aarch64::execute(fixed, two_vectors, input, sparse_row_mapping, out);
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
-        IsaTag::Sse2 => {
-            x86::execute_sse2(plan.shape, input, sparse_row_mapping, out);
+        Kernel::Sse2 { fixed } => {
+            x86::execute_sse2(fixed, input, sparse_row_mapping, out);
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
-        IsaTag::Avx2 => {
+        Kernel::Avx2 { fixed } => {
             // SAFETY: the plan is created only after runtime AVX2 detection.
-            unsafe { x86::execute_avx2(plan.shape, input, sparse_row_mapping, out) };
+            unsafe { x86::execute_avx2(fixed, input, sparse_row_mapping, out) };
             Ok(())
         }
         #[cfg(target_arch = "x86_64")]
-        IsaTag::Avx512 => {
+        Kernel::Avx512 { fixed } => {
             // SAFETY: the plan is created only after runtime AVX-512BW
             // detection, which implies AVX-512F.
-            unsafe { x86::execute_avx512(plan.shape, input, sparse_row_mapping, out) };
+            unsafe { x86::execute_avx512(fixed, input, sparse_row_mapping, out) };
             Ok(())
         }
         #[cfg(test)]

@@ -180,8 +180,9 @@ mod tests {
         7, 17, 31, 63, 127, 255, 511, 1_023, 2_047, 4_095, 8_191, 16_383, 24_575, 32_760, 32_772,
         49_151, 65_527,
     ];
-    const EDGE_RANGES: [(Token, Token); 3] = [
+    const EDGE_RANGES: [(Token, Token); 4] = [
         (Token::MIN, 3),
+        (1_234, 1_240),
         (0x7ffe, 0x8001),
         (Token::MAX - 3, Token::MAX),
     ];
@@ -295,26 +296,6 @@ mod tests {
         assert_cover::<O, POINTS, RANGES>(&codes, &row_offsets, &cover::<POINTS, RANGES>());
     }
 
-    fn assert_sse2_shape<O: Offset, const POINTS: usize, const RANGES: usize>() {
-        let (codes, row_offsets) = input::<O>();
-        let cover = cover::<POINTS, RANGES>();
-        let mut expected = Vec::new();
-        super::super::scan_scalar(&codes, &row_offsets, &cover, &mut expected);
-        for sparse_row_mapping in [false, true] {
-            let mut actual = Vec::new();
-            unsafe {
-                sse2::scan_sse2_fixed::<O, POINTS, RANGES>(
-                    &codes,
-                    &row_offsets,
-                    &cover,
-                    sparse_row_mapping,
-                    &mut actual,
-                )
-            };
-            assert_eq!(actual, expected);
-        }
-    }
-
     fn assert_full_domain_range<O: Offset>() {
         let (codes, row_offsets) = input::<O>();
         let cover = ProbeCover::from_membership(vec![true; usize::from(Token::MAX) + 1]);
@@ -330,21 +311,12 @@ mod tests {
     }
 
     fn assert_all_shapes<O: Offset>() {
-        assert_shape::<O, 1, 0>();
-        assert_shape::<O, 2, 0>();
-        assert_shape::<O, 3, 0>();
-        assert_shape::<O, 0, 1>();
-        assert_shape::<O, 1, 1>();
-        assert_shape::<O, 2, 1>();
-    }
-
-    fn assert_all_sse2_shapes<O: Offset>() {
         macro_rules! assert_shapes {
             ($(($points:literal, $ranges:literal),)+) => {
-                $(assert_sse2_shape::<O, $points, $ranges>();)+
+                $(assert_shape::<O, $points, $ranges>();)+
             };
         }
-        with_sse2_fixed_shapes!(assert_shapes);
+        with_x86_fixed_shapes!(assert_shapes);
     }
 
     fn edge_input<O: Offset>(len: usize, cover: &ProbeCover) -> (Vec<Token>, Vec<O>) {
@@ -457,12 +429,6 @@ mod tests {
         assert_all_shapes::<u64>();
         assert_full_domain_range::<u32>();
         assert_full_domain_range::<u64>();
-    }
-
-    #[test]
-    fn all_sse2_fixed_shapes_match_scalar() {
-        assert_all_sse2_shapes::<u32>();
-        assert_all_sse2_shapes::<u64>();
     }
 
     #[test]

@@ -9,7 +9,7 @@ use super::super::template::{DYN, Isa, scan_dynamic, scan_fixed as fixed, walk};
 #[cfg(test)]
 use super::super::{
     AnalysisFacts, CoverShape, RegionFacts, ScanFacts, ScanInput,
-    policy::{self, TargetCaps},
+    policy::{self, Kernel, TargetCaps},
 };
 #[cfg(test)]
 use super::execute as execute_neon;
@@ -283,11 +283,15 @@ pub(in crate::search::substring::prefilter) fn scan_neon<O: Offset>(
             },
         },
     );
-    execute_neon(
-        plan.shape,
-        plan.group,
-        ScanInput::full(codes, row_offsets, pf),
-        sparse_row_mapping,
-        out,
-    );
+    match plan.kernel {
+        Kernel::Empty => {}
+        Kernel::Neon { fixed, two_vectors } => execute_neon(
+            fixed,
+            two_vectors,
+            ScanInput::full(codes, row_offsets, pf),
+            sparse_row_mapping,
+            out,
+        ),
+        _ => unreachable!("NEON target selected a non-NEON kernel"),
+    }
 }
