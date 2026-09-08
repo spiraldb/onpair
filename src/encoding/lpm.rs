@@ -217,7 +217,7 @@ impl LongestPrefixMatcher {
     pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
         let n = dict.num_tokens();
         let mut me = Self {
-            short_map: HashMap::with_capacity(n.min(BUCKET_PREFIX_LEN * 256)),
+            short_map: HashMap::with_capacity(n),
             long_map: HashMap::new(),
             max_short_len: 1,
             next_id: n as u32,
