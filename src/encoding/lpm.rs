@@ -216,9 +216,12 @@ impl LongestPrefixMatcher {
     /// token so [`find_longest_match`](Self::find_longest_match) stays total.
     pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
         let n = dict.num_tokens();
+        let long_capacity = (0..n)
+            .filter(|&i| dict.token(i as Token).len() > BUCKET_PREFIX_LEN)
+            .count();
         let mut me = Self {
-            short_map: HashMap::with_capacity(n.min(BUCKET_PREFIX_LEN * 256)),
-            long_map: HashMap::new(),
+            short_map: HashMap::with_capacity(n),
+            long_map: HashMap::with_capacity(long_capacity),
             max_short_len: 1,
             next_id: n as u32,
         };
