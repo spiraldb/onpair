@@ -249,7 +249,7 @@ pub(super) enum Kernel {
 
 /// Complete, ephemeral execution plan for one scan region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring::prefilter) struct KernelPlan {
+pub(super) struct KernelPlan {
     pub(super) kernel: Kernel,
     pub(super) row_mapping: RowMapping,
     pub(super) reserve: usize,

@@ -56,9 +56,23 @@ impl<'a, O> ScanInput<'a, O> {
     }
 }
 
+/// Scan one complete code stream and append its candidate rows.
+#[inline]
+pub(super) fn candidates<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    analysis: &PrefilterAnalysis,
+    out: &mut Vec<usize>,
+) -> Result<(), PrefilterError> {
+    let input = ScanInput::full(codes, row_offsets, analysis.probe_cover());
+    let plan = choose_kernel(input, analysis);
+    out.reserve(plan.reserve);
+    execute(plan, input, out)
+}
+
 /// Derive an ephemeral kernel plan without inspecting code values.
 #[inline]
-pub(super) fn plan<O: Offset>(input: ScanInput<'_, O>, analysis: &PrefilterAnalysis) -> KernelPlan {
+fn choose_kernel<O: Offset>(input: ScanInput<'_, O>, analysis: &PrefilterAnalysis) -> KernelPlan {
     let facts = ScanFacts {
         analysis: AnalysisFacts {
             shape: CoverShape {
@@ -74,11 +88,6 @@ pub(super) fn plan<O: Offset>(input: ScanInput<'_, O>, analysis: &PrefilterAnaly
         },
     };
     select_kernel(detect_target_caps(), facts)
-}
-
-#[inline]
-pub(super) const fn reserve(plan: KernelPlan) -> usize {
-    plan.reserve
 }
 
 /// Compatibility entry for tests that exercise dispatch with a synthetic
@@ -114,7 +123,7 @@ pub(super) fn scan<O: Offset>(
 /// Execute a previously selected plan. This is the first stage that inspects
 /// code values.
 #[inline]
-pub(super) fn execute<O: Offset>(
+fn execute<O: Offset>(
     plan: KernelPlan,
     input: ScanInput<'_, O>,
     out: &mut Vec<usize>,

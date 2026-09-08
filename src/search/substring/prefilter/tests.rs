@@ -3,10 +3,10 @@
 
 //! End-to-end soundness, graph invariants, and SIMD/scalar agreement.
 
+use super::compile::compile_cover;
 use super::cover::ProbeCover;
 use super::graph::{AlignmentGraph, build_alignment_graph, contained_tokens};
 use super::mincut::minimum_vertex_cut;
-use super::plan::plan;
 use super::{analyze_prefilter, prefilter_candidates};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{Token, TokenRange};
@@ -550,7 +550,7 @@ fn assert_kernel_matches_scalar(
         b"zzz",
     ];
     for &pat in patterns {
-        let pf = plan(view.dict, pat, frequencies.as_view());
+        let pf = compile_cover(view.dict, pat, frequencies.as_view());
         let mut scalar = Vec::new();
         let mut simd = Vec::new();
         super::scan::scan_scalar(view.codes, view.row_offsets, &pf, &mut scalar);

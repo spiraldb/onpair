@@ -16,7 +16,7 @@ use crate::search::index::TokenFrequencyIndexView;
 
 /// Compile a sound probe cover for `pattern` over `dict`, cheapest by term
 /// frequency according to the advisory `frequencies` weights.
-pub(super) fn plan(
+pub(super) fn compile_cover(
     dict: CompactDictionaryView<'_>,
     pattern: &[u8],
     frequencies: TokenFrequencyIndexView<'_>,

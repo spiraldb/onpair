@@ -31,18 +31,18 @@
 //! # Shape
 //! * [`TokenFrequencyIndex`] — the reusable per-column selectivity index the
 //!   compiler reads and the caller owns.
+//! * `compile` — pattern to normalized cover, preserving every selected id
+//!   regardless of its advisory frequency.
 //! * `graph` — pattern to alignment DAG: every layout of the pattern across
 //!   token boundaries, as one graph whose cuts are exactly the sound covers.
 //! * `mincut` — the cheapest such cut, by max-flow over the split DAG.
-//! * `plan` — the two of them end to end: pattern in, normalized cover out,
-//!   preserving every selected id regardless of its advisory frequency.
 //! * `cover` — the cover itself, in both the shapes the scan wants.
 //! * `scan` — the vector kernels. Profitability stays outside execution.
 
+mod compile;
 mod cover;
 mod graph;
 mod mincut;
-mod plan;
 mod scan;
 
 #[cfg(test)]
@@ -190,7 +190,7 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
         "the empty pattern matches every row and needs no prefilter"
     );
     let frequencies_view = frequencies.as_view();
-    let probe_cover = plan::plan(dict, pattern, frequencies_view);
+    let probe_cover = compile::compile_cover(dict, pattern, frequencies_view);
     let covered_frequency = probe_cover
         .points
         .iter()
@@ -237,8 +237,5 @@ pub fn prefilter_candidates<O: Offset>(
     analysis: &PrefilterAnalysis,
     out: &mut Vec<usize>,
 ) -> Result<(), PrefilterError> {
-    let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
-    let plan = scan::plan(input, analysis);
-    out.reserve(scan::reserve(plan));
-    scan::execute(plan, input, out)
+    scan::candidates(codes, row_offsets, analysis, out)
 }
