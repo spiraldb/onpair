@@ -64,6 +64,10 @@ pub(super) fn candidates<O: Offset>(
     analysis: &PrefilterAnalysis,
     out: &mut Vec<usize>,
 ) -> Result<(), PrefilterError> {
+    if analysis.matches_all {
+        out.extend(0..row_offsets.len().saturating_sub(1));
+        return Ok(());
+    }
     let input = ScanInput::full(codes, row_offsets, analysis.probe_cover());
     let plan = choose_kernel(input, analysis);
     out.reserve(plan.reserve);

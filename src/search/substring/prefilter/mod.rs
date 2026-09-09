@@ -16,9 +16,12 @@
 //! another exact substring test recovers the precise answer, since a sound cover
 //! drops no true match.
 //!
+//! An empty pattern matches every row, including rows without codes. Its
+//! analysis needs no probes, and execution appends all rows without scanning.
+//!
 //! # Soundness
-//! Every occurrence of the pattern in an encoded row falls into one of two cases,
-//! and the cover covers both:
+//! Every occurrence of a non-empty pattern in an encoded row falls into one of
+//! two cases, and the cover covers both:
 //!
 //! * **One token contains the whole pattern.** Its id is added unconditionally
 //!   (only reachable when `pattern.len() <= MAX_TOKEN_SIZE`).
@@ -74,31 +77,38 @@ impl std::fmt::Display for PrefilterError {
 
 impl std::error::Error for PrefilterError {}
 
-/// The normalized probe cover selected for a pattern and its frequency.
+/// A pattern's prefilter checks and their frequency, or an all-rows result.
 ///
 /// Points and ranges are disjoint, so each covered token occurrence is counted
-/// exactly once.
+/// exactly once. An empty pattern matches all rows and needs no probes.
 #[derive(Debug, Clone)]
 pub struct PrefilterAnalysis {
     probe_cover: ProbeCover,
     covered_frequency: u32,
     total_frequency: u32,
+    /// Empty patterns admit even rows without codes, independently of the cover.
+    matches_all: bool,
 }
 
 impl PrefilterAnalysis {
     /// The normalized checks the SIMD prefilter can execute.
+    ///
+    /// For an empty pattern this cover is empty, but [`prefilter_candidates`]
+    /// still returns every row using the analysis's all-rows flag.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
     }
 
     /// Number of code positions whose token is covered by the probes.
+    /// Returns zero for an empty pattern, which needs no probes.
     pub fn covered_frequency(&self) -> u32 {
         self.covered_frequency
     }
 
     /// Fraction of code positions whose token is covered by the probes.
     ///
-    /// Returns `0.0` when the indexed code stream is empty.
+    /// Returns `0.0` when the indexed code stream is empty or the pattern is
+    /// empty and needs no probes.
     pub fn covered_fraction(&self) -> f64 {
         if self.total_frequency == 0 {
             0.0
@@ -113,7 +123,7 @@ impl PrefilterAnalysis {
     }
 
     /// SIMD comparisons each vector of the code stream pays for this cover: one
-    /// per point, two per inclusive range.
+    /// per point, two per inclusive range. Zero for an empty pattern.
     pub fn comparison_cost(&self) -> usize {
         let cover = self.probe_cover();
         cover
@@ -127,9 +137,14 @@ impl PrefilterAnalysis {
     /// Verification is charged per row, so the estimate is covered codes per
     /// row: exact when no row holds two covered codes, an over-estimate
     /// otherwise. Returns `0.0` for an empty region and never exceeds `1.0`.
+    /// An empty pattern admits every row, so its fraction is `1.0` for any
+    /// non-empty region, even one consisting entirely of empty rows.
     pub fn expected_candidate_row_fraction(&self, row_count: usize) -> f64 {
         if row_count == 0 {
             return 0.0;
+        }
+        if self.matches_all {
+            return 1.0;
         }
         (f64::from(self.covered_frequency) / row_count as f64).min(1.0)
     }
@@ -150,8 +165,11 @@ const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
 /// [`analyze_prefilter`]: its
 /// [`comparison_cost`](PrefilterAnalysis::comparison_cost) per code, and the
 /// [`expected_candidate_row_fraction`](PrefilterAnalysis::expected_candidate_row_fraction)
-/// it sends to per-row verification. An empty cover passes both: it proves no
-/// encoded row can match, so it scans nothing and admits nothing.
+/// it sends to per-row verification. For a non-empty pattern, an empty cover
+/// passes both: it proves no encoded row can match, so it scans nothing and
+/// admits nothing.
+/// An empty pattern also passes: its all-rows answer is exact and requires
+/// neither a scan nor verification.
 ///
 /// This is a performance hint, not a correctness requirement, and it neither
 /// executes nor bypasses the prefilter. The thresholds were calibrated on
@@ -160,14 +178,16 @@ const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
 /// with materially different columns or architectures may choose their own
 /// policy.
 pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: usize) -> bool {
-    analysis.comparison_cost() <= MAX_SIMD_COMPARISONS
-        && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION
+    analysis.matches_all
+        || (analysis.comparison_cost() <= MAX_SIMD_COMPARISONS
+            && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION)
 }
 
-/// Analyze `pattern` and return its normalized minimum-cut probe cover.
+/// Analyze `pattern`, selecting a normalized minimum-cut probe cover when needed.
 ///
 /// This function constructs the checks and reports their frequency; the caller
-/// decides whether executing them is profitable.
+/// decides whether executing them is profitable. An empty pattern produces an
+/// analysis that admits every row without compiling probes.
 ///
 /// # Precondition
 /// `dict` is conformant: sorted, complete, and unique. These properties are
@@ -176,19 +196,19 @@ pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: u
 /// `frequencies` must use `dict`'s token domain and the scanned code count.
 /// Values are advisory weights: they affect the plan and profitability, but
 /// never remove members from the resulting cover.
-///
-/// # Panics
-/// Panics when `pattern` is empty. The empty pattern matches every row and
-/// should bypass prefilter analysis.
 pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
     pattern: &[u8],
     dict: CompactDictionaryView<'_>,
     frequencies: &TokenFrequencyIndex<S>,
 ) -> PrefilterAnalysis {
-    assert!(
-        !pattern.is_empty(),
-        "the empty pattern matches every row and needs no prefilter"
-    );
+    if pattern.is_empty() {
+        return PrefilterAnalysis {
+            probe_cover: ProbeCover::from_membership(Vec::new()),
+            covered_frequency: 0,
+            total_frequency: frequencies.total_frequency(),
+            matches_all: true,
+        };
+    }
     let frequencies_view = frequencies.as_view();
     let probe_cover = compile::compile_cover(dict, pattern, frequencies_view);
     let covered_frequency = probe_cover
@@ -206,22 +226,26 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
         probe_cover,
         covered_frequency,
         total_frequency: frequencies.total_frequency(),
+        matches_all: false,
     }
 }
 
-/// Execute `analysis` and append the ascending rows that contain a covered code.
+/// Execute `analysis` and append its candidate rows in ascending order.
 ///
 /// The result is a **sound superset**. Verify the survivors with an exact check,
 /// such as a [`ContainsTable`](super::ContainsTable) passed to
 /// [`contains`](super::contains()), to recover the precise answer.
 ///
-/// This function only executes the analyzed cover; the caller decides whether
-/// scanning it is profitable.
+/// For a non-empty pattern, candidates are rows containing a covered code; the
+/// caller decides whether scanning the cover is profitable. An empty pattern
+/// appends every row, including empty rows, without scanning or needing SIMD.
 ///
 /// The function does not silently fall back to a full scalar scan. If the target
-/// has no SIMD implementation, it returns an error without modifying `out`.
+/// has no SIMD implementation and a scan is needed, it returns an error without
+/// modifying `out`.
 ///
-/// An empty cover appends nothing and succeeds without SIMD support.
+/// For a non-empty pattern, an empty cover appends nothing and succeeds without
+/// SIMD support.
 ///
 /// # Precondition
 /// `row_offsets` are valid delimiters for `codes`, and every code lies in the

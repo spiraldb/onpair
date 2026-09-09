@@ -273,10 +273,6 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         frequencies: &TokenFrequencyIndex<S>,
         out: &mut Vec<usize>,
     ) -> Result<(), PrefilterError> {
-        if pattern.is_empty() {
-            out.extend(0..self.num_rows());
-            return Ok(());
-        }
         let analysis = analyze_prefilter(pattern, self.dict, frequencies);
         prefilter_candidates(self.codes, self.row_offsets, &analysis, out)
     }

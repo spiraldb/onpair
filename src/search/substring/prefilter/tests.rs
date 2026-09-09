@@ -7,7 +7,7 @@ use super::compile::compile_cover;
 use super::cover::ProbeCover;
 use super::graph::{AlignmentGraph, build_alignment_graph, contained_tokens};
 use super::mincut::minimum_vertex_cut;
-use super::{analyze_prefilter, prefilter_candidates};
+use super::{analyze_prefilter, prefilter_candidates, prefilter_is_likely_profitable};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{Token, TokenRange};
 use crate::search::index::{
@@ -22,9 +22,6 @@ fn candidates<S: TokenFrequencyIndexStorage>(
     frequencies: &TokenFrequencyIndex<S>,
     pattern: &[u8],
 ) -> Vec<usize> {
-    if pattern.is_empty() {
-        return (0..view.num_rows()).collect();
-    }
     let mut out = Vec::new();
     let analysis = analyze_prefilter(pattern, dict, frequencies);
     prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut out).unwrap();
@@ -308,6 +305,59 @@ fn sound_on_edge_cases() {
             b"", b"hello", b"world", b"o w", b"bca", b"bcabca", b"aa", b"aab", b"aabaa", b"absent",
         ],
     );
+}
+
+/// Empty rows have no token that a probe scan can find. The all-rows answer must
+/// include them and preserve the candidate API's append semantics.
+#[test]
+fn empty_pattern_appends_all_rows() {
+    let cases: &[&[&[u8]]] = &[&[b"", b"alpha", b"", b"beta", b""], &[b"", b""], &[]];
+    for &rows in cases {
+        let col = compress_rows(rows);
+        let view = col.view();
+        let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+        let analysis = analyze_prefilter(b"", view.dict, &frequencies);
+        assert!(analysis.probe_cover().is_empty());
+        assert_eq!(analysis.comparison_cost(), 0);
+        assert_eq!(analysis.covered_frequency(), 0);
+        assert_eq!(analysis.covered_fraction(), 0.0);
+        assert_eq!(analysis.total_frequency(), view.codes.len() as u32);
+        assert_eq!(
+            analysis.expected_candidate_row_fraction(view.num_rows()),
+            if rows.is_empty() { 0.0 } else { 1.0 }
+        );
+        assert!(prefilter_is_likely_profitable(&analysis, view.num_rows()));
+
+        let expected: Vec<_> = (0..rows.len()).collect();
+        let mut got = vec![usize::MAX];
+        prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut got).unwrap();
+        assert_eq!(got[0], usize::MAX);
+        assert_eq!(got[1..], expected);
+        assert_eq!(
+            view.rows_containing_prefiltered(b"", &frequencies),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            view.rows_containing_prefiltered_memmem(b"", &frequencies),
+            Ok(expected)
+        );
+    }
+}
+
+#[test]
+fn empty_probe_cover_still_appends_nothing() {
+    let analysis = super::PrefilterAnalysis {
+        probe_cover: ProbeCover::from_membership(vec![false]),
+        covered_frequency: 0,
+        total_frequency: 1,
+        matches_all: false,
+    };
+    assert_eq!(analysis.expected_candidate_row_fraction(3), 0.0);
+    assert!(prefilter_is_likely_profitable(&analysis, 3));
+
+    let mut rows = vec![usize::MAX];
+    prefilter_candidates(&[0], &[0u32, 0, 1, 1], &analysis, &mut rows).unwrap();
+    assert_eq!(rows, vec![usize::MAX]);
 }
 
 #[test]
