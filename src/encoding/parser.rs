@@ -11,6 +11,7 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::encoding::config::{Config, Error, TrainingConfig};
 use crate::encoding::lpm::LongestPrefixMatcher;
+use crate::encoding::rows::{ArrowRows, Rows};
 use crate::encoding::trainer::{TrainResult, train};
 
 /// A trained encoder. Holds the [`CompactDictionary`] (cloned into each
@@ -39,8 +40,13 @@ impl Parser {
     /// `(bytes, offsets)` is a valid Arrow pair (non-empty, monotonic
     /// non-decreasing offsets, last `<= bytes.len()`).
     pub(crate) fn train_unchecked<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Self {
+        Self::train_rows(&ArrowRows::new(bytes, offsets), cfg)
+    }
+
+    /// Train directly from a [`Rows`] input without flattening it first.
+    pub fn train_rows<R: Rows + ?Sized>(rows: &R, cfg: Config) -> Self {
         let internal_cfg: TrainingConfig = cfg.into();
-        let TrainResult { dict, lpm } = train(bytes, offsets, &internal_cfg);
+        let TrainResult { dict, lpm } = train(rows, &internal_cfg);
         // `train` returns a dictionary that is sorted and read-padded by
         // construction — nothing left to do here.
         Self { dict, lpm }
@@ -61,7 +67,13 @@ impl Parser {
     /// Like [`Parser::parse`] but skips offset validation; same caller
     /// guarantees as [`Parser::train_unchecked`].
     pub(crate) fn parse_unchecked<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Column<O> {
-        let (codes, row_offsets) = encode_strings(bytes, offsets, &self.lpm);
+        let mut codes = Vec::new();
+        let mut row_offsets = Vec::new();
+        self.parse_rows_into(
+            &ArrowRows::new(bytes, offsets),
+            &mut codes,
+            &mut row_offsets,
+        );
         // `self.dict` is already read-padded, so the cloned column dictionary is
         // too.
         Column {
@@ -70,31 +82,44 @@ impl Parser {
             row_offsets,
         }
     }
-}
 
-/// Encode every string into a flat code stream plus per-row offsets. Offset
-/// `[i]..[i + 1]` indexes the codes for row `i`.
-pub(crate) fn encode_strings<O: Offset>(
-    bytes: &[u8],
-    offsets: &[O],
-    lpm: &LongestPrefixMatcher,
-) -> (Vec<Token>, Vec<O>) {
-    let n = offsets.len() - 1;
-    let mut codes: Vec<Token> = Vec::with_capacity(bytes.len());
-    let mut row_offsets: Vec<O> = Vec::with_capacity(n + 1);
-    row_offsets.push(O::from_usize(0));
-    for i in 0..n {
-        let s = offsets[i].to_usize();
-        let e = offsets[i + 1].to_usize();
-        let mut pos = s;
-        while pos < e {
-            let (tok, mlen) = lpm.find_longest_match(&bytes[pos..e]);
-            codes.push(tok);
-            pos += mlen;
+    /// Clear and encode rows into reusable code and offset buffers.
+    /// `O` must be wide enough to address the resulting code stream.
+    pub fn parse_rows_into<R: Rows + ?Sized, O: Offset>(
+        &self,
+        rows: &R,
+        codes: &mut Vec<Token>,
+        row_offsets: &mut Vec<O>,
+    ) {
+        let n = rows.num_rows();
+        codes.clear();
+        row_offsets.clear();
+        row_offsets.reserve(n + 1);
+        row_offsets.push(O::from_usize(0));
+
+        for i in 0..n {
+            let row = rows.row(i);
+            let mut pos = 0;
+            while pos < row.len() {
+                let (tok, mlen) = self.lpm.find_longest_match(&row[pos..]);
+                codes.push(tok);
+                pos += mlen;
+            }
+            row_offsets.push(O::from_usize(codes.len()));
         }
-        row_offsets.push(O::from_usize(codes.len()));
     }
-    (codes, row_offsets)
+
+    /// Encode any [`Rows`] input into a self-contained [`Column`].
+    pub fn parse_rows<R: Rows + ?Sized, O: Offset>(&self, rows: &R) -> Column<O> {
+        let mut codes = Vec::new();
+        let mut row_offsets = Vec::new();
+        self.parse_rows_into(rows, &mut codes, &mut row_offsets);
+        Column {
+            dict: self.dict.clone(),
+            codes,
+            row_offsets,
+        }
+    }
 }
 
 /// Validate the `(bytes, offsets)` Arrow pair: `offsets` must be non-empty and
@@ -122,6 +147,29 @@ mod tests {
     };
     use crate::encoding::config::{FixedThreshold, ThresholdSpec, TrainingConfig};
     use crate::encoding::trainer::train;
+    use crate::{DEFAULT_CONFIG, MaxDictBits};
+
+    fn encode_strings<O: Offset>(
+        bytes: &[u8],
+        offsets: &[O],
+        lpm: &LongestPrefixMatcher,
+    ) -> (Vec<Token>, Vec<O>) {
+        let rows = ArrowRows::new(bytes, offsets);
+        let mut codes = Vec::new();
+        let mut row_offsets = vec![O::from_usize(0)];
+        for i in 0..rows.num_rows() {
+            let row = rows.row(i);
+            let mut pos = 0;
+            while pos < row.len() {
+                let (tok, mlen) = lpm.find_longest_match(&row[pos..]);
+                codes.push(tok);
+                pos += mlen;
+            }
+            row_offsets.push(O::from_usize(codes.len()));
+        }
+        (codes, row_offsets)
+    }
+
     use crate::test_corpus::{
         alternating_strings as make_alternating_strings, binary_strings as make_binary_strings,
         homogeneous_strings as make_homogeneous_strings, make_raw,
@@ -174,7 +222,7 @@ mod tests {
             threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
             seed: Some(seed),
         };
-        let TrainResult { dict, lpm } = train(&raw.data, &raw.offsets, &cfg);
+        let TrainResult { dict, lpm } = train(&ArrowRows::new(&raw.data, &raw.offsets), &cfg);
         let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
         decode_all(&codes, dict.as_view()) == raw.data
     }
@@ -233,7 +281,7 @@ mod tests {
             threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
             seed: Some(42),
         };
-        let TrainResult { dict: _, lpm } = train(&raw.data, &raw.offsets, &cfg);
+        let TrainResult { dict: _, lpm } = train(&ArrowRows::new(&raw.data, &raw.offsets), &cfg);
         let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
         assert!(
             codes.len() < raw.data.len(),
@@ -242,10 +290,52 @@ mod tests {
     }
 
     #[test]
+    fn rows_and_contiguous_input_agree() {
+        let corpus: Vec<Vec<u8>> = make_user_strings(200)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        let raw = make_raw(&corpus);
+        let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+
+        for bits in WIDTHS {
+            let cfg = Config {
+                max_dict_bits: MaxDictBits::new(*bits).unwrap(),
+                ..DEFAULT_CONFIG
+            };
+            let flat = Parser::train(&raw.data, &raw.offsets, cfg).unwrap();
+            let by_rows = Parser::train_rows(rows.as_slice(), cfg);
+            assert_eq!(flat.dict.bytes(), by_rows.dict.bytes(), "bits={bits}");
+
+            let a: Column<u32> = flat.parse(&raw.data, &raw.offsets).unwrap();
+            let b: Column<u32> = by_rows.parse_rows(rows.as_slice());
+            assert_eq!(a.codes, b.codes, "bits={bits}");
+            assert_eq!(a.row_offsets, b.row_offsets, "bits={bits}");
+        }
+    }
+
+    #[test]
     fn validate_offsets_rejects_empty_and_overflow() {
         assert_eq!(validate_offsets::<u32>(b"abc", &[]), Err(Error::InvalidArg));
         assert_eq!(validate_offsets(b"abc", &[0u32, 4]), Err(Error::InvalidArg));
         assert_eq!(validate_offsets(b"abc", &[0u32, 3]), Ok(()));
+    }
+
+    #[test]
+    fn nonzero_start_offset_roundtrips() {
+        let bytes = b"skipalphabetaunused";
+        let offsets = [4u32, 9, 13];
+        let column = crate::compress(bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let dict = column.dict.as_view();
+
+        assert_eq!(
+            decode_row(&column.codes, &column.row_offsets, dict, 0),
+            b"alpha"
+        );
+        assert_eq!(
+            decode_row(&column.codes, &column.row_offsets, dict, 1),
+            b"beta"
+        );
     }
 
     #[test]

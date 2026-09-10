@@ -5,10 +5,10 @@
 //!
 //! [`config`] is the public training configuration. [`trainer`] discovers a
 //! dictionary from a sample; [`parser`] drives the [`lpm`] longest-prefix
-//! matcher over the input to produce a column. [`hash`] is the shared hasher.
+//! matcher over the input to produce a column.
 
 pub(crate) mod config;
-pub(crate) mod hash;
 pub(crate) mod lpm;
 pub(crate) mod parser;
+pub(crate) mod rows;
 pub(crate) mod trainer;
