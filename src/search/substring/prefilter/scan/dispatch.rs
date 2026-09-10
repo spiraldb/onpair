@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! A plan as the two type parameters [`scan`] wants.
+//! A plan as the two type parameters [`both_stages`] wants.
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::matcher::PER_BATCH;
@@ -49,7 +49,7 @@ fn with_skip<O: Offset, S: Matcher, P: Matcher>(
     }
 }
 
-/// The planned kernel pair as the type parameters [`scan`] wants.
+/// The planned kernel pair as the type parameters [`both_stages`] wants.
 pub(super) fn run<O: Offset>(
     plan: Plan,
     cover: &ProbeCover,
