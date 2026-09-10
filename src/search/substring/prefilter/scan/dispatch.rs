@@ -10,7 +10,7 @@ use super::policy::{Match, Plan, Resolve};
 use super::{Check, both_stages, resolver};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-use crate::search::prefilter::ProbeCover;
+use crate::search::substring::prefilter::ProbeCover;
 
 /// The resolver half of the dispatch.
 fn with_resolver<O: Offset, M: Matcher>(

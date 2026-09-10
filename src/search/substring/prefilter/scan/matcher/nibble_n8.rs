@@ -14,19 +14,19 @@ use super::range::{Held, check_ranges, hold};
 use super::shared::{Hits, Vectors, words};
 use super::{Block, Mask, Matcher};
 use crate::core::types::Token;
-use crate::search::prefilter::ProbeCover;
+use crate::search::substring::prefilter::ProbeCover;
 
 /// The bits in a table byte.
-pub(in crate::search::prefilter::scan) const PER_BATCH: usize = 8;
+pub(in crate::search::substring::prefilter::scan) const PER_BATCH: usize = 8;
 
 #[cfg(any(
     target_arch = "aarch64",
     all(target_arch = "x86_64", target_feature = "avx512bw")
 ))]
-pub(in crate::search::prefilter::scan) const MAX_BATCHES: usize = 3;
+pub(in crate::search::substring::prefilter::scan) const MAX_BATCHES: usize = 3;
 /// Three batches of four tables plus the nibbles would spill AVX2's sixteen registers.
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::prefilter::scan) const MAX_BATCHES: usize = 2;
+pub(in crate::search::substring::prefilter::scan) const MAX_BATCHES: usize = 2;
 
 /// A 16-byte shuffle row, broadcast into every 128-bit lane on x86 since
 /// `vpshufb` indexes within lanes.
@@ -38,7 +38,7 @@ type Table = __m256i;
 type Table = __m512i;
 
 /// One table per nibble of a code, low byte first, low nibble first.
-pub(in crate::search::prefilter::scan) struct Batch([Table; 4]);
+pub(in crate::search::substring::prefilter::scan) struct Batch([Table; 4]);
 
 /// Token `k` owns bit `1 << k` in the row each of its nibbles indexes.
 fn batch(tokens: &[Token]) -> Batch {
@@ -208,7 +208,7 @@ unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors
     _mm512_test_epi8_mask(hit, hit)
 }
 
-pub(in crate::search::prefilter::scan) struct NibbleN8<
+pub(in crate::search::substring::prefilter::scan) struct NibbleN8<
     const BATCHES: usize,
     const SKIP_MOVEMASK_IF_NO_MATCH: bool,
 > {

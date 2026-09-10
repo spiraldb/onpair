@@ -4,9 +4,9 @@
 //! One table byte per u16 code, one load per code. L = 1, any K, any R, scalar.
 
 use super::{Block, Mask, Matcher};
-use crate::search::prefilter::ProbeCover;
+use crate::search::substring::prefilter::ProbeCover;
 
-pub(in crate::search::prefilter::scan) struct Table {
+pub(in crate::search::substring::prefilter::scan) struct Table {
     /// 0xFF where the cover admits the code, not 1, so `& 1` reads as one bit.
     admits: Vec<u8>,
 }

@@ -4,7 +4,7 @@
 //! Every resolver against [`expected_rows`], on the same masks and layers.
 
 use super::{GallopSeek, LinearSeek, Mask, Resolver, expected_rows};
-use crate::search::prefilter::scan::{BLOCK, Check};
+use crate::search::substring::prefilter::scan::{BLOCK, Check};
 
 /// Blocks per case: enough that a row can span one whole block and still
 /// start and end inside the stream.

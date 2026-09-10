@@ -10,7 +10,7 @@ use crate::core::offset::Offset;
 /// The row of a hit found by doubling the step from the cursor until the
 /// offsets overshoot, then binary searching that bracket: log(rows crossed)
 /// instead of one step each. What a sparse mask over short rows wants.
-pub(in crate::search::prefilter::scan) struct GallopSeek<'a, O>(Cursor<'a, O>);
+pub(in crate::search::substring::prefilter::scan) struct GallopSeek<'a, O>(Cursor<'a, O>);
 
 impl<'a, O: Offset> Resolver<'a> for GallopSeek<'a, O> {
     type Offset = O;

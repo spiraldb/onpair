@@ -23,9 +23,9 @@ mod resolver;
 mod walk;
 
 use matcher::Matcher;
-pub(in crate::search::prefilter) use policy::{Facts, Region, scan_ns};
+pub(in crate::search::substring::prefilter) use policy::{Facts, Region, scan_ns};
 use resolver::Resolver;
-pub(in crate::search::prefilter) use walk::Walk;
+pub(in crate::search::substring::prefilter) use walk::Walk;
 
 use super::PrefilterAnalysis;
 use super::cover::ProbeCover;
@@ -174,7 +174,7 @@ pub(super) fn scan_scalar<O: Offset>(
 }
 
 /// Codes per block, 64 words of mask. Kernels rely on the multiple of 64.
-pub(in crate::search::prefilter) const BLOCK: usize = 4096;
+pub(in crate::search::substring::prefilter) const BLOCK: usize = 4096;
 
 /// The instruction set this build's kernels run on. The other thing a cost
 /// is per: the same kernel is a different cost on each, since what a range
@@ -185,7 +185,7 @@ pub(in crate::search::prefilter) const BLOCK: usize = 4096;
 /// machines' numbers out of a CSV and has to name their sets.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::prefilter) enum Isa {
+pub(in crate::search::substring::prefilter) enum Isa {
     Neon,
     Avx2,
     Avx512Bw,
@@ -196,13 +196,13 @@ impl Isa {
     /// The one this build compiled. A const, so the dispatch over it folds
     /// away and the other sets' costs are never asked for.
     #[cfg(target_arch = "aarch64")]
-    pub(in crate::search::prefilter) const BUILT: Self = Self::Neon;
+    pub(in crate::search::substring::prefilter) const BUILT: Self = Self::Neon;
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-    pub(in crate::search::prefilter) const BUILT: Self = Self::Avx512Bw;
+    pub(in crate::search::substring::prefilter) const BUILT: Self = Self::Avx512Bw;
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-    pub(in crate::search::prefilter) const BUILT: Self = Self::Avx2;
+    pub(in crate::search::substring::prefilter) const BUILT: Self = Self::Avx2;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    pub(in crate::search::prefilter) const BUILT: Self = Self::Scalar;
+    pub(in crate::search::substring::prefilter) const BUILT: Self = Self::Scalar;
 }
 
 /// One block of codes, exactly what a matcher is handed.

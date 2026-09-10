@@ -21,23 +21,23 @@ use super::{BLOCK, Isa};
 
 /// What the planner reads about the region. No code values are inspected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::prefilter) struct Facts {
+pub(in crate::search::substring::prefilter) struct Facts {
     /// Codes the mask is expected to set a bit for, over the whole region.
-    pub(in crate::search::prefilter) expected_hits: usize,
+    pub(in crate::search::substring::prefilter) expected_hits: usize,
     /// Codes in the region, which with the hits is the density the
     /// pack-skipping flag turns on.
-    pub(in crate::search::prefilter) code_count: usize,
-    pub(in crate::search::prefilter) row_count: usize,
+    pub(in crate::search::substring::prefilter) code_count: usize,
+    pub(in crate::search::substring::prefilter) row_count: usize,
 }
 
 /// What stage one's cost depends on: the cover's counts, with no code
 /// values. A planner holds these before it has a cover.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::prefilter) struct Shape {
+pub(in crate::search::substring::prefilter) struct Shape {
     /// K.
-    pub(in crate::search::prefilter) tokens: usize,
+    pub(in crate::search::substring::prefilter) tokens: usize,
     /// R.
-    pub(in crate::search::prefilter) ranges: usize,
+    pub(in crate::search::substring::prefilter) ranges: usize,
 }
 
 impl Shape {
@@ -77,7 +77,7 @@ pub(super) enum Resolve {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::prefilter::scan) struct Plan {
+pub(in crate::search::substring::prefilter::scan) struct Plan {
     pub(super) matcher: Match,
     pub(super) resolver: Resolve,
     /// Whether the matcher tests its lanes before packing them, which is a
@@ -175,7 +175,10 @@ pub(super) fn takes(kernel: Match, shape: Shape) -> bool {
 /// What the planned matcher costs per code at this hit density: the kernel
 /// [`select_matcher`] picks plus the pack-skipping flag where it pays. The
 /// scalar kernels have no pack to skip.
-pub(in crate::search::prefilter) fn stage_one_ns_per_code(shape: Shape, density: f64) -> f64 {
+pub(in crate::search::substring::prefilter) fn stage_one_ns_per_code(
+    shape: Shape,
+    density: f64,
+) -> f64 {
     let matcher = select_matcher(shape);
     let skip = match matcher {
         Match::Table => 0.0,
@@ -325,16 +328,16 @@ fn select_resolver(facts: Facts) -> Resolve {
 
 /// The stream a cover would be scanned over.
 #[derive(Clone, Copy, Debug)]
-pub(in crate::search::prefilter) struct Region {
-    pub(in crate::search::prefilter) code_count: usize,
-    pub(in crate::search::prefilter) row_count: usize,
+pub(in crate::search::substring::prefilter) struct Region {
+    pub(in crate::search::substring::prefilter) code_count: usize,
+    pub(in crate::search::substring::prefilter) row_count: usize,
 }
 
 /// Expected nanoseconds to scan `cover` over `region` and walk every hit,
 /// given the `covered` codes it matches there: stage one at the kernel the
 /// shape gets, stage two at the cheaper resolver, the walk per hit. An empty
 /// cover proves no row matches and costs nothing.
-pub(in crate::search::prefilter) fn scan_ns(
+pub(in crate::search::substring::prefilter) fn scan_ns(
     cover: &ProbeCover,
     covered: u32,
     region: Region,

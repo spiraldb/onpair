@@ -9,9 +9,9 @@ use super::{EqOr, Range};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::{NibbleN8, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
-use crate::search::prefilter::ProbeCover;
-use crate::search::prefilter::scan::policy::{Match, Shape, takes};
-use crate::search::prefilter::scan::{BLOCK, Check, both_stages, resolver};
+use crate::search::substring::prefilter::ProbeCover;
+use crate::search::substring::prefilter::scan::policy::{Match, Shape, takes};
+use crate::search::substring::prefilter::scan::{BLOCK, Check, both_stages, resolver};
 
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
     let mut bits = [0u64; BLOCK / 64];

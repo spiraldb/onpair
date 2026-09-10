@@ -36,7 +36,7 @@ use super::utils::{error, file_name, line, read_csv, slope, write_csv};
 use super::{best, isa_cfg, isa_name, isa_named, machine, mask_stream};
 use crate::core::types::Token;
 use crate::core::types::TokenRange;
-use crate::search::prefilter::ProbeCover;
+use crate::search::substring::prefilter::ProbeCover;
 
 /// Ranges per probe. R is the axis a range's cost is expected to move with,
 /// so it is swept and everything else about a range is a control.

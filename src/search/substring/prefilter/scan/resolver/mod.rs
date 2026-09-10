@@ -12,8 +12,8 @@ mod tests;
 use super::{Check, Mask};
 use crate::core::offset::Offset;
 
-pub(in crate::search::prefilter::scan) use gallop_seek::GallopSeek;
-pub(in crate::search::prefilter::scan) use linear_seek::LinearSeek;
+pub(in crate::search::substring::prefilter::scan) use gallop_seek::GallopSeek;
+pub(in crate::search::substring::prefilter::scan) use linear_seek::LinearSeek;
 
 /// Appends the rows the set bits fall in, ascending and without repeats, one
 /// block of mask at a time. Blocks arrive in stream order, only the non-empty
@@ -22,7 +22,7 @@ pub(in crate::search::prefilter::scan) use linear_seek::LinearSeek;
 /// bit 0. The row layer covers every code a bit can be set for, so a set bit
 /// always has a row. A row goes out on its first bit that `check` passes,
 /// and its further bits are never read.
-pub(in crate::search::prefilter::scan) trait Resolver<'a>:
+pub(in crate::search::substring::prefilter::scan) trait Resolver<'a>:
     Sized
 {
     /// The width the row layer is stored at, which the resolver reads in
@@ -39,7 +39,7 @@ pub(in crate::search::prefilter::scan) trait Resolver<'a>:
 /// the tests check against this, so a resolver is never checked against a
 /// sibling that could be wrong the same way. Nothing outside them asks.
 #[cfg(test)]
-pub(in crate::search::prefilter::scan) fn expected_rows<O: Offset>(
+pub(in crate::search::substring::prefilter::scan) fn expected_rows<O: Offset>(
     mask: &[u64],
     row_offsets: &[O],
 ) -> Vec<usize> {

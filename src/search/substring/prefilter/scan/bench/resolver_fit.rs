@@ -33,7 +33,7 @@ use super::loader::{NeedleSet, SAMPLE, load_corpus, load_needles, paths, row_lay
 use super::utils::{error, file_name, lstsq, read_csv, write_csv};
 use super::{best, machine, resolve_stream};
 use crate::core::types::Token;
-use crate::search::prefilter::ProbeCover;
+use crate::search::substring::prefilter::ProbeCover;
 
 /// Streams for stage two, picked for their mean row length: about seven codes
 /// a row and about eighty. Only one encoding of each, `onpair16`: a wider code
