@@ -46,6 +46,4 @@ perf.data.old
 # Local Claude / agent state
 .claude/settings.local.json
 
-
-# Throwaway bench corpora and fit results (see ~/.claude/projects/.../throwaway)
 /bench/
