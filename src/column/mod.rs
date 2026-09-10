@@ -220,10 +220,6 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         pattern: &[u8],
         frequencies: &TokenFrequencyIndex<S>,
     ) -> Vec<usize> {
-        // The empty pattern occurs at offset 0 of every row.
-        if pattern.is_empty() {
-            return (0..self.num_rows()).collect();
-        }
         let analysis = analyze_prefilter(pattern, self.dict, frequencies, self.num_rows());
         let mut rows = Vec::new();
         prefilter_candidates(

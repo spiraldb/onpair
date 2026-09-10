@@ -11,7 +11,7 @@ use super::graph::{
 use super::mincut::min_cut;
 use super::plan::{cheapest_cover, cover_frequency};
 use super::scan::{Region, scan_ns};
-use super::{analyze_prefilter, prefilter_candidates};
+use super::{analyze_prefilter, prefilter_candidates, prefilter_is_likely_profitable};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::{
@@ -26,9 +26,6 @@ fn candidates<S: TokenFrequencyIndexStorage>(
     frequencies: &TokenFrequencyIndex<S>,
     pattern: &[u8],
 ) -> Vec<usize> {
-    if pattern.is_empty() {
-        return (0..view.num_rows()).collect();
-    }
     let mut out = Vec::new();
     let analysis = analyze_prefilter(pattern, dict, frequencies, view.num_rows());
     prefilter_candidates(view.codes, view.row_offsets, dict, &analysis, &mut out);
@@ -387,6 +384,67 @@ fn sound_on_edge_cases() {
             b"", b"hello", b"world", b"o w", b"bca", b"bcabca", b"aa", b"aab", b"aabaa", b"absent",
         ],
     );
+}
+
+/// Empty rows have no token that a probe scan can find. The all-rows answer must
+/// include them and preserve the candidate API's append semantics.
+#[test]
+fn empty_pattern_appends_all_rows() {
+    let cases: &[&[&[u8]]] = &[&[b"", b"alpha", b"", b"beta", b""], &[b"", b""], &[]];
+    for &rows in cases {
+        let col = compress_rows(rows);
+        let view = col.view();
+        let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+        let analysis = analyze_prefilter(b"", view.dict, &frequencies, view.num_rows());
+        assert!(analysis.probe_cover().is_empty());
+        assert_eq!(analysis.comparison_cost(), 0);
+        assert_eq!(analysis.covered_frequency(), 0);
+        assert_eq!(analysis.covered_fraction(), 0.0);
+        assert_eq!(analysis.expected_scan_ns(), 0.0);
+        assert_eq!(analysis.total_frequency(), view.codes.len() as u32);
+        assert_eq!(
+            analysis.expected_candidate_row_fraction(view.num_rows()),
+            if rows.is_empty() { 0.0 } else { 1.0 }
+        );
+        assert!(prefilter_is_likely_profitable(&analysis, view.num_rows()));
+
+        let expected: Vec<_> = (0..rows.len()).collect();
+        let mut got = vec![usize::MAX];
+        prefilter_candidates(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
+        assert_eq!(got[0], usize::MAX);
+        assert_eq!(got[1..], expected);
+        assert_eq!(
+            view.rows_containing_prefiltered(b"", &frequencies),
+            expected
+        );
+    }
+}
+
+/// A non-empty pattern whose cover came out empty proves no row matches, and
+/// must not be confused with the all-rows answer.
+#[test]
+fn empty_probe_cover_still_appends_nothing() {
+    let analysis = super::PrefilterAnalysis {
+        probe_cover: ProbeCover::new(Vec::new(), Vec::new()),
+        covered_frequency: 0,
+        total_frequency: 1,
+        scan_ns: 0.0,
+        walk: super::scan::Walk::default(),
+        matches_all: false,
+    };
+    assert_eq!(analysis.expected_candidate_row_fraction(3), 0.0);
+    assert!(prefilter_is_likely_profitable(&analysis, 3));
+
+    let dict = crate::compress(b"a", &[0u32, 1], DEFAULT_CONFIG).unwrap();
+    let mut rows = vec![usize::MAX];
+    prefilter_candidates(
+        &[0],
+        &[0u32, 0, 1, 1],
+        dict.view().dict,
+        &analysis,
+        &mut rows,
+    );
+    assert_eq!(rows, vec![usize::MAX]);
 }
 
 #[test]

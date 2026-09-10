@@ -15,8 +15,11 @@
 //! domain (`walk`), so the rows [`prefilter_candidates`] returns are exactly
 //! the rows containing the pattern and no caller-side verification is needed.
 //!
+//! An empty pattern matches every row, including rows without codes. Its
+//! analysis needs no probes, and execution appends all rows without scanning.
+//!
 //! # Soundness
-//! Every occurrence of the pattern in an encoded row falls into one of two cases,
+//! Every occurrence of a non-empty pattern in an encoded row falls into one of two cases,
 //! and the cover covers both:
 //!
 //! * **One token contains the whole pattern.** Its id is added unconditionally
@@ -60,10 +63,11 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
-/// The normalized probe cover selected for a pattern and its frequency.
+/// The normalized probe cover selected for a pattern and its frequency, or an
+/// all-rows result.
 ///
 /// Points and ranges are disjoint, so each covered token occurrence is counted
-/// exactly once.
+/// exactly once. An empty pattern matches all rows and needs no probes.
 #[derive(Debug, Clone)]
 pub struct PrefilterAnalysis {
     probe_cover: ProbeCover,
@@ -71,10 +75,15 @@ pub struct PrefilterAnalysis {
     total_frequency: u32,
     scan_ns: f64,
     walk: scan::Walk,
+    /// Empty patterns admit even rows without codes, independently of the cover.
+    matches_all: bool,
 }
 
 impl PrefilterAnalysis {
     /// The normalized checks the SIMD prefilter can execute.
+    ///
+    /// For an empty pattern this cover is empty, but [`prefilter_candidates`]
+    /// still returns every row.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
     }
@@ -82,18 +91,21 @@ impl PrefilterAnalysis {
     /// Expected nanoseconds to scan the cover over the analyzed stream and
     /// verify the rows it admits, from the fitted kernel model. The number
     /// the cover was chosen by, so alternatives compare against it directly.
+    /// Zero for an empty pattern, which scans nothing.
     pub fn expected_scan_ns(&self) -> f64 {
         self.scan_ns
     }
 
     /// Number of code positions whose token is covered by the probes.
+    /// Zero for an empty pattern, which needs no probes.
     pub fn covered_frequency(&self) -> u32 {
         self.covered_frequency
     }
 
     /// Fraction of code positions whose token is covered by the probes.
     ///
-    /// Returns `0.0` when the indexed code stream is empty.
+    /// Returns `0.0` when the indexed code stream is empty or the pattern is
+    /// empty and needs no probes.
     pub fn covered_fraction(&self) -> f64 {
         if self.total_frequency == 0 {
             0.0
@@ -108,7 +120,7 @@ impl PrefilterAnalysis {
     }
 
     /// SIMD comparisons each vector of the code stream pays for this cover: one
-    /// per point, two per inclusive range.
+    /// per point, two per inclusive range. Zero for an empty pattern.
     pub fn comparison_cost(&self) -> usize {
         let cover = self.probe_cover();
         cover
@@ -122,9 +134,14 @@ impl PrefilterAnalysis {
     /// Verification is charged per row, so the estimate is covered codes per
     /// row: exact when no row holds two covered codes, an over-estimate
     /// otherwise. Returns `0.0` for an empty region and never exceeds `1.0`.
+    /// An empty pattern admits every row, so its fraction is `1.0` for any
+    /// non-empty region, even one consisting entirely of empty rows.
     pub fn expected_candidate_row_fraction(&self, row_count: usize) -> f64 {
         if row_count == 0 {
             return 0.0;
+        }
+        if self.matches_all {
+            return 1.0;
         }
         (f64::from(self.covered_frequency) / row_count as f64).min(1.0)
     }
@@ -145,8 +162,10 @@ const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
 /// [`analyze_prefilter`]: its
 /// [`comparison_cost`](PrefilterAnalysis::comparison_cost) per code, and the
 /// [`expected_candidate_row_fraction`](PrefilterAnalysis::expected_candidate_row_fraction)
-/// it sends to per-row verification. An empty cover passes both: it proves no
-/// encoded row can match, so it scans nothing and admits nothing.
+/// it sends to per-row verification. For a non-empty pattern, an empty cover
+/// passes both: it proves no encoded row can match, so it scans nothing and
+/// admits nothing. An empty pattern also passes: its all-rows answer is exact
+/// and requires neither a scan nor verification.
 ///
 /// This is a performance hint, not a correctness requirement, and it neither
 /// executes nor bypasses the prefilter. The thresholds were calibrated on
@@ -155,15 +174,17 @@ const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
 /// with materially different columns or architectures may choose their own
 /// policy.
 pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: usize) -> bool {
-    analysis.comparison_cost() <= MAX_SIMD_COMPARISONS
-        && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION
+    analysis.matches_all
+        || (analysis.comparison_cost() <= MAX_SIMD_COMPARISONS
+            && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION)
 }
 
 /// Analyze `pattern` and return the sound probe cover the scan cost model
 /// prices lowest over a stream of `row_count` rows.
 ///
 /// This function constructs the checks and reports their frequency and cost;
-/// the caller decides whether executing them is profitable.
+/// the caller decides whether executing them is profitable. An empty pattern
+/// produces an analysis that admits every row without compiling probes.
 ///
 /// # Precondition
 /// `dict` is conformant: sorted, complete, and unique. These properties are
@@ -174,19 +195,24 @@ pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: u
 /// never remove members from the resulting cover.
 ///
 /// # Panics
-/// Panics when `pattern` is empty. The empty pattern matches every row and
-/// should bypass prefilter analysis. Panics when it is longer than
-/// [`MAX_PATTERN_LEN`], which is what the alignment walk's node ids hold.
+/// Panics when `pattern` is longer than [`MAX_PATTERN_LEN`], which is what the
+/// alignment walk's node ids hold.
 pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
     pattern: &[u8],
     dict: CompactDictionaryView<'_>,
     frequencies: &TokenFrequencyIndex<S>,
     row_count: usize,
 ) -> PrefilterAnalysis {
-    assert!(
-        !pattern.is_empty(),
-        "the empty pattern matches every row and needs no prefilter"
-    );
+    if pattern.is_empty() {
+        return PrefilterAnalysis {
+            probe_cover: ProbeCover::from_runs(Vec::new()),
+            covered_frequency: 0,
+            total_frequency: frequencies.total_frequency(),
+            scan_ns: 0.0,
+            walk: scan::Walk::default(),
+            matches_all: true,
+        };
+    }
     assert!(
         pattern.len() <= MAX_PATTERN_LEN,
         "pattern of {} bytes exceeds the prefilter's {MAX_PATTERN_LEN}",
@@ -199,6 +225,7 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
         total_frequency: frequencies.total_frequency(),
         scan_ns: planned.scan_ns,
         walk: planned.walk,
+        matches_all: false,
     }
 }
 
@@ -210,7 +237,9 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
 /// [`BytesVerifier`](super::BytesVerifier) is needed behind this.
 ///
 /// This function only executes the analyzed cover; the caller decides whether
-/// scanning it is profitable. An empty cover appends nothing.
+/// scanning it is profitable. For a non-empty pattern, an empty cover appends
+/// nothing. An empty pattern appends every row, including empty rows, without
+/// scanning.
 ///
 /// # Precondition
 /// `row_offsets` are valid delimiters for `codes`, every code lies in the
@@ -224,6 +253,10 @@ pub fn prefilter_candidates<O: Offset>(
     analysis: &PrefilterAnalysis,
     out: &mut Vec<usize>,
 ) {
+    if analysis.matches_all {
+        out.extend(0..row_offsets.len().saturating_sub(1));
+        return;
+    }
     let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
     let plan = scan::plan(input, analysis);
     scan::execute(plan, input, &analysis.walk, dict, out);

@@ -159,8 +159,9 @@ impl EdgesByToken {
     }
 }
 
-/// The alignment graph flattened for walking from a hit.
-#[derive(Debug, Clone)]
+/// The alignment graph flattened for walking from a hit. The default is the
+/// walk of no graph, which an all-rows analysis carries and never runs.
+#[derive(Debug, Clone, Default)]
 pub(in crate::search::prefilter) struct Walk {
     nodes: Vec<Node>,
     edges: EdgesByToken,
