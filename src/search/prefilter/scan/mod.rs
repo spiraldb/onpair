@@ -27,8 +27,8 @@ pub(in crate::search::prefilter) use policy::{Facts, Region, scan_ns};
 use resolver::Resolver;
 pub(in crate::search::prefilter) use walk::Walk;
 
-use super::cover::ProbeCover;
 use super::PrefilterAnalysis;
+use super::cover::ProbeCover;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;

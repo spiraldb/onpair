@@ -81,7 +81,10 @@ struct Edge {
 impl Edge {
     fn new(from: u32, to: u32) -> Self {
         debug_assert!(from < to, "an edge advances the needle offset");
-        debug_assert!(to <= u32::from(u16::MAX), "needle outgrew the edge's node ids");
+        debug_assert!(
+            to <= u32::from(u16::MAX),
+            "needle outgrew the edge's node ids"
+        );
         Self {
             from: from as u16,
             to: to as u16,
