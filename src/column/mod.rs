@@ -17,7 +17,11 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
-use crate::search::{ContainsTable, PrefixQuery, contains, equals, starts_with, tokenize};
+use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
+use crate::search::{
+    ContainsTable, PrefixQuery, analyze_prefilter, contains, equals, prefilter_candidates,
+    starts_with, tokenize,
+};
 
 /// Owned compressed column, produced by [`Column::compress`] /
 /// [`Parser::parse`](crate::Parser::parse). Self-contained: it carries its own
@@ -188,6 +192,44 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     pub fn rows_containing(&self, pattern: &[u8]) -> Vec<usize> {
         let table = ContainsTable::new(pattern, self.dict);
         self.select(|codes| contains(codes, &table))
+    }
+
+    /// Ascending indices of the rows containing `pattern`, from the SIMD
+    /// prefilter alone.
+    ///
+    /// [`prefilter_candidates`] scans the code stream for the rows holding a
+    /// probe and verifies each hit against the alignment graph, so the rows
+    /// come back exact and nothing runs behind it. Worth it exactly when the
+    /// pattern is selective; a pattern most rows match is more cheaply answered
+    /// by [`rows_containing`](Self::rows_containing) directly. This explicitly
+    /// named method always runs the prefilter. An adaptive caller can use
+    /// [`analyze_prefilter`] to inspect the probe cover and its frequency
+    /// before choosing whether to scan it.
+    ///
+    /// `frequencies` must use this view's token domain and code count. Build an
+    /// exact index with
+    /// [`build_token_frequency_index`](crate::search::index::build_token_frequency_index),
+    /// or validate stored weights with [`TokenFrequencyIndex::validate_safety`].
+    /// Inexact weights affect planning, not query correctness.
+    ///
+    /// # Panics
+    /// If `pattern` is longer than
+    /// [`MAX_PATTERN_LEN`](crate::search::MAX_PATTERN_LEN).
+    pub fn rows_containing_prefiltered<S: TokenFrequencyIndexStorage>(
+        &self,
+        pattern: &[u8],
+        frequencies: &TokenFrequencyIndex<S>,
+    ) -> Vec<usize> {
+        let analysis = analyze_prefilter(pattern, self.dict, frequencies, self.num_rows());
+        let mut rows = Vec::new();
+        prefilter_candidates(
+            self.codes,
+            self.row_offsets,
+            self.dict,
+            &analysis,
+            &mut rows,
+        );
+        rows
     }
 
     /// Ascending indices of the rows whose codes satisfy `pred`.
@@ -396,5 +438,61 @@ mod tests {
                 .collect();
             assert_eq!(view.rows_containing(needle), con, "contains {needle:?}");
         }
+    }
+
+    /// The prefiltered path is an optimization of `rows_containing` and nothing
+    /// else: same rows, same order.
+    #[test]
+    fn prefiltered_search_agrees_with_rows_containing() {
+        use crate::DictionaryView;
+        use crate::search::index::build_token_frequency_index;
+        use crate::test_corpus::user_strings;
+        let corpus: Vec<Vec<u8>> = user_strings(60)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+        let (bytes, offsets) = pack(&rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+        let needles: &[&[u8]] = &[
+            b"",
+            b"h",
+            b"https",
+            b"https://www.example.com/",
+            b"example",
+            b".com",
+            b"://",
+            b"zzz",
+        ];
+        for &needle in needles {
+            let want = view.rows_containing(needle);
+            assert_eq!(
+                view.rows_containing_prefiltered(needle, &freqs),
+                want,
+                "prefiltered {needle:?}"
+            );
+        }
+    }
+
+    /// The prefilter takes patterns `ContainsTable` rejects: its own cap is the
+    /// walk's node ids, not the KMP table's 255-byte state width.
+    #[test]
+    fn prefiltered_takes_patterns_the_kmp_table_rejects() {
+        use crate::DictionaryView;
+        use crate::search::index::build_token_frequency_index;
+        let long = vec![b'q'; 400];
+        let mut hit = long.clone();
+        hit.extend_from_slice(b"tail");
+        let rows: &[&[u8]] = &[b"short", hit.as_slice(), b"qqq"];
+        let (bytes, offsets) = pack(rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+
+        let got = view.rows_containing_prefiltered(&long, &freqs);
+        assert_eq!(got, vec![1]);
     }
 }

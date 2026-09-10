@@ -68,18 +68,18 @@ mod core;
 mod decoding;
 mod encoding;
 pub mod search;
-
 #[cfg(test)]
 mod test_corpus;
 
 pub use crate::column::{Column, ColumnView};
+
 pub use crate::core::dictionary::{
     CompactDictionary, CompactDictionaryView, Dictionary, DictionaryStorage, DictionaryView,
     OwnedDictionaryStorage, WideDictionary, WideDictionaryView, code_bits_for_num_tokens,
 };
 pub use crate::core::offset::Offset;
 pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
-pub use crate::core::validate::InvalidColumn;
+pub use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex};
 pub use crate::decoding::{
     DECODE_PADDING, OutputTooSmall, decode_into, decoded_len, try_decode_into,
 };

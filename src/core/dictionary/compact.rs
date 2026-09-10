@@ -431,6 +431,26 @@ impl<'a> CompactDictionaryView<'a> {
         Self { bytes, offsets }
     }
 
+    /// The token bytes without the read-padding, plus the offsets attributing
+    /// them: every byte belongs to exactly one token, so a bulk substring
+    /// search over the buffer finds the same matches as one per token.
+    #[inline]
+    pub(crate) fn token_payload(&self) -> (&'a [u8], &'a [u32]) {
+        let logical = self.offsets.last().copied().unwrap_or(0) as usize;
+        (&self.bytes[..logical], self.offsets)
+    }
+
+    /// Get a token with the fixed length.
+    #[inline]
+    pub(crate) fn token_window(&self, id: Token) -> (usize, [u8; MAX_TOKEN_SIZE]) {
+        let begin = self.offsets[id as usize] as usize;
+        let end = self.offsets[id as usize + 1] as usize;
+        let fixed_end = begin + MAX_TOKEN_SIZE;
+        let len = end - begin;
+        let window = self.bytes[begin..fixed_end].try_into().unwrap();
+        (len, window)
+    }
+
     /// Validate raw borrowed `(bytes, offsets)` for safe decoding over the same
     /// slices (no copy) — the checked door across the safety boundary. The
     /// borrowed bytes must already be read-padded (a borrow cannot be extended).

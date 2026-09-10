@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a SIMD substring prefilter with frequency-aware min-cut probe planning
+  and exact compressed-domain or decoded-byte verification.
 - Add row-based training and compression without flattening input first.
 - Add encoding into reusable caller-owned buffers.
 

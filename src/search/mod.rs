@@ -33,16 +33,31 @@
 //!   [`PrefixQuery`].
 //! * [`contains`](contains()) — rows containing a pattern, via a precomputed
 //!   token-level KMP [`ContainsTable`].
+//! * [`index::build_token_frequency_index`] — build the reusable selectivity
+//!   index for a code stream.
+//! * [`analyze_prefilter`] — derive a normalized probe cover and report its
+//!   frequency.
+//! * [`prefilter_candidates`] — the rows containing a pattern, collected by
+//!   running a probe cover over the code stream. Every hit is verified against
+//!   the alignment graph in the compressed domain, so the rows are exact and
+//!   nothing verifies behind it.
+//! * [`BytesVerifier`] — an exact check in the decoded domain: decode a row
+//!   into a reused buffer and `memmem` it. What the prefilter is measured
+//!   against, and the substring check without a pattern-length cap.
 //! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
 
-mod contains;
 mod equals;
+pub mod index;
 mod lookup;
 mod prefix;
+mod substring;
 mod tokenize;
 
-pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefix::{PrefixQuery, starts_with};
+pub use substring::{
+    BytesVerifier, ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, ProbeCover,
+    analyze_prefilter, contains, prefilter_candidates, prefilter_is_likely_profitable,
+};
 pub use tokenize::tokenize;
