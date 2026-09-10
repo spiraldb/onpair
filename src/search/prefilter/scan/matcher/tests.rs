@@ -231,6 +231,80 @@ fn agree_on_ranges_of_wide_codes() {
     );
 }
 
+/// Probes on both sides of 0x8000 and a range across it. AVX2 has no
+/// unsigned 16-bit compare, so a range written with the signed one would
+/// put 0x8000 below 0x7fff; the kernels must not.
+#[test]
+fn agree_on_the_sign_boundary() {
+    let mut codes = [0 as Token; BLOCK];
+    for (at, code) in codes.iter_mut().enumerate() {
+        *code = [0x7ffe, 0x7fff, 0x8000, 0x8001, 0x8002, 7][at % 6];
+    }
+    for needles in [
+        vec![0x7fff],
+        vec![0x8000],
+        vec![0x8001],
+        vec![0x7fff, 0x8000, 0x8001],
+    ] {
+        every_matcher(&ProbeCover::new(needles, vec![]), &codes);
+    }
+    for (lo, hi) in [
+        (0x7ffe, 0x8001),
+        (0x7fff, 0x7fff),
+        (0x8000, 0x8000),
+        (0, 0x7fff),
+        (0x8000, Token::MAX),
+    ] {
+        let range = TokenRange {
+            begin: lo,
+            last: hi,
+        };
+        every_matcher(&ProbeCover::new(vec![], vec![range]), &codes);
+        every_matcher(&ProbeCover::new(vec![7], vec![range]), &codes);
+    }
+    let across = expected(
+        &ProbeCover::new(
+            vec![],
+            vec![TokenRange {
+                begin: 0x7ffe,
+                last: 0x8001,
+            }],
+        ),
+        &codes,
+    );
+    assert_eq!(
+        across[0] & 0x3f,
+        0b001111,
+        "the definition misplaced 0x8000"
+    );
+}
+
+/// Probes at the top of the code space, in a block that holds those codes:
+/// a range ending at `Token::MAX` has nothing above it to reject, and the
+/// width arithmetic must not wrap.
+#[test]
+fn agree_at_the_top_of_the_code_space() {
+    let mut codes = [0 as Token; BLOCK];
+    for (at, code) in codes.iter_mut().enumerate() {
+        *code = [65527, 65531, 65532, 65533, 65534, Token::MAX, 7][at % 7];
+    }
+    for needles in [vec![65527], vec![Token::MAX], vec![65527, Token::MAX]] {
+        every_matcher(&ProbeCover::new(needles, vec![]), &codes);
+    }
+    for (lo, hi) in [
+        (65532, Token::MAX),
+        (Token::MAX, Token::MAX),
+        (65528, 65531),
+    ] {
+        let range = TokenRange {
+            begin: lo,
+            last: hi,
+        };
+        every_matcher(&ProbeCover::new(vec![], vec![range]), &codes);
+        every_matcher(&ProbeCover::new(vec![65527], vec![range]), &codes);
+    }
+}
+
 /// The codes just outside either end of what the cover admits, with a
 /// range setting one end.
 #[test]
@@ -277,12 +351,24 @@ fn the_driver_scans_every_block() {
         .collect();
     let row_offsets: Vec<u32> = (0..=codes.len() as u32).step_by(64).collect();
     let at = 2 * BLOCK + 40;
-    let needles = codes[at..at + 1].to_vec();
+    let cover = ProbeCover::new(codes[at..at + 1].to_vec(), vec![]);
     let mut found = Vec::new();
     both_stages::<Table, resolver::LinearSeek<'_, u32>>(
-        &ProbeCover::new(needles.to_vec(), vec![]),
+        &cover,
         &codes,
         &row_offsets,
+        Check::Superset,
+        &mut found,
+    );
+    assert_eq!(found, vec![at / 64]);
+
+    // The same layer at the wide offset width.
+    let wide: Vec<u64> = row_offsets.iter().map(|&o| u64::from(o)).collect();
+    found.clear();
+    both_stages::<Table, resolver::GallopSeek<'_, u64>>(
+        &cover,
+        &codes,
+        &wide,
         Check::Superset,
         &mut found,
     );

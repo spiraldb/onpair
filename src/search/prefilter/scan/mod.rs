@@ -319,6 +319,21 @@ mod tests {
         assert!(facts(ScanInput::full(&codes, rowless, &cover), 1, 8).is_none());
     }
 
+    /// Rows but no codes: the block driver has nothing to hand the matcher,
+    /// and the empty rows must come out as no candidates rather than a panic.
+    #[test]
+    fn rows_without_codes_make_no_candidate() {
+        let cover = ProbeCover {
+            points: vec![7],
+            ranges: Vec::new(),
+        };
+        let mut out = Vec::new();
+        scan(&[], &[0u32, 0, 0, 0], &cover, 0, &mut out);
+        assert!(out.is_empty());
+        scan(&[], &[0u64, 0, 0, 0], &cover, 0, &mut out);
+        assert!(out.is_empty());
+    }
+
     /// The facts the scan plans its own halves from.
     #[test]
     fn the_scan_is_handed_the_region_it_will_see() {
