@@ -431,27 +431,24 @@ impl<'a> CompactDictionaryView<'a> {
         Self { bytes, offsets }
     }
 
-    /// The token bytes without the trailing read-padding, plus the offsets
-    /// attributing them.
-    ///
-    /// Every byte of the returned buffer belongs to exactly one token, which is
-    /// what makes the buffer a valid haystack for a bulk substring search: a match
-    /// at `hit` lies inside token `id` exactly when `offsets[id] <= hit` and
-    /// `hit + len <= offsets[id + 1]`. The substring prefilter uses this to sweep
-    /// the whole dictionary with a single `memmem` search rather than one per
-    /// token. Trimming the read-padding is the one care needed — it is the only
-    /// part of `bytes` belonging to no token.
-    ///
-    /// Inherent and crate-internal on purpose, rather than a method on
-    /// [`DictionaryView`]: the buffer is a fact about *this* layout, so a caller
-    /// that needs it needs this type. The strided
-    /// [`WideDictionaryView`](super::WideDictionaryView) has no counterpart — the
-    /// tail of each of its rows holds the bytes of the *following* tokens, so a
-    /// match found there need not lie in any token at all.
+    /// The token bytes without the read-padding, plus the offsets attributing
+    /// them: every byte belongs to exactly one token, so a bulk substring
+    /// search over the buffer finds the same matches as one per token.
     #[inline]
     pub(crate) fn token_payload(&self) -> (&'a [u8], &'a [u32]) {
         let logical = self.offsets.last().copied().unwrap_or(0) as usize;
         (&self.bytes[..logical], self.offsets)
+    }
+
+    /// Get a token with the fixed length.
+    #[inline]
+    pub(crate) fn token_window(&self, id: Token) -> (usize, [u8; MAX_TOKEN_SIZE]) {
+        let begin = self.offsets[id as usize] as usize;
+        let end = self.offsets[id as usize + 1] as usize;
+        let fixed_end = begin + MAX_TOKEN_SIZE;
+        let len = end - begin;
+        let window = self.bytes[begin..fixed_end].try_into().unwrap();
+        (len, window)
     }
 
     /// Validate raw borrowed `(bytes, offsets)` for safe decoding over the same

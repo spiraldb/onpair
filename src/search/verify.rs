@@ -60,11 +60,10 @@ use crate::decoding::DECODE_PADDING;
 ///
 /// let mut verifier = BytesVerifier::new(b"pha");
 /// let mut rows = Vec::new();
-/// let analysis = analyze_prefilter(b"pha", view.dict, &freqs);
-/// prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut rows)?;
+/// let analysis = analyze_prefilter(b"pha", view.dict, &freqs, view.num_rows());
+/// prefilter_candidates(view.codes, view.row_offsets, view.dict, &analysis, &mut rows);
 /// verifier.retain(view, &mut rows);
 /// assert_eq!(rows, vec![0, 2]);
-/// # Ok::<(), onpair::search::PrefilterError>(())
 /// ```
 pub struct BytesVerifier<'p> {
     /// The prepared needle. Borrows the pattern rather than copying it.

@@ -8,20 +8,20 @@
 //! codes. This module trims that per-row work down to the rows that *can* match.
 //! It compiles a **sound probe cover** from the pattern — dictionary token ids
 //! and id ranges chosen so that *any* row containing the pattern holds at least
-//! one probe token — then scans the flat code stream to collect a **superset** of
-//! the matching rows ([`prefilter_candidates`]).
+//! one probe token — then scans the flat code stream for the rows holding one
+//! ([`prefilter_candidates`]).
 //!
-//! The prefilter stops there: it hands back the candidate rows and leaves the
-//! exact check to the caller. Verifying only those survivors with `contains` or
-//! another exact substring test recovers the precise answer, since a sound cover
-//! drops no true match.
+//! Every hit is then checked against the alignment graph in the compressed
+//! domain (`walk`), so the rows [`prefilter_candidates`] returns are exactly
+//! the rows containing the pattern and no caller-side verification is needed.
 //!
 //! # Soundness
 //! Every occurrence of the pattern in an encoded row falls into one of two cases,
 //! and the cover covers both:
 //!
 //! * **One token contains the whole pattern.** Its id is added unconditionally
-//!   (only reachable when `pattern.len() <= MAX_TOKEN_SIZE`).
+//!   (only reachable when `pattern.len() <= MAX_TOKEN_SIZE`), as the range of
+//!   tokens the pattern is a prefix of or as the set holding it further in.
 //! * **The occurrence crosses at least one token boundary.** Then it begins at
 //!   some feasible first-token alignment `k`, after which greedy parsing of
 //!   `pattern[k..]` is deterministic. Every such layout is one path through the
@@ -33,11 +33,16 @@
 //!   compiler reads and the caller owns.
 //! * `graph` — pattern to alignment DAG: every layout of the pattern across
 //!   token boundaries, as one graph whose cuts are exactly the sound covers.
-//! * `mincut` — the cheapest such cut, by max-flow over the split DAG.
-//! * `plan` — the two of them end to end: pattern in, normalized cover out,
-//!   preserving every selected id regardless of its advisory frequency.
+//! * `mincut` — the cheapest such cut, by max-flow over the split DAG, under
+//!   whatever edge weights it is handed.
+//! * `plan` — the three end to end: pattern in, the cover the model prices
+//!   lowest out, preserving every selected id regardless of its advisory
+//!   frequency.
 //! * `cover` — the cover itself, in both the shapes the scan wants.
-//! * `scan` — the vector kernels. Profitability stays outside execution.
+//! * `walk` — the graph flattened for checking a hit in codes, forward to the
+//!   sink and back to the source.
+//! * `scan` — the vector kernels and, in `policy`, the fitted cost model
+//!   that picks them and prices a cover. Profitability stays outside execution.
 
 mod cover;
 mod graph;
@@ -55,25 +60,6 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
-/// Reason SIMD prefilter execution could not proceed.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum PrefilterError {
-    /// The crate has no SIMD prefilter kernel for this target architecture.
-    UnsupportedArchitecture,
-}
-
-impl std::fmt::Display for PrefilterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::UnsupportedArchitecture => {
-                "the substring prefilter has no SIMD kernel for this architecture"
-            }
-        })
-    }
-}
-
-impl std::error::Error for PrefilterError {}
-
 /// The normalized probe cover selected for a pattern and its frequency.
 ///
 /// Points and ranges are disjoint, so each covered token occurrence is counted
@@ -83,12 +69,21 @@ pub struct PrefilterAnalysis {
     probe_cover: ProbeCover,
     covered_frequency: u32,
     total_frequency: u32,
+    scan_ns: f64,
+    walk: scan::Walk,
 }
 
 impl PrefilterAnalysis {
     /// The normalized checks the SIMD prefilter can execute.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
+    }
+
+    /// Expected nanoseconds to scan the cover over the analyzed stream and
+    /// verify the rows it admits, from the fitted kernel model. The number
+    /// the cover was chosen by, so alternatives compare against it directly.
+    pub fn expected_scan_ns(&self) -> f64 {
+        self.scan_ns
     }
 
     /// Number of code positions whose token is covered by the probes.
@@ -164,10 +159,11 @@ pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: u
         && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION
 }
 
-/// Analyze `pattern` and return its normalized minimum-cut probe cover.
+/// Analyze `pattern` and return the sound probe cover the scan cost model
+/// prices lowest over a stream of `row_count` rows.
 ///
-/// This function constructs the checks and reports their frequency; the caller
-/// decides whether executing them is profitable.
+/// This function constructs the checks and reports their frequency and cost;
+/// the caller decides whether executing them is profitable.
 ///
 /// # Precondition
 /// `dict` is conformant: sorted, complete, and unique. These properties are
@@ -179,66 +175,60 @@ pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: u
 ///
 /// # Panics
 /// Panics when `pattern` is empty. The empty pattern matches every row and
-/// should bypass prefilter analysis.
+/// should bypass prefilter analysis. Panics when it is longer than
+/// [`MAX_PATTERN_LEN`], which is what the alignment walk's node ids hold.
 pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
     pattern: &[u8],
     dict: CompactDictionaryView<'_>,
     frequencies: &TokenFrequencyIndex<S>,
+    row_count: usize,
 ) -> PrefilterAnalysis {
     assert!(
         !pattern.is_empty(),
         "the empty pattern matches every row and needs no prefilter"
     );
-    let frequencies_view = frequencies.as_view();
-    let probe_cover = plan::plan(dict, pattern, frequencies_view);
-    let covered_frequency = probe_cover
-        .points
-        .iter()
-        .map(|&token| frequencies_view.frequency(token))
-        .chain(
-            probe_cover
-                .ranges
-                .iter()
-                .map(|&range| frequencies_view.range_frequency(range)),
-        )
-        .sum();
+    assert!(
+        pattern.len() <= MAX_PATTERN_LEN,
+        "pattern of {} bytes exceeds the prefilter's {MAX_PATTERN_LEN}",
+        pattern.len()
+    );
+    let planned = plan::plan(dict, pattern, frequencies.as_view(), row_count);
     PrefilterAnalysis {
-        probe_cover,
-        covered_frequency,
+        probe_cover: planned.cover,
+        covered_frequency: planned.covered,
         total_frequency: frequencies.total_frequency(),
+        scan_ns: planned.scan_ns,
+        walk: planned.walk,
     }
 }
 
-/// Execute `analysis` and append the ascending rows that contain a covered code.
+/// Execute `analysis` and append the ascending rows containing the pattern.
 ///
-/// The result is a **sound superset**. Verify the survivors with an exact check,
-/// such as a [`ContainsTable`](super::ContainsTable) passed to
-/// [`contains`](super::contains()), to recover the precise answer.
+/// The rows are exact, not a superset: every hit on the cover is verified
+/// against the alignment graph in the compressed domain, so no caller-side
+/// check such as [`contains`](super::contains()) or a
+/// [`BytesVerifier`](super::BytesVerifier) is needed behind this.
 ///
 /// This function only executes the analyzed cover; the caller decides whether
-/// scanning it is profitable.
-///
-/// The function does not silently fall back to a full scalar scan. If the target
-/// has no SIMD implementation, it returns an error without modifying `out`.
-///
-/// An empty cover appends nothing and succeeds without SIMD support.
+/// scanning it is profitable. An empty cover appends nothing.
 ///
 /// # Precondition
-/// `row_offsets` are valid delimiters for `codes`, and every code lies in the
-/// token domain of the analyzed cover. A validated [`Column`](crate::Column)
-/// and an analysis built for that column satisfy these properties.
-///
-/// # Errors
-/// Returns [`PrefilterError::UnsupportedArchitecture`] when no SIMD kernel is
-/// available for a non-empty cover.
+/// `row_offsets` are valid delimiters for `codes`, every code lies in the
+/// token domain of the analyzed cover, and `dict` is the dictionary the
+/// analysis was built over. A validated [`Column`](crate::Column) and an
+/// analysis built for that column satisfy these properties.
 pub fn prefilter_candidates<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
+    dict: CompactDictionaryView<'_>,
     analysis: &PrefilterAnalysis,
     out: &mut Vec<usize>,
-) -> Result<(), PrefilterError> {
+) {
     let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
     let plan = scan::plan(input, analysis);
-    out.reserve(scan::reserve(plan));
-    scan::execute(plan, input, out)
+    scan::execute(plan, input, &analysis.walk, dict, out);
 }
+
+/// The longest pattern [`analyze_prefilter`] takes: one node per needle offset
+/// plus the sink, all of them inside the walk's `u16` ids.
+pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;

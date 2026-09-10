@@ -67,12 +67,12 @@ mod column;
 mod core;
 mod decoding;
 mod encoding;
-pub mod fsst;
 pub mod search;
 #[cfg(test)]
 mod test_corpus;
 
 pub use crate::column::{Column, ColumnView};
+
 pub use crate::core::dictionary::{
     CompactDictionary, CompactDictionaryView, Dictionary, DictionaryStorage, DictionaryView,
     OwnedDictionaryStorage, WideDictionary, WideDictionaryView, code_bits_for_num_tokens,

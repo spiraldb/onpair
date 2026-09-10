@@ -19,8 +19,8 @@ use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 use crate::search::{
-    BytesVerifier, ContainsTable, PrefilterError, PrefixQuery, analyze_prefilter, contains, equals,
-    prefilter_candidates, starts_with, tokenize,
+    ContainsTable, PrefixQuery, analyze_prefilter, contains, equals, prefilter_candidates,
+    starts_with, tokenize,
 };
 
 /// Owned compressed column, produced by [`Column::compress`] /
@@ -194,17 +194,17 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         self.select(|codes| contains(codes, &table))
     }
 
-    /// Ascending indices of the rows containing `pattern`, narrowed by the SIMD
-    /// prefilter and verified in the compressed domain.
+    /// Ascending indices of the rows containing `pattern`, from the SIMD
+    /// prefilter alone.
     ///
-    /// [`prefilter_candidates`] collects a sound superset of the rows from the
-    /// code stream, and each survivor then takes the same [`ContainsTable`] walk
-    /// [`rows_containing`](Self::rows_containing) applies to every row — paid on
-    /// the candidates only. Worth it exactly when the pattern is selective; a
-    /// pattern most rows match is more cheaply answered by `rows_containing`
-    /// directly. This explicitly named method always runs the prefilter. An
-    /// adaptive caller can use [`analyze_prefilter`] to inspect the probe cover
-    /// and its frequency before choosing whether to scan it.
+    /// [`prefilter_candidates`] scans the code stream for the rows holding a
+    /// probe and verifies each hit against the alignment graph, so the rows
+    /// come back exact and nothing runs behind it. Worth it exactly when the
+    /// pattern is selective; a pattern most rows match is more cheaply answered
+    /// by [`rows_containing`](Self::rows_containing) directly. This explicitly
+    /// named method always runs the prefilter. An adaptive caller can use
+    /// [`analyze_prefilter`] to inspect the probe cover and its frequency
+    /// before choosing whether to scan it.
     ///
     /// `frequencies` must use this view's token domain and code count. Build an
     /// exact index with
@@ -212,73 +212,28 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// or validate stored weights with [`TokenFrequencyIndex::validate_safety`].
     /// Inexact weights affect planning, not query correctness.
     ///
-    /// # Errors
-    /// Returns [`PrefilterError::UnsupportedArchitecture`] when a code scan is
-    /// required but no SIMD kernel is available. It never falls back to
-    /// [`rows_containing`](Self::rows_containing) on its own.
-    ///
     /// # Panics
-    /// If `pattern` is longer than 255 bytes, the state width of
-    /// [`ContainsTable`]. The check happens before the prefilter runs, so it does
-    /// not depend on whether the prefilter would have refused; for longer
-    /// patterns use
-    /// [`rows_containing_prefiltered_memmem`](Self::rows_containing_prefiltered_memmem).
+    /// If `pattern` is longer than
+    /// [`MAX_PATTERN_LEN`](crate::search::MAX_PATTERN_LEN).
     pub fn rows_containing_prefiltered<S: TokenFrequencyIndexStorage>(
         &self,
         pattern: &[u8],
         frequencies: &TokenFrequencyIndex<S>,
-    ) -> Result<Vec<usize>, PrefilterError> {
-        let table = ContainsTable::new(pattern, self.dict);
-        let mut rows = Vec::new();
-        self.prefilter_into(pattern, frequencies, &mut rows)?;
-        rows.retain(|&k| contains(self.row_codes(k), &table));
-        Ok(rows)
-    }
-
-    /// Ascending indices of the rows containing `pattern`, narrowed by the SIMD
-    /// prefilter and verified by decoding each candidate and searching its bytes.
-    ///
-    /// The same prefilter as
-    /// [`rows_containing_prefiltered`](Self::rows_containing_prefiltered) with the
-    /// other verifier behind it — see [`BytesVerifier`] for why decoding the
-    /// survivors beats walking their codes, and note that this one has no
-    /// pattern-length limit.
-    ///
-    /// One decode buffer serves every candidate. It is discarded when this returns,
-    /// so a caller issuing many queries against one column should drive
-    /// [`prefilter_candidates`] and a kept [`BytesVerifier`] directly and reuse
-    /// both buffers.
-    ///
-    /// # Errors
-    /// As [`rows_containing_prefiltered`](Self::rows_containing_prefiltered).
-    pub fn rows_containing_prefiltered_memmem<S: TokenFrequencyIndexStorage>(
-        &self,
-        pattern: &[u8],
-        frequencies: &TokenFrequencyIndex<S>,
-    ) -> Result<Vec<usize>, PrefilterError> {
-        let mut rows = Vec::new();
-        self.prefilter_into(pattern, frequencies, &mut rows)?;
-        // The empty pattern occurs at offset 0 of every row, so the prefilter's
-        // answer is already exact and decoding the column would only confirm it.
-        if !pattern.is_empty() {
-            BytesVerifier::new(pattern).retain(*self, &mut rows);
-        }
-        Ok(rows)
-    }
-
-    /// The prefilter half both `rows_containing_prefiltered*` methods share.
-    fn prefilter_into<S: TokenFrequencyIndexStorage>(
-        &self,
-        pattern: &[u8],
-        frequencies: &TokenFrequencyIndex<S>,
-        out: &mut Vec<usize>,
-    ) -> Result<(), PrefilterError> {
+    ) -> Vec<usize> {
+        // The empty pattern occurs at offset 0 of every row.
         if pattern.is_empty() {
-            out.extend(0..self.num_rows());
-            return Ok(());
+            return (0..self.num_rows()).collect();
         }
-        let analysis = analyze_prefilter(pattern, self.dict, frequencies);
-        prefilter_candidates(self.codes, self.row_offsets, &analysis, out)
+        let analysis = analyze_prefilter(pattern, self.dict, frequencies, self.num_rows());
+        let mut rows = Vec::new();
+        prefilter_candidates(
+            self.codes,
+            self.row_offsets,
+            self.dict,
+            &analysis,
+            &mut rows,
+        );
+        rows
     }
 
     /// Ascending indices of the rows whose codes satisfy `pred`.
@@ -489,11 +444,8 @@ mod tests {
         }
     }
 
-    /// Both prefiltered paths are optimizations of `rows_containing` and nothing
-    /// else: same rows, same order. A refusal is a legitimate answer — the
-    /// prefilter declines rather than degrading — but it has to be the same
-    /// decision for both, since they share the plan and differ only in how they
-    /// verify.
+    /// The prefiltered path is an optimization of `rows_containing` and nothing
+    /// else: same rows, same order.
     #[test]
     fn prefiltered_search_agrees_with_rows_containing() {
         use crate::DictionaryView;
@@ -521,20 +473,18 @@ mod tests {
         ];
         for &needle in needles {
             let want = view.rows_containing(needle);
-            let kmp = view.rows_containing_prefiltered(needle, &freqs);
-            let mem = view.rows_containing_prefiltered_memmem(needle, &freqs);
-            assert_eq!(kmp.is_ok(), mem.is_ok(), "split refusal for {needle:?}");
-            if let (Ok(kmp), Ok(mem)) = (kmp, mem) {
-                assert_eq!(kmp, want, "prefiltered kmp {needle:?}");
-                assert_eq!(mem, want, "prefiltered memmem {needle:?}");
-            }
+            assert_eq!(
+                view.rows_containing_prefiltered(needle, &freqs),
+                want,
+                "prefiltered {needle:?}"
+            );
         }
     }
 
-    /// `ContainsTable` caps the pattern at 255 bytes and the decoded-domain
-    /// verifier does not, which is the whole reason both methods exist.
+    /// The prefilter takes patterns `ContainsTable` rejects: its own cap is the
+    /// walk's node ids, not the KMP table's 255-byte state width.
     #[test]
-    fn prefiltered_memmem_takes_patterns_the_kmp_table_rejects() {
+    fn prefiltered_takes_patterns_the_kmp_table_rejects() {
         use crate::DictionaryView;
         use crate::search::index::build_token_frequency_index;
         let long = vec![b'q'; 400];
@@ -546,8 +496,7 @@ mod tests {
         let view = col.view();
         let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
 
-        if let Ok(got) = view.rows_containing_prefiltered_memmem(&long, &freqs) {
-            assert_eq!(got, vec![1]);
-        }
+        let got = view.rows_containing_prefiltered(&long, &freqs);
+        assert_eq!(got, vec![1]);
     }
 }

@@ -27,18 +27,22 @@
 //! edge: nothing precedes its first token, so its layouts begin at the source.
 //! Between states, [`ProbeSet::Point`] for a token of the greedy parse; into the
 //! sink, [`ProbeSet::Range`] for the tokens a needle suffix is a prefix of, the
-//! occurrence ending inside a longer token. Probes are weighted by term
-//! frequency. [`ProbeSet::SetTooBig`] is the one step a cut may not select: its
+//! occurrence ending inside a longer token. Each probe carries its term
+//! frequency; what cutting it costs is the cut's caller's to say.
+//! [`ProbeSet::SetTooBig`] is the one step a cut may not select: its
 //! probe was never materialized, so it is entered free and the cut pays further
-//! along the chain.
+//! along the chain. Alignment `1` is that step for nearly every first byte:
+//! a byte ends more than [`PROBE_SET_SIZE_LIMIT_K1`] tokens unless it is rare.
 //!
 //! An offset out of which no token is a prefix of the remaining needle has no
-//! parse step of its own. A dictionary with an escape code answers that with the
-//! escape; one without has to supply a transition for every byte itself, so a
-//! needle that finds none is a malformed column rather than a shorter graph.
+//! parse step of its own. The dictionary has to supply a transition for every
+//! byte itself, so a needle that finds none is a malformed column rather than a
+//! shorter graph.
 //!
 //! A token whose bytes contain the *whole* needle is represented as an edge going
-//! straight from source to sink. It will always be a part of the min cut.
+//! straight from source to sink. It will always be a part of the min cut. Two
+//! such edges exist: the needle at a token's start is the terminal range out of
+//! node 0, the needle further in is the contained set.
 //!
 //! # Size
 //! Exactly `n + 1` nodes and at most `2n + 16` edges for a needle of `n` bytes,
@@ -47,59 +51,82 @@
 
 use memchr::memmem::Finder;
 
+use super::cover::ProbeCover;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::search::index::TokenFrequencyIndexView;
+use crate::search::lookup::narrow;
 use crate::search::prefix_range;
 
-/// Largest first-token set still cheap enough to enumerate as an explicit
-/// probe. A wider set is not built, so the alignment is entered unconditionally
-/// and the cut has to pay for it further along the chain.
-pub(super) const SET_CAP: usize = 16;
+/// Largest first-token set still worth enumerating as an explicit probe.
+pub(super) const PROBE_SET_SIZE_LIMIT: usize = 512;
+
+/// Alignment 1's own, much lower limit: for needle `"XYZ"` every token ending
+/// in `X` qualifies, while at `k = 2` only the far fewer ending in `XY` do.
+pub(super) const PROBE_SET_SIZE_LIMIT_K1: usize = 16;
 
 /// The token set an edge probes for, or [`ProbeSet::SetTooBig`] for the one
 /// step a cut may not select.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum ProbeSet {
     /// A single token: an interior token of the greedy parse.
     Point(Token),
     /// Every token a needle suffix is a prefix of.
     Range(TokenRange),
-    /// An explicit token set, as `set_ids[start..start + len]`.
-    Set { start: u32, len: u32 },
-    /// Would have been a [`Set`](ProbeSet::Set), but more than [`SET_CAP`] tokens qualified.
+    /// An explicit token set.
+    Set(Box<[Token]>),
+    /// Would have been a [`Set`](ProbeSet::Set), but more than
+    /// [`PROBE_SET_SIZE_LIMIT`] tokens qualified.
     SetTooBig,
 }
 
 /// One parse step, and the probe that catches every layout crossing it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Edge {
     pub(super) from: u32,
     pub(super) to: u32,
     /// The token set a scan looks for to catch this step.
     probe: ProbeSet,
     /// Term frequency of `probe`; zero when it carries none.
-    weight: u32,
+    frequency: u32,
 }
 
 impl Edge {
-    /// What cutting this edge costs, or `None` if no cut may select it.
-    pub(super) fn cost(&self) -> Option<u32> {
-        match self.probe {
-            ProbeSet::SetTooBig => None,
-            _ => Some(self.weight),
+    /// Whether a cut may select this edge: it carries a probe.
+    pub(super) fn cuttable(&self) -> bool {
+        !matches!(self.probe, ProbeSet::SetTooBig)
+    }
+
+    /// The token set this step probes for.
+    pub(super) fn probe(&self) -> &ProbeSet {
+        &self.probe
+    }
+
+    /// Codes the probe matches in the indexed stream.
+    pub(super) fn frequency(&self) -> u32 {
+        self.frequency
+    }
+
+    /// What the probe puts in a cover, as `(points, ranges)` before adjacent
+    /// ones merge.
+    pub(super) fn shape(&self) -> (u32, u32) {
+        match &self.probe {
+            ProbeSet::SetTooBig => (0, 0),
+            ProbeSet::Point(_) => (1, 0),
+            ProbeSet::Range(_) => (0, 1),
+            ProbeSet::Set(ids) => (ids.len() as u32, 0),
         }
     }
 
     /// Used for testing
     #[cfg(test)]
-    pub(super) fn synthetic(from: u32, to: u32, cost: Option<u32>) -> Self {
+    pub(super) fn synthetic(from: u32, to: u32, frequency: Option<u32>) -> Self {
         Self {
             from,
             to,
-            probe: cost.map_or(ProbeSet::SetTooBig, |_| ProbeSet::Point(Token::MAX)),
-            weight: cost.unwrap_or(0),
+            probe: frequency.map_or(ProbeSet::SetTooBig, |_| ProbeSet::Point(Token::MAX)),
+            frequency: frequency.unwrap_or(0),
         }
     }
 }
@@ -133,73 +160,71 @@ impl Nodes {
 
 /// The alignment DAG for one needle over one dictionary.
 pub(super) struct AlignmentGraph {
-    /// Every explicit probe set's ids, back to back.
-    set_ids: Vec<Token>,
-    /// The parse steps, each carrying its probe and that probe's weight.
+    /// The parse steps, each carrying its probe and that probe's frequency.
     pub(super) edges: Vec<Edge>,
     pub(super) nodes: Nodes,
-    pub(super) num_tokens: usize,
 }
 
-impl AlignmentGraph {
-    /// The token ids `cut`'s probes cover, as a membership table over the
-    /// dictionary.
-    pub(super) fn membership(&self, cut: &[&Edge]) -> Vec<bool> {
-        let mut members = vec![false; self.num_tokens.max(256)];
+impl ProbeCover {
+    /// The cover `cut`'s probes form: every id a run of one, every range
+    /// itself. Merging is [`from_runs`](Self::from_runs)'s work.
+    pub(super) fn from_edge_cut(cut: &[&Edge]) -> Self {
+        let point = |id: Token| TokenRange {
+            begin: id,
+            last: id,
+        };
+        let mut runs = Vec::with_capacity(cut.len());
         for edge in cut {
-            match edge.probe {
+            match &edge.probe {
                 ProbeSet::SetTooBig => debug_assert!(false, "cut selected an unprobed step"),
-                ProbeSet::Point(id) => members[id as usize] = true,
-                ProbeSet::Range(range) => {
-                    for id in range.begin..=range.last {
-                        members[id as usize] = true;
-                    }
-                }
-                ProbeSet::Set { start, len } => {
-                    for &id in &self.set_ids[start as usize..(start + len) as usize] {
-                        members[id as usize] = true;
-                    }
-                }
+                ProbeSet::Point(id) => runs.push(point(*id)),
+                ProbeSet::Range(range) => runs.push(*range),
+                ProbeSet::Set(ids) => runs.extend(ids.iter().map(|&id| point(id))),
             }
         }
-        members
+        Self::from_runs(runs)
     }
 }
 
 /// Greedy longest in-needle token at `suffix`, capped at [`MAX_TOKEN_SIZE`].
 /// Replicates the encoder's longest-prefix match restricted to the needle.
 ///
-/// `None` if no token is a prefix of `suffix`: the loop covers `len == 1`, so a
+/// `None` if no token is a prefix of `suffix`: the walk covers `len == 1`, so a
 /// miss means the dictionary has no single-byte token for `suffix[0]`. Reading an
 /// id off the empty range instead would probe for an unrelated token and quietly
-/// cost selectivity, so the caller decides — an escape, or a malformed panic.
+/// cost selectivity, so the caller panics on the malformed column instead.
+///
+/// One narrowing walk rather than a [`prefix_range`] per candidate length: the
+/// range for `suffix[..k + 1]` is the range for `suffix[..k]` narrowed by one
+/// more byte, so restarting at each length would re-search the whole dictionary
+/// every time. Once the range empties no longer prefix can match, and a longer
+/// prefix always narrows further, so the walk stops there.
 fn greedy_in_needle(dict: CompactDictionaryView<'_>, suffix: &[u8]) -> Option<(Token, usize)> {
     debug_assert!(
         !suffix.is_empty(),
         "greedy_in_needle needs a non-empty suffix"
     );
-    for len in (1..=suffix.len().min(MAX_TOKEN_SIZE)).rev() {
-        let range = prefix_range(dict, &suffix[..len]);
-        if !range.is_empty() && dict.token_len(range.begin) == len {
-            return Some((range.begin, len));
+    let num_tokens = dict.num_tokens();
+    if num_tokens == 0 {
+        return None;
+    }
+    let mut range = TokenRange {
+        begin: 0,
+        last: (num_tokens - 1) as Token,
+    };
+    let mut longest = None;
+    for (k, &byte) in suffix.iter().take(MAX_TOKEN_SIZE).enumerate() {
+        range = narrow(dict, range, k, byte);
+        if range.is_empty() {
+            break;
+        }
+        // Every token in `range` starts with `suffix[..=k]`; the shortest sorts
+        // first, and it *is* that prefix exactly when its length matches.
+        if dict.token_len(range.begin) == k + 1 {
+            longest = Some((range.begin, k + 1));
         }
     }
-
-    None
-}
-
-/// Every token whose bytes contain the whole needle, and so matches it on its
-/// own. Provably empty once the needle outgrows a token, which skips the pass.
-///
-/// Ascending, without duplicates.
-pub(super) fn contained_tokens(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Vec<Token> {
-    let mut out = Vec::new();
-    if needle.len() > MAX_TOKEN_SIZE {
-        return out;
-    }
-    let (payload, offsets) = dict.token_payload();
-    contained_by_search(payload, offsets, needle, &mut out);
-    out
+    longest
 }
 
 /// One vectorized sweep of the whole token payload, attributing each match to the
@@ -211,108 +236,51 @@ pub(super) fn contained_tokens(dict: CompactDictionaryView<'_>, needle: &[u8]) -
 ///
 /// # Where to resume
 /// This is the subtle part, and plain non-overlapping iteration gets it wrong.
-/// After an *accepted* match at `hit`, nothing before `hit + n` remains to be
-/// found — this token is already recorded, and the next token begins at or after
-/// `hit + n`. After a match *rejected* for spanning two tokens, resuming at
-/// `hit + n` would step over the start of the token it ran into: with `a` and `aa`
-/// adjacent in the payload, the rejected match of `aa` at offset 0 would hide the
-/// real one at offset 1. A rejected match therefore resumes at the boundary it
-/// crossed, the earliest offset at which a match can still lie inside one token.
-fn contained_by_search(payload: &[u8], offsets: &[u32], needle: &[u8], out: &mut Vec<Token>) {
-    let n = needle.len();
-    let finder = Finder::new(needle);
-    let mut from = 0usize;
-    let mut id = 0usize;
-    while let Some(found) = finder.find(&payload[from..]) {
-        let hit = from + found;
-        while offsets[id + 1] as usize <= hit {
-            id += 1;
-        }
-        let end = offsets[id + 1] as usize;
-        if hit + n <= end {
-            if out.last() != Some(&(id as Token)) {
-                out.push(id as Token);
-            }
-            from = hit + n;
-        } else {
-            from = end;
-        }
-        // Both arms advance: `hit < end` because `hit` lies inside token `id`.
-    }
-}
-
 struct Builder<'d, 'n, 'f> {
     dict: CompactDictionaryView<'d>,
     needle: &'n [u8],
     frequencies: TokenFrequencyIndexView<'f>,
-    set_ids: Vec<Token>,
     edges: Vec<Edge>,
     nodes: Nodes,
-    /// `greedy[o]`: the greedy parse at needle offset `o`, computed at most
-    /// once. Every alignment reaching `o` reuses it — the memo *is* the state
-    /// merging.
+    /// `greedy[o]`: the greedy parse at needle offset `o`, computed once when
+    /// there is one. Every alignment reaching `o` reuses it — the memo *is* the
+    /// state merging.
     greedy: Vec<Option<(Token, usize)>>,
     /// `built[o]`: whether the steps out of offset `o` have been emitted. Node
     /// ids are offsets, so this is all the builder has left to track.
     built: Vec<bool>,
-    /// The code standing in for a byte no token covers, or `None` when the
-    /// dictionary has to supply a transition for every byte itself.
-    escape_token: Option<Token>,
 }
 
 impl Builder<'_, '_, '_> {
     /// Term frequency of `set`. Summing an explicit set cannot overflow: its
     /// ids are distinct, so the sum is at most the code stream's length.
-    fn weight_of(&self, set: ProbeSet) -> u32 {
+    fn frequency_of(&self, set: &ProbeSet) -> u32 {
         match set {
             ProbeSet::SetTooBig => 0,
-            ProbeSet::Point(id) => self.frequencies.frequency(id),
-            ProbeSet::Range(range) => self.frequencies.range_frequency(range),
-            ProbeSet::Set { start, len } => self.set_ids[start as usize..(start + len) as usize]
-                .iter()
-                .map(|&id| self.frequencies.frequency(id))
-                .sum(),
-        }
-    }
-
-    /// Intern `ids` as an explicit probe set, which is what makes it weighable.
-    fn create_probe_set(&mut self, ids: &[Token]) -> ProbeSet {
-        let start = self.set_ids.len() as u32;
-        self.set_ids.extend_from_slice(ids);
-        ProbeSet::Set {
-            start,
-            len: ids.len() as u32,
+            ProbeSet::Point(id) => self.frequencies.frequency(*id),
+            ProbeSet::Range(range) => self.frequencies.range_frequency(*range),
+            ProbeSet::Set(ids) => ids.iter().map(|&id| self.frequencies.frequency(id)).sum(),
         }
     }
 
     /// Add the step `from -> to`, which can be stepped by `probe`.
     fn add_edge(&mut self, from: u32, to: u32, probe: ProbeSet) {
-        let weight = self.weight_of(probe);
+        let frequency = self.frequency_of(&probe);
         self.edges.push(Edge {
             from,
             to,
             probe,
-            weight,
+            frequency,
         });
     }
 
     /// The greedy step out of `offset`, or `None` when the dictionary holds no
-    /// token that is a prefix of what remains — see [`build_state`](Self::build_state).
-    fn greedy_at(&mut self, offset: usize) -> (Token, usize) {
-        if let Some(hit) = self.greedy[offset] {
-            return hit;
+    /// token that is a prefix of what remains.
+    fn greedy_at(&mut self, offset: usize) -> Option<(Token, usize)> {
+        if self.greedy[offset].is_none() {
+            self.greedy[offset] = greedy_in_needle(self.dict, &self.needle[offset..]);
         }
-        if let Some(hit) = greedy_in_needle(self.dict, &self.needle[offset..]) {
-            self.greedy[offset] = Some(hit);
-            return hit;
-        }
-
-        if let Some(escape_token) = self.escape_token {
-            return (escape_token, 1);
-        }
-        // if no escape tokens are allowed, the dictionary must guarantee a transition e.g.,
-        // by containing all the individual bytes.
-        panic_malformed(InvalidColumn::IncompleteAlphabet)
+        self.greedy[offset]
     }
 
     /// The tokens the needle suffix at `offset` is a prefix of, or the empty
@@ -344,118 +312,195 @@ impl Builder<'_, '_, '_> {
     }
 
     /// Emit the steps out of the state at `offset` and return where its greedy
-    /// step lands, or `None` when there is no step to take. A successor is named
-    /// by its offset, so it needs no node to exist yet — which is what lets the
-    /// chain run forwards.
+    /// step lands. A successor is named by its offset, so it needs no node to
+    /// exist yet, which is what lets the chain run forwards.
     ///
     /// # Dead ends
-    /// No token being a prefix of `needle[offset..]` is not malformed input: it
-    /// says no tokenization of any row can have a boundary here with the needle
-    /// running past it. A token starting at `offset` either ends inside the needle
-    /// — then its bytes *are* such a prefix — or covers the rest of it, and that
-    /// case is the terminal range emitted above. So the lane simply ends, and
-    /// since the state can no longer reach the accept node, no layout runs through
-    /// it and the cut owes nothing for it.
-    ///
-    /// A complete alphabet makes this unreachable, since every byte is then a
-    /// token of its own. An FSST table is the case that reaches it.
+    /// No token is a prefix of `needle[offset..]` only when the dictionary lacks
+    /// a single-byte token for that byte, which a conformant one cannot, so the
+    /// dead end is a malformed column rather than a shorter graph.
     fn build_state(&mut self, offset: usize) -> usize {
         let state = offset as u32;
 
-        // The occurrence may end inside a longer token starting here.
-        let terminal = self.terminal_range(offset);
-        if !terminal.is_empty() {
-            self.add_edge(state, self.nodes.sink(), ProbeSet::Range(terminal));
-        }
-
-        let (token, len) = self.greedy_at(offset);
-        let next = offset + len;
-        if next < self.needle.len() {
-            self.add_edge(state, next as u32, ProbeSet::Point(token));
-        } else {
-            // A greedy step that reaches the needle's end consumed
-            // `needle[offset..]` exactly, so that token is in its own prefix
-            // range: this step is `offset -> sink`, already probed above by a
-            // range containing it. A parallel point probe would only make the
-            // cut pay twice for one step.
-            debug_assert!(
-                terminal.contains(token),
-                "the exact final token belongs to its own prefix range"
+        // The occurrence may end inside a longer token starting here. At offset
+        // 0 that token is one the needle is a prefix of and the step runs
+        // source to sink, which is why `contained_tokens` leaves those out: one
+        // interval probes them, where the contained set would spend an id each.
+        let terminal_token_range = self.terminal_range(offset);
+        if !terminal_token_range.is_empty() {
+            self.add_edge(
+                state,
+                self.nodes.sink(),
+                ProbeSet::Range(terminal_token_range),
             );
         }
-        next
+
+        let next_token = self.greedy_at(offset);
+
+        if let Some((token, token_length)) = next_token {
+            let next_offset = offset + token_length;
+            if next_offset < self.needle.len() {
+                self.add_edge(state, next_offset as u32, ProbeSet::Point(token));
+            } else {
+                // A greedy step that reaches the needle's end consumed
+                // `needle[offset..]` exactly, so that token should appear in the
+                // terminal range.
+                debug_assert!(
+                    terminal_token_range.contains(token),
+                    "the exact final token belongs to its own prefix range"
+                );
+            }
+            next_offset
+        } else {
+            panic_malformed(InvalidColumn::IncompleteAlphabet)
+        }
     }
 }
 
-/// Build the alignment DAG for `needle` over `dict`, weighting each probe by
-/// its term frequency in the indexed code stream.
+/// For each alignment `k >= 1`, how many tokens end with `needle[..k]` and,
+/// while the set stays small enough to be worth probing for, which ones. At
+/// most [`PROBE_SET_SIZE_LIMIT`] ids for each of at most [`MAX_TOKEN_SIZE`] alignments, so
+/// fixed arrays hold them all.
+///
+/// Counts saturate one past [`PROBE_SET_SIZE_LIMIT`]: the planner asks only whether a set is
+/// empty or too big to name, so counting further would keep the pass running
+/// for an answer nothing reads.
+pub(super) struct FirstTokenSets {
+    pub(super) count: [usize; MAX_TOKEN_SIZE],
+    pub(super) ids: [Token; MAX_TOKEN_SIZE * PROBE_SET_SIZE_LIMIT],
+}
+
+impl FirstTokenSets {
+    fn new() -> Self {
+        Self {
+            count: [0; MAX_TOKEN_SIZE],
+            ids: [0; MAX_TOKEN_SIZE * PROBE_SET_SIZE_LIMIT],
+        }
+    }
+
+    fn record(&mut self, k: usize, id: usize) {
+        if self.count[k] < PROBE_SET_SIZE_LIMIT {
+            self.ids[k * PROBE_SET_SIZE_LIMIT + self.count[k]] = id as Token;
+        }
+        self.count[k] = (self.count[k] + 1).min(PROBE_SET_SIZE_LIMIT + 1);
+    }
+}
+
+/// Everything one needle needs from the dictionary.
+pub(super) struct Candidates {
+    pub(super) first: FirstTokenSets,
+    /// Tokens holding the whole needle at a non-zero offset, ascending and
+    /// without duplicates. A token that starts with the needle is in the
+    /// terminal range instead, even when it holds the needle again further in.
+    pub(super) contained: Vec<Token>,
+}
+
+/// Both sets from the dictionary.
+pub(super) fn alignment_candidates(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Candidates {
+    let (payload, offsets) = dict.token_payload();
+    let mut candidates = Candidates {
+        first: FirstTokenSets::new(),
+        contained: Vec::new(),
+    };
+    if needle.len() > 1 {
+        alignment_k1_candidates(payload, offsets, needle[0], &mut candidates.first);
+    }
+    sweep_for_candidates(payload, offsets, needle, &mut candidates);
+    candidates
+}
+
+/// Alignment 1: the tokens ending in `byte`, with `needle[1]` starting the
+/// next token. A token that is only `byte` is alignment 0's and skipped. Most bytes end far more than [`PROBE_SET_SIZE_LIMIT_K1`]
+/// tokens, so the pass stops there and saturates the count, which marks the
+/// set as never enumerated rather than as one that fit.
+fn alignment_k1_candidates(payload: &[u8], offsets: &[u32], byte: u8, first: &mut FirstTokenSets) {
+    for (token_id, bounds) in offsets.windows(2).enumerate() {
+        let (token_begin, token_end) = (bounds[0] as usize, bounds[1] as usize);
+        if token_end - token_begin > 1 && payload[token_end - 1] == byte {
+            first.record(1, token_id);
+            if first.count[1] > PROBE_SET_SIZE_LIMIT_K1 {
+                first.count[1] = PROBE_SET_SIZE_LIMIT + 1;
+                return;
+            }
+        }
+    }
+}
+
+/// One `memmem` sweep of the payload for `needle[..2]`, or for the whole of a
+/// one-byte needle. Every alignment `k >= 2` and every contained occurrence
+/// begins with it, and two adjacent bytes are far rarer than one.
+///
+/// A hit's tail, from the hit to its token's end, says what the hit is: an
+/// alignment when it is shorter than the needle and a prefix of it, a
+/// contained occurrence when it starts with the needle. A hit at a token's
+/// start is alignment 0's or the terminal range's and is skipped.
+fn sweep_for_candidates(
+    payload: &[u8],
+    offsets: &[u32],
+    needle: &[u8],
+    candidates: &mut Candidates,
+) {
+    let needle_len = needle.len();
+    let finder = Finder::new(&needle[..needle_len.min(2)]);
+    let (mut search_from, mut token_id) = (0usize, 0usize);
+    while let Some(found_offset) = finder.find(&payload[search_from..]) {
+        let hit_offset = search_from + found_offset;
+        search_from = hit_offset + 1;
+        while offsets[token_id + 1] as usize <= hit_offset {
+            token_id += 1;
+        }
+        let (token_begin, token_end) = (offsets[token_id] as usize, offsets[token_id + 1] as usize);
+        let token_tail_from_hit = &payload[hit_offset..token_end];
+        if token_tail_from_hit.len() < needle_len.min(2) {
+            continue;
+        }
+        let at_token_start = hit_offset == token_begin;
+        if token_tail_from_hit.starts_with(needle) {
+            if !at_token_start {
+                candidates.contained.push(token_id as Token);
+            }
+            search_from = token_end + 1 - needle_len;
+        } else if !at_token_start
+            && token_tail_from_hit.len() < needle_len
+            && needle.starts_with(token_tail_from_hit)
+        {
+            // The tail is a prefix of the needle, so the token ends with exactly
+            // that many needle bytes: alignment k is its length.
+            candidates.first.record(token_tail_from_hit.len(), token_id);
+        }
+    }
+}
+
+/// Build the alignment DAG for `needle` over `dict`, each probe carrying its
+/// term frequency in the indexed code stream.
 pub(super) fn build_alignment_graph(
     dict: CompactDictionaryView<'_>,
     needle: &[u8],
     frequencies: TokenFrequencyIndexView<'_>,
 ) -> AlignmentGraph {
     debug_assert!(!needle.is_empty());
-    // for FSST we also have the frequency of escape bytes
-    debug_assert!(frequencies.num_tokens() >= dict.num_tokens());
+    debug_assert!(frequencies.num_tokens() == dict.num_tokens());
 
     let n = needle.len();
     debug_assert!(n < u32::MAX as usize, "needle outgrew u32 node ids");
-    let ntok = dict.num_tokens();
 
     let mut b = Builder {
         dict,
         needle,
         frequencies,
-        set_ids: Vec::new(),
         edges: Vec::new(),
         nodes: Nodes::new(n),
         greedy: vec![None; n],
         built: vec![false; n],
-        escape_token: Some(0xFF),
     };
 
-    // First-token sets in one dictionary pass: for each alignment k >= 1, how
-    // many tokens end with needle[..k] and — while the set stays small enough to
-    // be worth probing for — which ones. At most `SET_CAP` ids for each of at
-    // most `MAX_TOKEN_SIZE` alignments, so a fixed scratch array holds them all.
-    //
-    // The pass is driven by a final-byte table rather than by trying every k
-    // against every token. A token can only end with `needle[..k]` if its own
-    // last byte is `needle[k - 1]`, so one lookup yields the handful of k worth
-    // comparing — for most tokens, none at all. That turns the inner loop from
-    // `kmax` suffix comparisons into a load and a branch.
     let kmax = n.min(MAX_TOKEN_SIZE);
-    let mut ks_ending_in = [0u16; 256];
-    for k in 1..kmax {
-        ks_ending_in[needle[k - 1] as usize] |= 1 << (k - 1);
-    }
-    let mut first_count = [0usize; MAX_TOKEN_SIZE];
-    let mut first_ids = [0 as Token; MAX_TOKEN_SIZE * SET_CAP];
-    for id in 0..ntok {
-        let token = dict.token(id as Token);
-        let len = token.len();
-        // A suffix of length k needs a token at least that long.
-        let fits = if len >= MAX_TOKEN_SIZE {
-            u16::MAX
-        } else {
-            (1u16 << len) - 1
-        };
-        let mut ks = ks_ending_in[token[len - 1] as usize] & fits;
-        while ks != 0 {
-            let k = ks.trailing_zeros() as usize + 1;
-            ks &= ks - 1;
-            if token[len - k..] == needle[..k] {
-                if first_count[k] < SET_CAP {
-                    first_ids[k * SET_CAP + first_count[k]] = id as Token;
-                }
-                first_count[k] += 1;
-            }
-        }
-    }
+    let candidates = alignment_candidates(dict, needle);
+    let (first, contained) = (&candidates.first, candidates.contained);
 
     for k in 0..kmax {
         // Alignment 0 is always feasible: the first token can start at the needle.
-        if k != 0 && first_count[k] == 0 {
+        if k != 0 && first.count[k] == 0 {
             continue;
         }
         // Emits the chain of steps from this alignment's entry to the sink.
@@ -467,8 +512,11 @@ pub(super) fn build_alignment_graph(
         // `needle[..k]` as its tail; the set of tokens it could be is what
         // probes that step — when the pass kept them.
         if k != 0 {
-            let probe = if first_count[k] <= SET_CAP {
-                b.create_probe_set(&first_ids[k * SET_CAP..k * SET_CAP + first_count[k]])
+            let probe = if first.count[k] <= PROBE_SET_SIZE_LIMIT {
+                ProbeSet::Set(
+                    first.ids[k * PROBE_SET_SIZE_LIMIT..k * PROBE_SET_SIZE_LIMIT + first.count[k]]
+                        .into(),
+                )
             } else {
                 ProbeSet::SetTooBig
             };
@@ -477,10 +525,12 @@ pub(super) fn build_alignment_graph(
     }
 
     // A token holding the whole needle needs no boundary, going from source to sink
-    let contained = contained_tokens(dict, needle);
     if !contained.is_empty() {
-        let probe = b.create_probe_set(&contained);
-        b.add_edge(b.nodes.source(), b.nodes.sink(), probe);
+        b.add_edge(
+            b.nodes.source(),
+            b.nodes.sink(),
+            ProbeSet::Set(contained.into()),
+        );
     }
 
     // The bound the module doc advertises: two edges per needle offset, plus
@@ -492,9 +542,7 @@ pub(super) fn build_alignment_graph(
     );
 
     AlignmentGraph {
-        set_ids: b.set_ids,
         edges: b.edges,
         nodes: b.nodes,
-        num_tokens: ntok,
     }
 }

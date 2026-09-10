@@ -4,9 +4,13 @@
 //! End-to-end soundness, graph invariants, and SIMD/scalar agreement.
 
 use super::cover::ProbeCover;
-use super::graph::{AlignmentGraph, Edge, build_alignment_graph, contained_tokens};
+use super::graph::{
+    AlignmentGraph, Edge, PROBE_SET_SIZE_LIMIT, PROBE_SET_SIZE_LIMIT_K1, alignment_candidates,
+    build_alignment_graph,
+};
 use super::mincut::min_cut;
-use super::plan::plan;
+use super::plan::{cheapest_cover, cover_frequency};
+use super::scan::{Region, scan_ns};
 use super::{analyze_prefilter, prefilter_candidates};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
@@ -26,8 +30,8 @@ fn candidates<S: TokenFrequencyIndexStorage>(
         return (0..view.num_rows()).collect();
     }
     let mut out = Vec::new();
-    let analysis = analyze_prefilter(pattern, dict, frequencies);
-    prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut out).unwrap();
+    let analysis = analyze_prefilter(pattern, dict, frequencies, view.num_rows());
+    prefilter_candidates(view.codes, view.row_offsets, dict, &analysis, &mut out);
     out
 }
 
@@ -39,18 +43,58 @@ impl TokenFrequencyIndexStorage for BorrowedFrequencies<'_> {
     }
 }
 
-/// The obvious way to find the tokens containing `needle`: compare every window
-/// of every token. This is the oracle for the flat-payload `memmem` sweep that
-/// replaced it — the sweep is a different algorithm over a different buffer, with
+/// The obvious way to find the tokens containing `needle` without starting with
+/// it: compare every window of every token. This is the oracle for the anchored
+/// payload sweep that replaced it — the sweep is a different algorithm over a different buffer, with
 /// match attribution and a resume rule of its own, so it earns a reference
 /// implementation rather than only end-to-end soundness checks.
 fn contained_tokens_by_scan(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Vec<Token> {
     (0..dict.num_tokens() as Token)
         .filter(|&id| {
             let token = dict.token(id);
-            token.len() >= needle.len() && token.windows(needle.len()).any(|w| w == needle)
+            !token.starts_with(needle)
+                && token.len() >= needle.len()
+                && token.windows(needle.len()).any(|w| w == needle)
         })
         .collect()
+}
+
+/// The obvious way to find the first-token sets: try every alignment against
+/// every token. This is the oracle for the anchored sweep, which visits only
+/// the payload positions where `needle[..2]` occurs and so never looks at most
+/// tokens at all.
+fn first_token_sets_by_scan(
+    dict: CompactDictionaryView<'_>,
+    needle: &[u8],
+) -> (
+    [usize; MAX_TOKEN_SIZE],
+    [Token; MAX_TOKEN_SIZE * PROBE_SET_SIZE_LIMIT],
+) {
+    let mut count = [0usize; MAX_TOKEN_SIZE];
+    let mut ids = [0 as Token; MAX_TOKEN_SIZE * PROBE_SET_SIZE_LIMIT];
+    for id in 0..dict.num_tokens() as Token {
+        let token = dict.token(id);
+        for k in 1..needle.len().min(MAX_TOKEN_SIZE) {
+            if k < token.len() && token[token.len() - k..] == needle[..k] {
+                // Alignment 1 stores only what its walk saw before it stopped.
+                let cap = if k == 1 {
+                    PROBE_SET_SIZE_LIMIT_K1 + 1
+                } else {
+                    PROBE_SET_SIZE_LIMIT
+                };
+                if count[k] < cap {
+                    ids[k * PROBE_SET_SIZE_LIMIT + count[k]] = id;
+                }
+                // Saturating, like the pass: the planner reads only empty or
+                // too big.
+                count[k] = (count[k] + 1).min(PROBE_SET_SIZE_LIMIT + 1);
+            }
+        }
+    }
+    if count[1] > PROBE_SET_SIZE_LIMIT_K1 {
+        count[1] = PROBE_SET_SIZE_LIMIT + 1;
+    }
+    (count, ids)
 }
 
 fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
@@ -75,9 +119,9 @@ fn decode_row(view: ColumnView<'_, u32>, k: usize) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) }.to_vec()
 }
 
-/// What the cut pays for `edge`, which must be one of the graph's probe edges.
+/// What a frequency-weighted cut pays for `edge`.
 fn probe_weight(edge: &Edge) -> u64 {
-    u64::from(edge.cost().expect("only probe edges are ever selected"))
+    u64::from(edge.frequency())
 }
 
 /// Whether the sink is reachable from the source without taking an edge
@@ -118,15 +162,10 @@ fn selected(selection: &[&Edge], edge: &Edge) -> bool {
 
 /// Whether every row that really contains the pattern holds a token one of
 /// `selection`'s probes covers — what a cover exists to guarantee.
-fn covers_every_match(
-    view: ColumnView<'_, u32>,
-    graph: &AlignmentGraph,
-    selection: &[&Edge],
-    want: &[usize],
-) -> bool {
-    let members = graph.membership(selection);
+fn covers_every_match(view: ColumnView<'_, u32>, selection: &[&Edge], want: &[usize]) -> bool {
+    let cover = ProbeCover::from_edge_cut(selection);
     want.iter()
-        .all(|&row| view.row_codes(row).iter().any(|&c| members[c as usize]))
+        .all(|&row| view.row_codes(row).iter().any(|&c| cover.contains(c)))
 }
 
 /// The properties the alignment DAG has to have, checked directly on the graph:
@@ -141,14 +180,10 @@ fn check_graph(
     want: &[usize],
 ) {
     let graph = build_alignment_graph(view.dict, pat, frequencies.as_view());
-    let probes: Vec<&Edge> = graph
-        .edges
-        .iter()
-        .filter(|edge| edge.cost().is_some())
-        .collect();
+    let probes: Vec<&Edge> = graph.edges.iter().filter(|edge| edge.cuttable()).collect();
 
     assert!(
-        !sink_reachable_avoiding(&graph, |edge| edge.cost().is_some()),
+        !sink_reachable_avoiding(&graph, Edge::cuttable),
         "a source-to-sink path carries no probe for {pat:?}"
     );
 
@@ -156,8 +191,8 @@ fn check_graph(
     // number of codes the probe would actually match. Nothing downstream can
     // notice the cut optimizing a wrong number.
     for &edge in &probes {
-        let covered = graph.membership(&[edge]);
-        let matched = view.codes.iter().filter(|&&c| covered[c as usize]).count();
+        let covered = ProbeCover::from_edge_cut(&[edge]);
+        let matched = view.codes.iter().filter(|&&c| covered.contains(c)).count();
         assert_eq!(
             probe_weight(edge) as usize,
             matched,
@@ -168,7 +203,7 @@ fn check_graph(
     // Cutting everything cuttable is the weakest sound cover the graph can
     // produce; if even that misses a matching row, the DAG is incomplete.
     assert!(
-        covers_every_match(view, &graph, &probes, want),
+        covers_every_match(view, &probes, want),
         "some row matching {pat:?} holds no probe token at all"
     );
 
@@ -183,15 +218,15 @@ fn check_graph(
         pat.len()
     );
 
-    // The cut is what the plan will actually scan for, so it has to block the
-    // DAG on its own and still catch every matching row.
-    let cut = min_cut(&graph.edges, graph.nodes);
+    // A cut has to block the DAG on its own and still catch every matching
+    // row, whatever it was weighted by.
+    let cut = min_cut(&graph.edges, graph.nodes, probe_weight);
     assert!(
         !sink_reachable_avoiding(&graph, |edge| selected(&cut, edge)),
         "the minimum cut leaves a source-to-sink path open for {pat:?}"
     );
     assert!(
-        covers_every_match(view, &graph, &cut, want),
+        covers_every_match(view, &cut, want),
         "the minimum cut misses a row matching {pat:?}"
     );
 
@@ -229,26 +264,39 @@ fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
             .collect();
         if !pat.is_empty() {
             check_graph(view, &frequencies, pat, &want);
+            let candidates = alignment_candidates(view.dict, pat);
             assert_eq!(
-                contained_tokens(view.dict, pat),
+                candidates.contained,
                 contained_tokens_by_scan(view.dict, pat),
                 "the payload sweep and a per-token scan disagree for {pat:?}"
             );
+            assert_eq!(
+                (candidates.first.count, candidates.first.ids),
+                first_token_sets_by_scan(view.dict, pat),
+                "the anchored sweep and a per-token scan disagree for {pat:?}"
+            );
         }
 
-        let cand = candidates(view, view.dict, &frequencies, pat);
-        assert!(want.iter().all(|row| cand.contains(row)), "unsound {pat:?}");
-        assert!(
-            cand.windows(2).all(|w| w[0] < w[1]),
-            "unordered candidates for {pat:?}"
-        );
+        let mut cand = Vec::new();
+        if pat.is_empty() {
+            cand.extend(0..view.num_rows());
+        } else {
+            let analysis = analyze_prefilter(pat, view.dict, &frequencies, view.num_rows());
+            prefilter_candidates(
+                view.codes,
+                view.row_offsets,
+                view.dict,
+                &analysis,
+                &mut cand,
+            );
+        }
+        assert_eq!(cand, want, "incorrect result for {pat:?}");
 
         let table = ContainsTable::new(pat, view.dict);
-        let exact: Vec<_> = cand
-            .into_iter()
+        let by_kmp: Vec<_> = (0..view.num_rows())
             .filter(|&row| contains(view.row_codes(row), &table))
             .collect();
-        assert_eq!(exact, want, "incorrect result for {pat:?}");
+        assert_eq!(by_kmp, want, "the KMP oracle disagrees for {pat:?}");
     }
 }
 
@@ -283,7 +331,7 @@ fn contained_tokens_survive_a_match_spanning_two_tokens() {
 
     for pat in [b"aa".as_slice(), b"aaa", b"aaaa"] {
         assert_eq!(
-            contained_tokens(dict, pat),
+            alignment_candidates(dict, pat).contained,
             contained_tokens_by_scan(dict, pat),
             "contained tokens for {pat:?} disagree with a per-token scan"
         );
@@ -374,6 +422,27 @@ fn matches_brute_force_on_binary_corpus() {
     check(&rows, patterns);
 }
 
+/// The same overlap through a trained dictionary and the whole scan: the
+/// walk's result is checked against byte containment whenever it ran.
+#[test]
+fn overlapping_occurrences_through_the_scan() {
+    let rows: &[&[u8]] = &[
+        b"appappapple",
+        b"appapple pie",
+        b"an appappappapple",
+        b"appappaple",
+        b"apple",
+        b"aabaaabaa",
+        b"aaaa",
+        b"abababab",
+        b"ababx abab",
+    ];
+    check(
+        rows,
+        &[b"appapple", b"aaa", b"abab", b"ababab", b"apple", b"papp"],
+    );
+}
+
 #[test]
 fn prefilter_accepts_pattern_over_255_bytes() {
     let long = vec![b'a'; 300];
@@ -384,10 +453,16 @@ fn prefilter_accepts_pattern_over_255_bytes() {
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     let pat = vec![b'a'; 256];
     let mut candidates = Vec::new();
-    let analysis = analyze_prefilter(&pat, view.dict, &frequencies);
-    prefilter_candidates(view.codes, view.row_offsets, &analysis, &mut candidates).unwrap();
+    let analysis = analyze_prefilter(&pat, view.dict, &frequencies, view.num_rows());
+    prefilter_candidates(
+        view.codes,
+        view.row_offsets,
+        view.dict,
+        &analysis,
+        &mut candidates,
+    );
 
-    assert!(candidates.contains(&0));
+    assert_eq!(candidates, vec![0]);
 }
 
 #[test]
@@ -395,7 +470,7 @@ fn analysis_reports_normalized_cover_frequency() {
     let col = compress_rows(&[b"alpha", b"beta"]);
     let view = col.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let analysis = analyze_prefilter(b"a", view.dict, &frequencies);
+    let analysis = analyze_prefilter(b"a", view.dict, &frequencies, view.num_rows());
     let cover = analysis.probe_cover();
     let expected: u32 = cover
         .points()
@@ -430,8 +505,8 @@ fn external_storage_matches_owned_prefilter_analysis_and_results() {
     .unwrap();
 
     let pattern = b"alpha";
-    let owned_analysis = analyze_prefilter(pattern, view.dict, &owned);
-    let external_analysis = analyze_prefilter(pattern, view.dict, &external);
+    let owned_analysis = analyze_prefilter(pattern, view.dict, &owned, view.num_rows());
+    let external_analysis = analyze_prefilter(pattern, view.dict, &external, view.num_rows());
     assert_eq!(
         external_analysis.probe_cover().points(),
         owned_analysis.probe_cover().points()
@@ -454,14 +529,21 @@ fn external_storage_matches_owned_prefilter_analysis_and_results() {
     );
 }
 
-/// A cut hands over overlapping probe sets — a range and a point naming the
+/// A cut hands over overlapping probe runs — a range and a point naming the
 /// same token, two ranges that abut, the mandatory contained tokens unioned on
-/// top — so the probes are re-derived from the ids themselves. Anything less is
-/// a redundant comparison paid on every vector of the code stream.
+/// top, in no order — so the cover merges them into maximal runs. Anything less
+/// is a redundant comparison paid on every vector of the code stream.
 #[test]
 fn cover_probes_the_maximal_runs_of_its_membership() {
-    let table = vec![true, true, false, true, false, false, true, true, true];
-    let pf = ProbeCover::from_membership(table.clone());
+    let run = |begin, last| TokenRange { begin, last };
+    let pf = ProbeCover::from_runs(vec![
+        run(7, 8),
+        run(0, 0),
+        run(3, 3),
+        run(6, 7),
+        run(1, 1),
+        run(8, 8),
+    ]);
 
     assert_eq!(pf.points, vec![3]);
     assert_eq!(
@@ -471,8 +553,11 @@ fn cover_probes_the_maximal_runs_of_its_membership() {
             TokenRange { begin: 6, last: 8 },
         ]
     );
-    assert_eq!(pf.table, table);
-    assert!(ProbeCover::from_membership(vec![false; 4]).is_empty());
+    let members = [true, true, false, true, false, false, true, true, true];
+    for (code, &member) in members.iter().enumerate() {
+        assert_eq!(pf.contains(code as Token), member, "membership at {code}");
+    }
+    assert!(ProbeCover::from_runs(Vec::new()).is_empty());
 }
 
 /// Even a safety-valid index that falsely reports every actually used token as
@@ -497,7 +582,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
     )
     .unwrap();
     let pattern = b"alpha";
-    let analysis = analyze_prefilter(pattern, view.dict, &frequencies);
+    let analysis = analyze_prefilter(pattern, view.dict, &frequencies, view.num_rows());
     assert!(!analysis.probe_cover().is_empty());
     assert_eq!(analysis.covered_frequency(), 0);
 
@@ -516,11 +601,10 @@ fn wide_probe_cover_dispatches_soundly() {
     let pf = ProbeCover {
         points: vec![0; 33],
         ranges: Vec::new(),
-        table: vec![true],
     };
     let mut candidates = Vec::new();
 
-    super::scan::scan(&[0], &[0u32, 1], &pf, 1, &mut candidates).unwrap();
+    super::scan::scan(&[0u16], &[0u32, 1], &pf, 1, &mut candidates);
     assert_eq!(candidates, vec![0]);
 }
 
@@ -549,67 +633,14 @@ fn each_hit_row_is_appended_once_in_order() {
         row_offsets.push(codes.len() as u32);
     }
 
-    let pf = ProbeCover::from_membership(vec![false, true]);
+    let pf = ProbeCover::from_runs(vec![TokenRange { begin: 1, last: 2 }]);
     let mut out = Vec::new();
-    super::scan::scan(&codes, &row_offsets, &pf, 43, &mut out).unwrap();
+    super::scan::scan(&codes, &row_offsets, &pf, 43, &mut out);
     assert_eq!(out, vec![1, 4]);
 
     let mut oracle = Vec::new();
     super::scan::scan_scalar(&codes, &row_offsets, &pf, &mut oracle);
     assert_eq!(out, oracle);
-}
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn assert_kernel_matches_scalar(
-    kernel: impl Fn(&[Token], &[u32], &ProbeCover, bool, &mut Vec<usize>),
-) {
-    use crate::test_corpus::user_strings;
-    let corpus: Vec<Vec<u8>> = user_strings(60)
-        .into_iter()
-        .map(String::into_bytes)
-        .collect();
-    let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
-    let col = compress_rows(&rows);
-    let view = col.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let patterns: &[&[u8]] = &[
-        b"e",
-        b"://",
-        b"example",
-        b".com/page",
-        b"https://www.example.com",
-        b"zzz",
-    ];
-    for &pat in patterns {
-        let pf = plan(view.dict, pat, frequencies.as_view());
-        let mut scalar = Vec::new();
-        let mut simd = Vec::new();
-        super::scan::scan_scalar(view.codes, view.row_offsets, &pf, &mut scalar);
-        kernel(view.codes, view.row_offsets, &pf, false, &mut simd);
-        assert_eq!(scalar, simd, "kernel disagrees with scalar for {pat:?}");
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn neon_matches_scalar() {
-    assert_kernel_matches_scalar(super::scan::scan_neon::<u32>);
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn x86_kernels_match_scalar() {
-    assert_kernel_matches_scalar(super::scan::scan_sse2::<u32>);
-    if std::is_x86_feature_detected!("avx2") {
-        assert_kernel_matches_scalar(|codes, ro, pf, sparse_row_mapping, cand| unsafe {
-            super::scan::scan_avx2(codes, ro, pf, sparse_row_mapping, cand)
-        });
-    }
-    if std::is_x86_feature_detected!("avx512bw") {
-        assert_kernel_matches_scalar(|codes, ro, pf, sparse_row_mapping, cand| unsafe {
-            super::scan::scan_avx512(codes, ro, pf, sparse_row_mapping, cand)
-        });
-    }
 }
 
 #[test]
@@ -638,5 +669,106 @@ fn signed_bias_range_matches_unsigned() {
                 "c={c} lo={lo} hi={hi}"
             );
         }
+    }
+}
+
+/// A cover of `points` singleton tokens, ids spaced so none merge.
+fn cover_of(points: usize) -> ProbeCover {
+    ProbeCover::from_runs(
+        (0..points as Token)
+            .map(|id| TokenRange {
+                begin: 2 * id,
+                last: 2 * id,
+            })
+            .collect(),
+    )
+}
+
+/// The two things a cut can trade: more probes cost no less at equal
+/// coverage, and more coverage costs more at equal shape.
+#[test]
+fn scan_cost_is_monotone_in_probes_and_coverage() {
+    let region = Region {
+        code_count: 1 << 24,
+        row_count: 1 << 18,
+    };
+    let costs: Vec<f64> = [1, 3, 8, 16, 24]
+        .into_iter()
+        .map(|points| scan_ns(&cover_of(points), 1 << 12, region))
+        .collect();
+    assert!(
+        costs.windows(2).all(|pair| pair[0] <= pair[1]),
+        "wider covers cost less: {costs:?}"
+    );
+    let one = cover_of(1);
+    let sparse = scan_ns(&one, 1 << 10, region);
+    let dense = scan_ns(&one, 1 << 20, region);
+    assert!(sparse < dense, "{sparse} for 2^10 hits, {dense} for 2^20");
+    assert_eq!(scan_ns(&cover_of(0), 0, region), 0.0);
+}
+
+/// The sweep never does worse than the frequency-only cut it starts from,
+/// and what it picks is priced as it reports.
+#[test]
+fn sweep_prices_at_or_below_the_frequency_cut() {
+    use crate::test_corpus::user_strings;
+    let corpus: Vec<Vec<u8>> = user_strings(200)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+    let col = compress_rows(&rows);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let freq = frequencies.as_view();
+    let region = Region {
+        code_count: view.codes.len(),
+        row_count: view.num_rows(),
+    };
+    for pat in [
+        b"e".as_slice(),
+        b"://",
+        b".com/page",
+        b"https://www.example.com",
+    ] {
+        let graph = build_alignment_graph(view.dict, pat, freq);
+        let by_frequency = min_cut(&graph.edges, graph.nodes, |edge| {
+            u64::from(edge.frequency())
+        });
+        let baseline = ProbeCover::from_edge_cut(&by_frequency);
+        let baseline_ns = scan_ns(&baseline, cover_frequency(&baseline, freq), region);
+
+        let (cover, covered, ns) = cheapest_cover(&graph, freq, region);
+        assert_eq!(covered, cover_frequency(&cover, freq));
+        assert_eq!(ns, scan_ns(&cover, covered, region));
+        assert!(
+            ns <= baseline_ns,
+            "{pat:?}: sweep {ns} against {baseline_ns}"
+        );
+    }
+}
+
+/// The split scan verifies its hits, so on the covers it takes the rows come
+/// out exact and the caller has nothing left to check.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn split_scan_returns_exact_rows() {
+    use crate::test_corpus::user_strings;
+    let corpus: Vec<Vec<u8>> = user_strings(200)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+    let col = compress_rows(&rows);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    for pat in [b"example".as_slice(), b".com", b"://", b"page", b"user"] {
+        let analysis = analyze_prefilter(pat, view.dict, &frequencies, view.num_rows());
+        let mut got = Vec::new();
+        prefilter_candidates(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
+        let want: Vec<usize> = (0..view.num_rows())
+            .filter(|&k| byte_contains(&decode_row(view, k), pat))
+            .collect();
+        assert_eq!(got, want, "{pat:?}");
     }
 }

@@ -37,12 +37,13 @@
 //!   index for a code stream.
 //! * [`analyze_prefilter`] — derive a normalized probe cover and report its
 //!   frequency.
-//! * [`prefilter_candidates`] — a sound *superset* of the rows containing a
-//!   pattern, collected by running a probe cover over the code stream. The caller
-//!   verifies the survivors with [`contains()`] or another exact check.
-//! * [`BytesVerifier`] — that exact check in the decoded domain: decode a
-//!   candidate row into a reused buffer and `memmem` it. The faster of the two
-//!   verifies, and the one without a pattern-length cap.
+//! * [`prefilter_candidates`] — the rows containing a pattern, collected by
+//!   running a probe cover over the code stream. Every hit is verified against
+//!   the alignment graph in the compressed domain, so the rows are exact and
+//!   nothing verifies behind it.
+//! * [`BytesVerifier`] — an exact check in the decoded domain: decode a row
+//!   into a reused buffer and `memmem` it. What the prefilter is measured
+//!   against, and the substring check without a pattern-length cap.
 //! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
 
 mod contains;
@@ -58,7 +59,7 @@ pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefilter::{
-    PrefilterAnalysis, PrefilterError, ProbeCover, analyze_prefilter, prefilter_candidates,
+    MAX_PATTERN_LEN, PrefilterAnalysis, ProbeCover, analyze_prefilter, prefilter_candidates,
     prefilter_is_likely_profitable,
 };
 pub use prefix::{PrefixQuery, starts_with};

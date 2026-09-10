@@ -3,12 +3,9 @@
 
 //! The compiled probe cover: what the scan compares codes against.
 //!
-//! A cover carries the same membership set in two shapes, because the two scan
-//! paths want different ones. The vector kernels compare each code against every
-//! point (equality) and every range (unsigned `>= lo && <= hi`), so they want the
-//! point and range lists; the scalar tail wants one lookup per code, so it wants
-//! the membership table. The table is what the planner hands over, and the lists
-//! are read back off it.
+//! A cover carries the token ids in the two shapes the kernels compare against:
+//! points, tested for equality, and inclusive ranges, tested as unsigned
+//! `>= lo && <= hi`.
 
 use crate::core::types::{Token, TokenRange};
 
@@ -21,7 +18,6 @@ use crate::core::types::{Token, TokenRange};
 pub struct ProbeCover {
     pub(super) points: Vec<Token>,
     pub(super) ranges: Vec<TokenRange>,
-    pub(super) table: Vec<bool>,
 }
 
 impl ProbeCover {
@@ -35,44 +31,42 @@ impl ProbeCover {
         &self.ranges
     }
 
-    /// Turn each maximal run in `table` into a range, or a point for a singleton.
-    /// This removes overlapping probes while preserving membership exactly;
-    /// advisory frequencies do not participate.
-    pub(super) fn from_membership(table: Vec<bool>) -> Self {
-        let mut points = Vec::new();
-        let mut ranges = Vec::new();
-        let mut id = 0;
-        while id < table.len() {
-            if !table[id] {
-                id += 1;
-                continue;
-            }
-            let begin = id;
-            while id < table.len() && table[id] {
-                id += 1;
-            }
-            let last = id - 1;
-            let probe = TokenRange {
-                begin: begin as Token,
-                last: last as Token,
-            };
-            if probe.last == probe.begin {
-                points.push(probe.begin);
-            } else {
-                ranges.push(probe);
-            }
-        }
-
-        Self {
-            points,
-            ranges,
-            table,
-        }
-    }
-
     /// Whether the cover names no token id.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.points.is_empty() && self.ranges.is_empty()
+    }
+
+    /// Merge runs that overlap or abut, then file single-id runs as points and
+    /// the rest as ranges. Input may be in any order. The planner reaches this
+    /// through [`from_edge_cut`](Self::from_edge_cut), defined beside the graph.
+    pub(super) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
+        runs.sort_unstable_by_key(|run| run.begin);
+        let mut merged: Vec<TokenRange> = Vec::with_capacity(runs.len());
+        for run in runs {
+            match merged.last_mut() {
+                Some(open) if run.begin <= open.last.saturating_add(1) => {
+                    open.last = open.last.max(run.last)
+                }
+                _ => merged.push(run),
+            }
+        }
+        let (points, ranges): (Vec<_>, Vec<_>) =
+            merged.into_iter().partition(|run| run.begin == run.last);
+        let points = points.into_iter().map(|run| run.begin).collect();
+        Self { points, ranges }
+    }
+
+    /// Points and ranges as given. Ranges must be disjoint.
+    #[cfg(test)]
+    pub(super) fn new(points: Vec<Token>, ranges: Vec<TokenRange>) -> Self {
+        Self { points, ranges }
+    }
+
+    /// Whether the cover names `code`. The test oracles ask; the kernels
+    /// never do, they probe the whole vector.
+    #[cfg(test)]
+    pub fn contains(&self, code: Token) -> bool {
+        self.points.contains(&code) || self.ranges.iter().any(|range| range.contains(code))
     }
 }
