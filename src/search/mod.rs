@@ -15,8 +15,11 @@
 //!   binary search.
 //! * **Complete** — all 256 single-byte tokens are present, so any query string
 //!   is encodable into codes.
-//! * **Unique** — no two tokens are equal, so distinct code sequences denote
-//!   distinct strings; equality then reduces to comparing code slices.
+//! * **Unique** — no two tokens have equal bytes, so each token has one ID.
+//!
+//! Equality, prefix search and the graph prefilter require rows greedily
+//! tokenized with the same dictionary, as produced by the encoder. Dictionary
+//! validation alone does not establish this property for externally supplied codes.
 //!
 //! # Shape
 //! Each query is **prepared once** (tokenize the needle, or build a transition
@@ -37,13 +40,12 @@
 //!   index for a code stream.
 //! * [`analyze_prefilter`] — derive a normalized probe cover and report its
 //!   frequency.
-//! * [`prefilter_candidates`] — the rows containing a pattern, collected by
+//! * [`prefilter_matches`] — the rows containing a pattern, collected by
 //!   running a probe cover over the code stream. Every hit is verified against
 //!   the alignment graph in the compressed domain, so the rows are exact and
-//!   nothing verifies behind it.
-//! * [`BytesVerifier`] — an exact check in the decoded domain: decode a row
-//!   into a reused buffer and `memmem` it. What the prefilter is measured
-//!   against, and the substring check without a pattern-length cap.
+//!   each emitted row is an exact match. `prefilter_candidates` remains an alias
+//!   with the same exact behavior. Graph needles may contain up to 65,535 bytes;
+//!   standalone KMP supports up to 255 bytes.
 //! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
 
 mod equals;
@@ -57,7 +59,7 @@ pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefix::{PrefixQuery, starts_with};
 pub use substring::{
-    BytesVerifier, ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, ProbeCover,
-    analyze_prefilter, contains, prefilter_candidates, prefilter_is_likely_profitable,
+    ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, ProbeCover, analyze_prefilter, contains,
+    prefilter_candidates, prefilter_is_likely_profitable, prefilter_matches,
 };
 pub use tokenize::tokenize;

@@ -3,7 +3,7 @@
 
 //! Stage two: the resolvers against one mask per needle set, built once from
 //! the cover itself so no matcher runs while the clock does, and the four
-//! constants of `policy::stage_two_ns` fitted to what that measured.
+//! constants of `plan::cost::stage_two_ns` fitted to what that measured.
 //!
 //! The sweep's axes are the mask's hit density and the row length, swept
 //! past each other because that is what decides which resolver wins. Rates

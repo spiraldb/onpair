@@ -14,7 +14,7 @@ use super::select::select_matcher;
 pub(in crate::search::substring) const BYTES_PER_CODE: f64 = 2.0;
 
 /// Codes one pass of the pack covers, which is the two mask words
-/// [`words`](super::super::scan::matcher) writes at a time and the unit the flag decides
+/// the matcher writes at a time and the unit the flag decides
 /// over.
 const PACK_GROUP: f64 = 128.0;
 

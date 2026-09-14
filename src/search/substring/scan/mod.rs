@@ -17,7 +17,7 @@
 #[cfg(test)]
 mod bench;
 mod dispatch;
-pub(super) mod matcher;
+mod matcher;
 mod resolver;
 
 use super::PrefilterAnalysis;
@@ -37,18 +37,14 @@ use resolver::Resolver;
 
 /// Borrowed buffers for one scan region.
 #[derive(Clone, Copy)]
-pub(super) struct ScanInput<'a, O> {
-    pub(super) codes: &'a [Token],
-    pub(super) row_offsets: &'a [O],
-    pub(super) cover: &'a ProbeCover,
+struct ScanInput<'a, O> {
+    codes: &'a [Token],
+    row_offsets: &'a [O],
+    cover: &'a ProbeCover,
 }
 
 impl<'a, O> ScanInput<'a, O> {
-    pub(super) const fn full(
-        codes: &'a [Token],
-        row_offsets: &'a [O],
-        cover: &'a ProbeCover,
-    ) -> Self {
+    const fn full(codes: &'a [Token], row_offsets: &'a [O], cover: &'a ProbeCover) -> Self {
         Self {
             codes,
             row_offsets,

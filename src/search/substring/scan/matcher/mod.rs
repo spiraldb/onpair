@@ -32,7 +32,7 @@ pub(in crate::search::substring::scan) use table::Table;
 pub(in crate::search::substring::scan) trait Matcher:
     Sized
 {
-    /// Callers check `policy::takes` first.
+    /// Callers check `plan::select::takes` first.
     fn new(cover: &ProbeCover) -> Self;
 
     /// Fills `bits` for one block. `false` promises an empty mask, so stage two

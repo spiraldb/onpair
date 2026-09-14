@@ -14,7 +14,10 @@ mod tests;
 
 pub use alignment::cover::ProbeCover;
 pub use query::{
-    MAX_PATTERN_LEN, PrefilterAnalysis, analyze_prefilter, prefilter_candidates,
-    prefilter_is_likely_profitable,
+    MAX_PATTERN_LEN, PrefilterAnalysis, analyze_prefilter, prefilter_is_likely_profitable,
+    prefilter_matches,
 };
-pub use verify::{BytesVerifier, ContainsTable, contains};
+pub use verify::{ContainsTable, contains};
+
+/// Compatibility name for the exact scan, preserving the PR signature.
+pub use query::prefilter_matches as prefilter_candidates;

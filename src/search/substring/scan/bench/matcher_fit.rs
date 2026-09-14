@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Stage one: every kernel of this build against every probe shape, and the
-//! matcher rows of `policy::ns_per_code` fitted to what that measured.
+//! matcher rows of `plan::cost::ns_per_code` fitted to what that measured.
 //!
 //! A probe is K tokens from the catalog, R ranges spread over the code space,
 //! or both, since a cover arrives as points and runs together. R is the axis
@@ -396,7 +396,7 @@ fn points(row: &[&Row]) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// The fits as `policy::ns_per_code` would have them, to paste under the
+/// The fits as `plan::cost::ns_per_code` would have them, to paste under the
 /// `cfg` for the build the rows came from. Only the kernels the sweep
 /// measured are emitted; the rest keep whatever the model says now.
 fn snippet(machine: &str, source: &str, fit: &Fit) {

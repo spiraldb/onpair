@@ -105,7 +105,7 @@ impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for EqOr<SKIP_MOVEMASK_IF_NO
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: `policy::takes` answered for the set.
+        // SAFETY: `plan::select::takes` answered for the set.
         unsafe { mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.tokens, &self.ranges, codes, bits) }
     }
 }

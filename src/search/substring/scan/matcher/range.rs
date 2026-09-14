@@ -107,7 +107,7 @@ impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for Range<SKIP_MOVEMASK_IF_N
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: `policy::takes` answered for the set.
+        // SAFETY: `plan::select::takes` answered for the set.
         unsafe { mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.0, codes, bits) }
     }
 }
@@ -120,7 +120,9 @@ fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
-    let (&first, rest) = held.split_first().expect("a range, per policy::takes");
+    let (&first, rest) = held
+        .split_first()
+        .expect("a range, per plan::select::takes");
     words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| unsafe {
         check_ranges(inside(first, codes), rest, codes)
     })

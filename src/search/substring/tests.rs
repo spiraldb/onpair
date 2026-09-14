@@ -13,7 +13,7 @@ use super::plan::cost::scan_ns;
 use super::plan::facts::RegionFacts;
 use super::plan::{cheapest_cover, cover_frequency};
 use super::scan::detect_target_caps;
-use super::{analyze_prefilter, prefilter_candidates, prefilter_is_likely_profitable};
+use super::{analyze_prefilter, prefilter_is_likely_profitable, prefilter_matches};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::{
@@ -30,7 +30,7 @@ fn candidates<S: TokenFrequencyIndexStorage>(
 ) -> Vec<usize> {
     let mut out = Vec::new();
     let analysis = analyze_prefilter(pattern, dict, frequencies, view.num_rows());
-    prefilter_candidates(view.codes, view.row_offsets, dict, &analysis, &mut out);
+    prefilter_matches(view.codes, view.row_offsets, dict, &analysis, &mut out);
     out
 }
 
@@ -281,7 +281,7 @@ fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
             cand.extend(0..view.num_rows());
         } else {
             let analysis = analyze_prefilter(pat, view.dict, &frequencies, view.num_rows());
-            prefilter_candidates(
+            prefilter_matches(
                 view.codes,
                 view.row_offsets,
                 view.dict,
@@ -412,7 +412,7 @@ fn empty_pattern_appends_all_rows() {
 
         let expected: Vec<_> = (0..rows.len()).collect();
         let mut got = vec![usize::MAX];
-        prefilter_candidates(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
+        prefilter_matches(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
         assert_eq!(got[0], usize::MAX);
         assert_eq!(got[1..], expected);
         assert_eq!(
@@ -439,7 +439,7 @@ fn empty_probe_cover_still_appends_nothing() {
 
     let dict = crate::compress(b"a", &[0u32, 1], DEFAULT_CONFIG).unwrap();
     let mut rows = vec![usize::MAX];
-    prefilter_candidates(
+    prefilter_matches(
         &[0],
         &[0u32, 0, 1, 1],
         dict.view().dict,
@@ -514,7 +514,7 @@ fn prefilter_accepts_pattern_over_255_bytes() {
     let pat = vec![b'a'; 256];
     let mut candidates = Vec::new();
     let analysis = analyze_prefilter(&pat, view.dict, &frequencies, view.num_rows());
-    prefilter_candidates(
+    prefilter_matches(
         view.codes,
         view.row_offsets,
         view.dict,
@@ -830,10 +830,37 @@ fn split_scan_returns_exact_rows() {
     for pat in [b"example".as_slice(), b".com", b"://", b"page", b"user"] {
         let analysis = analyze_prefilter(pat, view.dict, &frequencies, view.num_rows());
         let mut got = Vec::new();
-        prefilter_candidates(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
+        prefilter_matches(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
         let want: Vec<usize> = (0..view.num_rows())
             .filter(|&k| byte_contains(&decode_row(view, k), pat))
             .collect();
         assert_eq!(got, want, "{pat:?}");
     }
+}
+
+/// The old public name retains exact verification and append semantics.
+#[test]
+fn compatibility_alias_returns_exact_rows_and_preserves_output() {
+    let col = compress_rows(&[b"appappapple", b"apple", b"", b"appapple"]);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let analysis = analyze_prefilter(b"appapple", view.dict, &frequencies, view.num_rows());
+    let mut matches = vec![usize::MAX];
+    let mut alias = matches.clone();
+    prefilter_matches(
+        view.codes,
+        view.row_offsets,
+        view.dict,
+        &analysis,
+        &mut matches,
+    );
+    crate::search::prefilter_candidates(
+        view.codes,
+        view.row_offsets,
+        view.dict,
+        &analysis,
+        &mut alias,
+    );
+    assert_eq!(matches, vec![usize::MAX, 0, 3]);
+    assert_eq!(alias, matches);
 }

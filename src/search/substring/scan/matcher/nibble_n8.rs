@@ -222,7 +222,7 @@ impl<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: `policy::takes` answered for the set.
+        // SAFETY: `plan::select::takes` answered for the set.
         unsafe {
             mask::<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>(&self.batches, &self.ranges, codes, bits)
         }

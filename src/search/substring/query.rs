@@ -9,10 +9,10 @@
 //! It compiles a **sound probe cover** from the pattern — dictionary token ids
 //! and id ranges chosen so that *any* row containing the pattern holds at least
 //! one probe token — then scans the flat code stream for the rows holding one
-//! ([`prefilter_candidates`]).
+//! ([`prefilter_matches`]).
 //!
 //! Every hit is then checked against the alignment graph in the compressed
-//! domain (`walk`), so the rows [`prefilter_candidates`] returns are exactly
+//! domain (`walk`), so the rows [`prefilter_matches`] returns are exactly
 //! the rows containing the pattern and no caller-side verification is needed.
 //!
 //! An empty pattern matches every row, including rows without codes. Its
@@ -31,21 +31,12 @@
 //!   alignment DAG, and the cover is a cut of that DAG — so whichever layout the
 //!   occurrence takes, it runs into a probe.
 //!
-//! # Shape
-//! * [`TokenFrequencyIndex`] — the reusable per-column selectivity index the
-//!   compiler reads and the caller owns.
-//! * `graph` — pattern to alignment DAG: every layout of the pattern across
-//!   token boundaries, as one graph whose cuts are exactly the sound covers.
-//! * `mincut` — the cheapest such cut, by max-flow over the split DAG, under
-//!   whatever edge weights it is handed.
-//! * `plan` — the three end to end: pattern in, the cover the model prices
-//!   lowest out, preserving every selected id regardless of its advisory
-//!   frequency.
-//! * `cover` — the cover itself, in both the shapes the scan wants.
-//! * `walk` — the graph flattened for checking a hit in codes, forward to the
-//!   sink and back to the source.
-//! * `scan` — the vector kernels and, in `policy`, the fitted cost model
-//!   that picks them and prices a cover. Profitability stays outside execution.
+//! # Responsibilities
+//! `query` coordinates graph construction, cost-based cover selection and walk
+//! compilation. `alignment` owns the graph and cut solver; `plan` prices and
+//! selects covers and execution plans using explicit facts and capabilities.
+//! `scan` produces hits and resolves rows, calling the exact verifier in
+//! `verify::walk`. Profitability remains a caller decision.
 
 use super::alignment::graph::build_alignment_graph;
 use super::plan::facts::RegionFacts;
@@ -76,7 +67,7 @@ pub struct PrefilterAnalysis {
 impl PrefilterAnalysis {
     /// The normalized checks the SIMD prefilter can execute.
     ///
-    /// For an empty pattern this cover is empty, but [`prefilter_candidates`]
+    /// For an empty pattern this cover is empty, but [`prefilter_matches`]
     /// still returns every row.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
@@ -235,10 +226,8 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
 
 /// Execute `analysis` and append the ascending rows containing the pattern.
 ///
-/// The rows are exact, not a superset: every hit on the cover is verified
-/// against the alignment graph in the compressed domain, so no caller-side
-/// check such as [`contains`](super::contains()) or a
-/// [`BytesVerifier`](super::BytesVerifier) is needed behind this.
+/// Every hit on the cover is checked against the alignment graph in the
+/// compressed domain. Emitted rows contain a complete occurrence of the pattern.
 ///
 /// This function only executes the analyzed cover; the caller decides whether
 /// scanning it is profitable. For a non-empty pattern, an empty cover appends
@@ -248,9 +237,12 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
 /// # Precondition
 /// `row_offsets` are valid delimiters for `codes`, every code lies in the
 /// token domain of the analyzed cover, and `dict` is the dictionary the
-/// analysis was built over. A validated [`Column`](crate::Column) and an
-/// analysis built for that column satisfy these properties.
-pub fn prefilter_candidates<O: Offset>(
+/// analysis was built over. Rows must be greedily tokenized with that same
+/// conformant dictionary, as produced by [`Column::compress`](crate::Column::compress).
+/// Validating a dictionary or externally supplied column buffers alone does not
+/// establish greedy tokenization. Each scan appends each matching row once in
+/// ascending order, preserving all prior contents of `out`.
+pub fn prefilter_matches<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     dict: CompactDictionaryView<'_>,

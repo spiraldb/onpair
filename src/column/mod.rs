@@ -19,7 +19,7 @@ use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 use crate::search::{
-    ContainsTable, PrefixQuery, analyze_prefilter, contains, equals, prefilter_candidates,
+    ContainsTable, PrefixQuery, analyze_prefilter, contains, equals, prefilter_matches,
     starts_with, tokenize,
 };
 
@@ -194,17 +194,18 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         self.select(|codes| contains(codes, &table))
     }
 
-    /// Ascending indices of the rows containing `pattern`, from the SIMD
-    /// prefilter alone.
+    /// Ascending indices of the rows containing `pattern`, using a probe cover
+    /// and exact graph verification.
     ///
-    /// [`prefilter_candidates`] scans the code stream for the rows holding a
+    /// [`prefilter_matches`] scans the code stream for the rows holding a
     /// probe and verifies each hit against the alignment graph, so the rows
-    /// come back exact and nothing runs behind it. Worth it exactly when the
-    /// pattern is selective; a pattern most rows match is more cheaply answered
-    /// by [`rows_containing`](Self::rows_containing) directly. This explicitly
-    /// named method always runs the prefilter. An adaptive caller can use
-    /// [`analyze_prefilter`] to inspect the probe cover and its frequency
-    /// before choosing whether to scan it.
+    /// come back exact. This method always runs the prefilter; callers can use
+    /// [`analyze_prefilter`] to inspect its cover, frequency and estimated cost
+    /// before choosing a search operation.
+    ///
+    /// Rows must be greedily tokenized with this view's conformant dictionary,
+    /// as produced by the encoder. Buffer validation alone does not establish
+    /// greedy tokenization for externally supplied codes.
     ///
     /// `frequencies` must use this view's token domain and code count. Build an
     /// exact index with
@@ -222,7 +223,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     ) -> Vec<usize> {
         let analysis = analyze_prefilter(pattern, self.dict, frequencies, self.num_rows());
         let mut rows = Vec::new();
-        prefilter_candidates(
+        prefilter_matches(
             self.codes,
             self.row_offsets,
             self.dict,
