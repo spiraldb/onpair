@@ -93,6 +93,7 @@ pub(in crate::search::substring) enum ResolverKind {
 /// Only vector operations occur inside a vector target's configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::substring) enum VectorMatcher {
+    OnePoint,
     EqOr,
     Range,
     NibbleN8 { batches: usize },

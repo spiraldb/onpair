@@ -83,6 +83,19 @@ pub(super) fn run<O: Offset>(
     unreachable!("this target compiles only scalar execution: {selected:?}");
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     match selected {
+        #[cfg(target_arch = "aarch64")]
+        VectorMatcher::OnePoint => {
+            with_skip::<O, matcher::OnePoint<true>, matcher::OnePoint<false>>(
+                plan,
+                cover,
+                codes,
+                row_offsets,
+                check,
+                out,
+            )
+        }
+        #[cfg(target_arch = "x86_64")]
+        VectorMatcher::OnePoint => unreachable!("the one-point specialization is NEON-only"),
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         VectorMatcher::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
             plan,

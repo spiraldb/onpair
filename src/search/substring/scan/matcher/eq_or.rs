@@ -123,3 +123,28 @@ fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
         check_ranges(hits(tokens, codes), ranges, codes)
     })
 }
+
+/// Refactor's fixed one-point preparation, using the PR mask/resolver seam.
+#[cfg(target_arch = "aarch64")]
+pub(in crate::search::substring::scan) struct OnePoint<const SKIP: bool>(Broadcast);
+
+#[cfg(target_arch = "aarch64")]
+impl<const SKIP: bool> Matcher for OnePoint<SKIP> {
+    fn new(cover: &ProbeCover) -> Self {
+        debug_assert_eq!((cover.points().len(), cover.ranges().len()), (1, 0));
+        Self(broadcast(cover.points()[0]))
+    }
+
+    fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
+        // SAFETY: NEON is baseline on AArch64; the block supplies every load.
+        unsafe { one_point_mask::<SKIP>(self.0, codes, bits) }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+fn one_point_mask<const SKIP: bool>(point: Broadcast, codes: &Block, bits: &mut Mask) -> bool {
+    words::<SKIP>(codes, bits, |values| {
+        narrow(values.map(|value| vceqq_u16(value, point)))
+    })
+}

@@ -63,6 +63,11 @@ fn block() -> Block {
 
 /// Every matcher on one cover and one block.
 fn every_matcher(cover: &ProbeCover, codes: &Block) {
+    #[cfg(target_arch = "aarch64")]
+    if cover.points().len() == 1 && cover.ranges().is_empty() {
+        agrees::<super::OnePoint<false>>(MatcherKind::EqOr, "one_point", cover, codes);
+        agrees::<super::OnePoint<true>>(MatcherKind::EqOr, "one_point_skip", cover, codes);
+    }
     agrees::<Table>(MatcherKind::Table, "table", cover, codes);
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {

@@ -39,3 +39,6 @@ pub(in crate::search::substring::scan) trait Matcher:
     /// is skipped; `true` promises nothing.
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool;
 }
+
+#[cfg(target_arch = "aarch64")]
+pub(in crate::search::substring::scan) use eq_or::OnePoint;

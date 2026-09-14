@@ -72,6 +72,16 @@ pub(in crate::search::substring) fn select_scan_plan(
                 resolver,
             };
         }
+        MatcherKind::EqOr
+            if caps.isa == Isa::Neon
+                && facts.analysis.shape
+                    == (CoverShape {
+                        points: 1,
+                        ranges: 0,
+                    }) =>
+        {
+            VectorMatcher::OnePoint
+        }
         MatcherKind::EqOr => VectorMatcher::EqOr,
         MatcherKind::Range => VectorMatcher::Range,
         MatcherKind::NibbleN8K => VectorMatcher::NibbleN8 {
