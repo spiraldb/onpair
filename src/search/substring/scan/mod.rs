@@ -20,17 +20,20 @@ mod dispatch;
 pub(super) mod matcher;
 mod resolver;
 
-use super::plan::cost as policy;
-pub(in crate::search::substring) use super::plan::cost::Facts;
-pub(in crate::search::substring) use super::verify::walk::Walk;
-use matcher::Matcher;
-use resolver::Resolver;
-
 use super::PrefilterAnalysis;
-use super::alignment::cover::ProbeCover;
+use super::ProbeCover;
+pub(super) use super::plan::facts::BLOCK;
+#[cfg(test)]
+use super::plan::facts::Isa;
+use super::plan::facts::{AnalysisFacts, CoverShape, Kernel, RegionFacts, ScanFacts, ScanPlan};
+use super::plan::select::select_scan_plan;
+use super::verify::walk::Walk;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
+pub(super) use dispatch::detect_target_caps;
+use matcher::Matcher;
+use resolver::Resolver;
 
 /// Borrowed buffers for one scan region.
 #[derive(Clone, Copy)]
@@ -54,52 +57,52 @@ impl<'a, O> ScanInput<'a, O> {
     }
 }
 
-/// What the scan will be handed, without inspecting code values. `None` where
-/// the region admits nothing whatever runs over it: an empty cover proves no
-/// row matches, and a region with no rows has nothing to emit.
-pub(super) type ScanPlan = Option<Facts>;
-
-/// Derive an ephemeral plan without inspecting code values.
+/// Append exact matches while keeping region planning and execution private.
 #[inline]
-pub(super) fn plan<O: Offset>(input: ScanInput<'_, O>, analysis: &PrefilterAnalysis) -> ScanPlan {
-    facts(
+pub(super) fn matches<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    dict: CompactDictionaryView<'_>,
+    analysis: &PrefilterAnalysis,
+    out: &mut Vec<usize>,
+) {
+    let input = ScanInput::full(codes, row_offsets, analysis.probe_cover());
+    let plan = select_scan_plan(
+        detect_target_caps(),
+        facts(
+            input,
+            analysis.covered_frequency() as usize,
+            analysis.total_frequency() as usize,
+        ),
+    );
+    execute_check(
+        plan,
         input,
-        analysis.covered_frequency() as usize,
-        analysis.total_frequency() as usize,
-    )
+        Check::Walk {
+            walk: &analysis.walk,
+            dict,
+            codes,
+        },
+        out,
+    );
 }
 
-/// The region the scan will see and the hits it can expect there. Which
-/// kernel runs over it is `policy`'s business, decided once the probe
-/// is built.
 fn facts<O: Offset>(
     input: ScanInput<'_, O>,
-    covered_frequency: usize,
-    total_frequency: usize,
-) -> ScanPlan {
-    let row_count = input.row_offsets.len().saturating_sub(1);
-    if input.cover.is_empty() || row_count == 0 {
-        return None;
+    covered_codes: usize,
+    indexed_codes: usize,
+) -> ScanFacts {
+    ScanFacts {
+        analysis: AnalysisFacts {
+            shape: CoverShape::of(input.cover),
+            covered_codes,
+            indexed_codes,
+        },
+        region: RegionFacts {
+            code_count: input.codes.len(),
+            row_count: input.row_offsets.len().saturating_sub(1),
+        },
     }
-    Some(Facts {
-        expected_hits: expected_hits(covered_frequency, total_frequency, input.codes.len()),
-        code_count: input.codes.len(),
-        row_count,
-    })
-}
-
-/// Covered codes expected in this region: exact for the indexed population,
-/// and a projection of it for a subset. Planning only, never correctness.
-fn expected_hits(covered_frequency: usize, total_frequency: usize, code_count: usize) -> usize {
-    if total_frequency == code_count {
-        return covered_frequency;
-    }
-    if total_frequency == 0 {
-        return 0;
-    }
-    let projected =
-        (covered_frequency as u128).saturating_mul(code_count as u128) / total_frequency as u128;
-    usize::try_from(projected).unwrap_or(usize::MAX)
 }
 
 /// Compatibility entry for tests that exercise dispatch with a synthetic
@@ -114,25 +117,14 @@ pub(super) fn scan<O: Offset>(
 ) {
     let input = ScanInput::full(codes, row_offsets, cover);
     execute_check(
-        facts(input, covered_frequency, codes.len()),
+        select_scan_plan(
+            detect_target_caps(),
+            facts(input, covered_frequency, codes.len()),
+        ),
         input,
         Check::Superset,
         out,
     );
-}
-
-/// Execute a previously derived plan. This is the first stage that inspects
-/// code values. Every hit goes through `walk`, so the rows are exact.
-#[inline]
-pub(super) fn execute<O: Offset>(
-    plan: ScanPlan,
-    input: ScanInput<'_, O>,
-    walk: &Walk,
-    dict: CompactDictionaryView<'_>,
-    out: &mut Vec<usize>,
-) {
-    let codes = input.codes;
-    execute_check(plan, input, Check::Walk { walk, dict, codes }, out);
 }
 
 /// The plan under whatever stage two asks of a hit.
@@ -142,11 +134,11 @@ fn execute_check<O: Offset>(
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
-    let Some(facts) = plan else {
+    if plan.kernel == Kernel::Empty {
         return;
-    };
+    }
     dispatch::run(
-        policy::select(input.cover, facts),
+        plan,
         input.cover,
         input.codes,
         input.row_offsets,
@@ -170,38 +162,6 @@ pub(super) fn scan_scalar<O: Offset>(
             out.push(row);
         }
     }
-}
-
-/// Codes per block, 64 words of mask. Kernels rely on the multiple of 64.
-pub(in crate::search::substring) const BLOCK: usize = 4096;
-
-/// The instruction set this build's kernels run on. The other thing a cost
-/// is per: the same kernel is a different cost on each, since what a range
-/// or a pack costs is the set's business. `Scalar` is a target with no
-/// vector kernels at all, where only the byte table is compiled.
-///
-/// Total by design though a build compiles one of them: a fit reads other
-/// machines' numbers out of a CSV and has to name their sets.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring) enum Isa {
-    Neon,
-    Avx2,
-    Avx512Bw,
-    Scalar,
-}
-
-impl Isa {
-    /// The one this build compiled. A const, so the dispatch over it folds
-    /// away and the other sets' costs are never asked for.
-    #[cfg(target_arch = "aarch64")]
-    pub(in crate::search::substring) const BUILT: Self = Self::Neon;
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-    pub(in crate::search::substring) const BUILT: Self = Self::Avx512Bw;
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-    pub(in crate::search::substring) const BUILT: Self = Self::Avx2;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    pub(in crate::search::substring) const BUILT: Self = Self::Scalar;
 }
 
 /// One block of codes, exactly what a matcher is handed.
@@ -297,7 +257,12 @@ mod tests {
         let rows = [0u32, 4, 8];
         let takes = |points: Vec<Token>, ranges: Vec<TokenRange>| {
             let cover = ProbeCover { points, ranges };
-            facts(ScanInput::full(&codes, &rows, &cover), 1, codes.len()).is_some()
+            select_scan_plan(
+                detect_target_caps(),
+                facts(ScanInput::full(&codes, &rows, &cover), 1, codes.len()),
+            )
+            .kernel
+                != Kernel::Empty
         };
         assert!(takes(vec![7], Vec::new()), "a point");
         assert!(
@@ -315,7 +280,14 @@ mod tests {
             ranges: Vec::new(),
         };
         let rowless: &[u32] = &[0];
-        assert!(facts(ScanInput::full(&codes, rowless, &cover), 1, 8).is_none());
+        assert!(
+            select_scan_plan(
+                detect_target_caps(),
+                facts(ScanInput::full(&codes, rowless, &cover), 1, 8)
+            )
+            .kernel
+                == Kernel::Empty
+        );
     }
 
     /// Rows but no codes: the block driver has nothing to hand the matcher,
@@ -344,23 +316,22 @@ mod tests {
         };
         assert_eq!(
             facts(ScanInput::full(&codes, &rows, &cover), 500, 10_000),
-            Some(Facts {
-                // A twentieth of the indexed codes are covered, so a
-                // twentieth of the region's.
-                expected_hits: 100,
-                code_count: 2_000,
-                row_count: 200,
-            })
+            ScanFacts {
+                analysis: AnalysisFacts {
+                    shape: CoverShape {
+                        points: 1,
+                        ranges: 0
+                    },
+                    covered_codes: 500,
+                    indexed_codes: 10000
+                },
+                region: RegionFacts {
+                    // A twentieth of the indexed codes are covered, so a
+                    // twentieth of the region's.
+                    code_count: 2_000,
+                    row_count: 200,
+                }
+            }
         );
-    }
-
-    /// The projection at its ends: the whole index, none of it, and a region
-    /// wider than the index it was measured over.
-    #[test]
-    fn the_hit_estimate_is_a_projection_of_the_index() {
-        assert_eq!(expected_hits(7, 100, 100), 7);
-        assert_eq!(expected_hits(500, 10_000, 2_000), 100);
-        assert_eq!(expected_hits(1, 0, 100), 0);
-        assert_eq!(expected_hits(1, 1, usize::MAX), usize::MAX);
     }
 }

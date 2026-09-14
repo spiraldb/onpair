@@ -21,17 +21,6 @@ pub(super) type Hits = [__m256i; 2];
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 pub(super) type Hits = u64;
 
-/// NEON is baseline; AVX2 and AVX-512 are not, so the planner asks before
-/// naming a vector kernel.
-pub(in crate::search::substring) fn available() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    return true;
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-    return std::arch::is_x86_feature_detected!("avx2");
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-    return std::arch::is_x86_feature_detected!("avx512bw");
-}
-
 /// The 64 codes of one mask word.
 #[cfg(target_arch = "aarch64")]
 pub(in crate::search::substring::scan) type Vectors = [uint16x8_t; 8];

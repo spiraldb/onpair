@@ -47,6 +47,9 @@
 //! * `scan` — the vector kernels and, in `policy`, the fitted cost model
 //!   that picks them and prices a cover. Profitability stays outside execution.
 
+use super::alignment::graph::build_alignment_graph;
+use super::plan::facts::RegionFacts;
+use super::verify::walk::Walk;
 use super::{ProbeCover, plan, scan};
 
 use crate::core::dictionary::CompactDictionaryView;
@@ -65,7 +68,7 @@ pub struct PrefilterAnalysis {
     pub(super) covered_frequency: u32,
     pub(super) total_frequency: u32,
     pub(super) scan_ns: f64,
-    pub(super) walk: scan::Walk,
+    pub(super) walk: Walk,
     /// Empty patterns admit even rows without codes, independently of the cover.
     pub(super) matches_all: bool,
 }
@@ -200,7 +203,7 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
             covered_frequency: 0,
             total_frequency: frequencies.total_frequency(),
             scan_ns: 0.0,
-            walk: scan::Walk::default(),
+            walk: Walk::default(),
             matches_all: true,
         };
     }
@@ -209,13 +212,23 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
         "pattern of {} bytes exceeds the prefilter's {MAX_PATTERN_LEN}",
         pattern.len()
     );
-    let planned = plan::plan(dict, pattern, frequencies.as_view(), row_count);
+    let graph = build_alignment_graph(dict, pattern, frequencies.as_view());
+    let region = RegionFacts {
+        code_count: frequencies.total_frequency() as usize,
+        row_count,
+    };
+    let (cover, covered, scan_ns) = plan::cheapest_cover(
+        &graph,
+        frequencies.as_view(),
+        region,
+        scan::detect_target_caps(),
+    );
     PrefilterAnalysis {
-        probe_cover: planned.cover,
-        covered_frequency: planned.covered,
+        probe_cover: cover,
+        covered_frequency: covered,
         total_frequency: frequencies.total_frequency(),
-        scan_ns: planned.scan_ns,
-        walk: planned.walk,
+        scan_ns,
+        walk: Walk::from_graph(&graph, pattern),
         matches_all: false,
     }
 }
@@ -248,9 +261,7 @@ pub fn prefilter_candidates<O: Offset>(
         out.extend(0..row_offsets.len().saturating_sub(1));
         return;
     }
-    let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
-    let plan = scan::plan(input, analysis);
-    scan::execute(plan, input, &analysis.walk, dict, out);
+    scan::matches(codes, row_offsets, dict, analysis, out);
 }
 
 /// The longest pattern [`analyze_prefilter`] takes: one node per needle offset

@@ -107,7 +107,7 @@ fn machine() -> String {
     format!(
         "{} {model} {}",
         std::env::consts::ARCH,
-        isa_name(Isa::BUILT)
+        isa_name(super::detect_target_caps().isa)
     )
     .replace(',', " ")
     .split_whitespace()

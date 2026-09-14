@@ -15,49 +15,16 @@
 //! safety-valid stored weights may contain false zeroes, so pruning by
 //! frequency would be unsound. Profitability remains a caller decision.
 
-use super::alignment::cover::ProbeCover;
-use super::alignment::graph::{AlignmentGraph, Edge, build_alignment_graph};
-use super::alignment::mincut::MinCut;
-use super::verify::walk::Walk;
-
 pub(super) mod cost;
-use self::cost::{Region, scan_ns};
-use crate::core::dictionary::CompactDictionaryView;
+pub(super) mod facts;
+pub(super) mod select;
+
+use self::cost::scan_ns;
+use self::facts::{RegionFacts, TargetCaps};
+use super::ProbeCover;
+use super::alignment::graph::{AlignmentGraph, Edge};
+use super::alignment::mincut::MinCut;
 use crate::search::index::TokenFrequencyIndexView;
-
-/// What [`plan`] settles on for one pattern.
-pub(super) struct Planned {
-    pub(super) cover: ProbeCover,
-    /// Codes the cover matches in the indexed stream.
-    pub(super) covered: u32,
-    /// [`scan_ns`] of the cover.
-    pub(super) scan_ns: f64,
-    /// The exact check a hit on the cover admits.
-    pub(super) walk: Walk,
-}
-
-/// Compile a sound probe cover for `pattern` over `dict`, cheapest by the
-/// scan cost model over a stream of `row_count` rows.
-pub(super) fn plan(
-    dict: CompactDictionaryView<'_>,
-    pattern: &[u8],
-    frequencies: TokenFrequencyIndexView<'_>,
-    row_count: usize,
-) -> Planned {
-    let graph = build_alignment_graph(dict, pattern, frequencies);
-    let region = Region {
-        code_count: frequencies.total_frequency() as usize,
-        row_count,
-    };
-    let (cover, covered, scan_ns) = cheapest_cover(&graph, frequencies, region);
-
-    Planned {
-        cover,
-        covered,
-        scan_ns,
-        walk: Walk::from_graph(&graph, pattern),
-    }
-}
 
 /// The cut whose cover [`scan_ns`] prices lowest, with what it covers and
 /// costs.
@@ -71,7 +38,8 @@ pub(super) fn plan(
 pub(super) fn cheapest_cover(
     graph: &AlignmentGraph,
     frequencies: TokenFrequencyIndexView<'_>,
-    region: Region,
+    region: RegionFacts,
+    caps: TargetCaps,
 ) -> (ProbeCover, u32, f64) {
     let ceiling = u64::from(frequencies.total_frequency());
     let by = |lambda: u64| {
@@ -86,7 +54,7 @@ pub(super) fn cheapest_cover(
         let edges: Vec<&Edge> = cut.iter().map(|&at| &graph.edges[at as usize]).collect();
         let cover = ProbeCover::from_edge_cut(&edges);
         let covered = cover_frequency(&cover, frequencies);
-        let ns = scan_ns(&cover, covered, region);
+        let ns = scan_ns(caps, &cover, covered, region);
         if best.as_ref().is_none_or(|(_, _, best_ns)| ns < *best_ns) {
             *best = Some((cover, covered, ns));
         }

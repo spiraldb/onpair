@@ -9,8 +9,10 @@ use super::alignment::graph::{
     build_alignment_graph,
 };
 use super::alignment::mincut::min_cut;
-use super::plan::cost::{Region, scan_ns};
+use super::plan::cost::scan_ns;
+use super::plan::facts::RegionFacts;
 use super::plan::{cheapest_cover, cover_frequency};
+use super::scan::detect_target_caps;
 use super::{analyze_prefilter, prefilter_candidates, prefilter_is_likely_profitable};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
@@ -429,7 +431,7 @@ fn empty_probe_cover_still_appends_nothing() {
         covered_frequency: 0,
         total_frequency: 1,
         scan_ns: 0.0,
-        walk: super::scan::Walk::default(),
+        walk: super::verify::walk::Walk::default(),
         matches_all: false,
     };
     assert_eq!(analysis.expected_candidate_row_fraction(3), 0.0);
@@ -746,23 +748,23 @@ fn cover_of(points: usize) -> ProbeCover {
 /// coverage, and more coverage costs more at equal shape.
 #[test]
 fn scan_cost_is_monotone_in_probes_and_coverage() {
-    let region = Region {
+    let region = RegionFacts {
         code_count: 1 << 24,
         row_count: 1 << 18,
     };
     let costs: Vec<f64> = [1, 3, 8, 16, 24]
         .into_iter()
-        .map(|points| scan_ns(&cover_of(points), 1 << 12, region))
+        .map(|points| scan_ns(detect_target_caps(), &cover_of(points), 1 << 12, region))
         .collect();
     assert!(
         costs.windows(2).all(|pair| pair[0] <= pair[1]),
         "wider covers cost less: {costs:?}"
     );
     let one = cover_of(1);
-    let sparse = scan_ns(&one, 1 << 10, region);
-    let dense = scan_ns(&one, 1 << 20, region);
+    let sparse = scan_ns(detect_target_caps(), &one, 1 << 10, region);
+    let dense = scan_ns(detect_target_caps(), &one, 1 << 20, region);
     assert!(sparse < dense, "{sparse} for 2^10 hits, {dense} for 2^20");
-    assert_eq!(scan_ns(&cover_of(0), 0, region), 0.0);
+    assert_eq!(scan_ns(detect_target_caps(), &cover_of(0), 0, region), 0.0);
 }
 
 /// The sweep never does worse than the frequency-only cut it starts from,
@@ -779,7 +781,7 @@ fn sweep_prices_at_or_below_the_frequency_cut() {
     let view = col.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     let freq = frequencies.as_view();
-    let region = Region {
+    let region = RegionFacts {
         code_count: view.codes.len(),
         row_count: view.num_rows(),
     };
@@ -794,11 +796,16 @@ fn sweep_prices_at_or_below_the_frequency_cut() {
             u64::from(edge.frequency())
         });
         let baseline = ProbeCover::from_edge_cut(&by_frequency);
-        let baseline_ns = scan_ns(&baseline, cover_frequency(&baseline, freq), region);
+        let baseline_ns = scan_ns(
+            detect_target_caps(),
+            &baseline,
+            cover_frequency(&baseline, freq),
+            region,
+        );
 
-        let (cover, covered, ns) = cheapest_cover(&graph, freq, region);
+        let (cover, covered, ns) = cheapest_cover(&graph, freq, region, detect_target_caps());
         assert_eq!(covered, cover_frequency(&cover, freq));
-        assert_eq!(ns, scan_ns(&cover, covered, region));
+        assert_eq!(ns, scan_ns(detect_target_caps(), &cover, covered, region));
         assert!(
             ns <= baseline_ns,
             "{pat:?}: sweep {ns} against {baseline_ns}"

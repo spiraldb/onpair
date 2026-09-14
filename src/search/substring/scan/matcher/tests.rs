@@ -10,7 +10,7 @@ use super::{EqOr, Range};
 use super::{NibbleN8, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
-use crate::search::substring::plan::cost::{Match, Shape, takes};
+use crate::search::substring::plan::facts::{CoverShape, MatcherKind};
 use crate::search::substring::scan::{BLOCK, Check, both_stages, resolver};
 
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
@@ -40,8 +40,8 @@ fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
 
 /// Bit for bit with the definition, where the policy hands the kernel the
 /// cover at all.
-fn agrees<M: Matcher>(kind: Match, name: &str, cover: &ProbeCover, codes: &Block) {
-    if !takes(kind, Shape::of(cover)) {
+fn agrees<M: Matcher>(kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
+    if !takes(detect_target_caps(), kind, CoverShape::of(cover)) {
         return;
     }
     assert_eq!(
@@ -63,15 +63,15 @@ fn block() -> Block {
 
 /// Every matcher on one cover and one block.
 fn every_matcher(cover: &ProbeCover, codes: &Block) {
-    agrees::<Table>(Match::Table, "table", cover, codes);
+    agrees::<Table>(MatcherKind::Table, "table", cover, codes);
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
-        agrees::<EqOr<false>>(Match::EqOr, "eq_or", cover, codes);
-        agrees::<EqOr<true>>(Match::EqOr, "eq_or_skip_empty", cover, codes);
-        agrees::<Range<false>>(Match::Range, "range", cover, codes);
-        agrees::<Range<true>>(Match::Range, "range_skip_empty", cover, codes);
+        agrees::<EqOr<false>>(MatcherKind::EqOr, "eq_or", cover, codes);
+        agrees::<EqOr<true>>(MatcherKind::EqOr, "eq_or_skip_empty", cover, codes);
+        agrees::<Range<false>>(MatcherKind::Range, "range", cover, codes);
+        agrees::<Range<true>>(MatcherKind::Range, "range_skip_empty", cover, codes);
         // At the batch count the dispatch compiles for K.
-        let n8k = Match::NibbleN8K;
+        let n8k = MatcherKind::NibbleN8K;
         match cover.points().len().div_ceil(PER_BATCH) {
             1 => {
                 agrees::<NibbleN8<1, false>>(n8k, "nibble_n8", cover, codes);
@@ -394,3 +394,6 @@ fn padding_makes_no_candidate() {
         assert!(found.is_empty(), "over {length} codes: {found:?}");
     }
 }
+
+use crate::search::substring::plan::select::takes;
+use crate::search::substring::scan::detect_target_caps;

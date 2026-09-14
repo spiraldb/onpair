@@ -33,7 +33,7 @@ use super::utils::{error, file_name, lstsq, read_csv, write_csv};
 use super::{best, machine, resolve_stream};
 use crate::core::types::Token;
 use crate::search::substring::ProbeCover;
-use crate::search::substring::plan::cost::{Resolve, seek_ns_per_row, stage_two_ns};
+use crate::search::substring::plan::cost::{seek_ns_per_row, stage_two_ns};
 
 /// Streams for stage two, picked for their mean row length: about seven codes
 /// a row and about eighty. Only one encoding of each, `onpair16`: a wider code
@@ -78,10 +78,10 @@ struct Row {
 }
 
 impl Row {
-    fn resolve(&self) -> Resolve {
+    fn resolve(&self) -> ResolverKind {
         match self.resolver.as_str() {
-            "linear_seek" => Resolve::LinearSeek,
-            _ => Resolve::GallopSeek,
+            "linear_seek" => ResolverKind::LinearSeek,
+            _ => ResolverKind::GallopSeek,
         }
     }
 
@@ -124,8 +124,10 @@ impl Row {
     fn terms(&self) -> [f64; 4] {
         let (words, emitted, crossed) = (self.words(), self.emitted(), self.crossed());
         match self.resolve() {
-            Resolve::LinearSeek => [words, emitted, crossed, 0.0],
-            Resolve::GallopSeek => [words, 0.0, 0.0, emitted * (1.0 + crossed / emitted).log2()],
+            ResolverKind::LinearSeek => [words, emitted, crossed, 0.0],
+            ResolverKind::GallopSeek => {
+                [words, 0.0, 0.0, emitted * (1.0 + crossed / emitted).log2()]
+            }
         }
     }
 
@@ -268,10 +270,10 @@ fn measure(stream: &str, machine: &str, out: &mut Vec<Row>) {
 /// Rows crossed per emitted row above which the search beats the walk. From
 /// g = 2: at g = 1 every row hits and the two constants sit within the fit's
 /// error of each other, which is not a crossover.
-fn crossover(seek: impl Fn(Resolve, f64) -> f64) -> f64 {
+fn crossover(seek: impl Fn(ResolverKind, f64) -> f64) -> f64 {
     let mut g = 2.0;
     while g < 1e7 {
-        if seek(Resolve::GallopSeek, g) < seek(Resolve::LinearSeek, g) {
+        if seek(ResolverKind::GallopSeek, g) < seek(ResolverKind::LinearSeek, g) {
             return g;
         }
         g *= 1.001;
@@ -281,7 +283,7 @@ fn crossover(seek: impl Fn(Resolve, f64) -> f64) -> f64 {
 
 /// Mean relative error, in percent, of `predict` over the rows of one
 /// resolver.
-fn resolver_error(row: &[&Row], resolver: Resolve, predict: impl Fn(&Row) -> f64) -> f64 {
+fn resolver_error(row: &[&Row], resolver: ResolverKind, predict: impl Fn(&Row) -> f64) -> f64 {
     let point: Vec<(f64, f64)> = row
         .iter()
         .filter(|row| row.resolve() == resolver)
@@ -352,12 +354,12 @@ fn fit(rows: &[Row], source: &str) {
         println!("  {:<12} {word:.2} per word", "both");
         for (resolver, name, terms) in [
             (
-                Resolve::LinearSeek,
+                ResolverKind::LinearSeek,
                 "linear_seek",
                 format!("{per_row:.2} per row + {cross:.2} per crossed"),
             ),
             (
-                Resolve::GallopSeek,
+                ResolverKind::GallopSeek,
                 "gallop_seek",
                 format!("{step:.2} per halving"),
             ),
@@ -369,8 +371,8 @@ fn fit(rows: &[Row], source: &str) {
             );
         }
         let g_fit = crossover(|resolver, g| match resolver {
-            Resolve::LinearSeek => per_row + cross * g,
-            Resolve::GallopSeek => step * (1.0 + g).log2(),
+            ResolverKind::LinearSeek => per_row + cross * g,
+            ResolverKind::GallopSeek => step * (1.0 + g).log2(),
         });
         println!(
             "  gallop_seek above g = {g_fit:.0} rows crossed per emitted row, one hit row in {:.3}; the compiled model says {:.0}",
@@ -414,3 +416,5 @@ fn refit() {
     println!("{}\n{} rows", path.display(), rows.len());
     fit(&rows, &file_name(&path));
 }
+
+use crate::search::substring::plan::facts::ResolverKind;

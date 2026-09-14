@@ -36,7 +36,7 @@ use super::{best, isa_cfg, isa_name, isa_named, machine, mask_stream};
 use crate::core::types::Token;
 use crate::core::types::TokenRange;
 use crate::search::substring::ProbeCover;
-use crate::search::substring::plan::cost::{BYTES_PER_CODE, Match, Shape, ns_per_code, takes};
+use crate::search::substring::plan::cost::{BYTES_PER_CODE, ns_per_code};
 
 /// Ranges per probe. R is the axis a range's cost is expected to move with,
 /// so it is swept and everything else about a range is a control.
@@ -89,9 +89,9 @@ impl Row {
         BYTES_PER_CODE / self.gbs
     }
 
-    fn shape(&self) -> Shape {
-        Shape {
-            tokens: self.count,
+    fn shape(&self) -> CoverShape {
+        CoverShape {
+            points: self.count,
             ranges: self.ranges,
         }
     }
@@ -192,17 +192,17 @@ fn probes<'a>(sets: &'a [NeedleSet]) -> Vec<Probe<'a>> {
 /// Seconds for stage one over the codes, and the rows a whole scan finds
 /// over the checked prefix and its row layer, or `None` if the kernel
 /// declined the probe.
-type Run = fn(Match, &Probe<'_>, &[Token], &[Token], &[u32]) -> Option<(f64, Vec<usize>)>;
+type Run = fn(MatcherKind, &Probe<'_>, &[Token], &[Token], &[u32]) -> Option<(f64, Vec<usize>)>;
 
 /// One kernel as the harness sees it, so they can be held in one list and
 /// taken in turn on each probe.
 struct Kernel {
     name: &'static str,
-    kind: Match,
+    kind: MatcherKind,
     run: Run,
 }
 
-fn kernel<M: Matcher>(kind: Match, name: &'static str) -> Kernel {
+fn kernel<M: Matcher>(kind: MatcherKind, name: &'static str) -> Kernel {
     Kernel {
         name,
         kind,
@@ -211,14 +211,14 @@ fn kernel<M: Matcher>(kind: Match, name: &'static str) -> Kernel {
 }
 
 fn run<M: Matcher>(
-    kind: Match,
+    kind: MatcherKind,
     probe: &Probe<'_>,
     codes: &[Token],
     checked: &[Token],
     check_rows: &[u32],
 ) -> Option<(f64, Vec<usize>)> {
     let cover = probe.cover();
-    if !takes(kind, Shape::of(&cover)) {
+    if !takes(detect_target_caps(), kind, CoverShape::of(&cover)) {
         return None;
     }
     let matcher = M::new(&cover);
@@ -240,7 +240,7 @@ fn run<M: Matcher>(
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn nibble_n8k<const SKIP: bool>(name: &'static str) -> Kernel {
     fn run_8k<const SKIP: bool>(
-        kind: Match,
+        kind: MatcherKind,
         probe: &Probe<'_>,
         codes: &[Token],
         checked: &[Token],
@@ -255,20 +255,20 @@ fn nibble_n8k<const SKIP: bool>(name: &'static str) -> Kernel {
     }
     Kernel {
         name,
-        kind: Match::NibbleN8K,
+        kind: MatcherKind::NibbleN8K,
         run: run_8k::<SKIP>,
     }
 }
 
 fn kernels() -> Vec<Kernel> {
     #[allow(unused_mut)]
-    let mut all = vec![kernel::<Table>(Match::Table, "table")];
+    let mut all = vec![kernel::<Table>(MatcherKind::Table, "table")];
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     all.extend([
-        kernel::<EqOr<false>>(Match::EqOr, "eq_or"),
-        kernel::<EqOr<true>>(Match::EqOr, "eq_or_skip"),
-        kernel::<Range<false>>(Match::Range, "range"),
-        kernel::<Range<true>>(Match::Range, "range_skip"),
+        kernel::<EqOr<false>>(MatcherKind::EqOr, "eq_or"),
+        kernel::<EqOr<true>>(MatcherKind::EqOr, "eq_or_skip"),
+        kernel::<Range<false>>(MatcherKind::Range, "range"),
+        kernel::<Range<true>>(MatcherKind::Range, "range_skip"),
         nibble_n8k::<false>("nibble_n8k"),
         nibble_n8k::<true>("nibble_n8k_skip"),
     ]);
@@ -368,15 +368,15 @@ struct Fit {
 
 /// The variant this build compiled, so the model can be asked what it
 /// predicts. `None` where this build has no such kernel.
-fn compiled(matcher: &str) -> Option<Match> {
+fn compiled(matcher: &str) -> Option<MatcherKind> {
     Some(match matcher {
-        "table" => Match::Table,
+        "table" => MatcherKind::Table,
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        "eq_or" => Match::EqOr,
+        "eq_or" => MatcherKind::EqOr,
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        "range" => Match::Range,
+        "range" => MatcherKind::Range,
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        "nibble_n8k" => Match::NibbleN8K,
+        "nibble_n8k" => MatcherKind::NibbleN8K,
         _ => return None,
     })
 }
@@ -410,7 +410,7 @@ fn snippet(machine: &str, source: &str, fit: &Fit) {
     println!("\n/// Fitted on {machine}, from {source}.");
     println!("{}", isa_cfg(isa));
     println!(
-        "fn {}(matcher: Match, shape: Shape) -> f64 {{",
+        "fn {}(matcher: MatcherKind, shape: CoverShape) -> f64 {{",
         isa_name(isa)
     );
     println!("    let k = shape.tokens as f64;");
@@ -418,13 +418,13 @@ fn snippet(machine: &str, source: &str, fit: &Fit) {
     println!("    let batches = shape.tokens.div_ceil(PER_BATCH) as f64;");
     println!("    match matcher {{");
     if let Some(table) = fit.table {
-        println!("        Match::Table => {table:.3},");
+        println!("        MatcherKind::Table => {table:.3},");
     }
     // One arm per kernel, which is the shape the model has and the order
     // `README.md` tabulates them in.
     if let Some((a, b)) = fit.eq_or {
         println!(
-            "        Match::EqOr => {a:.5} + {b:.5} * k + {:.5} * r,",
+            "        MatcherKind::EqOr => {a:.5} + {b:.5} * k + {:.5} * r,",
             fit.beside
         );
     }
@@ -434,12 +434,12 @@ fn snippet(machine: &str, source: &str, fit: &Fit) {
             slope => format!(" + {slope:.5} * batches"),
         };
         println!(
-            "        Match::NibbleN8K => {a:.5}{batches} + {:.5} * r,",
+            "        MatcherKind::NibbleN8K => {a:.5}{batches} + {:.5} * r,",
             fit.beside_n8k
         );
     }
     if let Some((a, b)) = fit.range {
-        println!("        Match::Range => {a:.5} + {b:.5} * r,");
+        println!("        MatcherKind::Range => {a:.5} + {b:.5} * r,");
     }
     println!("    }}");
     println!("}}");
@@ -494,7 +494,12 @@ fn fit(rows: &[Row], source: &str) {
                 .map(|kernel| {
                     let by_shape: Vec<(f64, f64)> = alone
                         .iter()
-                        .map(|row| (ns_per_code(kernel, row.shape()), row.ns()))
+                        .map(|row| {
+                            (
+                                ns_per_code(detect_target_caps().isa, kernel, row.shape()),
+                                row.ns(),
+                            )
+                        })
                         .collect();
                     error(&by_shape, |predicted| predicted)
                 })
@@ -611,3 +616,8 @@ fn refit() {
     println!("{}\n{} rows", path.display(), rows.len());
     fit(&rows, &file_name(&path));
 }
+
+use crate::search::substring::plan::facts::{CoverShape, MatcherKind};
+
+use crate::search::substring::plan::select::takes;
+use crate::search::substring::scan::detect_target_caps;

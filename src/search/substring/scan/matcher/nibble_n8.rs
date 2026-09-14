@@ -16,17 +16,7 @@ use super::{Block, Mask, Matcher};
 use crate::core::types::Token;
 use crate::search::substring::ProbeCover;
 
-/// The bits in a table byte.
-pub(in crate::search::substring) const PER_BATCH: usize = 8;
-
-#[cfg(any(
-    target_arch = "aarch64",
-    all(target_arch = "x86_64", target_feature = "avx512bw")
-))]
-pub(in crate::search::substring) const MAX_BATCHES: usize = 3;
-/// Three batches of four tables plus the nibbles would spill AVX2's sixteen registers.
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::substring) const MAX_BATCHES: usize = 2;
+use crate::search::substring::plan::facts::PER_BATCH;
 
 /// A 16-byte shuffle row, broadcast into every 128-bit lane on x86 since
 /// `vpshufb` indexes within lanes.
