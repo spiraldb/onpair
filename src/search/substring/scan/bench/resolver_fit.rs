@@ -27,13 +27,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::super::policy::{Resolve, seek_ns_per_row, stage_two_ns};
 use super::super::{BLOCK, blocks, clear_from, resolver};
 use super::loader::{NeedleSet, SAMPLE, load_corpus, load_needles, paths, row_layer};
 use super::utils::{error, file_name, lstsq, read_csv, write_csv};
 use super::{best, machine, resolve_stream};
 use crate::core::types::Token;
-use crate::search::substring::prefilter::ProbeCover;
+use crate::search::substring::ProbeCover;
+use crate::search::substring::plan::cost::{Resolve, seek_ns_per_row, stage_two_ns};
 
 /// Streams for stage two, picked for their mean row length: about seven codes
 /// a row and about eighty. Only one encoding of each, `onpair16`: a wider code

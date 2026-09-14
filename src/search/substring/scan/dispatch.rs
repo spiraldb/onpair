@@ -3,14 +3,14 @@
 
 //! A plan as the two type parameters [`both_stages`] wants.
 
+use super::super::plan::cost::{Match, Plan, Resolve};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::matcher::PER_BATCH;
 use super::matcher::{self, Matcher};
-use super::policy::{Match, Plan, Resolve};
 use super::{Check, both_stages, resolver};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-use crate::search::substring::prefilter::ProbeCover;
+use crate::search::substring::ProbeCover;
 
 /// The resolver half of the dispatch.
 fn with_resolver<O: Offset, M: Matcher>(

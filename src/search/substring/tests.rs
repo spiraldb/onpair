@@ -3,14 +3,14 @@
 
 //! End-to-end soundness, graph invariants, and SIMD/scalar agreement.
 
-use super::cover::ProbeCover;
-use super::graph::{
+use super::alignment::cover::ProbeCover;
+use super::alignment::graph::{
     AlignmentGraph, Edge, PROBE_SET_SIZE_LIMIT, PROBE_SET_SIZE_LIMIT_K1, alignment_candidates,
     build_alignment_graph,
 };
-use super::mincut::min_cut;
+use super::alignment::mincut::min_cut;
+use super::plan::cost::{Region, scan_ns};
 use super::plan::{cheapest_cover, cover_frequency};
-use super::scan::{Region, scan_ns};
 use super::{analyze_prefilter, prefilter_candidates, prefilter_is_likely_profitable};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};

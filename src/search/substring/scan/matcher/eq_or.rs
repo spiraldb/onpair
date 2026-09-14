@@ -19,7 +19,7 @@ use super::shared::narrow;
 use super::shared::{Hits, Vectors, words};
 use super::{Block, Mask, Matcher};
 use crate::core::types::Token;
-use crate::search::substring::prefilter::ProbeCover;
+use crate::search::substring::ProbeCover;
 
 /// A token broadcast to every lane.
 #[cfg(target_arch = "aarch64")]
@@ -91,8 +91,7 @@ unsafe fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
     hit
 }
 
-pub(in crate::search::substring::prefilter::scan) struct EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool>
-{
+pub(in crate::search::substring::scan) struct EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool> {
     tokens: Vec<Broadcast>,
     ranges: Vec<Held>,
 }

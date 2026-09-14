@@ -26,7 +26,6 @@ use super::super::matcher::{EqOr, Range};
 use super::super::matcher::{Matcher, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::super::matcher::{NibbleN8, PER_BATCH};
-use super::super::policy::{BYTES_PER_CODE, Match, Shape, ns_per_code, takes};
 use super::super::{BLOCK, Check, Isa, both_stages, resolver};
 use super::loader::{
     CHECK_CODES, CODES, NeedleSet, SAMPLE, STREAMS, WIDE, code, load_corpus, load_needles, paths,
@@ -36,7 +35,8 @@ use super::utils::{error, file_name, line, read_csv, slope, write_csv};
 use super::{best, isa_cfg, isa_name, isa_named, machine, mask_stream};
 use crate::core::types::Token;
 use crate::core::types::TokenRange;
-use crate::search::substring::prefilter::ProbeCover;
+use crate::search::substring::ProbeCover;
+use crate::search::substring::plan::cost::{BYTES_PER_CODE, Match, Shape, ns_per_code, takes};
 
 /// Ranges per probe. R is the axis a range's cost is expected to move with,
 /// so it is swept and everything else about a range is a control.

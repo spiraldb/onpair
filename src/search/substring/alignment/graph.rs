@@ -60,16 +60,16 @@ use crate::search::lookup::narrow;
 use crate::search::prefix_range;
 
 /// Largest first-token set still worth enumerating as an explicit probe.
-pub(super) const PROBE_SET_SIZE_LIMIT: usize = 512;
+pub(in crate::search::substring) const PROBE_SET_SIZE_LIMIT: usize = 512;
 
 /// Alignment 1's own, much lower limit: for needle `"XYZ"` every token ending
 /// in `X` qualifies, while at `k = 2` only the far fewer ending in `XY` do.
-pub(super) const PROBE_SET_SIZE_LIMIT_K1: usize = 16;
+pub(in crate::search::substring) const PROBE_SET_SIZE_LIMIT_K1: usize = 16;
 
 /// The token set an edge probes for, or [`ProbeSet::SetTooBig`] for the one
 /// step a cut may not select.
 #[derive(Clone, Debug)]
-pub(super) enum ProbeSet {
+pub(in crate::search::substring) enum ProbeSet {
     /// A single token: an interior token of the greedy parse.
     Point(Token),
     /// Every token a needle suffix is a prefix of.
@@ -83,9 +83,9 @@ pub(super) enum ProbeSet {
 
 /// One parse step, and the probe that catches every layout crossing it.
 #[derive(Clone, Debug)]
-pub(super) struct Edge {
-    pub(super) from: u32,
-    pub(super) to: u32,
+pub(in crate::search::substring) struct Edge {
+    pub(in crate::search::substring) from: u32,
+    pub(in crate::search::substring) to: u32,
     /// The token set a scan looks for to catch this step.
     probe: ProbeSet,
     /// Term frequency of `probe`; zero when it carries none.
@@ -94,23 +94,23 @@ pub(super) struct Edge {
 
 impl Edge {
     /// Whether a cut may select this edge: it carries a probe.
-    pub(super) fn cuttable(&self) -> bool {
+    pub(in crate::search::substring) fn cuttable(&self) -> bool {
         !matches!(self.probe, ProbeSet::SetTooBig)
     }
 
     /// The token set this step probes for.
-    pub(super) fn probe(&self) -> &ProbeSet {
+    pub(in crate::search::substring) fn probe(&self) -> &ProbeSet {
         &self.probe
     }
 
     /// Codes the probe matches in the indexed stream.
-    pub(super) fn frequency(&self) -> u32 {
+    pub(in crate::search::substring) fn frequency(&self) -> u32 {
         self.frequency
     }
 
     /// What the probe puts in a cover, as `(points, ranges)` before adjacent
     /// ones merge.
-    pub(super) fn shape(&self) -> (u32, u32) {
+    pub(in crate::search::substring) fn shape(&self) -> (u32, u32) {
         match &self.probe {
             ProbeSet::SetTooBig => (0, 0),
             ProbeSet::Point(_) => (1, 0),
@@ -121,7 +121,11 @@ impl Edge {
 
     /// Used for testing
     #[cfg(test)]
-    pub(super) fn synthetic(from: u32, to: u32, frequency: Option<u32>) -> Self {
+    pub(in crate::search::substring) fn synthetic(
+        from: u32,
+        to: u32,
+        frequency: Option<u32>,
+    ) -> Self {
         Self {
             from,
             to,
@@ -134,41 +138,41 @@ impl Edge {
 /// The node numbering, which the needle's length fixes entirely: ids are needle
 /// offsets, so there is nothing else to know about the node set.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Nodes {
+pub(in crate::search::substring) struct Nodes {
     needle_len: usize,
 }
 
 impl Nodes {
-    pub(super) fn new(needle_len: usize) -> Self {
+    pub(in crate::search::substring) fn new(needle_len: usize) -> Self {
         Self { needle_len }
     }
 
-    pub(super) fn count(self) -> usize {
+    pub(in crate::search::substring) fn count(self) -> usize {
         self.needle_len + 1
     }
 
     /// Where every layout begins: no needle byte consumed yet.
-    pub(super) fn source(self) -> u32 {
+    pub(in crate::search::substring) fn source(self) -> u32 {
         0
     }
 
     /// Where every layout ends: every needle byte consumed.
-    pub(super) fn sink(self) -> u32 {
+    pub(in crate::search::substring) fn sink(self) -> u32 {
         self.needle_len as u32
     }
 }
 
 /// The alignment DAG for one needle over one dictionary.
-pub(super) struct AlignmentGraph {
+pub(in crate::search::substring) struct AlignmentGraph {
     /// The parse steps, each carrying its probe and that probe's frequency.
-    pub(super) edges: Vec<Edge>,
-    pub(super) nodes: Nodes,
+    pub(in crate::search::substring) edges: Vec<Edge>,
+    pub(in crate::search::substring) nodes: Nodes,
 }
 
 impl ProbeCover {
     /// The cover `cut`'s probes form: every id a run of one, every range
     /// itself. Merging is [`from_runs`](Self::from_runs)'s work.
-    pub(super) fn from_edge_cut(cut: &[&Edge]) -> Self {
+    pub(in crate::search::substring) fn from_edge_cut(cut: &[&Edge]) -> Self {
         let point = |id: Token| TokenRange {
             begin: id,
             last: id,
@@ -365,9 +369,9 @@ impl Builder<'_, '_, '_> {
 /// Counts saturate one past [`PROBE_SET_SIZE_LIMIT`]: the planner asks only whether a set is
 /// empty or too big to name, so counting further would keep the pass running
 /// for an answer nothing reads.
-pub(super) struct FirstTokenSets {
-    pub(super) count: [usize; MAX_TOKEN_SIZE],
-    pub(super) ids: [Token; MAX_TOKEN_SIZE * PROBE_SET_SIZE_LIMIT],
+pub(in crate::search::substring) struct FirstTokenSets {
+    pub(in crate::search::substring) count: [usize; MAX_TOKEN_SIZE],
+    pub(in crate::search::substring) ids: [Token; MAX_TOKEN_SIZE * PROBE_SET_SIZE_LIMIT],
 }
 
 impl FirstTokenSets {
@@ -387,16 +391,19 @@ impl FirstTokenSets {
 }
 
 /// Everything one needle needs from the dictionary.
-pub(super) struct Candidates {
-    pub(super) first: FirstTokenSets,
+pub(in crate::search::substring) struct Candidates {
+    pub(in crate::search::substring) first: FirstTokenSets,
     /// Tokens holding the whole needle at a non-zero offset, ascending and
     /// without duplicates. A token that starts with the needle is in the
     /// terminal range instead, even when it holds the needle again further in.
-    pub(super) contained: Vec<Token>,
+    pub(in crate::search::substring) contained: Vec<Token>,
 }
 
 /// Both sets from the dictionary.
-pub(super) fn alignment_candidates(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Candidates {
+pub(in crate::search::substring) fn alignment_candidates(
+    dict: CompactDictionaryView<'_>,
+    needle: &[u8],
+) -> Candidates {
     let (payload, offsets) = dict.token_payload();
     let mut candidates = Candidates {
         first: FirstTokenSets::new(),
@@ -473,7 +480,7 @@ fn sweep_for_candidates(
 
 /// Build the alignment DAG for `needle` over `dict`, each probe carrying its
 /// term frequency in the indexed code stream.
-pub(super) fn build_alignment_graph(
+pub(in crate::search::substring) fn build_alignment_graph(
     dict: CompactDictionaryView<'_>,
     needle: &[u8],
     frequencies: TokenFrequencyIndexView<'_>,

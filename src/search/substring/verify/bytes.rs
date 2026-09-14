@@ -3,7 +3,7 @@
 
 //! Exact substring verification in the decoded domain.
 //!
-//! [`prefilter_candidates`](super::prefilter_candidates) returns a superset, and
+//! [`prefilter_candidates`](super::super::prefilter_candidates) returns a superset, and
 //! something has to check it. One option stays compressed:
 //! [`contains`](super::contains()) steps a token-level KMP automaton over a row's
 //! codes and never decodes. This module is the other one — decode the row, then
@@ -98,7 +98,7 @@ impl<'p> BytesVerifier<'p> {
     /// Drop from `rows` every row that does not contain the pattern, keeping the
     /// rest in place and in order.
     ///
-    /// Intended for the candidate list [`prefilter_candidates`](super::prefilter_candidates)
+    /// Intended for the candidate list [`prefilter_candidates`](super::super::prefilter_candidates)
     /// appended to: filtering happens in place, so verification adds no allocation
     /// of its own beyond the decode buffer.
     ///

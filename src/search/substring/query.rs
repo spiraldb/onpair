@@ -47,16 +47,7 @@
 //! * `scan` — the vector kernels and, in `policy`, the fitted cost model
 //!   that picks them and prices a cover. Profitability stays outside execution.
 
-mod cover;
-mod graph;
-mod mincut;
-mod plan;
-mod scan;
-
-#[cfg(test)]
-mod tests;
-
-pub use cover::ProbeCover;
+use super::{ProbeCover, plan, scan};
 
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
@@ -70,13 +61,13 @@ use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 /// exactly once. An empty pattern matches all rows and needs no probes.
 #[derive(Debug, Clone)]
 pub struct PrefilterAnalysis {
-    probe_cover: ProbeCover,
-    covered_frequency: u32,
-    total_frequency: u32,
-    scan_ns: f64,
-    walk: scan::Walk,
+    pub(super) probe_cover: ProbeCover,
+    pub(super) covered_frequency: u32,
+    pub(super) total_frequency: u32,
+    pub(super) scan_ns: f64,
+    pub(super) walk: scan::Walk,
     /// Empty patterns admit even rows without codes, independently of the cover.
-    matches_all: bool,
+    pub(super) matches_all: bool,
 }
 
 impl PrefilterAnalysis {

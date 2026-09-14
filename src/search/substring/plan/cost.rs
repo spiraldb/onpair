@@ -12,36 +12,36 @@
 //! shape and selectivity compare on one number. Every constant is a fit under
 //! `bench::fit` to the sweeps in `bench`.
 
-use super::super::cover::ProbeCover;
+use super::super::alignment::cover::ProbeCover;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::matcher::simd_available;
+use super::super::scan::matcher::simd_available;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::matcher::{MAX_BATCHES, PER_BATCH};
-use super::{BLOCK, Isa};
+use super::super::scan::matcher::{MAX_BATCHES, PER_BATCH};
+use super::super::scan::{BLOCK, Isa};
 
 /// What the planner reads about the region. No code values are inspected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring::prefilter) struct Facts {
+pub(in crate::search::substring) struct Facts {
     /// Codes the mask is expected to set a bit for, over the whole region.
-    pub(in crate::search::substring::prefilter) expected_hits: usize,
+    pub(in crate::search::substring) expected_hits: usize,
     /// Codes in the region, which with the hits is the density the
     /// pack-skipping flag turns on.
-    pub(in crate::search::substring::prefilter) code_count: usize,
-    pub(in crate::search::substring::prefilter) row_count: usize,
+    pub(in crate::search::substring) code_count: usize,
+    pub(in crate::search::substring) row_count: usize,
 }
 
 /// What stage one's cost depends on: the cover's counts, with no code
 /// values. A planner holds these before it has a cover.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring::prefilter) struct Shape {
+pub(in crate::search::substring) struct Shape {
     /// K.
-    pub(in crate::search::substring::prefilter) tokens: usize,
+    pub(in crate::search::substring) tokens: usize,
     /// R.
-    pub(in crate::search::substring::prefilter) ranges: usize,
+    pub(in crate::search::substring) ranges: usize,
 }
 
 impl Shape {
-    pub(super) fn of(cover: &ProbeCover) -> Self {
+    pub(in crate::search::substring) fn of(cover: &ProbeCover) -> Self {
         Self {
             tokens: cover.points().len(),
             ranges: cover.ranges().len(),
@@ -54,7 +54,7 @@ impl Shape {
 /// batched bitmap run on all three vector sets; the byte table is scalar and
 /// runs anywhere.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Match {
+pub(in crate::search::substring) enum Match {
     /// One byte per code of the whole code space. Takes every cover, so it
     /// is what a target with no vector kernel runs, and where the ladder ends
     /// on one that has them.
@@ -71,25 +71,25 @@ pub(super) enum Match {
 
 /// Stage two.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Resolve {
+pub(in crate::search::substring) enum Resolve {
     LinearSeek,
     GallopSeek,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring::prefilter::scan) struct Plan {
-    pub(super) matcher: Match,
-    pub(super) resolver: Resolve,
+pub(in crate::search::substring) struct Plan {
+    pub(in crate::search::substring) matcher: Match,
+    pub(in crate::search::substring) resolver: Resolve,
     /// Whether the matcher tests its lanes before packing them, which is a
     /// const the kernel is compiled for rather than a branch it takes.
-    pub(super) skip: bool,
+    pub(in crate::search::substring) skip: bool,
 }
 
 /// What one code weighs, so that a cost per code reads as a rate per byte.
 #[cfg(test)]
-pub(super) const BYTES_PER_CODE: f64 = 2.0;
+pub(in crate::search::substring) const BYTES_PER_CODE: f64 = 2.0;
 
-pub(super) fn select(cover: &ProbeCover, facts: Facts) -> Plan {
+pub(in crate::search::substring) fn select(cover: &ProbeCover, facts: Facts) -> Plan {
     Plan {
         matcher: select_matcher(Shape::of(cover)),
         resolver: select_resolver(facts),
@@ -107,7 +107,7 @@ fn density(facts: Facts) -> f64 {
 }
 
 /// Codes one pass of the pack covers, which is the two mask words
-/// [`words`](super::matcher) writes at a time and the unit the flag decides
+/// [`words`](super::super::scan::matcher) writes at a time and the unit the flag decides
 /// over.
 const PACK_GROUP: f64 = 128.0;
 
@@ -156,7 +156,7 @@ fn select_matcher(shape: Shape) -> Match {
 
 /// Which covers each kernel holds: its limit on K and which lists it reads.
 /// The kernels do not check this themselves.
-pub(super) fn takes(kernel: Match, shape: Shape) -> bool {
+pub(in crate::search::substring) fn takes(kernel: Match, shape: Shape) -> bool {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let Shape { tokens, ranges } = shape;
     match kernel {
@@ -175,10 +175,7 @@ pub(super) fn takes(kernel: Match, shape: Shape) -> bool {
 /// What the planned matcher costs per code at this hit density: the kernel
 /// [`select_matcher`] picks plus the pack-skipping flag where it pays. The
 /// scalar kernels have no pack to skip.
-pub(in crate::search::substring::prefilter) fn stage_one_ns_per_code(
-    shape: Shape,
-    density: f64,
-) -> f64 {
+pub(in crate::search::substring) fn stage_one_ns_per_code(shape: Shape, density: f64) -> f64 {
     let matcher = select_matcher(shape);
     let skip = match matcher {
         Match::Table => 0.0,
@@ -193,7 +190,7 @@ pub(in crate::search::substring::prefilter) fn stage_one_ns_per_code(
 /// costs NEON, and a bitmap batch half again. Each is `bench::fit` on that
 /// set's own sweep, and each is a table, so `README.md` reads as its rows.
 /// The dispatch folds away, [`Isa::BUILT`] being a const.
-pub(super) fn ns_per_code(matcher: Match, shape: Shape) -> f64 {
+pub(in crate::search::substring) fn ns_per_code(matcher: Match, shape: Shape) -> f64 {
     match Isa::BUILT {
         #[cfg(target_arch = "aarch64")]
         Isa::Neon => neon(matcher, shape),
@@ -290,7 +287,7 @@ const GALLOP_SEEK_STEP_NS: f64 = 3.89;
 /// What a resolver pays per emitted row, less the word scan both pay, when
 /// the cursor crosses `g` rows to reach it: the walk is linear in `g`, the
 /// search logarithmic.
-pub(super) fn seek_ns_per_row(resolver: Resolve, g: f64) -> f64 {
+pub(in crate::search::substring) fn seek_ns_per_row(resolver: Resolve, g: f64) -> f64 {
     match resolver {
         Resolve::LinearSeek => LINEAR_SEEK_ROW_NS + LINEAR_SEEK_CROSS_NS * g,
         Resolve::GallopSeek => GALLOP_SEEK_STEP_NS * (1.0 + g).log2(),
@@ -299,7 +296,12 @@ pub(super) fn seek_ns_per_row(resolver: Resolve, g: f64) -> f64 {
 
 /// Stage two over `words` mask words in blocks that hit, emitting `emitted`
 /// rows with `crossed` rows walked or searched past on the way.
-pub(super) fn stage_two_ns(resolver: Resolve, words: f64, emitted: f64, crossed: f64) -> f64 {
+pub(in crate::search::substring) fn stage_two_ns(
+    resolver: Resolve,
+    words: f64,
+    emitted: f64,
+    crossed: f64,
+) -> f64 {
     if emitted <= 0.0 {
         return WORD_NS * words;
     }
@@ -328,16 +330,16 @@ fn select_resolver(facts: Facts) -> Resolve {
 
 /// The stream a cover would be scanned over.
 #[derive(Clone, Copy, Debug)]
-pub(in crate::search::substring::prefilter) struct Region {
-    pub(in crate::search::substring::prefilter) code_count: usize,
-    pub(in crate::search::substring::prefilter) row_count: usize,
+pub(in crate::search::substring) struct Region {
+    pub(in crate::search::substring) code_count: usize,
+    pub(in crate::search::substring) row_count: usize,
 }
 
 /// Expected nanoseconds to scan `cover` over `region` and walk every hit,
 /// given the `covered` codes it matches there: stage one at the kernel the
 /// shape gets, stage two at the cheaper resolver, the walk per hit. An empty
 /// cover proves no row matches and costs nothing.
-pub(in crate::search::substring::prefilter) fn scan_ns(
+pub(in crate::search::substring) fn scan_ns(
     cover: &ProbeCover,
     covered: u32,
     region: Region,

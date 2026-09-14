@@ -23,7 +23,7 @@
 
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::types::{Token, TokenRange};
-use crate::search::substring::prefilter::graph::{AlignmentGraph, ProbeSet};
+use crate::search::substring::alignment::graph::{AlignmentGraph, ProbeSet};
 
 const SOURCE: u32 = 0;
 
@@ -162,7 +162,7 @@ impl EdgesByToken {
 /// The alignment graph flattened for walking from a hit. The default is the
 /// walk of no graph, which an all-rows analysis carries and never runs.
 #[derive(Debug, Clone, Default)]
-pub(in crate::search::substring::prefilter) struct Walk {
+pub(in crate::search::substring) struct Walk {
     nodes: Vec<Node>,
     edges: EdgesByToken,
 }
@@ -170,10 +170,7 @@ pub(in crate::search::substring::prefilter) struct Walk {
 impl Walk {
     /// Flattens `graph`. Every graph the planner builds has a walk:
     /// `analyze_prefilter` caps the needle so its node ids fit an [`Edge`].
-    pub(in crate::search::substring::prefilter) fn from_graph(
-        graph: &AlignmentGraph,
-        needle: &[u8],
-    ) -> Self {
+    pub(in crate::search::substring) fn from_graph(graph: &AlignmentGraph, needle: &[u8]) -> Self {
         let mut nodes = vec![Node::default(); graph.nodes.count()];
         let mut token_edges: Vec<(Token, Edge)> = Vec::new();
         for edge in &graph.edges {
@@ -217,7 +214,7 @@ impl Walk {
     /// Whether an occurrence of the needle inside `codes[row_start..row_end]`
     /// has the covered token at `hit_code_index` as one of its parse steps.
     #[inline]
-    pub(super) fn check(
+    pub(in crate::search::substring) fn check(
         &self,
         dict: CompactDictionaryView<'_>,
         codes: &[Token],
@@ -305,7 +302,7 @@ mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
     use crate::search::index::build_token_frequency_index;
-    use crate::search::substring::prefilter::graph::build_alignment_graph;
+    use crate::search::substring::alignment::graph::build_alignment_graph;
     use crate::search::tokenize;
 
     /// A complete dictionary of the single bytes plus `extra`, greedy-encoding

@@ -15,11 +15,13 @@
 //! safety-valid stored weights may contain false zeroes, so pruning by
 //! frequency would be unsound. Profitability remains a caller decision.
 
-use super::cover::ProbeCover;
-use super::graph::{AlignmentGraph, Edge, build_alignment_graph};
-use super::mincut::MinCut;
-use super::scan::Walk;
-use super::scan::{Region, scan_ns};
+use super::alignment::cover::ProbeCover;
+use super::alignment::graph::{AlignmentGraph, Edge, build_alignment_graph};
+use super::alignment::mincut::MinCut;
+use super::verify::walk::Walk;
+
+pub(super) mod cost;
+use self::cost::{Region, scan_ns};
 use crate::core::dictionary::CompactDictionaryView;
 use crate::search::index::TokenFrequencyIndexView;
 

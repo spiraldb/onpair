@@ -211,7 +211,7 @@ impl Dinic {
 /// in place and the cut lands in a buffer the solver owns. That matters because
 /// the graph is tiny — a handful of live nodes — so building it cost about what
 /// solving it does.
-pub(super) struct MinCut {
+pub(in crate::search::substring) struct MinCut {
     flow: Dinic,
     nodes: Nodes,
     /// The cut of the last solve, as indices into the caller's edge slice.
@@ -219,7 +219,7 @@ pub(super) struct MinCut {
 }
 
 impl MinCut {
-    pub(super) fn new(edges: &[Edge], nodes: Nodes) -> Self {
+    pub(in crate::search::substring) fn new(edges: &[Edge], nodes: Nodes) -> Self {
         debug_assert!(
             edges.len() * 2 <= u32::MAX as usize,
             "the residual graph outgrew u32 arc ids"
@@ -240,7 +240,11 @@ impl MinCut {
     /// Panics if some source-to-sink path runs entirely through uncuttable
     /// edges, which no cut can block. Returning a set that fails to disconnect
     /// them would hand back an unsound cover instead.
-    pub(super) fn solve(&mut self, edges: &[Edge], weight: impl Fn(&Edge) -> u64) -> &[u32] {
+    pub(in crate::search::substring) fn solve(
+        &mut self,
+        edges: &[Edge],
+        weight: impl Fn(&Edge) -> u64,
+    ) -> &[u32] {
         // One more than every finite cut, so a minimum cut never prefers an
         // uncuttable step over the edges that stand for real probes.
         let finite_sum = edges
@@ -286,7 +290,11 @@ impl MinCut {
 /// prices the same graph many times and uses [`MinCut::solve`] directly; this
 /// is for callers that cut once.
 #[cfg(test)]
-pub(super) fn min_cut(edges: &[Edge], nodes: Nodes, weight: impl Fn(&Edge) -> u64) -> Vec<&Edge> {
+pub(in crate::search::substring) fn min_cut(
+    edges: &[Edge],
+    nodes: Nodes,
+    weight: impl Fn(&Edge) -> u64,
+) -> Vec<&Edge> {
     let mut solver = MinCut::new(edges, nodes);
     solver
         .solve(edges, weight)

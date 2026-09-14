@@ -19,18 +19,18 @@ use super::shared::narrow;
 use super::shared::{Hits, Vectors, or, words};
 use super::{Block, Mask, Matcher};
 use crate::core::types::TokenRange;
-use crate::search::substring::prefilter::ProbeCover;
+use crate::search::substring::ProbeCover;
 
 /// `begin` and `last - begin`, each broadcast.
 #[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::prefilter::scan) type Held = (uint16x8_t, uint16x8_t);
+pub(in crate::search::substring::scan) type Held = (uint16x8_t, uint16x8_t);
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::substring::prefilter::scan) type Held = (__m256i, __m256i);
+pub(in crate::search::substring::scan) type Held = (__m256i, __m256i);
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(in crate::search::substring::prefilter::scan) type Held = (__m512i, __m512i);
+pub(in crate::search::substring::scan) type Held = (__m512i, __m512i);
 
 #[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> Held {
+pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
     // SAFETY: neon is baseline on aarch64.
     unsafe {
         (
@@ -42,15 +42,12 @@ pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> 
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
-    (lo, width): Held,
-    codes: Vectors,
-) -> Hits {
+pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
     narrow(codes.map(|codes| vcleq_u16(vsubq_u16(codes, lo), width)))
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> Held {
+pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
     // SAFETY: avx2, checked by `available` before planning.
     unsafe {
         (
@@ -63,10 +60,7 @@ pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> 
 /// No unsigned u16 compare below AVX-512: `min(x, width) == x` is `x <= width`.
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
-pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
-    (lo, width): Held,
-    codes: Vectors,
-) -> Hits {
+pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
     narrow(codes.map(|codes| {
         let inside = _mm256_sub_epi16(codes, lo);
         _mm256_cmpeq_epi16(_mm256_min_epu16(inside, width), inside)
@@ -74,7 +68,7 @@ pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> Held {
+pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
     // SAFETY: avx512bw, enabled by the build and checked by `available`.
     unsafe {
         (
@@ -86,10 +80,7 @@ pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> 
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[target_feature(enable = "avx512f,avx512bw")]
-pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
-    (lo, width): Held,
-    codes: Vectors,
-) -> Hits {
+pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
     let inside = |codes| _mm512_cmple_epu16_mask(_mm512_sub_epi16(codes, lo), width);
     join(inside(codes[0]), inside(codes[1]))
 }
@@ -106,9 +97,9 @@ pub(super) unsafe fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) 
 }
 
 /// For a cover with no tokens.
-pub(in crate::search::substring::prefilter::scan) struct Range<
-    const SKIP_MOVEMASK_IF_NO_MATCH: bool,
->(Vec<Held>);
+pub(in crate::search::substring::scan) struct Range<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
+    Vec<Held>,
+);
 
 impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for Range<SKIP_MOVEMASK_IF_NO_MATCH> {
     fn new(cover: &ProbeCover) -> Self {

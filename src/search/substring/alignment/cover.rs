@@ -16,8 +16,8 @@ use crate::core::types::{Token, TokenRange};
 /// that — it is established by whoever selects the ids.
 #[derive(Debug, Clone)]
 pub struct ProbeCover {
-    pub(super) points: Vec<Token>,
-    pub(super) ranges: Vec<TokenRange>,
+    pub(in crate::search::substring) points: Vec<Token>,
+    pub(in crate::search::substring) ranges: Vec<TokenRange>,
 }
 
 impl ProbeCover {
@@ -40,7 +40,7 @@ impl ProbeCover {
     /// Merge runs that overlap or abut, then file single-id runs as points and
     /// the rest as ranges. Input may be in any order. The planner reaches this
     /// through [`from_edge_cut`](Self::from_edge_cut), defined beside the graph.
-    pub(super) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
+    pub(in crate::search::substring) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
         runs.sort_unstable_by_key(|run| run.begin);
         let mut merged: Vec<TokenRange> = Vec::with_capacity(runs.len());
         for run in runs {
@@ -59,7 +59,7 @@ impl ProbeCover {
 
     /// Points and ranges as given. Ranges must be disjoint.
     #[cfg(test)]
-    pub(super) fn new(points: Vec<Token>, ranges: Vec<TokenRange>) -> Self {
+    pub(in crate::search::substring) fn new(points: Vec<Token>, ranges: Vec<TokenRange>) -> Self {
         Self { points, ranges }
     }
 
