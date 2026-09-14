@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Timing harness for the split scan, and the fits that turn its rows into
-//! the constants in `policy`.
+//! the constants in `plan::cost`.
 //!
 //! ```text
 //! cargo test --release --lib scan::bench::matcher_fit::sweep  -- --ignored --nocapture
@@ -14,7 +14,7 @@
 //! needle set, so what is timed is the mask-to-rows half alone. Each `sweep`
 //! writes one timestamped CSV to `bench/output/`, which the marimo dashboards
 //! out of tree read, then fits the model to its rows and prints the
-//! block to paste into `policy`; each `refit` does the same from the newest
+//! block to paste into `plan::cost`; each `refit` does the same from the newest
 //! CSV, or the one `MASK_CSV` or `RESOLVE_CSV` names, so a constant is a
 //! measurement and not a memory.
 //!
@@ -164,15 +164,4 @@ fn isa_named(name: &str) -> Option<Isa> {
     [Isa::Neon, Isa::Avx2, Isa::Avx512Bw, Isa::Scalar]
         .into_iter()
         .find(|isa| isa_name(*isa) == name)
-}
-
-/// The `cfg` a build of this set sits behind, for a fit to print above the
-/// function it emits. Must agree with the `cfg`s on the functions in `policy`.
-fn isa_cfg(isa: Isa) -> &'static str {
-    match isa {
-        Isa::Neon => "#[cfg(target_arch = \"aarch64\")]",
-        Isa::Avx2 => "#[cfg(all(target_arch = \"x86_64\", not(target_feature = \"avx512bw\")))]",
-        Isa::Avx512Bw => "#[cfg(all(target_arch = \"x86_64\", target_feature = \"avx512bw\"))]",
-        Isa::Scalar => "#[cfg(not(any(target_arch = \"aarch64\", target_arch = \"x86_64\")))]",
-    }
 }

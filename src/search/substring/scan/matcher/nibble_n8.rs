@@ -88,7 +88,7 @@ unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 fn table(row: [u8; 16]) -> Table {
-    // SAFETY: avx2, checked by `available`; the row is the load's 16 bytes.
+    // SAFETY: avx2, checked by `detect_target_caps`; the row is the load's 16 bytes.
     unsafe { _mm256_broadcastsi128_si256(_mm_loadu_si128(row.as_ptr().cast())) }
 }
 

@@ -132,16 +132,15 @@ impl PrefilterAnalysis {
     }
 }
 
-/// Widest cover the specialized SIMD kernels serve; wider covers fall through to
-/// a generic loop costing roughly 1.8x more per comparison.
+/// Comparison threshold retained from the original profitability calibration.
+/// Matcher admission is selected separately by the scan cost model.
 const MAX_SIMD_COMPARISONS: usize = 16;
 
-/// Largest share of rows the default policy sends to exact verification, which
-/// costs 2.1x to 6.5x per row what bulk decoding does.
+/// Covered-code fraction per row admitted by the original heuristic.
 const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
 
-/// Return whether the default empirical policy expects prefiltering to beat a
-/// bulk-decode fallback over a region of `row_count` rows.
+/// Return the legacy empirical profitability hint for a region of
+/// `row_count` rows. It does not select or execute a fallback.
 ///
 /// The policy prices the two costs a scan pays, both known after
 /// [`analyze_prefilter`]: its
@@ -155,7 +154,8 @@ const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
 /// This is a performance hint, not a correctness requirement, and it neither
 /// executes nor bypasses the prefilter. The thresholds were calibrated on
 /// AArch64 over 2877 `contains` queries against a bulk-decode-plus-`memmem`
-/// fallback, where they admit no query the fallback would have won. Callers
+/// reference implementation. That historical calibration is not a guarantee
+/// for the current walker, especially on long repetitive needles. Callers
 /// with materially different columns or architectures may choose their own
 /// policy.
 pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: usize) -> bool {

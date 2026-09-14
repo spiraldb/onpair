@@ -50,7 +50,7 @@ unsafe fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 fn broadcast(code: Token) -> Broadcast {
-    // SAFETY: avx2, checked by `available` before planning.
+    // SAFETY: avx2, checked by `detect_target_caps` before planning.
     unsafe { _mm256_set1_epi16(code as i16) }
 }
 
@@ -69,7 +69,7 @@ unsafe fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 fn broadcast(code: Token) -> Broadcast {
-    // SAFETY: avx512bw, enabled by the build and checked by `available`.
+    // SAFETY: avx512bw, enabled by the build and checked by `detect_target_caps`.
     unsafe { _mm512_set1_epi16(code as i16) }
 }
 

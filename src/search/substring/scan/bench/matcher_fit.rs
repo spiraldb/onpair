@@ -32,7 +32,7 @@ use super::loader::{
     row_layer,
 };
 use super::utils::{error, file_name, line, read_csv, slope, write_csv};
-use super::{best, isa_cfg, isa_name, isa_named, machine, mask_stream};
+use super::{best, isa_name, isa_named, machine, mask_stream};
 use crate::core::types::Token;
 use crate::core::types::TokenRange;
 use crate::search::substring::ProbeCover;
@@ -397,7 +397,7 @@ fn points(row: &[&Row]) -> Vec<(f64, f64)> {
 }
 
 /// The fits as `plan::cost::ns_per_code` would have them, to paste under the
-/// `cfg` for the build the rows came from. Only the kernels the sweep
+/// target-specific cost function the rows came from. Only the kernels the sweep
 /// measured are emitted; the rest keep whatever the model says now.
 fn snippet(machine: &str, source: &str, fit: &Fit) {
     // The set is the last word of the machine column, and it decides which
@@ -408,14 +408,13 @@ fn snippet(machine: &str, source: &str, fit: &Fit) {
         .and_then(isa_named)
         .unwrap_or(Isa::Scalar);
     println!("\n/// Fitted on {machine}, from {source}.");
-    println!("{}", isa_cfg(isa));
     println!(
         "fn {}(matcher: MatcherKind, shape: CoverShape) -> f64 {{",
         isa_name(isa)
     );
-    println!("    let k = shape.tokens as f64;");
+    println!("    let k = shape.points as f64;");
     println!("    let r = shape.ranges as f64;");
-    println!("    let batches = shape.tokens.div_ceil(PER_BATCH) as f64;");
+    println!("    let batches = shape.points.div_ceil(PER_BATCH) as f64;");
     println!("    match matcher {{");
     if let Some(table) = fit.table {
         println!("        MatcherKind::Table => {table:.3},");

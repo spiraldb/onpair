@@ -38,3 +38,10 @@ fitted constants in `../plan/cost.rs`. Labels identify the target actually
 available to the run. AVX2 nibble coefficients remain extrapolated, and the
 constant walk cost does not describe its known pathological case. Correctness
 oracles and controlled performance measurements remain separate checks.
+
+For one point and no ranges on NEON, the selected equality matcher uses a fixed
+broadcast instead of allocated probe vectors. Its packing and resolver remain
+the PR implementation. The existing equality coefficients are retained as a
+conservative estimate, so this specialization does not alter cover selection.
+The integration measurements cover the exact pipeline as well as reused analysis;
+this is not a general adoption of the refactor's architecture-specific scanners.
