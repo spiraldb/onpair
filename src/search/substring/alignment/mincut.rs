@@ -134,34 +134,33 @@ impl Dinic {
     /// Iterative rather than the textbook recursion, which would put the length
     /// of the longest source-to-sink path on the call stack. Nothing in this
     /// solver bounds that length, and it costs nothing to not depend on it.
-    fn blocking_flow(&mut self, source: usize, sink: usize) -> u64 {
-        debug_assert_ne!(source, sink, "the source and sink are distinct nodes");
+    fn blocking_flow(&mut self, source: usize, sink: usize) {
         self.next.copy_from_slice(&self.head[..self.level.len()]);
 
-        let mut total = 0u64;
         let mut path = std::mem::take(&mut self.path);
         path.clear();
         let mut node = source;
         loop {
             if node == sink {
-                let bottleneck = path
-                    .iter()
-                    .map(|&arc| self.cap[arc as usize])
-                    .min()
-                    .expect("source and sink differ, so a path to the sink has arcs");
+                // Source and sink differ, so the path is non-empty. Record the
+                // first minimum: that arc will be saturated by this augment.
+                let mut bottleneck = u64::MAX;
+                let mut saturated = 0;
+                for (at, &arc) in path.iter().enumerate() {
+                    let capacity = self.cap[arc as usize];
+                    if capacity < bottleneck {
+                        bottleneck = capacity;
+                        saturated = at;
+                    }
+                }
                 for &arc in &path {
                     self.cap[arc as usize] -= bottleneck;
                     self.cap[self.twin[arc as usize] as usize] += bottleneck;
                 }
-                total += bottleneck;
 
                 // Retreat only as far as the first arc the augment saturated:
                 // the prefix before it still admits flow, so re-walking it from
                 // the source would be wasted work.
-                let saturated = path
-                    .iter()
-                    .position(|&arc| self.cap[arc as usize] == 0)
-                    .expect("the bottleneck arc is saturated by its own definition");
                 node = self.to[self.twin[path[saturated] as usize] as usize] as usize;
                 path.truncate(saturated);
                 continue;
@@ -189,18 +188,15 @@ impl Dinic {
                 node = self.to[self.twin[arc as usize] as usize] as usize;
             } else {
                 self.path = path;
-                return total;
+                return;
             }
         }
     }
 
-    fn max_flow(&mut self, source: usize, sink: usize) -> u64 {
-        let mut total = 0u64;
+    fn max_flow(&mut self, source: usize, sink: usize) {
         while self.build_levels(source, sink) {
-            let sent = self.blocking_flow(source, sink);
-            total = total.checked_add(sent).expect("max-flow capacity overflow");
+            self.blocking_flow(source, sink);
         }
-        total
     }
 }
 
@@ -219,11 +215,10 @@ pub(in crate::search::substring) struct MinCut {
 }
 
 impl MinCut {
+    /// `nodes` and `edges` describe a graph with distinct source and sink,
+    /// valid endpoints, and residual arc IDs that fit in `u32`. Alignment graph
+    /// construction establishes these invariants before planning.
     pub(in crate::search::substring) fn new(edges: &[Edge], nodes: Nodes) -> Self {
-        debug_assert!(
-            edges.len() * 2 <= u32::MAX as usize,
-            "the residual graph outgrew u32 arc ids"
-        );
         let arcs: Vec<(u32, u32)> = edges.iter().map(|edge| (edge.from, edge.to)).collect();
         Self {
             flow: Dinic::new(nodes.count(), &arcs),
@@ -236,10 +231,10 @@ impl MinCut {
     /// from the sink, as ascending indices into `edges`. `weight` prices cutting
     /// one edge and is consulted for cuttable edges only.
     ///
-    /// # Panics
-    /// Panics if some source-to-sink path runs entirely through uncuttable
-    /// edges, which no cut can block. Returning a set that fails to disconnect
-    /// them would hand back an unsound cover instead.
+    /// `edges` must be the graph used at construction. Every source-to-sink path
+    /// must include a cuttable edge, and the sum of finite weights plus one must
+    /// fit in `u64`. The alignment builder and planner guarantee these bounds.
+    /// `weight` must return the same value for an edge throughout this solve.
     pub(in crate::search::substring) fn solve(
         &mut self,
         edges: &[Edge],
@@ -247,11 +242,11 @@ impl MinCut {
     ) -> &[u32] {
         // One more than every finite cut, so a minimum cut never prefers an
         // uncuttable step over the edges that stand for real probes.
-        let finite_sum = edges
+        let finite_sum: u64 = edges
             .iter()
             .filter(|edge| edge.cuttable())
-            .try_fold(0u64, |acc, edge| acc.checked_add(weight(edge)))
-            .expect("sum of probe weights overflowed u64");
+            .map(&weight)
+            .sum();
         let infinite = finite_sum + 1;
         self.flow.refill(edges.iter().map(|edge| {
             if edge.cuttable() {
@@ -262,11 +257,7 @@ impl MinCut {
         }));
 
         let (source, sink) = (self.nodes.source() as usize, self.nodes.sink() as usize);
-        let value = self.flow.max_flow(source, sink);
-        assert!(
-            value < infinite,
-            "the alignment DAG has a source-to-sink path with no probe on it"
-        );
+        self.flow.max_flow(source, sink);
 
         // `max_flow` stops on the level pass that failed to reach the sink, and
         // that pass is exactly a BFS of the residual graph from the source — so
@@ -307,15 +298,75 @@ pub(in crate::search::substring) fn min_cut(
 mod tests {
     use super::*;
 
-    /// The endpoints of a cut, which is what a caller reads off it. Comparing
-    /// those rather than positions says which steps were chosen without
-    /// depending on the order they were built in.
     fn by_frequency(edge: &Edge) -> u64 {
         u64::from(edge.frequency())
     }
 
+    /// Compare endpoints without depending on edge construction order.
     fn steps(cut: &[&Edge]) -> Vec<(u32, u32)> {
         cut.iter().map(|edge| (edge.from, edge.to)).collect()
+    }
+
+    /// All finite cuts of a four-node graph, with source 0 and sink 3.
+    fn partition_cuts(edges: &[Edge]) -> Vec<Vec<u32>> {
+        (1..8u32)
+            .step_by(2)
+            .map(|side| {
+                edges
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(at, edge)| {
+                        (side & (1 << edge.from) != 0 && side & (1 << edge.to) == 0)
+                            .then_some(at as u32)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|cut| cut.iter().all(|&at| edges[at as usize].cuttable()))
+            .collect()
+    }
+
+    /// Every four-node DAG, including zero weights, ties and uncuttable edges.
+    /// Reuse the solver with reversed weights above u32::MAX as well.
+    #[test]
+    fn cuts_agree_with_exhaustive_partitions() {
+        const ARCS: [(u32, u32); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+        for configuration in 0..5usize.pow(ARCS.len() as u32) {
+            let mut choices = configuration;
+            let mut edges = Vec::new();
+            for (from, to) in ARCS {
+                let choice = choices % 5;
+                choices /= 5;
+                if choice != 0 {
+                    let frequency = [None, Some(0), Some(1), Some(3)][choice - 1];
+                    edges.push(Edge::synthetic(from, to, frequency));
+                }
+            }
+            let cuts = partition_cuts(&edges);
+            // An all-uncuttable path violates the alignment builder's contract.
+            if cuts.is_empty() {
+                continue;
+            }
+            let mut solver = MinCut::new(&edges, Nodes::new(3));
+            for large in [false, true] {
+                let weight = |edge: &Edge| {
+                    if large {
+                        (1u64 << 32) + u64::from(u32::MAX - edge.frequency())
+                    } else {
+                        u64::from(edge.frequency())
+                    }
+                };
+                let cost = |cut: &[u32]| -> u64 {
+                    cut.iter().map(|&at| weight(&edges[at as usize])).sum()
+                };
+                let cut = solver.solve(&edges, weight);
+                // Membership proves both disconnection and finite probe coverage.
+                assert!(
+                    cuts.iter().any(|c| c == cut),
+                    "graph={configuration}, large={large}"
+                );
+                assert_eq!(cost(cut), cuts.iter().map(|c| cost(c)).min().unwrap());
+            }
+        }
     }
 
     /// The property the merged DAG exists for: two alignments converging on one

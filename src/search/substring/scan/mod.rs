@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Scans of the code stream against a compiled cover: codes to bit mask,
-//! bit mask to rows. See README.md for the contract between the halves.
+//! bit mask to rows.
 //!
 //! The scan takes any cover with something in it - the points as tokens, the
 //! ranges beside them, or either alone - and picks its own two halves from a
@@ -11,8 +11,7 @@
 //!
 //! Vector kernels are compiled for NEON, AVX2 and AVX-512; a target with
 //! none, or an x86 without AVX2, runs the byte table instead, which is
-//! scalar and portable. The scalar routine under `cfg(test)` is the
-//! correctness oracle.
+//! scalar and portable.
 
 #[cfg(test)]
 mod bench;
@@ -20,7 +19,7 @@ mod dispatch;
 mod matcher;
 mod resolver;
 
-use super::PrefilterAnalysis;
+use super::ContainsScan;
 use super::ProbeCover;
 pub(super) use super::plan::facts::BLOCK;
 #[cfg(test)]
@@ -59,23 +58,23 @@ pub(super) fn matches<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     dict: CompactDictionaryView<'_>,
-    analysis: &PrefilterAnalysis,
+    scan: &ContainsScan,
     out: &mut Vec<usize>,
 ) {
-    let input = ScanInput::full(codes, row_offsets, analysis.probe_cover());
+    let input = ScanInput::full(codes, row_offsets, scan.probe_cover());
     let plan = select_scan_plan(
         detect_target_caps(),
         facts(
             input,
-            analysis.covered_frequency() as usize,
-            analysis.total_frequency() as usize,
+            scan.covered_frequency() as usize,
+            scan.total_frequency() as usize,
         ),
     );
     execute_check(
         plan,
         input,
         Check::Walk {
-            walk: &analysis.walk,
+            walk: &scan.walk,
             dict,
             codes,
         },
@@ -102,7 +101,7 @@ fn facts<O: Offset>(
 }
 
 /// Compatibility entry for tests that exercise dispatch with a synthetic
-/// cover, without constructing a complete analysis.
+/// cover, without constructing a complete scan.
 #[cfg(test)]
 pub(super) fn scan<O: Offset>(
     codes: &[Token],
@@ -141,23 +140,6 @@ fn execute_check<O: Offset>(
         check,
         out,
     );
-}
-
-/// Test oracle for the split scan.
-#[cfg(test)]
-pub(super) fn scan_scalar<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
-    pf: &ProbeCover,
-    out: &mut Vec<usize>,
-) {
-    for row in 0..row_offsets.len().saturating_sub(1) {
-        let a = row_offsets[row].to_usize();
-        let b = row_offsets[row + 1].to_usize();
-        if codes[a..b].iter().any(|&code| pf.contains(code)) {
-            out.push(row);
-        }
-    }
 }
 
 /// One block of codes, exactly what a matcher is handed.
@@ -220,16 +202,16 @@ fn both_stages<'a, M: Matcher, R: Resolver<'a>>(
 /// gets the stream index of the block and how many of its codes are the
 /// stream's; bits past `valid` are the padding's and must go.
 fn blocks(codes: &[Token], step: &mut dyn FnMut(&Block, usize, usize)) {
+    let (whole, rest) = codes.as_chunks::<BLOCK>();
     let mut at = 0;
-    while at + BLOCK <= codes.len() {
-        step(codes[at..at + BLOCK].try_into().unwrap(), at, BLOCK);
+    for block in whole {
+        step(block, at, BLOCK);
         at += BLOCK;
     }
-    if at < codes.len() {
-        let rest = codes.len() - at;
+    if !rest.is_empty() {
         let mut tail = [Token::default(); BLOCK];
-        tail[..rest].copy_from_slice(&codes[at..]);
-        step(&tail, at, rest);
+        tail[..rest.len()].copy_from_slice(rest);
+        step(&tail, at, rest.len());
     }
 }
 

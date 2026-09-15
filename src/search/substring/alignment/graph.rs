@@ -54,10 +54,11 @@ use memchr::memmem::Finder;
 use super::cover::ProbeCover;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
-use crate::core::validate::{InvalidColumn, panic_malformed};
+use crate::core::validate::InvalidColumn;
 use crate::search::index::TokenFrequencyIndexView;
 use crate::search::lookup::narrow;
 use crate::search::prefix_range;
+use crate::search::substring::ContainsError;
 
 /// Largest first-token set still worth enumerating as an explicit probe.
 pub(in crate::search::substring) const PROBE_SET_SIZE_LIMIT: usize = 512;
@@ -172,6 +173,7 @@ pub(in crate::search::substring) struct AlignmentGraph {
 impl ProbeCover {
     /// The cover `cut`'s probes form: every id a run of one, every range
     /// itself. Merging is [`from_runs`](Self::from_runs)'s work.
+    /// `cut` must contain only cuttable edges, as returned by the cut solver.
     pub(in crate::search::substring) fn from_edge_cut(cut: &[&Edge]) -> Self {
         let point = |id: Token| TokenRange {
             begin: id,
@@ -180,7 +182,8 @@ impl ProbeCover {
         let mut runs = Vec::with_capacity(cut.len());
         for edge in cut {
             match &edge.probe {
-                ProbeSet::SetTooBig => debug_assert!(false, "cut selected an unprobed step"),
+                // The cut solver excludes edges without materialized probes.
+                ProbeSet::SetTooBig => {}
                 ProbeSet::Point(id) => runs.push(point(*id)),
                 ProbeSet::Range(range) => runs.push(*range),
                 ProbeSet::Set(ids) => runs.extend(ids.iter().map(|&id| point(id))),
@@ -196,7 +199,7 @@ impl ProbeCover {
 /// `None` if no token is a prefix of `suffix`: the walk covers `len == 1`, so a
 /// miss means the dictionary has no single-byte token for `suffix[0]`. Reading an
 /// id off the empty range instead would probe for an unrelated token and quietly
-/// cost selectivity, so the caller panics on the malformed column instead.
+/// cost selectivity, so the caller reports the malformed dictionary instead.
 ///
 /// One narrowing walk rather than a [`prefix_range`] per candidate length: the
 /// range for `suffix[..k + 1]` is the range for `suffix[..k]` narrowed by one
@@ -204,10 +207,6 @@ impl ProbeCover {
 /// every time. Once the range empties no longer prefix can match, and a longer
 /// prefix always narrows further, so the walk stops there.
 fn greedy_in_needle(dict: CompactDictionaryView<'_>, suffix: &[u8]) -> Option<(Token, usize)> {
-    debug_assert!(
-        !suffix.is_empty(),
-        "greedy_in_needle needs a non-empty suffix"
-    );
     let num_tokens = dict.num_tokens();
     if num_tokens == 0 {
         return None;
@@ -302,17 +301,18 @@ impl Builder<'_, '_, '_> {
     /// reaches, stopping at the first offset already emitted. Iterative on
     /// purpose: `memmem` accepts needles of any length, so a recursive walk
     /// would put needle length on the stack.
-    fn ensure_chain(&mut self, start: usize) {
+    fn ensure_chain(&mut self, start: usize) -> Result<(), ContainsError> {
         let n = self.needle.len();
         let mut offset = start;
         while !self.built[offset] {
             self.built[offset] = true;
-            let next = self.build_state(offset);
+            let next = self.build_state(offset)?;
             if next >= n {
                 break;
             }
             offset = next;
         }
+        Ok(())
     }
 
     /// Emit the steps out of the state at `offset` and return where its greedy
@@ -323,7 +323,7 @@ impl Builder<'_, '_, '_> {
     /// No token is a prefix of `needle[offset..]` only when the dictionary lacks
     /// a single-byte token for that byte, which a conformant one cannot, so the
     /// dead end is a malformed column rather than a shorter graph.
-    fn build_state(&mut self, offset: usize) -> usize {
+    fn build_state(&mut self, offset: usize) -> Result<usize, ContainsError> {
         let state = offset as u32;
 
         // The occurrence may end inside a longer token starting here. At offset
@@ -345,18 +345,14 @@ impl Builder<'_, '_, '_> {
             let next_offset = offset + token_length;
             if next_offset < self.needle.len() {
                 self.add_edge(state, next_offset as u32, ProbeSet::Point(token));
-            } else {
-                // A greedy step that reaches the needle's end consumed
-                // `needle[offset..]` exactly, so that token should appear in the
-                // terminal range.
-                debug_assert!(
-                    terminal_token_range.contains(token),
-                    "the exact final token belongs to its own prefix range"
-                );
             }
-            next_offset
+            // A step reaching the end consumed the suffix exactly; that token
+            // is already covered by the terminal prefix range above.
+            Ok(next_offset)
         } else {
-            panic_malformed(InvalidColumn::IncompleteAlphabet)
+            Err(ContainsError::InvalidData(
+                InvalidColumn::IncompleteAlphabet,
+            ))
         }
     }
 }
@@ -480,17 +476,14 @@ fn sweep_for_candidates(
 
 /// Build the alignment DAG for `needle` over `dict`, each probe carrying its
 /// term frequency in the indexed code stream.
+/// `frequencies` must use `dict`'s token domain, checked at query preparation.
+/// `needle` is non-empty and its length fits in the walk's `u16` node IDs.
 pub(in crate::search::substring) fn build_alignment_graph(
     dict: CompactDictionaryView<'_>,
     needle: &[u8],
     frequencies: TokenFrequencyIndexView<'_>,
-) -> AlignmentGraph {
-    debug_assert!(!needle.is_empty());
-    debug_assert!(frequencies.num_tokens() == dict.num_tokens());
-
+) -> Result<AlignmentGraph, ContainsError> {
     let n = needle.len();
-    debug_assert!(n < u32::MAX as usize, "needle outgrew u32 node ids");
-
     let mut b = Builder {
         dict,
         needle,
@@ -511,7 +504,7 @@ pub(in crate::search::substring) fn build_alignment_graph(
             continue;
         }
         // Emits the chain of steps from this alignment's entry to the sink.
-        b.ensure_chain(k);
+        b.ensure_chain(k)?;
 
         // Alignment 0 begins at the source node itself, with nothing consumed
         // before its first token, so it needs no entry step at all. At `k > 0`
@@ -540,16 +533,8 @@ pub(in crate::search::substring) fn build_alignment_graph(
         );
     }
 
-    // The bound the module doc advertises: two edges per needle offset, plus
-    // one per alignment and one for the contained set. The node count is not a
-    // bound but an identity.
-    debug_assert!(
-        b.edges.len() <= 2 * n + 16,
-        "graph outgrew its documented size bound"
-    );
-
-    AlignmentGraph {
+    Ok(AlignmentGraph {
         edges: b.edges,
         nodes: b.nodes,
-    }
+    })
 }

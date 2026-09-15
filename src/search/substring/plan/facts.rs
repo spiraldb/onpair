@@ -10,6 +10,7 @@ pub(in crate::search::substring) const PER_BATCH: usize = 8;
 
 /// Targets also name coefficient sets in calibration files.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Some variants are only constructed on other build targets.
 pub(in crate::search::substring) enum Isa {
     Scalar,
     Neon,
@@ -93,7 +94,6 @@ pub(in crate::search::substring) enum ResolverKind {
 /// Only vector operations occur inside a vector target's configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::substring) enum VectorMatcher {
-    OnePoint,
     EqOr,
     Range,
     NibbleN8 { batches: usize },

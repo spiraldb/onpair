@@ -21,7 +21,7 @@ const PACK_GROUP: f64 = 128.0;
 /// What `SKIP_MOVEMASK_IF_NO_MATCH` adds, in ns per code: the lane OR it pays on
 /// every group, less the pack it saves on the groups with no match. Both are
 /// fitted to the two ends of the sweep and land on their instruction counts.
-/// Negative is worth taking. See `README.md`.
+/// Negative is worth taking.
 pub(in crate::search::substring) fn skip_ns_per_code(isa: Isa, density: f64) -> f64 {
     let (reduction, pack) = match isa {
         // AVX-512 already produces a mask: skipping the pack only adds work.
@@ -61,7 +61,17 @@ pub(in crate::search::substring) fn ns_per_code(
         Isa::Avx2 => avx2(matcher, shape),
         Isa::Avx512Bw => avx512bw(matcher, shape),
         Isa::Scalar => match matcher {
-            MatcherKind::Table => 0.195,
+            // PR prices the table for the build target even when SIMD is unavailable.
+            // These cfg conditions fold at compile time.
+            MatcherKind::Table => {
+                if cfg!(all(target_arch = "x86_64", target_feature = "avx512bw")) {
+                    avx512bw(matcher, shape)
+                } else if cfg!(target_arch = "x86_64") {
+                    avx2(matcher, shape)
+                } else {
+                    0.195
+                }
+            }
             _ => f64::INFINITY,
         },
     }

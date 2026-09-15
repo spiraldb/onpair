@@ -228,7 +228,7 @@ impl DictionaryView for WideDictionaryView<'_> {
 mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, OwnedDictionaryStorage, pad_raw};
-    use crate::search::{ContainsTable, PrefixQuery, contains, starts_with, tokenize};
+    use crate::search::{ContainsDfa, PrefixQuery, row_contains, starts_with, tokenize};
     use crate::{DECODE_PADDING, decode_into, decoded_len, try_decode_into};
     use std::mem::MaybeUninit;
 
@@ -268,8 +268,8 @@ mod tests {
 
         let prefix = PrefixQuery::new(text, view);
         let _ = starts_with(codes, &prefix);
-        let table = ContainsTable::new(text, view);
-        let _ = contains(codes, &table);
+        let dfa = ContainsDfa::new(text, view).unwrap();
+        let _ = row_contains(codes, &dfa);
 
         let expected: Vec<u8> = codes
             .iter()

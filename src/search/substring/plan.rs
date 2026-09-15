@@ -42,6 +42,10 @@ pub(super) fn cheapest_cover(
     caps: TargetCaps,
 ) -> (ProbeCover, u32, f64) {
     let ceiling = u64::from(frequencies.total_frequency());
+    // With n <= u16::MAX and F <= u32::MAX, there are at most 2n + 16 edges.
+    // Their comparison counts sum to at most 3n + 15*512 + 65536: one point
+    // and range per offset, up to 15 entry sets, and one contained-token set.
+    // For lambda <= F + 1, total finite capacity is therefore below 2^51.
     let by = |lambda: u64| {
         move |edge: &Edge| {
             let (points, ranges) = edge.shape();
@@ -49,19 +53,16 @@ pub(super) fn cheapest_cover(
         }
     };
     let mut solver = MinCut::new(&graph.edges, graph.nodes);
-    let mut best: Option<(ProbeCover, u32, f64)> = None;
-    let price = |cut: &[u32], best: &mut Option<(ProbeCover, u32, f64)>| {
+    let price = |cut: &[u32]| {
         let edges: Vec<&Edge> = cut.iter().map(|&at| &graph.edges[at as usize]).collect();
         let cover = ProbeCover::from_edge_cut(&edges);
         let covered = cover_frequency(&cover, frequencies);
         let ns = scan_ns(caps, &cover, covered, region);
-        if best.as_ref().is_none_or(|(_, _, best_ns)| ns < *best_ns) {
-            *best = Some((cover, covered, ns));
-        }
+        (cover, covered, ns)
     };
 
     let narrowest = solver.solve(&graph.edges, by(ceiling + 1)).to_vec();
-    price(&narrowest, &mut best);
+    let mut best = price(&narrowest);
 
     let mut last: Vec<u32> = Vec::new();
     let mut lambda = 0u64;
@@ -72,11 +73,14 @@ pub(super) fn cheapest_cover(
         }
         if cut != last {
             last = cut.to_vec();
-            price(&last, &mut best);
+            let candidate = price(&last);
+            if candidate.2 < best.2 {
+                best = candidate;
+            }
         }
         lambda = (lambda * 4).max(1);
     }
-    best.expect("the sweep prices at least the narrowest cut")
+    best
 }
 
 /// Codes `cover` matches in the indexed stream. Points and ranges are

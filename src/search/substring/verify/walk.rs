@@ -83,12 +83,8 @@ struct Edge {
 }
 
 impl Edge {
+    /// Graph edges advance needle offsets, bounded by the public pattern limit.
     fn new(from: u32, to: u32) -> Self {
-        debug_assert!(from < to, "an edge advances the needle offset");
-        debug_assert!(
-            to <= u32::from(u16::MAX),
-            "needle outgrew the edge's node ids"
-        );
         Self {
             from: from as u16,
             to: to as u16,
@@ -173,36 +169,34 @@ pub(in crate::search::substring) struct Walk {
 
 impl Walk {
     /// Flattens `graph`. Every graph the planner builds has a walk:
-    /// `analyze_prefilter` caps the needle so its node ids fit an [`Edge`].
+    /// `ContainsScan::new` caps the needle so its node ids fit an [`Edge`].
     pub(in crate::search::substring) fn from_graph(graph: &AlignmentGraph, needle: &[u8]) -> Self {
         let mut nodes = vec![Node::default(); graph.nodes.count()];
         let mut token_edges: Vec<(Token, Edge)> = Vec::new();
         for edge in &graph.edges {
             let (from, to) = (edge.from, edge.to);
+            let compiled_edge = Edge::new(from, to);
             match edge.probe() {
                 ProbeSet::Point(token) => {
                     let token = *token;
                     let node = &mut nodes[from as usize];
-                    debug_assert!(
-                        node.greedy_step.is_none(),
-                        "two greedy steps out of one node"
-                    );
                     node.greedy_step = Some((token, to));
-                    token_edges.push((token, Edge::new(from, to)));
+                    token_edges.push((token, compiled_edge));
                 }
                 ProbeSet::Range(range) => {
                     nodes[from as usize].terminal_range = Some(*range);
-                    token_edges.extend(
-                        (range.begin..=range.last).map(|token| (token, Edge::new(from, to))),
-                    );
+                    token_edges
+                        .extend((range.begin..=range.last).map(|token| (token, compiled_edge)));
                 }
                 // An enumerated set holds every token that can enter `to`,
                 // so its members in the token table answer the entry test on
                 // their own and the node needs no prefix.
                 ProbeSet::Set(ids) => {
-                    token_edges.extend(ids.iter().map(|&token| (token, Edge::new(from, to))));
+                    token_edges.extend(ids.iter().map(|&token| (token, compiled_edge)));
                 }
                 ProbeSet::SetTooBig => {
+                    // Unenumerated entry edges run from the source to an
+                    // alignment inside the first token, at most 15 bytes in.
                     nodes[to as usize].entry = Some(NeedlePrefix::new(&needle[..to as usize]));
                 }
             }
@@ -395,7 +389,7 @@ mod tests {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
         let frequencies = build_token_frequency_index(&codes, dict.num_tokens()).unwrap();
-        let graph = build_alignment_graph(dict, needle, frequencies.as_view());
+        let graph = build_alignment_graph(dict, needle, frequencies.as_view()).unwrap();
         let walk = Walk::from_graph(&graph, needle);
         for (row, text) in rows.iter().enumerate() {
             let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);

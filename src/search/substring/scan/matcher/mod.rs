@@ -28,7 +28,7 @@ pub(in crate::search::substring::scan) use nibble_n8::NibbleN8;
 pub(in crate::search::substring::scan) use range::Range;
 pub(in crate::search::substring::scan) use table::Table;
 
-/// Bit `i` of `bits` is set iff the cover admits `codes[i]`. See `README.md`.
+/// Bit `i` of `bits` is set iff the cover admits `codes[i]`.
 pub(in crate::search::substring::scan) trait Matcher:
     Sized
 {
@@ -39,6 +39,3 @@ pub(in crate::search::substring::scan) trait Matcher:
     /// is skipped; `true` promises nothing.
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool;
 }
-
-#[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::scan) use eq_or::OnePoint;

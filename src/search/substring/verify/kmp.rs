@@ -5,7 +5,7 @@
 //!
 //! Substring search (`LIKE '%pattern%'`) runs byte-level KMP, but lifted to
 //! tokens: one transition per *token*, not per byte. The transition function is
-//! precomputed once into an immutable [`ContainsTable`]; [`contains`] then scans
+//! precomputed once into an immutable [`ContainsDfa`]; [`row_contains`] then scans
 //! a row's codes holding the KMP state in a local — no decode, no dictionary at
 //! scan time, O(#tokens) per row.
 //!
@@ -19,16 +19,18 @@
 use crate::core::dictionary::DictionaryView;
 use crate::core::types::{Token, TokenRange};
 use crate::search::lookup::prefix_range;
+use crate::search::substring::ContainsError;
 
 /// A KMP state: the number of leading pattern bytes matched, `0..=pattern.len()`.
 /// `u8`, so the pattern is limited to 255 bytes.
 type State = u8;
 
-/// Immutable token-level KMP transition table for one pattern, built once
-/// against a dictionary and shared (by `&`) across every row scanned. Holds no
-/// scan state — [`contains`] keeps the KMP state in a local.
+/// Immutable token-level substring DFA derived from KMP for one pattern and
+/// dictionary. Stores transitions and the accepting state, with no per-row
+/// execution state. [`row_contains`] keeps its current state in a local, so this
+/// DFA can be reused across rows and shared between concurrent calls.
 #[derive(Debug, Clone)]
-pub struct ContainsTable {
+pub struct ContainsDfa {
     /// Accept state — the pattern's byte length `m`. `0` ⇒ empty pattern.
     accept: State,
     /// `base[token]` = KMP state after running `token`'s bytes from state 0.
@@ -48,27 +50,33 @@ struct SparseTransition {
     target: State,
 }
 
-impl ContainsTable {
-    /// Build the transition table for `pattern` against the sorted `dict`.
+impl ContainsDfa {
+    /// Maximum pattern length, bounded by the DFA's `u8` state IDs.
+    pub const MAX_PATTERN_LEN: usize = State::MAX as usize;
+
+    /// Compile the DFA for `pattern` against the sorted `dict`.
     ///
-    /// # Panics
-    /// If `pattern` is longer than 255 bytes (KMP states are stored as `u8`).
-    pub fn new<V: DictionaryView>(pattern: &[u8], dict: V) -> Self {
-        assert!(
-            pattern.len() <= State::MAX as usize,
-            "contains pattern exceeds 255 bytes"
-        );
+    /// # Errors
+    /// Returns [`ContainsError::PatternTooLong`] if `pattern` is longer than
+    /// [`Self::MAX_PATTERN_LEN`].
+    pub fn new<V: DictionaryView>(pattern: &[u8], dict: V) -> Result<Self, ContainsError> {
+        if pattern.len() > Self::MAX_PATTERN_LEN {
+            return Err(ContainsError::PatternTooLong {
+                length: pattern.len(),
+                max: Self::MAX_PATTERN_LEN,
+            });
+        }
         let m = pattern.len();
         let num_tokens = dict.num_tokens();
 
         // Empty pattern: accept state 0, every token a no-op transition.
         if m == 0 {
-            return Self {
+            return Ok(Self {
                 accept: 0,
                 base: vec![0; num_tokens],
                 sparse: Vec::new(),
                 offsets: vec![0, 0],
-            };
+            });
         }
 
         let mut build = Build {
@@ -84,17 +92,17 @@ impl ContainsTable {
         build.base_pass();
         build.sparse_pass();
 
-        Self {
+        Ok(Self {
             accept: m as State,
             base: build.base,
             sparse: build.sparse,
             offsets: build.offsets,
-        }
+        })
     }
 
     /// KMP transition from `state` on `token`.
     ///
-    /// Precondition: `state < accept` — [`contains`] stops at `accept`, so
+    /// Precondition: `state < accept` — [`row_contains`] stops at `accept`, so
     /// `offsets[state + 1]` is in bounds.
     #[inline]
     fn next(&self, state: State, token: Token) -> State {
@@ -115,19 +123,22 @@ impl ContainsTable {
     }
 }
 
-/// Whether `codes` contains the pattern of `table` as a substring — even one that
+/// Whether `codes` contains the pattern of `dfa` as a substring — even one that
 /// straddles token boundaries.
 ///
 /// Stateless: the KMP state lives here, starting at 0 each call. Every step is a
-/// table lookup; no dictionary and no decode. Early-exits on the first match.
-pub fn contains(codes: &[Token], table: &ContainsTable) -> bool {
+/// transition lookup; no dictionary and no decode. Early-exits on the first match.
+///
+/// # Precondition
+/// Every code is a valid token ID from the dictionary used to prepare `dfa`.
+pub fn row_contains(codes: &[Token], dfa: &ContainsDfa) -> bool {
     let mut state: State = 0;
-    if state == table.accept {
+    if state == dfa.accept {
         return true; // empty pattern is a substring of everything
     }
     for &code in codes {
-        state = table.next(state, code);
-        if state == table.accept {
+        state = dfa.next(state, code);
+        if state == dfa.accept {
             return true;
         }
     }
@@ -155,7 +166,7 @@ fn kmp_failure(pattern: &[u8]) -> Vec<State> {
     fail
 }
 
-/// Scratch state for building a [`ContainsTable`].
+/// Scratch state for building a [`ContainsDfa`].
 struct Build<'a, V> {
     dict: V,
     p: &'a [u8],
@@ -207,12 +218,13 @@ impl<V: DictionaryView> Build<'_, V> {
     /// Append `(range, target)`, extending the previous range if it is adjacent
     /// and shares the target. Only merges within the current entry state.
     fn emit(&mut self, range: TokenRange, target: State) {
-        if self.sparse.len() > self.range_start {
-            let last = self.sparse.last_mut().unwrap();
-            if last.target == target && last.range.last as usize + 1 == range.begin as usize {
-                last.range.last = range.last;
-                return;
-            }
+        if self.sparse.len() > self.range_start
+            && let Some(last) = self.sparse.last_mut()
+            && last.target == target
+            && last.range.last as usize + 1 == range.begin as usize
+        {
+            last.range.last = range.last;
+            return;
         }
         self.sparse.push(SparseTransition { range, target });
     }
@@ -354,7 +366,7 @@ mod tests {
         unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) }.to_vec()
     }
 
-    /// Driving `contains` over every row must agree with a brute-force
+    /// Driving `row_contains` over every row must agree with a brute-force
     /// decode-and-substring oracle. The table is built from both the compact and
     /// the wide dictionary to confirm construction is representation-agnostic.
     fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
@@ -366,12 +378,12 @@ mod tests {
                 .filter(|&k| byte_contains(&decode_row(view, k), pat))
                 .collect();
 
-            for table in [
-                ContainsTable::new(pat, view.dict),
-                ContainsTable::new(pat, wide.as_view()),
+            for dfa in [
+                ContainsDfa::new(pat, view.dict).unwrap(),
+                ContainsDfa::new(pat, wide.as_view()).unwrap(),
             ] {
                 let got: Vec<usize> = (0..view.num_rows())
-                    .filter(|&k| contains(view.row_codes(k), &table))
+                    .filter(|&k| row_contains(view.row_codes(k), &dfa))
                     .collect();
                 assert_eq!(got, want, "pattern {pat:?}");
             }

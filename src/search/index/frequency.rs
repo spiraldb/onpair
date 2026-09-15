@@ -52,6 +52,10 @@ impl TokenFrequencyIndexStorage for OwnedTokenFrequencyIndexStorage {
 /// stream. Builder-produced indexes are exact. Safety-only indexes are valid
 /// advisory prefilter weights but cannot change query correctness.
 ///
+/// The index stores counts, not the dictionary or stream that defined its token
+/// IDs. Callers must keep it associated with that dictionary and stream; a
+/// matching token count alone does not establish that association.
+///
 /// Build the usual owned representation with [`build_token_frequency_index`],
 /// or validate another storage implementation without copying it:
 ///

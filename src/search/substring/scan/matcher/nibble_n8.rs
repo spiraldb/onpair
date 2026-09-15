@@ -3,7 +3,7 @@
 
 //! Four nibble-table shuffles per code, ANDed: a token bit that survives all
 //! four matched the whole code. Eight tokens per batch, batches ORed, ranges
-//! beside them. L = 1. See `README.md`.
+//! beside them.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;

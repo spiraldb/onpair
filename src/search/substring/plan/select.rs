@@ -29,16 +29,26 @@ pub(in crate::search::substring) fn takes(
 }
 
 pub(super) fn select_matcher(caps: TargetCaps, shape: CoverShape) -> MatcherKind {
-    [
-        MatcherKind::Table,
+    let mut best = MatcherKind::Table;
+    let mut best_cost = ns_per_code(caps.isa, best, shape);
+
+    for matcher in [
         MatcherKind::EqOr,
         MatcherKind::Range,
         MatcherKind::NibbleN8K,
-    ]
-    .into_iter()
-    .filter(|&matcher| takes(caps, matcher, shape))
-    .min_by(|&a, &b| ns_per_code(caps.isa, a, shape).total_cmp(&ns_per_code(caps.isa, b, shape)))
-    .expect("the byte table takes every cover")
+    ] {
+        if !takes(caps, matcher, shape) {
+            continue;
+        }
+
+        let cost = ns_per_code(caps.isa, matcher, shape);
+        if cost.total_cmp(&best_cost).is_lt() {
+            best = matcher;
+            best_cost = cost;
+        }
+    }
+
+    best
 }
 
 pub(in crate::search::substring) fn select_scan_plan(
@@ -72,16 +82,6 @@ pub(in crate::search::substring) fn select_scan_plan(
                 resolver,
             };
         }
-        MatcherKind::EqOr
-            if caps.isa == Isa::Neon
-                && facts.analysis.shape
-                    == (CoverShape {
-                        points: 1,
-                        ranges: 0,
-                    }) =>
-        {
-            VectorMatcher::OnePoint
-        }
         MatcherKind::EqOr => VectorMatcher::EqOr,
         MatcherKind::Range => VectorMatcher::Range,
         MatcherKind::NibbleN8K => VectorMatcher::NibbleN8 {
@@ -93,7 +93,7 @@ pub(in crate::search::substring) fn select_scan_plan(
         Isa::Neon => Kernel::Neon { matcher, skip },
         Isa::Avx2 => Kernel::Avx2 { matcher, skip },
         Isa::Avx512Bw => Kernel::Avx512Bw { matcher, skip },
-        Isa::Scalar => unreachable!("scalar selection admits only the table"),
+        Isa::Scalar => Kernel::Table,
     };
     ScanPlan { kernel, resolver }
 }

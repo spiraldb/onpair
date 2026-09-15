@@ -19,8 +19,8 @@ use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 use crate::search::{
-    ContainsTable, PrefixQuery, analyze_prefilter, contains, equals, prefilter_matches,
-    starts_with, tokenize,
+    ContainsDfa, ContainsError, ContainsScan, PrefixQuery, equals, row_contains, starts_with,
+    tokenize,
 };
 
 /// Owned compressed column, produced by [`Column::compress`] /
@@ -187,50 +187,48 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     }
 
     /// Ascending indices of the rows containing `pattern` as a substring,
-    /// prepared once as a [`ContainsTable`] and matched per row. Panics if
-    /// `pattern` exceeds 255 bytes.
-    pub fn rows_containing(&self, pattern: &[u8]) -> Vec<usize> {
-        let table = ContainsTable::new(pattern, self.dict);
-        self.select(|codes| contains(codes, &table))
+    /// prepared once as a [`ContainsDfa`] and matched per row.
+    ///
+    /// # Errors
+    /// Returns [`ContainsError::PatternTooLong`] if `pattern` exceeds
+    /// [`ContainsDfa::MAX_PATTERN_LEN`].
+    pub fn rows_containing(&self, pattern: &[u8]) -> Result<Vec<usize>, ContainsError> {
+        let dfa = ContainsDfa::new(pattern, self.dict)?;
+        Ok(self.select(|codes| row_contains(codes, &dfa)))
     }
 
     /// Ascending indices of the rows containing `pattern`, using a probe cover
     /// and exact graph verification.
     ///
-    /// [`prefilter_matches`] scans the code stream for the rows holding a
+    /// [`ContainsScan::scan`] scans the code stream for the rows holding a
     /// probe and verifies each hit against the alignment graph, so the rows
-    /// come back exact. This method always runs the prefilter; callers can use
-    /// [`analyze_prefilter`] to inspect its cover, frequency and estimated cost
-    /// before choosing a search operation.
+    /// come back exact. This method always runs the bulk scan. Callers can
+    /// prepare a reusable [`ContainsScan`] to inspect its cover, frequency and
+    /// estimated cost before choosing a search operation.
     ///
     /// Rows must be greedily tokenized with this view's conformant dictionary,
     /// as produced by the encoder. Buffer validation alone does not establish
     /// greedy tokenization for externally supplied codes.
     ///
-    /// `frequencies` must use this view's token domain and code count. Build an
-    /// exact index with
+    /// `frequencies` must be associated with this view's dictionary and code
+    /// stream. Build an exact index with
     /// [`build_token_frequency_index`](crate::search::index::build_token_frequency_index),
-    /// or validate stored weights with [`TokenFrequencyIndex::validate_safety`].
+    /// or validate stored weights with [`TokenFrequencyIndex::validate_safety`]
+    /// using this view's token count and code count. Preparation checks only
+    /// index size, not dictionary identity or agreement with the stream.
     /// Inexact weights affect planning, not query correctness.
     ///
-    /// # Panics
-    /// If `pattern` is longer than
-    /// [`MAX_PATTERN_LEN`](crate::search::MAX_PATTERN_LEN).
-    pub fn rows_containing_prefiltered<S: TokenFrequencyIndexStorage>(
+    /// # Errors
+    /// Propagates preparation errors from [`ContainsScan::new`].
+    pub fn rows_containing_with_scan<S: TokenFrequencyIndexStorage>(
         &self,
         pattern: &[u8],
         frequencies: &TokenFrequencyIndex<S>,
-    ) -> Vec<usize> {
-        let analysis = analyze_prefilter(pattern, self.dict, frequencies, self.num_rows());
+    ) -> Result<Vec<usize>, ContainsError> {
+        let scan = ContainsScan::new(pattern, self.dict, frequencies, self.num_rows())?;
         let mut rows = Vec::new();
-        prefilter_matches(
-            self.codes,
-            self.row_offsets,
-            self.dict,
-            &analysis,
-            &mut rows,
-        );
-        rows
+        scan.scan(self.codes, self.row_offsets, self.dict, &mut rows);
+        Ok(rows)
     }
 
     /// Ascending indices of the rows whose codes satisfy `pred`.
@@ -372,7 +370,7 @@ mod tests {
         // Duplicates are returned once per row, in ascending row order.
         assert_eq!(view.rows_equal_to(b"apple"), vec![0, 4]);
         assert_eq!(view.rows_starting_with(b"ap"), vec![0, 2, 4]);
-        assert_eq!(view.rows_containing(b"an"), vec![1]);
+        assert_eq!(view.rows_containing(b"an").unwrap(), vec![1]);
         // Absent needles select nothing.
         assert_eq!(view.rows_equal_to(b"grape"), Vec::<usize>::new());
     }
@@ -388,7 +386,7 @@ mod tests {
         // matches every row.
         assert_eq!(view.rows_equal_to(b""), vec![1, 3]);
         assert_eq!(view.rows_starting_with(b""), vec![0, 1, 2, 3]);
-        assert_eq!(view.rows_containing(b""), vec![0, 1, 2, 3]);
+        assert_eq!(view.rows_containing(b"").unwrap(), vec![0, 1, 2, 3]);
     }
 
     /// The column predicates must agree with a brute-force decode-and-match
@@ -437,7 +435,11 @@ mod tests {
                     needle.is_empty() || r.windows(needle.len()).any(|w| w == needle)
                 })
                 .collect();
-            assert_eq!(view.rows_containing(needle), con, "contains {needle:?}");
+            assert_eq!(
+                view.rows_containing(needle).unwrap(),
+                con,
+                "contains {needle:?}"
+            );
         }
     }
 
@@ -469,16 +471,16 @@ mod tests {
             b"zzz",
         ];
         for &needle in needles {
-            let want = view.rows_containing(needle);
+            let want = view.rows_containing(needle).unwrap();
             assert_eq!(
-                view.rows_containing_prefiltered(needle, &freqs),
+                view.rows_containing_with_scan(needle, &freqs).unwrap(),
                 want,
                 "prefiltered {needle:?}"
             );
         }
     }
 
-    /// The prefilter takes patterns `ContainsTable` rejects: its own cap is the
+    /// The prefilter takes patterns `ContainsDfa` rejects: its own cap is the
     /// walk's node ids, not the KMP table's 255-byte state width.
     #[test]
     fn prefiltered_takes_patterns_the_kmp_table_rejects() {
@@ -493,7 +495,7 @@ mod tests {
         let view = col.view();
         let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
 
-        let got = view.rows_containing_prefiltered(&long, &freqs);
+        let got = view.rows_containing_with_scan(&long, &freqs).unwrap();
         assert_eq!(got, vec![1]);
     }
 }

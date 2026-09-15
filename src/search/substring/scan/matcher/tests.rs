@@ -10,6 +10,8 @@ use super::{EqOr, Range};
 use super::{NibbleN8, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use crate::search::substring::plan::facts::Isa;
 use crate::search::substring::plan::facts::{CoverShape, MatcherKind};
 use crate::search::substring::scan::{BLOCK, Check, both_stages, resolver};
 
@@ -63,11 +65,6 @@ fn block() -> Block {
 
 /// Every matcher on one cover and one block.
 fn every_matcher(cover: &ProbeCover, codes: &Block) {
-    #[cfg(target_arch = "aarch64")]
-    if cover.points().len() == 1 && cover.ranges().is_empty() {
-        agrees::<super::OnePoint<false>>(MatcherKind::EqOr, "one_point", cover, codes);
-        agrees::<super::OnePoint<true>>(MatcherKind::EqOr, "one_point_skip", cover, codes);
-    }
     agrees::<Table>(MatcherKind::Table, "table", cover, codes);
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
@@ -123,6 +120,38 @@ fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) 
         &ProbeCover::new(cover.points().to_vec(), two.to_vec()),
         codes,
     );
+}
+
+#[test]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn eq_or_without_points_checks_ranges() {
+    if detect_target_caps().isa == Isa::Scalar {
+        return;
+    }
+    let codes = block();
+    for ranges in [
+        vec![],
+        vec![
+            TokenRange {
+                begin: 0,
+                last: 100,
+            },
+            TokenRange {
+                begin: 1000,
+                last: 2000,
+            },
+        ],
+    ] {
+        let cover = ProbeCover::new(vec![], ranges);
+        let want = expected(&cover, &codes);
+        let mut bits = [u64::MAX; BLOCK / 64];
+        EqOr::<false>::new(&cover).check(&codes, &mut bits);
+        assert_eq!(bits, want);
+        bits.fill(u64::MAX);
+        let any_hit = EqOr::<true>::new(&cover).check(&codes, &mut bits);
+        assert_eq!(bits, want);
+        assert!(any_hit || bits.iter().all(|&word| word == 0));
+    }
 }
 
 #[test]

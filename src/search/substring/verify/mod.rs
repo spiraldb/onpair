@@ -6,4 +6,4 @@
 mod kmp;
 pub(super) mod walk;
 
-pub use kmp::{ContainsTable, contains};
+pub use kmp::{ContainsDfa, row_contains};

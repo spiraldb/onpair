@@ -1,51 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Compressed-domain search: equality, prefix, and substring queries answered
-//! directly over the code stream, without decoding rows back to bytes.
+//! Equality, prefix and substring search over compressed codes, without decoding rows.
 //!
-//! These operations require a conformant dictionary — one that is sorted,
-//! complete, and unique. A dictionary produced by the trainer or passed through
-//! `validate` satisfies this precondition. [`crate::DictionaryView`]
-//! only guarantees structurally safe access; it does not establish these semantic
-//! properties:
+//! Prepare queries once and reuse them across rows or scans:
 //!
-//! * **Sorted** — tokens are in bytewise-lexicographic order, so a needle can be
-//!   tokenized ([`tokenize`](tokenize())) and prefix-ranged ([`prefix_range`]) by
-//!   binary search.
-//! * **Complete** — all 256 single-byte tokens are present, so any query string
-//!   is encodable into codes.
-//! * **Unique** — no two tokens have equal bytes, so each token has one ID.
+//! * Equality: [`tokenize`](tokenize()) the needle, then call [`equals`](equals()).
+//! * Prefix: build a [`PrefixQuery`], then call [`starts_with`].
+//! * Substring per row: build a [`ContainsDfa`], then call [`row_contains`].
+//! * Substring across rows: build a [`ContainsScan`], then call [`ContainsScan::scan`]
+//!   to append exact matching row indices. Preparation uses a reusable
+//!   [`index::TokenFrequencyIndex`].
 //!
-//! Equality, prefix search and the graph prefilter require rows greedily
-//! tokenized with the same dictionary, as produced by the encoder. Dictionary
-//! validation alone does not establish this property for externally supplied codes.
+//! Search requires a dictionary with unique tokens in bytewise-lexicographic order
+//! and all 256 single-byte tokens. Training or full dictionary validation establishes
+//! these properties; [`crate::DictionaryView`] alone guarantees only structural safety.
 //!
-//! # Shape
-//! Each query is **prepared once** (tokenize the needle, or build a transition
-//! table) into immutable data, then applied per row by a **free function over a
-//! `&[`[`Token`](crate::Token)`]`**. The row to scan is
-//! [`ColumnView::row_codes`](crate::ColumnView::row_codes), but the predicates
-//! take any code slice, so a caller can scan a prefiltered subset of rows
-//! rather than the whole column.
-//!
-//! # Operations
-//! * [`tokenize`](tokenize()) — segment a needle into its canonical code sequence.
-//! * [`equals`](equals()) — rows equal to a needle.
-//! * [`starts_with`] — rows beginning with a needle, via a prepared
-//!   [`PrefixQuery`].
-//! * [`contains`](contains()) — rows containing a pattern, via a precomputed
-//!   token-level KMP [`ContainsTable`].
-//! * [`index::build_token_frequency_index`] — build the reusable selectivity
-//!   index for a code stream.
-//! * [`analyze_prefilter`] — derive a normalized probe cover and report its
-//!   frequency.
-//! * [`prefilter_matches`] — the rows containing a pattern, collected by
-//!   running a probe cover over the code stream. Every hit is verified against
-//!   the alignment graph in the compressed domain, so each emitted row is an
-//!   exact match. Graph needles may contain up to 65,535 bytes; standalone KMP
-//!   supports up to 255 bytes.
-//! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
+//! Equality, prefix search and [`ContainsScan`] also require rows greedily tokenized
+//! with the same dictionary, as produced by the encoder. Validating external buffers
+//! does not establish greedy tokenization.
 
 mod equals;
 pub mod index;
@@ -57,8 +30,5 @@ mod tokenize;
 pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefix::{PrefixQuery, starts_with};
-pub use substring::{
-    ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, ProbeCover, analyze_prefilter, contains,
-    prefilter_is_likely_profitable, prefilter_matches,
-};
+pub use substring::{ContainsDfa, ContainsError, ContainsScan, ProbeCover, row_contains};
 pub use tokenize::tokenize;

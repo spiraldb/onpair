@@ -419,8 +419,7 @@ fn snippet(machine: &str, source: &str, fit: &Fit) {
     if let Some(table) = fit.table {
         println!("        MatcherKind::Table => {table:.3},");
     }
-    // One arm per kernel, which is the shape the model has and the order
-    // `README.md` tabulates them in.
+    // One arm per kernel, matching the cost model.
     if let Some((a, b)) = fit.eq_or {
         println!(
             "        MatcherKind::EqOr => {a:.5} + {b:.5} * k + {:.5} * r,",

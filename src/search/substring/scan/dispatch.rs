@@ -53,6 +53,7 @@ fn with_skip<O: Offset, S: Matcher, P: Matcher>(
 }
 
 /// The planned kernel pair as the type parameters [`both_stages`] wants.
+/// Planning supplies a kernel supported by this cover and the current CPU.
 pub(super) fn run<O: Offset>(
     plan: ScanPlan,
     cover: &ProbeCover,
@@ -66,36 +67,17 @@ pub(super) fn run<O: Offset>(
         Kernel::Table => {
             return with_resolver::<O, matcher::Table>(plan, cover, codes, row_offsets, check, out);
         }
-        Kernel::Neon { matcher, .. } => {
-            assert_eq!(detect_target_caps().isa, Isa::Neon);
-            matcher
-        }
-        Kernel::Avx2 { matcher, .. } => {
-            assert_eq!(detect_target_caps().isa, Isa::Avx2);
-            matcher
-        }
-        Kernel::Avx512Bw { matcher, .. } => {
-            assert_eq!(detect_target_caps().isa, Isa::Avx512Bw);
-            matcher
-        }
+        Kernel::Neon { matcher, .. }
+        | Kernel::Avx2 { matcher, .. }
+        | Kernel::Avx512Bw { matcher, .. } => matcher,
     };
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    unreachable!("this target compiles only scalar execution: {selected:?}");
+    {
+        let _ = selected;
+        with_resolver::<O, matcher::Table>(plan, cover, codes, row_offsets, check, out);
+    }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     match selected {
-        #[cfg(target_arch = "aarch64")]
-        VectorMatcher::OnePoint => {
-            with_skip::<O, matcher::OnePoint<true>, matcher::OnePoint<false>>(
-                plan,
-                cover,
-                codes,
-                row_offsets,
-                check,
-                out,
-            )
-        }
-        #[cfg(target_arch = "x86_64")]
-        VectorMatcher::OnePoint => unreachable!("the one-point specialization is NEON-only"),
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         VectorMatcher::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
             plan,
@@ -140,7 +122,7 @@ pub(super) fn run<O: Offset>(
                 check,
                 out,
             ),
-            _ => unreachable!("the planner caps the batches at MAX_BATCHES"),
+            _ => with_resolver::<O, matcher::Table>(plan, cover, codes, row_offsets, check, out),
         },
     }
 }

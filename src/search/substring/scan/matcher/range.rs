@@ -115,14 +115,15 @@ impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for Range<SKIP_MOVEMASK_IF_N
 /// Outside `check` so the closure inherits the target features and inlines.
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
-fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
+pub(super) fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     held: &[Held],
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
-    let (&first, rest) = held
-        .split_first()
-        .expect("a range, per plan::select::takes");
+    let Some((&first, rest)) = held.split_first() else {
+        bits.fill(0);
+        return false;
+    };
     words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| unsafe {
         check_ranges(inside(first, codes), rest, codes)
     })

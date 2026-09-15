@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! SIMD prefilter for substring search.
+//! Prepared bulk substring search with a probe cover and exact verification.
 //!
 //! Answering `LIKE '%pattern%'` exactly means checking every row — e.g. stepping
-//! the token-level KMP automaton of [`contains`](super::contains()) over its
-//! codes. This module trims that per-row work down to the rows that *can* match.
+//! the token-level KMP automaton of [`row_contains`](super::row_contains()) over
+//! its codes. This module trims that per-row work down to the rows that *can* match.
 //! It compiles a **sound probe cover** from the pattern — dictionary token ids
 //! and id ranges chosen so that *any* row containing the pattern holds at least
 //! one probe token — then scans the flat code stream for the rows holding one
-//! ([`prefilter_matches`]).
+//! ([`ContainsScan::scan`]).
 //!
 //! Every hit is then checked against the alignment graph in the compressed
-//! domain (`walk`), so the rows [`prefilter_matches`] returns are exactly
+//! domain (`walk`), so the rows [`ContainsScan::scan`] returns are exactly
 //! the rows containing the pattern and no caller-side verification is needed.
 //!
 //! An empty pattern matches every row, including rows without codes. Its
-//! analysis needs no probes, and execution appends all rows without scanning.
+//! preparation needs no probes, and execution appends all rows without scanning.
 //!
 //! # Soundness
 //! Every occurrence of a non-empty pattern in an encoded row falls into one of two cases,
@@ -41,20 +41,24 @@
 use super::alignment::graph::build_alignment_graph;
 use super::plan::facts::RegionFacts;
 use super::verify::walk::Walk;
-use super::{ProbeCover, plan, scan};
+use super::{ContainsError, ProbeCover, plan, scan};
 
-use crate::core::dictionary::CompactDictionaryView;
+use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
+use crate::core::validate::InvalidFrequencyIndex;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
-/// The normalized probe cover selected for a pattern and its frequency, or an
-/// all-rows result.
+/// Immutable prepared substring scan for one pattern and dictionary.
+///
+/// Holds the probe cover, compiled walker and cost/selectivity metadata. Each
+/// [`ContainsScan::scan`] call owns its execution state, so preparation can be reused
+/// across scans. The dictionary is supplied separately at execution.
 ///
 /// Points and ranges are disjoint, so each covered token occurrence is counted
 /// exactly once. An empty pattern matches all rows and needs no probes.
 #[derive(Debug, Clone)]
-pub struct PrefilterAnalysis {
+pub struct ContainsScan {
     pub(super) probe_cover: ProbeCover,
     pub(super) covered_frequency: u32,
     pub(super) total_frequency: u32,
@@ -64,10 +68,121 @@ pub struct PrefilterAnalysis {
     pub(super) matches_all: bool,
 }
 
-impl PrefilterAnalysis {
+impl ContainsScan {
+    /// Maximum pattern length, bounded by the compiled walker's `u16` node IDs.
+    pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
+
+    /// Prepare an exact substring scan for `pattern` over `row_count` rows.
+    /// Select the sound probe cover with the lowest modeled scan cost and compile
+    /// the alignment walker used to verify its hits.
+    ///
+    /// This constructor prepares the checks and reports their frequency and cost;
+    /// the caller decides whether executing them is profitable. An empty pattern
+    /// produces a scan that admits every row without compiling probes.
+    ///
+    /// # Precondition
+    /// `dict` is conformant: sorted, complete, and unique. These properties are
+    /// guaranteed for a dictionary trained by [`Parser::train`](crate::Parser::train)
+    /// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
+    /// `frequencies` must be associated with this dictionary's token IDs and the
+    /// code stream used for planning. Build or validate it at the input boundary
+    /// using `dict.num_tokens()` and that stream's codes or code count.
+    ///
+    /// Preparation only checks that the already validated index has
+    /// `dict.num_tokens() + 1` cumulative entries, so dictionary token IDs can
+    /// safely index it. This is a constant-time size check; it does not establish
+    /// dictionary identity or verify the frequencies against the stream.
+    /// Values are advisory weights: they affect the plan and profitability, but
+    /// never remove members from the resulting cover.
+    ///
+    /// # Errors
+    /// Returns [`ContainsError`] if the pattern exceeds [`Self::MAX_PATTERN_LEN`],
+    /// the index size does not match the dictionary, or greedy parsing encounters
+    /// a missing dictionary token.
+    pub fn new<S: TokenFrequencyIndexStorage>(
+        pattern: &[u8],
+        dict: CompactDictionaryView<'_>,
+        frequencies: &TokenFrequencyIndex<S>,
+        row_count: usize,
+    ) -> Result<Self, ContainsError> {
+        if pattern.len() > Self::MAX_PATTERN_LEN {
+            return Err(ContainsError::PatternTooLong {
+                length: pattern.len(),
+                max: Self::MAX_PATTERN_LEN,
+            });
+        }
+        if frequencies.num_tokens() != dict.num_tokens() {
+            return Err(ContainsError::InvalidData(
+                InvalidFrequencyIndex::BadLength.into(),
+            ));
+        }
+        if pattern.is_empty() {
+            return Ok(Self {
+                probe_cover: ProbeCover::from_runs(Vec::new()),
+                covered_frequency: 0,
+                total_frequency: frequencies.total_frequency(),
+                scan_ns: 0.0,
+                walk: Walk::default(),
+                matches_all: true,
+            });
+        }
+        let graph = build_alignment_graph(dict, pattern, frequencies.as_view())?;
+        let region = RegionFacts {
+            code_count: frequencies.total_frequency() as usize,
+            row_count,
+        };
+        let (cover, covered, scan_ns) = plan::cheapest_cover(
+            &graph,
+            frequencies.as_view(),
+            region,
+            scan::detect_target_caps(),
+        );
+        Ok(Self {
+            probe_cover: cover,
+            covered_frequency: covered,
+            total_frequency: frequencies.total_frequency(),
+            scan_ns,
+            walk: Walk::from_graph(&graph, pattern),
+            matches_all: false,
+        })
+    }
+
+    /// Execute this scan and append the ascending rows containing the pattern.
+    ///
+    /// Every hit on the cover is checked against the alignment graph in the
+    /// compressed domain. Emitted rows contain a complete occurrence of the pattern.
+    ///
+    /// This method only executes the prepared cover; the caller decides whether
+    /// scanning it is profitable. For a non-empty pattern, an empty cover appends
+    /// nothing. An empty pattern appends every row, including empty rows, without
+    /// scanning. Execution state is local to this call, so the same preparation
+    /// can be reused or shared between concurrent calls.
+    ///
+    /// # Precondition
+    /// `row_offsets` are valid delimiters for `codes`, every code lies in the
+    /// token domain of the prepared cover, and `dict` is the dictionary this
+    /// scan was built over. Rows must be greedily tokenized with that same
+    /// conformant dictionary, as produced by [`Column::compress`](crate::Column::compress).
+    /// Validating a dictionary or externally supplied column buffers alone does not
+    /// establish greedy tokenization. Each scan appends each matching row once in
+    /// ascending order, preserving all prior contents of `out`.
+    pub fn scan<O: Offset>(
+        &self,
+        codes: &[Token],
+        row_offsets: &[O],
+        dict: CompactDictionaryView<'_>,
+        out: &mut Vec<usize>,
+    ) {
+        if self.matches_all {
+            out.extend(0..row_offsets.len().saturating_sub(1));
+            return;
+        }
+        scan::matches(codes, row_offsets, dict, self, out);
+    }
+
     /// The normalized checks the SIMD prefilter can execute.
     ///
-    /// For an empty pattern this cover is empty, but [`prefilter_matches`]
+    /// For an empty pattern this cover is empty, but [`ContainsScan::scan`]
     /// still returns every row.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
@@ -131,131 +246,3 @@ impl PrefilterAnalysis {
         (f64::from(self.covered_frequency) / row_count as f64).min(1.0)
     }
 }
-
-/// Comparison threshold retained from the original profitability calibration.
-/// Matcher admission is selected separately by the scan cost model.
-const MAX_SIMD_COMPARISONS: usize = 16;
-
-/// Covered-code fraction per row admitted by the original heuristic.
-const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
-
-/// Return the legacy empirical profitability hint for a region of
-/// `row_count` rows. It does not select or execute a fallback.
-///
-/// The policy prices the two costs a scan pays, both known after
-/// [`analyze_prefilter`]: its
-/// [`comparison_cost`](PrefilterAnalysis::comparison_cost) per code, and the
-/// [`expected_candidate_row_fraction`](PrefilterAnalysis::expected_candidate_row_fraction)
-/// it sends to per-row verification. For a non-empty pattern, an empty cover
-/// passes both: it proves no encoded row can match, so it scans nothing and
-/// admits nothing. An empty pattern also passes: its all-rows answer is exact
-/// and requires neither a scan nor verification.
-///
-/// This is a performance hint, not a correctness requirement, and it neither
-/// executes nor bypasses the prefilter. The thresholds were calibrated on
-/// AArch64 over 2877 `contains` queries against a bulk-decode-plus-`memmem`
-/// reference implementation. That historical calibration is not a guarantee
-/// for the current walker, especially on long repetitive needles. Callers
-/// with materially different columns or architectures may choose their own
-/// policy.
-pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: usize) -> bool {
-    analysis.matches_all
-        || (analysis.comparison_cost() <= MAX_SIMD_COMPARISONS
-            && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION)
-}
-
-/// Analyze `pattern` and return the sound probe cover the scan cost model
-/// prices lowest over a stream of `row_count` rows.
-///
-/// This function constructs the checks and reports their frequency and cost;
-/// the caller decides whether executing them is profitable. An empty pattern
-/// produces an analysis that admits every row without compiling probes.
-///
-/// # Precondition
-/// `dict` is conformant: sorted, complete, and unique. These properties are
-/// guaranteed for a dictionary trained by [`Parser::train`](crate::Parser::train)
-/// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
-/// `frequencies` must use `dict`'s token domain and the scanned code count.
-/// Values are advisory weights: they affect the plan and profitability, but
-/// never remove members from the resulting cover.
-///
-/// # Panics
-/// Panics when `pattern` is longer than [`MAX_PATTERN_LEN`], which is what the
-/// alignment walk's node ids hold.
-pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
-    pattern: &[u8],
-    dict: CompactDictionaryView<'_>,
-    frequencies: &TokenFrequencyIndex<S>,
-    row_count: usize,
-) -> PrefilterAnalysis {
-    if pattern.is_empty() {
-        return PrefilterAnalysis {
-            probe_cover: ProbeCover::from_runs(Vec::new()),
-            covered_frequency: 0,
-            total_frequency: frequencies.total_frequency(),
-            scan_ns: 0.0,
-            walk: Walk::default(),
-            matches_all: true,
-        };
-    }
-    assert!(
-        pattern.len() <= MAX_PATTERN_LEN,
-        "pattern of {} bytes exceeds the prefilter's {MAX_PATTERN_LEN}",
-        pattern.len()
-    );
-    let graph = build_alignment_graph(dict, pattern, frequencies.as_view());
-    let region = RegionFacts {
-        code_count: frequencies.total_frequency() as usize,
-        row_count,
-    };
-    let (cover, covered, scan_ns) = plan::cheapest_cover(
-        &graph,
-        frequencies.as_view(),
-        region,
-        scan::detect_target_caps(),
-    );
-    PrefilterAnalysis {
-        probe_cover: cover,
-        covered_frequency: covered,
-        total_frequency: frequencies.total_frequency(),
-        scan_ns,
-        walk: Walk::from_graph(&graph, pattern),
-        matches_all: false,
-    }
-}
-
-/// Execute `analysis` and append the ascending rows containing the pattern.
-///
-/// Every hit on the cover is checked against the alignment graph in the
-/// compressed domain. Emitted rows contain a complete occurrence of the pattern.
-///
-/// This function only executes the analyzed cover; the caller decides whether
-/// scanning it is profitable. For a non-empty pattern, an empty cover appends
-/// nothing. An empty pattern appends every row, including empty rows, without
-/// scanning.
-///
-/// # Precondition
-/// `row_offsets` are valid delimiters for `codes`, every code lies in the
-/// token domain of the analyzed cover, and `dict` is the dictionary the
-/// analysis was built over. Rows must be greedily tokenized with that same
-/// conformant dictionary, as produced by [`Column::compress`](crate::Column::compress).
-/// Validating a dictionary or externally supplied column buffers alone does not
-/// establish greedy tokenization. Each scan appends each matching row once in
-/// ascending order, preserving all prior contents of `out`.
-pub fn prefilter_matches<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
-    dict: CompactDictionaryView<'_>,
-    analysis: &PrefilterAnalysis,
-    out: &mut Vec<usize>,
-) {
-    if analysis.matches_all {
-        out.extend(0..row_offsets.len().saturating_sub(1));
-        return;
-    }
-    scan::matches(codes, row_offsets, dict, analysis, out);
-}
-
-/// The longest pattern [`analyze_prefilter`] takes: one node per needle offset
-/// plus the sink, all of them inside the walk's `u16` ids.
-pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;

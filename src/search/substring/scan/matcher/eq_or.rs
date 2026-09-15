@@ -8,7 +8,7 @@ use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use super::range::{Held, check_ranges, hold};
+use super::range::{self, Held, check_ranges, hold};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 use super::shared::join;
 #[cfg(any(
@@ -37,8 +37,7 @@ fn broadcast(code: Token) -> Broadcast {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
-    let (first, rest) = tokens.split_first().unwrap();
+unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     let mut hit = codes.map(|codes| vceqq_u16(codes, *first));
     for token in rest {
         for (hit, &codes) in hit.iter_mut().zip(&codes) {
@@ -56,8 +55,7 @@ fn broadcast(code: Token) -> Broadcast {
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
-unsafe fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
-    let (first, rest) = tokens.split_first().unwrap();
+unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     let mut hit = codes.map(|codes| _mm256_cmpeq_epi16(codes, *first));
     for token in rest {
         for (hit, &codes) in hit.iter_mut().zip(&codes) {
@@ -76,8 +74,7 @@ fn broadcast(code: Token) -> Broadcast {
 /// Compares land in mask registers, so nothing to narrow.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
-    let (first, rest) = tokens.split_first().unwrap();
+unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     let mut hit = join(
         _mm512_cmpeq_epi16_mask(codes[0], *first),
         _mm512_cmpeq_epi16_mask(codes[1], *first),
@@ -119,32 +116,10 @@ fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
+    let Some((first, rest)) = tokens.split_first() else {
+        return range::mask::<SKIP_MOVEMASK_IF_NO_MATCH>(ranges, codes, bits);
+    };
     words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| unsafe {
-        check_ranges(hits(tokens, codes), ranges, codes)
-    })
-}
-
-/// Refactor's fixed one-point preparation, using the PR mask/resolver seam.
-#[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::scan) struct OnePoint<const SKIP: bool>(Broadcast);
-
-#[cfg(target_arch = "aarch64")]
-impl<const SKIP: bool> Matcher for OnePoint<SKIP> {
-    fn new(cover: &ProbeCover) -> Self {
-        debug_assert_eq!((cover.points().len(), cover.ranges().len()), (1, 0));
-        Self(broadcast(cover.points()[0]))
-    }
-
-    fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: NEON is baseline on AArch64; the block supplies every load.
-        unsafe { one_point_mask::<SKIP>(self.0, codes, bits) }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-fn one_point_mask<const SKIP: bool>(point: Broadcast, codes: &Block, bits: &mut Mask) -> bool {
-    words::<SKIP>(codes, bits, |values| {
-        narrow(values.map(|value| vceqq_u16(value, point)))
+        check_ranges(hits(first, rest, codes), ranges, codes)
     })
 }
