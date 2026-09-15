@@ -21,7 +21,7 @@
 //! This is sound for the same reason the cover is. The encoder's parse of any
 //! occurrence is one source-to-sink path of the graph.
 
-use crate::core::dictionary::CompactDictionaryView;
+use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::alignment::graph::{AlignmentGraph, ProbeSet};
 
@@ -63,10 +63,14 @@ impl NeedlePrefix {
 
     #[inline]
     fn is_tail_of(&self, dict: CompactDictionaryView<'_>, token: Token) -> bool {
-        let (token_len, window) = dict.token_window(token);
-        token_len >= self.len
-            && (u128::from_le_bytes(window) >> (8 * (token_len - self.len))) & self.mask
-                == self.bytes
+        let token_len = dict.token_len(token);
+        if token_len < self.len {
+            return false;
+        }
+        // SAFETY: token_len checked the token ID. The dictionary guarantees
+        // MAX_TOKEN_SIZE readable bytes at every valid token's pointer.
+        let window = unsafe { dict.token_ptr(token).cast::<u128>().read_unaligned() };
+        (u128::from_le(window) >> (8 * (token_len - self.len))) & self.mask == self.bytes
     }
 }
 
@@ -304,6 +308,62 @@ mod tests {
     use crate::search::index::build_token_frequency_index;
     use crate::search::substring::alignment::graph::build_alignment_graph;
     use crate::search::tokenize;
+
+    #[test]
+    fn needle_prefix_matches_token_suffixes() {
+        for token_len in 1..=16 {
+            for alignment in 0..16 {
+                for last in [false, true] {
+                    let token: Vec<u8> = (0..token_len).map(|i| (i * 67) as u8).collect();
+                    let mut bytes = vec![0xff; alignment];
+                    let mut offsets = vec![0u32];
+                    if alignment != 0 {
+                        offsets.push(alignment as u32);
+                    }
+                    let id = (offsets.len() - 1) as Token;
+                    bytes.extend_from_slice(&token);
+                    offsets.push(bytes.len() as u32);
+                    if !last {
+                        bytes.extend_from_slice(&[0xa5; 16]);
+                        offsets.push(bytes.len() as u32);
+                    }
+                    // Minimum readable padding, with nonzero bytes to ensure
+                    // neither neighboring tokens nor padding affect the match.
+                    let last_start = offsets[offsets.len() - 2] as usize;
+                    bytes.resize(last_start + 16, 0xa5);
+                    let dict = CompactDictionaryView::validate_safety(&bytes, &offsets).unwrap();
+                    for prefix_len in 1..=16 {
+                        let mut prefix = if prefix_len <= token_len {
+                            token[token_len - prefix_len..].to_vec()
+                        } else {
+                            vec![0; prefix_len]
+                        };
+                        assert_eq!(
+                            NeedlePrefix::new(&prefix).is_tail_of(dict, id),
+                            token.ends_with(&prefix),
+                        );
+                        for i in 0..prefix_len {
+                            prefix[i] ^= 0x80;
+                            assert_eq!(
+                                NeedlePrefix::new(&prefix).is_tail_of(dict, id),
+                                token.ends_with(&prefix),
+                            );
+                            prefix[i] ^= 0x80;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn needle_prefix_rejects_invalid_token_id() {
+        let bytes = [b'a'; 16];
+        let offsets = [0, 1];
+        let dict = CompactDictionaryView::validate_safety(&bytes, &offsets).unwrap();
+        NeedlePrefix::new(b"a").is_tail_of(dict, 1);
+    }
 
     /// A complete dictionary of the single bytes plus `extra`, greedy-encoding
     /// `rows` the way the encoder does.

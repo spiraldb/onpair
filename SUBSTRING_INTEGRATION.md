@@ -26,7 +26,9 @@ src/search/substring/
 
 The independent directed audit passed 98,301 analyses and 46,580,500 row comparisons. The deeper audit passed 263,106 graphs, 483,967,001 edge checks, 215,092,307 hit checks and 373,468 forced exact scans. It exercised 14,136 fixed one-point scans over both resolvers, both packing settings and both offset widths. The known non-greedy counterexample remains reproducible and is outside the newly documented precondition.
 
-8,832 native synthetic planning cases retain PR's matcher family, resolver, effective packing choice and modeled scan cost (the one-point implementation is normalized to its EqOr family). The graph and walker algorithms remain PR's, apart from relocation/visibility and the corrected google test.
+8,832 native synthetic planning cases retain PR's matcher family, resolver, effective packing choice and modeled scan cost (the one-point implementation is normalized to its EqOr family). The graph and walker algorithms remain PR's, apart from relocation/visibility and the corrected google test. The later dictionary-access simplification below preserves the walk's suffix semantics.
+
+**Dictionary-access review.** Removed `CompactDictionaryView::token_window`; the walker uses the existing checked `DictionaryView::token_len` and `token_ptr`, followed by an unaligned 16-byte read and the original little-endian shift/mask comparison. ARM64 and x86-64 assembly retains the same fixed-width comparison with fewer bounds checks. Twelve focused native ARM64 timing cases show no regression (comparison time ratios 0.800–0.819, short-token rejection 0.604–0.636). These timings measure the suffix predicate, not complete queries. After this change, 199 unit tests pass in both debug and release builds, including 77,824 new suffix-oracle comparisons and invalid-ID rejection; formatting and all-target/all-feature Clippy pass. The earlier larger audits and query timings above/below remain evidence for their original snapshots. Full assembly, sources and raw timings are in the surrounding workspace at `comparison/token-window/`.
 
 **Performance.** Eight sequential paired runs cover 64 URL/log scenarios across u32/u64 offsets, dictionary widths 9/12, tiny/large regions, absent/rare/common/dense queries, and both reused analysis and complete preparation-plus-scan. Original byte oracles, encoded-input fingerprints and complete cover fingerprints match in every case. On this ARM machine, large absent one-point scans improve about 4.6x and the rare one-point scan about 4.3x. Median merged/PR ratios are 0.994 for prepared scans and 0.997 for full queries; the slowest full-query ratio is 1.040 in these runs. A preparation-only outlier (2.17 versus 1.97 microseconds) did not reproduce in four further alternating paired runs; their mean merged/PR preparation ratio was 0.973. These synthetic warm-cache observations are not a universal performance guarantee or an x86 result.
 
@@ -46,7 +48,7 @@ One-point NEON uses one fixed broadcast and PR's original mask packing, driver a
 | A06 | Retained graph maximum 65,535 and standalone KMP maximum 255; no new cap. |
 | A07 | Retained compiled walk, coverage data and scan estimate in PrefilterAnalysis. |
 | A08 | Retained PR generic frequency builder and storage-backed index. |
-| A09 | Retained PR token_window and adopted refactor token_payload boundary documentation. |
+| A09 | Removed PR token_window after assembly/timing review; existing token_len/token_ptr preserve the fixed-width suffix check. Retained refactor token_payload boundary documentation. |
 | G01 | Retained PR offset-node, edge-probe graph. |
 | G02 | Retained PR source-to-sink contained-token and prefix edges. |
 | G03 | Retained PR forward greedy-chain construction and memoization. |
@@ -152,7 +154,7 @@ One-point NEON uses one fixed broadcast and PR's original mask packing, driver a
 | 40 | `src/search/substring/prefilter/scan/resolver/tests.rs` | `src/search/substring/scan/resolver/tests.rs`: retained PR responsibility, with required imports/names adapted. |
 | 41 | `src/search/substring/prefilter/scan/sink.rs` | Excluded candidate sink; PR `scan/resolver/` owns exact row completion. |
 | 42 | `src/search/substring/prefilter/scan/template.rs` | Excluded competing driver; PR shared mask/resolver seam retained. |
-| 43 | `src/search/substring/prefilter/scan/walk.rs` | `verify/walk.rs`: PR verifier; corrected test needle. |
+| 43 | `src/search/substring/prefilter/scan/walk.rs` | `verify/walk.rs`: PR verifier; corrected test needle; suffix check uses existing dictionary accessors with boundary tests. |
 | 44 | `src/search/substring/prefilter/scan/x86/avx2.rs` | Deferred additional x86 implementations; existing PR kernels retained. Explicit dispatch facts adopted separately. |
 | 45 | `src/search/substring/prefilter/scan/x86/avx512.rs` | Deferred additional x86 implementations; existing PR kernels retained. Explicit dispatch facts adopted separately. |
 | 46 | `src/search/substring/prefilter/scan/x86/mod.rs` | Deferred additional x86 implementations; existing PR kernels retained. Explicit dispatch facts adopted separately. |
