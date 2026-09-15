@@ -42,10 +42,9 @@
 //!   frequency.
 //! * [`prefilter_matches`] — the rows containing a pattern, collected by
 //!   running a probe cover over the code stream. Every hit is verified against
-//!   the alignment graph in the compressed domain, so the rows are exact and
-//!   each emitted row is an exact match. `prefilter_candidates` remains an alias
-//!   with the same exact behavior. Graph needles may contain up to 65,535 bytes;
-//!   standalone KMP supports up to 255 bytes.
+//!   the alignment graph in the compressed domain, so each emitted row is an
+//!   exact match. Graph needles may contain up to 65,535 bytes; standalone KMP
+//!   supports up to 255 bytes.
 //! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
 
 mod equals;
@@ -60,6 +59,6 @@ pub use lookup::prefix_range;
 pub use prefix::{PrefixQuery, starts_with};
 pub use substring::{
     ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, ProbeCover, analyze_prefilter, contains,
-    prefilter_candidates, prefilter_is_likely_profitable, prefilter_matches,
+    prefilter_is_likely_profitable, prefilter_matches,
 };
 pub use tokenize::tokenize;

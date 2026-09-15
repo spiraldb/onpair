@@ -838,29 +838,20 @@ fn split_scan_returns_exact_rows() {
     }
 }
 
-/// The old public name retains exact verification and append semantics.
+/// The public scan returns exact matches and preserves existing output.
 #[test]
-fn compatibility_alias_returns_exact_rows_and_preserves_output() {
+fn exact_scan_appends_matching_rows() {
     let col = compress_rows(&[b"appappapple", b"apple", b"", b"appapple"]);
     let view = col.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     let analysis = analyze_prefilter(b"appapple", view.dict, &frequencies, view.num_rows());
     let mut matches = vec![usize::MAX];
-    let mut alias = matches.clone();
-    prefilter_matches(
+    crate::search::prefilter_matches(
         view.codes,
         view.row_offsets,
         view.dict,
         &analysis,
         &mut matches,
     );
-    crate::search::prefilter_candidates(
-        view.codes,
-        view.row_offsets,
-        view.dict,
-        &analysis,
-        &mut alias,
-    );
     assert_eq!(matches, vec![usize::MAX, 0, 3]);
-    assert_eq!(alias, matches);
 }

@@ -18,6 +18,3 @@ pub use query::{
     prefilter_matches,
 };
 pub use verify::{ContainsTable, contains};
-
-/// Compatibility name for the exact scan, preserving the PR signature.
-pub use query::prefilter_matches as prefilter_candidates;
