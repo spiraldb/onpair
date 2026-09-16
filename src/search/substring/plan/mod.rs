@@ -61,13 +61,13 @@ pub(super) fn cheapest_cover(
         (cover, covered, ns)
     };
 
-    let narrowest = solver.solve(&graph.edges, by(ceiling + 1)).to_vec();
+    let narrowest = solver.solve(by(ceiling + 1)).to_vec();
     let mut best = price(&narrowest);
 
     let mut last: Vec<u32> = Vec::new();
     let mut lambda = 0u64;
     while lambda <= ceiling {
-        let cut = solver.solve(&graph.edges, by(lambda));
+        let cut = solver.solve(by(lambda));
         if cut == narrowest {
             break;
         }
