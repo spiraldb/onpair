@@ -38,7 +38,10 @@ fn broadcast(code: Token) -> Broadcast {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
-    let mut hit = codes.map(|codes| vceqq_u16(codes, *first));
+    let mut hit = codes;
+    for hit in &mut hit {
+        *hit = vceqq_u16(*hit, *first);
+    }
     for token in rest {
         for (hit, &codes) in hit.iter_mut().zip(&codes) {
             *hit = vorrq_u16(*hit, vceqq_u16(codes, *token));
@@ -56,7 +59,10 @@ fn broadcast(code: Token) -> Broadcast {
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
 unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
-    let mut hit = codes.map(|codes| _mm256_cmpeq_epi16(codes, *first));
+    let mut hit = codes;
+    for hit in &mut hit {
+        *hit = _mm256_cmpeq_epi16(*hit, *first);
+    }
     for token in rest {
         for (hit, &codes) in hit.iter_mut().zip(&codes) {
             *hit = _mm256_or_si256(*hit, _mm256_cmpeq_epi16(codes, *token));

@@ -43,7 +43,11 @@ pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
-    narrow(codes.map(|codes| vcleq_u16(vsubq_u16(codes, lo), width)))
+    let mut hit = codes;
+    for hit in &mut hit {
+        *hit = vcleq_u16(vsubq_u16(*hit, lo), width);
+    }
+    narrow(hit)
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
@@ -61,10 +65,12 @@ pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
 pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
-    narrow(codes.map(|codes| {
-        let inside = _mm256_sub_epi16(codes, lo);
-        _mm256_cmpeq_epi16(_mm256_min_epu16(inside, width), inside)
-    }))
+    let mut hit = codes;
+    for hit in &mut hit {
+        let inside = _mm256_sub_epi16(*hit, lo);
+        *hit = _mm256_cmpeq_epi16(_mm256_min_epu16(inside, width), inside);
+    }
+    narrow(hit)
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
