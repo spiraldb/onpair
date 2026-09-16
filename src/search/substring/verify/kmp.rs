@@ -1,37 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Compressed-domain substring search via a token-level KMP transition table.
+//! Search one encoded row using token transitions derived from byte-level KMP.
 //!
-//! Substring search (`LIKE '%pattern%'`) runs byte-level KMP, but lifted to
-//! tokens: one transition per *token*, not per byte. The transition function is
-//! precomputed once into an immutable [`ContainsDfa`]; [`row_contains`] then scans
-//! a row's codes holding the KMP state in a local — no decode, no dictionary at
-//! scan time, O(#tokens) per row.
+//! Preparation simulates each token's bytes and stores the resulting transitions
+//! in an immutable `ContainsDfa`. `row_contains` then advances one token at a
+//! time using local state, without reading the dictionary or decoding the row.
 //!
-//! The table is stored sparsely. `base[token]` is the transition from state 0
-//! (a dense array, one entry per token). For an entry state `s > 0` only a few
-//! tokens transition differently from `base`, and — because the dictionary is
-//! sorted — those tokens form a handful of contiguous [`TokenRange`]s, kept as
-//! per-state exceptions. A full `(states × tokens)` matrix would store the same
-//! function densely; the sparse form matches the data and stays small.
+//! The table stores a base transition per token, computed from state zero.
+//! Other states store only the token ranges whose transitions differ from that
+//! base. A lookup searches those ranges before falling back to the base entry.
+//!
+//! This path searches the entire row independently of the bulk scan's cover
+//! and graph walker. KMP failure links preserve overlapping partial matches;
+//! they are folded into token transitions during preparation.
 
 use crate::core::dictionary::DictionaryView;
 use crate::core::types::{Token, TokenRange};
 use crate::search::lookup::prefix_range;
 use crate::search::substring::ContainsError;
 
-/// A KMP state: the number of leading pattern bytes matched, `0..=pattern.len()`.
-/// `u8`, so the pattern is limited to 255 bytes.
+/// Number of leading pattern bytes matched, including the accepting length.
+/// The `u8` representation limits patterns to 255 bytes.
 type State = u8;
 
-/// Immutable token-level substring DFA derived from KMP for one pattern and
-/// dictionary. Stores transitions and the accepting state, with no per-row
-/// execution state. [`row_contains`] keeps its current state in a local, so this
-/// DFA can be reused across rows and shared between concurrent calls.
+/// Immutable token-transition DFA for one pattern and dictionary.
+/// Execution state lives in `row_contains`, so the prepared tables can be
+/// reused across rows and shared between concurrent calls.
 #[derive(Debug, Clone)]
 pub struct ContainsDfa {
-    /// Accept state — the pattern's byte length `m`. `0` ⇒ empty pattern.
+    /// Accepting state equal to the pattern length; zero for an empty pattern.
     accept: State,
     /// `base[token]` = KMP state after running `token`'s bytes from state 0.
     base: Vec<State>,
@@ -39,11 +37,11 @@ pub struct ContainsDfa {
     /// `sparse[offsets[s]..offsets[s + 1]]` transition to their `target` instead
     /// of `base[token]`. Ranges within a state are ascending and disjoint.
     sparse: Vec<SparseTransition>,
-    /// `offsets[s]..offsets[s + 1]` bounds state `s`'s exceptions; `len == m + 1`.
+    /// Offsets delimiting each non-accepting state's exception slice.
     offsets: Vec<u32>,
 }
 
-/// Tokens in `range` transition to `target` (overriding `base`).
+/// Token range that overrides the base transition for one entry state.
 #[derive(Debug, Clone, Copy)]
 struct SparseTransition {
     range: TokenRange,
@@ -54,10 +52,11 @@ impl ContainsDfa {
     /// Maximum pattern length, bounded by the DFA's `u8` state IDs.
     pub const MAX_PATTERN_LEN: usize = State::MAX as usize;
 
-    /// Compile the DFA for `pattern` against the sorted `dict`.
+    /// Compile token transitions for `pattern` using a sorted dictionary.
+    /// An empty pattern prepares a DFA that accepts every row, including empty rows.
     ///
     /// # Errors
-    /// Returns [`ContainsError::PatternTooLong`] if `pattern` is longer than
+    /// Returns [`ContainsError::PatternTooLong`] if the pattern exceeds
     /// [`Self::MAX_PATTERN_LEN`].
     pub fn new<V: DictionaryView>(pattern: &[u8], dict: V) -> Result<Self, ContainsError> {
         if pattern.len() > Self::MAX_PATTERN_LEN {
@@ -100,16 +99,15 @@ impl ContainsDfa {
         })
     }
 
-    /// KMP transition from `state` on `token`.
-    ///
-    /// Precondition: `state < accept` — [`row_contains`] stops at `accept`, so
-    /// `offsets[state + 1]` is in bounds.
+    /// Apply a token transition, checking this state's exceptions before the base.
+    /// Requires a valid dictionary token ID and `state < accept`; `row_contains`
+    /// stops at acceptance before another transition is needed.
     #[inline]
     fn next(&self, state: State, token: Token) -> State {
         if state > 0 {
             let lo = self.offsets[state as usize] as usize;
             let hi = self.offsets[state as usize + 1] as usize;
-            // Ranges ascending and disjoint ⇒ stop once past the token.
+            // Sorted disjoint ranges let the search stop after passing the token.
             for tr in &self.sparse[lo..hi] {
                 if token < tr.range.begin {
                     break;
@@ -123,11 +121,10 @@ impl ContainsDfa {
     }
 }
 
-/// Whether `codes` contains the pattern of `dfa` as a substring — even one that
-/// straddles token boundaries.
-///
-/// Stateless: the KMP state lives here, starting at 0 each call. Every step is a
-/// transition lookup; no dictionary and no decode. Early-exits on the first match.
+/// Whether the encoded row contains the prepared pattern.
+/// State starts at zero for each call. Token transitions account for matches
+/// inside tokens and across token boundaries; the first acceptance ends the scan.
+/// An empty pattern matches every row.
 ///
 /// # Precondition
 /// Every code is a valid token ID from the dictionary used to prepare `dfa`.
@@ -166,23 +163,24 @@ fn kmp_failure(pattern: &[u8]) -> Vec<State> {
     fail
 }
 
-/// Scratch state for building a [`ContainsDfa`].
+/// Temporary KMP simulation state used to build base and exceptional transitions.
 struct Build<'a, V> {
     dict: V,
+    /// Pattern bytes.
     p: &'a [u8],
+    /// Pattern length and accepting state.
     m: usize,
+    /// Byte-level failure links for falling back to shorter matched prefixes.
     fail: Vec<State>,
     base: Vec<State>,
     sparse: Vec<SparseTransition>,
     offsets: Vec<u32>,
-    /// Index into `sparse` where the current entry state's ranges begin (so
-    /// `emit` only merges within the state it is filling).
+    /// First exception for the current entry state, bounding adjacent-range merging.
     range_start: usize,
 }
 
 impl<V: DictionaryView> Build<'_, V> {
-    /// Run `data`'s bytes through the byte-level KMP from state `s` (the accept
-    /// state `m` is absorbing).
+    /// Simulate byte-level KMP from state `s`, retaining acceptance once reached.
     fn step_bytes(&self, mut s: State, data: &[u8]) -> State {
         for &b in data {
             if s as usize == self.m {
@@ -198,7 +196,7 @@ impl<V: DictionaryView> Build<'_, V> {
         s
     }
 
-    /// `base[t]` = state reached by running token `t`'s bytes from state 0.
+    /// Compute the state reached from zero after each complete dictionary token.
     fn base_pass(&mut self) {
         let p0 = self.p[0];
         for t in 0..self.base.len() {
@@ -229,7 +227,9 @@ impl<V: DictionaryView> Build<'_, V> {
         self.sparse.push(SparseTransition { range, target });
     }
 
-    /// Fill the sparse exceptions for every entry state `j` in `1..m`.
+    /// Record exceptions to the base table for every nonzero entry state.
+    /// Only token prefixes that can advance that state or one of its failure
+    /// states need traversal.
     fn sparse_pass(&mut self) {
         let mut relevant: Vec<u8> = Vec::new();
         for j in 1..self.m {
@@ -260,18 +260,17 @@ impl<V: DictionaryView> Build<'_, V> {
         self.offsets[self.m] = self.sparse.len() as u32;
     }
 
-    /// Walk the sorted-dictionary subtree `tr` at byte depth `depth`, tracking
-    /// the KMP state evolved from entry state j (`kmp_j`) against the one evolved
-    /// from state 0 (`kmp_0` = what `base` already records). Emits an exception
-    /// for every token where they differ. Pruned where the two states coincide.
+    /// Visit tokens sharing a prefix and compare two evolving KMP states.
+    /// `kmp_j` starts from the current entry state; `kmp_0` starts from zero.
+    /// Equal states need no exception and stop traversal of that subtree.
     fn traverse(&mut self, tr: TokenRange, depth: usize, kmp_j: State, kmp_0: State) {
         if kmp_j == kmp_0 || tr.is_empty() {
             return;
         }
         let (begin, last) = (tr.begin as usize, tr.last as usize);
 
-        // Full match from state j: it stays at the accept state through the whole
-        // subtree, so override any token whose `base` differs.
+        // Acceptance survives the remaining token bytes. Record only tokens
+        // whose complete base transition does not already accept.
         if kmp_j as usize == self.m {
             let exit = self.m as State;
             let mut i = begin;
@@ -343,6 +342,7 @@ mod tests {
     use crate::core::dictionary::Dictionary;
     use crate::{Column, DEFAULT_CONFIG, compress};
 
+    /// Compress byte rows for the DFA fixtures.
     fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
         let mut bytes = Vec::new();
         let mut offsets = vec![0u32];
@@ -353,11 +353,12 @@ mod tests {
         compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap()
     }
 
+    /// Independent byte-window oracle, including empty-pattern matches.
     fn byte_contains(hay: &[u8], needle: &[u8]) -> bool {
         needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
     }
 
-    /// Decode row `k` to bytes via the into-buffer API, for the oracle.
+    /// Decode one fixture row into bytes for the containment oracle.
     fn decode_row(view: crate::ColumnView<'_, u32>, k: usize) -> Vec<u8> {
         let mut buf =
             vec![std::mem::MaybeUninit::uninit(); view.row_decoded_len(k) + crate::DECODE_PADDING];
@@ -366,9 +367,7 @@ mod tests {
         unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) }.to_vec()
     }
 
-    /// Driving `row_contains` over every row must agree with a brute-force
-    /// decode-and-substring oracle. The table is built from both the compact and
-    /// the wide dictionary to confirm construction is representation-agnostic.
+    /// Compare row search with byte containment using compact and wide dictionaries.
     fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
         let col = compress_rows(rows);
         let view = col.view();
