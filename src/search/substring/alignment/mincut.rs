@@ -18,19 +18,19 @@
 //! # Cost
 //! Dinic is `O(V^2 E)` in the abstract, but the DAG it runs on here is small and
 //! narrow. Greedy parsing crosses the pattern a whole token at a time, so the
-//! state chain is `n / token_len` rather than `n` — the node array is indexed by
+//! state path is `n / token_len` rather than `n` — the node array is indexed by
 //! needle offset, so the offsets between are isolated — and every path leaves
 //! the source through one of at most `MAX_TOKEN_SIZE` alignments, which caps how
 //! many augmenting paths there are to find, independently of `n`. A 66-byte
 //! pattern over a 12k-token dictionary cuts in ~3us, two orders of magnitude
 //! under the dictionary pass in
-//! [`build_alignment_graph`](super::graph::build_alignment_graph) that produced
+//! [`AlignmentGraph::new`](super::graph::AlignmentGraph::new) that produced
 //! it; even a synthetic worst case of one state per byte over 1024 bytes stays
 //! near 150us. The solve is not what a plan waits on, and needs no length guard.
 
 use std::collections::VecDeque;
 
-use super::graph::{Edge, Nodes};
+use super::graph::Edge;
 
 /// The residual graph, in CSR: one allocation per array rather than one per
 /// node, since the whole arc set is known before the first push.
@@ -209,20 +209,20 @@ impl Dinic {
 /// solving it does.
 pub(in crate::search::substring) struct MinCut {
     flow: Dinic,
-    nodes: Nodes,
+    sink: usize,
     /// The cut of the last solve, as indices into the caller's edge slice.
     cut: Vec<u32>,
 }
 
 impl MinCut {
-    /// `nodes` and `edges` describe a graph with distinct source and sink,
-    /// valid endpoints, and residual arc IDs that fit in `u32`. Alignment graph
-    /// construction establishes these invariants before planning.
-    pub(in crate::search::substring) fn new(edges: &[Edge], nodes: Nodes) -> Self {
+    /// Nodes are numbered `0..node_count`, with source 0 and sink `node_count - 1`.
+    /// Requires at least two nodes, valid endpoints, and residual arc IDs that
+    /// fit in `u32`. Alignment graph construction establishes these invariants.
+    pub(in crate::search::substring) fn new(edges: &[Edge], node_count: usize) -> Self {
         let arcs: Vec<(u32, u32)> = edges.iter().map(|edge| (edge.from, edge.to)).collect();
         Self {
-            flow: Dinic::new(nodes.count(), &arcs),
-            nodes,
+            flow: Dinic::new(node_count, &arcs),
+            sink: node_count - 1,
             cut: Vec::new(),
         }
     }
@@ -256,8 +256,7 @@ impl MinCut {
             }
         }));
 
-        let (source, sink) = (self.nodes.source() as usize, self.nodes.sink() as usize);
-        self.flow.max_flow(source, sink);
+        self.flow.max_flow(0, self.sink);
 
         // `max_flow` stops on the level pass that failed to reach the sink, and
         // that pass is exactly a BFS of the residual graph from the source — so
@@ -283,10 +282,10 @@ impl MinCut {
 #[cfg(test)]
 pub(in crate::search::substring) fn min_cut(
     edges: &[Edge],
-    nodes: Nodes,
+    node_count: usize,
     weight: impl Fn(&Edge) -> u64,
 ) -> Vec<&Edge> {
-    let mut solver = MinCut::new(edges, nodes);
+    let mut solver = MinCut::new(edges, node_count);
     solver
         .solve(edges, weight)
         .iter()
@@ -297,6 +296,7 @@ pub(in crate::search::substring) fn min_cut(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::substring::alignment::graph::tests::synthetic_edge;
 
     fn by_frequency(edge: &Edge) -> u64 {
         u64::from(edge.frequency())
@@ -338,7 +338,7 @@ mod tests {
                 choices /= 5;
                 if choice != 0 {
                     let frequency = [None, Some(0), Some(1), Some(3)][choice - 1];
-                    edges.push(Edge::synthetic(from, to, frequency));
+                    edges.push(synthetic_edge(from, to, frequency));
                 }
             }
             let cuts = partition_cuts(&edges);
@@ -346,7 +346,7 @@ mod tests {
             if cuts.is_empty() {
                 continue;
             }
-            let mut solver = MinCut::new(&edges, Nodes::new(3));
+            let mut solver = MinCut::new(&edges, 4);
             for large in [false, true] {
                 let weight = |edge: &Edge| {
                     if large {
@@ -375,16 +375,13 @@ mod tests {
     fn shared_suffix_beats_two_local_choices() {
         // 0 -> 1 -(4)-> 3 -(6)-> 4  and  0 -> 2 -(4)-> 3 -(6)-> 4
         let edges = [
-            Edge::synthetic(0, 1, None),
-            Edge::synthetic(0, 2, None),
-            Edge::synthetic(1, 3, Some(4)),
-            Edge::synthetic(2, 3, Some(4)),
-            Edge::synthetic(3, 4, Some(6)),
+            synthetic_edge(0, 1, None),
+            synthetic_edge(0, 2, None),
+            synthetic_edge(1, 3, Some(4)),
+            synthetic_edge(2, 3, Some(4)),
+            synthetic_edge(3, 4, Some(6)),
         ];
-        assert_eq!(
-            steps(&min_cut(&edges, Nodes::new(4), by_frequency)),
-            vec![(3, 4)]
-        );
+        assert_eq!(steps(&min_cut(&edges, 5, by_frequency)), vec![(3, 4)]);
     }
 
     /// Two disjoint paths have to be cut on both, and a zero-weight probe is
@@ -393,32 +390,32 @@ mod tests {
     fn disjoint_paths_are_cut_separately() {
         // 0 -> 1 -(5)-> 4  and  0 -> 2 -(9)-> 3 -(0)-> 4
         let edges = [
-            Edge::synthetic(0, 1, None),
-            Edge::synthetic(1, 4, Some(5)),
-            Edge::synthetic(0, 2, None),
-            Edge::synthetic(2, 3, Some(9)),
-            Edge::synthetic(3, 4, Some(0)),
+            synthetic_edge(0, 1, None),
+            synthetic_edge(1, 4, Some(5)),
+            synthetic_edge(0, 2, None),
+            synthetic_edge(2, 3, Some(9)),
+            synthetic_edge(3, 4, Some(0)),
         ];
         assert_eq!(
-            steps(&min_cut(&edges, Nodes::new(4), by_frequency)),
+            steps(&min_cut(&edges, 5, by_frequency)),
             vec![(1, 4), (3, 4)]
         );
     }
 
     /// Depth is a property of the graph, not of any pattern length this solver
     /// gets to assume, so the DFS has to stay off the call stack. A recursive
-    /// `send` overflows well before this chain does.
+    /// `send` overflows well before this path does.
     #[test]
-    fn deep_chain_does_not_exhaust_the_stack() {
+    fn deep_path_does_not_exhaust_the_stack() {
         const LEN: u32 = 100_000;
         let mut edges: Vec<Edge> = (0..LEN - 1)
-            .map(|v| Edge::synthetic(v, v + 1, Some(7)))
+            .map(|v| synthetic_edge(v, v + 1, Some(7)))
             .collect();
         let cheapest = LEN / 2;
-        edges[cheapest as usize] = Edge::synthetic(cheapest, cheapest + 1, Some(3));
+        edges[cheapest as usize] = synthetic_edge(cheapest, cheapest + 1, Some(3));
 
         assert_eq!(
-            steps(&min_cut(&edges, Nodes::new(LEN as usize - 1), by_frequency)),
+            steps(&min_cut(&edges, LEN as usize, by_frequency)),
             vec![(cheapest, cheapest + 1)]
         );
     }

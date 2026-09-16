@@ -6,3 +6,4 @@
 pub(in crate::search::substring) mod cover;
 pub(in crate::search::substring) mod graph;
 pub(in crate::search::substring) mod mincut;
+pub(in crate::search::substring) mod starts;

@@ -23,7 +23,7 @@
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{Token, TokenRange};
-use crate::search::substring::alignment::graph::{AlignmentGraph, ProbeSet};
+use crate::search::substring::alignment::graph::{AlignmentGraph, EdgeKind};
 
 const SOURCE: u32 = 0;
 
@@ -171,30 +171,29 @@ impl Walk {
     /// Flattens `graph`. Every graph the planner builds has a walk:
     /// `ContainsScan::new` caps the needle so its node ids fit an [`Edge`].
     pub(in crate::search::substring) fn from_graph(graph: &AlignmentGraph, needle: &[u8]) -> Self {
-        let mut nodes = vec![Node::default(); graph.nodes.count()];
+        let mut nodes = vec![Node::default(); graph.node_count()];
         let mut token_edges: Vec<(Token, Edge)> = Vec::new();
         for edge in &graph.edges {
             let (from, to) = (edge.from, edge.to);
             let compiled_edge = Edge::new(from, to);
-            match edge.probe() {
-                ProbeSet::Point(token) => {
+            match edge.kind() {
+                EdgeKind::Single(token) => {
                     let token = *token;
                     let node = &mut nodes[from as usize];
                     node.greedy_step = Some((token, to));
                     token_edges.push((token, compiled_edge));
                 }
-                ProbeSet::Range(range) => {
+                EdgeKind::Range(range) => {
                     nodes[from as usize].terminal_range = Some(*range);
                     token_edges
                         .extend((range.begin..=range.last).map(|token| (token, compiled_edge)));
                 }
-                // An enumerated set holds every token that can enter `to`,
-                // so its members in the token table answer the entry test on
-                // their own and the node needs no prefix.
-                ProbeSet::Set(ids) => {
+                // Enumerated entries cover both partial and whole matches;
+                // the token table resolves either without a suffix check.
+                EdgeKind::Set(ids) => {
                     token_edges.extend(ids.iter().map(|&token| (token, compiled_edge)));
                 }
-                ProbeSet::SetTooBig => {
+                EdgeKind::UnenumeratedSet => {
                     // Unenumerated entry edges run from the source to an
                     // alignment inside the first token, at most 15 bytes in.
                     nodes[to as usize].entry = Some(NeedlePrefix::new(&needle[..to as usize]));
@@ -300,7 +299,7 @@ mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
     use crate::search::index::build_token_frequency_index;
-    use crate::search::substring::alignment::graph::build_alignment_graph;
+    use crate::search::substring::alignment::graph::AlignmentGraph;
     use crate::search::tokenize;
 
     #[test]
@@ -389,7 +388,7 @@ mod tests {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
         let frequencies = build_token_frequency_index(&codes, dict.num_tokens()).unwrap();
-        let graph = build_alignment_graph(dict, needle, frequencies.as_view()).unwrap();
+        let graph = AlignmentGraph::new(dict, needle, frequencies.as_view()).unwrap();
         let walk = Walk::from_graph(&graph, needle);
         for (row, text) in rows.iter().enumerate() {
             let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);
@@ -480,9 +479,8 @@ mod tests {
         );
     }
 
-    /// More than `PROBE_SET_SIZE_LIMIT` tokens end with `g`, so the planner never
-    /// enumerates alignment 1's set, and the entry is answered off the
-    /// dictionary as every entry is.
+    /// More than 16 tokens end with `g`, so the one-byte overlap is unenumerated
+    /// and the walker checks the token suffix directly.
     #[test]
     fn entry_through_a_set() {
         let tails: Vec<Vec<u8>> = (b'a'..=b'z').map(|b| vec![b, b'g']).collect();

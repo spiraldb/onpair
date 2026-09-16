@@ -49,7 +49,7 @@ pub use alignment::cover::ProbeCover;
 pub use error::ContainsError;
 pub use verify::{ContainsDfa, row_contains};
 
-use alignment::graph::build_alignment_graph;
+use alignment::graph::AlignmentGraph;
 use plan::facts::RegionFacts;
 use verify::walk::Walk;
 
@@ -136,7 +136,7 @@ impl ContainsScan {
                 matches_all: true,
             });
         }
-        let graph = build_alignment_graph(dict, pattern, frequencies.as_view())?;
+        let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
         let region = RegionFacts {
             code_count: frequencies.total_frequency() as usize,
             row_count,

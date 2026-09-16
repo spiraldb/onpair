@@ -1,45 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The compiled probe cover: what the scan compares codes against.
+//! Token IDs selected as probes for substring scanning.
 //!
-//! A cover carries the token ids in the two shapes the kernels compare against:
-//! points, tested for equality, and inclusive ranges, tested as unsigned
-//! `>= lo && <= hi`.
+//! Selected graph edges contribute single IDs, ranges, or explicit sets.
+//! Normalization combines them into sorted points and inclusive ranges,
+//! merging overlaps and adjacent IDs without changing the covered tokens.
 
+use super::graph::{Edge, EdgeKind};
 use crate::core::types::{Token, TokenRange};
 
-/// A sound probe cover over dictionary token ids.
+/// Token IDs that the scanner searches for.
 ///
-/// Sound means every row containing the pattern holds at least one covered
-/// token, so a scan for these ids drops no true match. Nothing here enforces
-/// that — it is established by whoever selects the ids.
+/// The planner chooses a cover that intersects every source-to-sink path
+/// in the alignment graph. Every matching row must therefore contain a
+/// covered token, but a probe hit still needs verification.
 #[derive(Debug, Clone)]
 pub struct ProbeCover {
+    /// Individual token IDs.
     pub(in crate::search::substring) points: Vec<Token>,
+    /// Inclusive ranges of token IDs.
     pub(in crate::search::substring) ranges: Vec<TokenRange>,
 }
 
 impl ProbeCover {
-    /// Equality probes issued for every SIMD vector.
+    /// Token IDs tested for equality.
     pub fn points(&self) -> &[Token] {
         &self.points
     }
 
-    /// Inclusive range probes issued for every SIMD vector.
+    /// Inclusive ranges of token IDs.
     pub fn ranges(&self) -> &[TokenRange] {
         &self.ranges
     }
 
-    /// Whether the cover names no token id.
+    /// Whether the cover contains no token IDs.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.points.is_empty() && self.ranges.is_empty()
     }
 
-    /// Merge runs that overlap or abut, then file single-id runs as points and
-    /// the rest as ranges. Input may be in any order. The planner reaches this
-    /// through [`from_edge_cut`](Self::from_edge_cut), defined beside the graph.
+    /// Normalize inclusive ranges into points and ranges.
+    ///
+    /// Input may be unsorted and contain duplicates. Overlapping and adjacent
+    /// ranges are merged; ranges containing one ID become points.
+    /// For example, `[10, 20]` and `[15, 30]` become `[10, 30]`.
     pub(in crate::search::substring) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
         runs.sort_unstable_by_key(|run| run.begin);
         let mut merged: Vec<TokenRange> = Vec::with_capacity(runs.len());
@@ -57,14 +62,35 @@ impl ProbeCover {
         Self { points, ranges }
     }
 
-    /// Points and ranges as given. Ranges must be disjoint.
+    /// Build a normalized cover from selected graph edges.
+    ///
+    /// Requires a cut that intersects every source-to-sink path and contains
+    /// no unenumerated sets. The cut solver establishes these conditions.
+    pub(in crate::search::substring) fn from_edge_cut(cut: &[&Edge]) -> Self {
+        let point = |id: Token| TokenRange {
+            begin: id,
+            last: id,
+        };
+        let mut runs = Vec::with_capacity(cut.len());
+        for edge in cut {
+            match edge.kind() {
+                EdgeKind::Single(id) => runs.push(point(*id)),
+                EdgeKind::Range(range) => runs.push(*range),
+                EdgeKind::Set(ids) => runs.extend(ids.iter().map(|&id| point(id))),
+                // Unenumerated sets have no IDs to collect and cannot be cut.
+                EdgeKind::UnenumeratedSet => {}
+            }
+        }
+        Self::from_runs(runs)
+    }
+
+    /// Build a test cover without normalization. Ranges must be disjoint.
     #[cfg(test)]
     pub(in crate::search::substring) fn new(points: Vec<Token>, ranges: Vec<TokenRange>) -> Self {
         Self { points, ranges }
     }
 
-    /// Whether the cover names `code`. The test oracles ask; the kernels
-    /// never do, they probe the whole vector.
+    /// Check membership of one token ID for test oracles.
     #[cfg(test)]
     pub fn contains(&self, code: Token) -> bool {
         self.points.contains(&code) || self.ranges.iter().any(|range| range.contains(code))

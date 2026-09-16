@@ -48,11 +48,11 @@ pub(super) fn cheapest_cover(
     // For lambda <= F + 1, total finite capacity is therefore below 2^51.
     let by = |lambda: u64| {
         move |edge: &Edge| {
-            let (points, ranges) = edge.shape();
-            u64::from(edge.frequency()) + lambda * u64::from(points + 2 * ranges)
+            let comparisons = edge.point_count() + 2 * edge.range_count();
+            u64::from(edge.frequency()) + lambda * u64::from(comparisons)
         }
     };
-    let mut solver = MinCut::new(&graph.edges, graph.nodes);
+    let mut solver = MinCut::new(&graph.edges, graph.node_count());
     let price = |cut: &[u32]| {
         let edges: Vec<&Edge> = cut.iter().map(|&at| &graph.edges[at as usize]).collect();
         let cover = ProbeCover::from_edge_cut(&edges);

@@ -5,11 +5,9 @@
 //! Matcher, resolver, walker and min-cut algorithms have their own unit tests.
 
 use super::alignment::cover::ProbeCover;
-use super::alignment::graph::{
-    AlignmentGraph, Edge, PROBE_SET_SIZE_LIMIT, PROBE_SET_SIZE_LIMIT_K1, alignment_candidates,
-    build_alignment_graph,
-};
+use super::alignment::graph::{AlignmentGraph, Edge};
 use super::alignment::mincut::min_cut;
+use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
 use super::plan::cost::scan_ns;
 use super::plan::facts::RegionFacts;
 use super::plan::{cheapest_cover, cover_frequency};
@@ -48,57 +46,16 @@ fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-/// Compare the payload sweep against independent per-token searches.
-fn check_candidates(dict: CompactDictionaryView<'_>, needle: &[u8]) {
-    let tokens: Vec<_> = (0..dict.num_tokens())
-        .map(|id| (id as Token, dict.token(id as Token)))
-        .collect();
-    let candidates = alignment_candidates(dict, needle);
-    let contained: Vec<_> = tokens
-        .iter()
-        .filter(|(_, token)| !token.starts_with(needle) && byte_contains(token, needle))
-        .map(|&(id, _)| id)
-        .collect();
-    assert_eq!(candidates.contained, contained, "contained: {needle:?}");
-
-    for k in 1..needle.len().min(MAX_TOKEN_SIZE) {
-        let expected: Vec<_> = tokens
-            .iter()
-            .filter(|(_, token)| token.len() > k && token.ends_with(&needle[..k]))
-            .map(|&(id, _)| id)
-            .collect();
-        let limit = if k == 1 {
-            PROBE_SET_SIZE_LIMIT_K1
-        } else {
-            PROBE_SET_SIZE_LIMIT
-        };
-        let count = if expected.len() > limit {
-            PROBE_SET_SIZE_LIMIT + 1
-        } else {
-            expected.len()
-        };
-        assert_eq!(candidates.first.count[k], count, "entry {k}: {needle:?}");
-        // Above the cap, only the recorded prefix and overflow marker matter.
-        let retained = expected.len().min(if k == 1 { limit + 1 } else { limit });
-        let start = k * PROBE_SET_SIZE_LIMIT;
-        assert_eq!(
-            candidates.first.ids[start..start + retained],
-            expected[..retained],
-            "entry {k}: {needle:?}"
-        );
-    }
-}
-
 fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: impl Fn(&Edge) -> bool) -> bool {
-    let mut adjacency = vec![Vec::new(); graph.nodes.count()];
+    let mut adjacency = vec![Vec::new(); graph.node_count()];
     for edge in &graph.edges {
         adjacency[edge.from as usize].push(edge);
     }
-    let mut seen = vec![false; graph.nodes.count()];
-    let mut stack = vec![graph.nodes.source() as usize];
-    seen[graph.nodes.source() as usize] = true;
+    let mut seen = vec![false; graph.node_count()];
+    let mut stack = vec![0];
+    seen[0] = true;
     while let Some(node) = stack.pop() {
-        if node == graph.nodes.sink() as usize {
+        if node == graph.sink() as usize {
             return true;
         }
         for edge in &adjacency[node] {
@@ -114,8 +71,8 @@ fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: impl Fn(&Edge) -> bo
 
 /// Builder guarantees relied on by the infallible cut solver and walker.
 fn check_graph(view: ColumnView<'_, u32>, frequencies: &TokenFrequencyIndex, needle: &[u8]) {
-    let graph = build_alignment_graph(view.dict, needle, frequencies.as_view()).unwrap();
-    assert_eq!(graph.nodes.count(), needle.len() + 1);
+    let graph = AlignmentGraph::new(view.dict, needle, frequencies.as_view()).unwrap();
+    assert_eq!(graph.node_count(), needle.len() + 1);
     assert!(graph.edges.len() <= 2 * needle.len() + MAX_TOKEN_SIZE);
     assert!(
         graph
@@ -148,7 +105,7 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
             .filter_map(|(row, bytes)| byte_contains(bytes, pattern).then_some(row))
             .collect();
         if !pattern.is_empty() {
-            check_candidates(view.dict, pattern);
+            check_starts(view.dict, pattern);
             check_graph(view, &frequencies, pattern);
         }
         let scan = ContainsScan::new(pattern, view.dict, &frequencies, rows.len()).unwrap();
@@ -354,22 +311,9 @@ fn boundary_match_with_a_maximal_first_token_is_covered() {
     let column = compress_rows(&rows);
     let dict = column.view().dict;
     let needle = b"klmnopabcdefghijklmnop";
-    // Internal entry alignments stop at 15 bytes; this needs the source chain.
+    // Internal entry alignments stop at 15 bytes; this needs the source path.
     assert!((0..dict.num_tokens()).any(|id| dict.token(id as Token) == &needle[..MAX_TOKEN_SIZE]));
     check(column.view(), &rows, &[needle]);
-}
-
-#[test]
-fn contained_token_sweep_handles_adjacent_payload_matches() {
-    // Payload-only fixture: `a|baba` has `aba` at offsets 0 and 2. Rejecting the
-    // cross-token hit at 0 must not skip the contained hit at 2.
-    let mut bytes = b"ababa".to_vec();
-    bytes.resize(5 + MAX_TOKEN_SIZE, 0);
-    let dict = CompactDictionaryView::validate_safety(&bytes, &[0u32, 1, 5]).unwrap();
-    assert_eq!(alignment_candidates(dict, b"aba").contained, [1]);
-    for pattern in [b"a".as_slice(), b"ba", b"aba"] {
-        check_candidates(dict, pattern);
-    }
 }
 
 #[test]
@@ -488,8 +432,8 @@ fn sweep_cost_does_not_exceed_the_frequency_cut() {
         b".com/page",
         b"https://www.example.com",
     ] {
-        let graph = build_alignment_graph(view.dict, pattern, freq).unwrap();
-        let cut = min_cut(&graph.edges, graph.nodes, |edge| {
+        let graph = AlignmentGraph::new(view.dict, pattern, freq).unwrap();
+        let cut = min_cut(&graph.edges, graph.node_count(), |edge| {
             u64::from(edge.frequency())
         });
         let baseline = ProbeCover::from_edge_cut(&cut);
@@ -512,7 +456,7 @@ fn planner_capacity_bound_fits_u64() {
     let dictionary_size = u128::from(Token::MAX) + 1;
     let edges = 2 * n + MAX_TOKEN_SIZE as u128;
     let comparisons =
-        3 * n + (MAX_TOKEN_SIZE - 1) as u128 * PROBE_SET_SIZE_LIMIT as u128 + dictionary_size;
+        3 * n + (MAX_TOKEN_SIZE - 1) as u128 * MAX_ENUMERATED_TOKENS as u128 + dictionary_size;
     let finite_capacity = edges * frequency + comparisons * (frequency + 1);
     assert!(finite_capacity < u128::from(u64::MAX));
 }
