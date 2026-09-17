@@ -1,323 +1,226 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Minimum-weight edge cuts of an alignment graph.
+//! Minimum-weight cuts of an alignment graph.
 //!
-//! A cut intersects every source-to-sink path, so its tokens form a sound
-//! probe cover. The planner supplies edge weights and compares the resulting
-//! covers using the scan cost model.
+//! Removing the source and sink leaves a forest: each internal node has
+//! at most one outgoing internal edge. Source and terminal edges become
+//! costs of placing a node on either side of the cut.
 //!
-//! Dinic's algorithm finds the cut through maximum flow. Each graph edge has
-//! a forward arc and a reverse arc that can undo earlier flow. Unenumerated
-//! edges receive a capacity larger than any finite cut, so they stay uncut.
-//! The solver reuses its topology and buffers when the planner changes weights.
+//! A forward pass combines subtree costs. A backward pass assigns sides,
+//! preferring the sink side on ties. Edges leaving the source side form
+//! the cut, returned in their original order.
 
-use std::collections::VecDeque;
+use super::graph::{AlignmentGraph, Edge};
 
-use super::graph::Edge;
-
-/// Residual graph and scratch buffers for Dinic's maximum-flow algorithm.
-///
-/// Outgoing arcs occupy contiguous slices of shared arrays. `arc_offsets` locates
-/// each node's slice; `reverse` links each arc to its reverse.
-struct Dinic {
-    /// Row starts, `num_nodes + 1` entries; node `v` owns `arc_offsets[v]..arc_offsets[v + 1]`.
-    arc_offsets: Vec<u32>,
-    /// Endpoint of each arc.
-    to: Vec<u32>,
-    /// Index of each reverse arc, whose capacity increases when flow is sent.
-    reverse: Vec<u32>,
-    /// Residual capacity of each arc.
-    capacity: Vec<u64>,
-    /// BFS distance from the source, or `-1` for nodes outside the level graph.
-    level: Vec<i32>,
-    /// First outgoing arc still worth trying in the current level graph.
-    next_arc: Vec<u32>,
-    /// Forward arc for each original edge, used to reload its weight.
-    forward: Vec<u32>,
-    /// Reusable queue for breadth-first traversal.
-    queue: VecDeque<usize>,
-    /// Arcs on the current source-to-node path, replacing recursive DFS.
-    path: Vec<u32>,
-}
-
-impl Dinic {
-    /// Allocate the residual topology from `(from, to)` edges.
-    /// Each edge gets a reverse arc. `refill` supplies capacities before solving.
-    fn new(num_nodes: usize, arcs: impl ExactSizeIterator<Item = (u32, u32)> + Clone) -> Self {
-        let mut arc_offsets = vec![0u32; num_nodes + 1];
-        for (from, to) in arcs.clone() {
-            arc_offsets[from as usize + 1] += 1;
-            arc_offsets[to as usize + 1] += 1;
-        }
-        for v in 0..num_nodes {
-            arc_offsets[v + 1] += arc_offsets[v];
-        }
-
-        let slots = arcs.len() * 2;
-        let mut cursor = arc_offsets.clone();
-        let mut edge_to = vec![0u32; slots];
-        let mut reverse = vec![0u32; slots];
-        let mut forward = vec![0u32; arcs.len()];
-        for ((from, to), forward_arc) in arcs.zip(&mut forward) {
-            let fwd = cursor[from as usize];
-            cursor[from as usize] += 1;
-            let rev = cursor[to as usize];
-            cursor[to as usize] += 1;
-            edge_to[fwd as usize] = to;
-            reverse[fwd as usize] = rev;
-            edge_to[rev as usize] = from;
-            reverse[rev as usize] = fwd;
-            *forward_arc = fwd;
-        }
-
-        Self {
-            arc_offsets,
-            to: edge_to,
-            reverse,
-            capacity: vec![0u64; slots],
-            level: vec![-1; num_nodes],
-            next_arc: vec![0; num_nodes],
-            forward,
-            queue: VecDeque::new(),
-            path: Vec::new(),
-        }
-    }
-
-    /// Reset forward capacities from edge weights and clear all reverse capacities.
-    fn refill(&mut self, capacities: impl Iterator<Item = u64>) {
-        self.capacity.fill(0);
-        for (at, capacity) in capacities.enumerate() {
-            self.capacity[self.forward[at] as usize] = capacity;
-        }
-    }
-
-    /// Find each node's distance from the source through positive-capacity arcs.
-    /// Returns whether the sink is reachable. On the final failed search,
-    /// nonnegative levels identify the source side of the minimum cut.
-    fn build_levels(&mut self, source: usize, sink: usize) -> bool {
-        self.level.fill(-1);
-        self.level[source] = 0;
-        self.queue.clear();
-        self.queue.push_back(source);
-        while let Some(v) = self.queue.pop_front() {
-            for arc in self.arc_offsets[v] as usize..self.arc_offsets[v + 1] as usize {
-                let to = self.to[arc] as usize;
-                if self.capacity[arc] > 0 && self.level[to] < 0 {
-                    self.level[to] = self.level[v] + 1;
-                    self.queue.push_back(to);
-                }
-            }
-        }
-        self.level[sink] >= 0
-    }
-
-    /// Send flow until no source-to-sink path remains in the current level graph.
-    /// An explicit path buffer keeps call-stack usage independent of graph depth.
-    fn blocking_flow(&mut self, source: usize, sink: usize) {
-        self.next_arc
-            .copy_from_slice(&self.arc_offsets[..self.level.len()]);
-
-        let mut path = std::mem::take(&mut self.path);
-        path.clear();
-        let mut node = source;
-        loop {
-            if node == sink {
-                // Source and sink differ, so the path is non-empty. Record the
-                // first minimum: that arc will be saturated by this augment.
-                let mut bottleneck = u64::MAX;
-                let mut saturated = 0;
-                for (at, &arc) in path.iter().enumerate() {
-                    let capacity = self.capacity[arc as usize];
-                    if capacity < bottleneck {
-                        bottleneck = capacity;
-                        saturated = at;
-                    }
-                }
-                for &arc in &path {
-                    self.capacity[arc as usize] -= bottleneck;
-                    self.capacity[self.reverse[arc as usize] as usize] += bottleneck;
-                }
-
-                // Resume before the first saturated arc. The earlier path
-                // still has capacity and can be reused.
-                node = self.to[self.reverse[path[saturated] as usize] as usize] as usize;
-                path.truncate(saturated);
-                continue;
-            }
-
-            // Follow arcs with capacity that advance exactly one BFS level.
-            let end = self.arc_offsets[node + 1];
-            while self.next_arc[node] < end {
-                let arc = self.next_arc[node] as usize;
-                if self.capacity[arc] > 0
-                    && self.level[self.to[arc] as usize] == self.level[node] + 1
-                {
-                    break;
-                }
-                self.next_arc[node] += 1;
-            }
-
-            if self.next_arc[node] < end {
-                let arc = self.next_arc[node];
-                path.push(arc);
-                node = self.to[arc as usize] as usize;
-            } else if let Some(arc) = path.pop() {
-                // This node cannot reach the sink in the current level graph.
-                self.level[node] = -1;
-                node = self.to[self.reverse[arc as usize] as usize] as usize;
-            } else {
-                self.path = path;
-                return;
-            }
-        }
-    }
-
-    /// Repeat level searches and blocking flows until the sink is unreachable.
-    /// The final levels are retained for cut extraction.
-    fn max_flow(&mut self, source: usize, sink: usize) {
-        while self.build_levels(source, sink) {
-            self.blocking_flow(source, sink);
-        }
-    }
-}
-
-/// A cut solver reusable with different weights on the same graph.
-/// The edge slice is borrowed for the lifetime of the solver.
-/// Each solve resets capacities and reuses the residual topology and buffers.
+/// A cut solver reusable with different weights on the same alignment graph.
+/// Each solve takes linear time and reuses the topology and scratch buffers.
 pub(in crate::search::substring) struct MinCut<'g> {
-    flow: Dinic,
     edges: &'g [Edge],
-    sink: usize,
-    /// The cut of the last solve, as indices into the borrowed edge slice.
+    /// Internal nodes incident to edges, in increasing needle-offset order.
+    active: Vec<usize>,
+    /// Next internal node, or the sink for a forest root. Zero means unused.
+    parent: Vec<usize>,
+    /// Weight of the internal edge to the parent; zero for forest roots.
+    parent_weight: Vec<i64>,
+    /// Cost of choosing the source side minus the cost of choosing the sink
+    /// side. Forced assignments are represented separately.
+    delta: Vec<i64>,
+    /// An unenumerated source edge prevents placing this node on the sink side.
+    forced_source: Vec<bool>,
+    /// Node assignments reconstructed by the latest solve.
+    source_side: Vec<bool>,
+    /// Selected edge indices, in original edge order.
     cut: Vec<u32>,
 }
 
 impl<'g> MinCut<'g> {
-    /// Nodes are numbered `0..node_count`, with source 0 and sink `node_count - 1`.
-    /// Requires at least two nodes, valid endpoints, and residual arc IDs that
-    /// fit in `u32`. Alignment graph construction establishes these invariants.
-    pub(in crate::search::substring) fn new(edges: &'g [Edge], node_count: usize) -> Self {
+    /// Record the topology once and allocate reusable buffers.
+    ///
+    /// Alignment construction guarantees forward edges, at most one internal
+    /// successor per node, and unenumerated edges only from the source to an
+    /// internal node. Nodes are needle offsets, with source 0 and sink last.
+    pub(in crate::search::substring) fn new(graph: &'g AlignmentGraph) -> Self {
+        let node_count = graph.node_count();
+        let sink = graph.sink() as usize;
+        let mut parent = vec![0; node_count];
+        let mut forced_source = vec![false; node_count];
+
+        for edge in &graph.edges {
+            let from = edge.from as usize;
+            let to = edge.to as usize;
+
+            // Mark incident internal nodes. Until a continuation is found,
+            // treat each as a root with a zero-cost virtual edge to the sink.
+            if from != 0 && parent[from] == 0 {
+                parent[from] = sink;
+            }
+            if to != sink && parent[to] == 0 {
+                parent[to] = sink;
+            }
+
+            if !edge.cuttable() {
+                forced_source[to] = true;
+            } else if from != 0 && to != sink {
+                parent[from] = to;
+            }
+        }
+
+        let active = parent
+            .iter()
+            .enumerate()
+            .filter_map(|(node, &next)| (next != 0).then_some(node))
+            .collect();
+
         Self {
-            flow: Dinic::new(node_count, edges.iter().map(|edge| (edge.from, edge.to))),
-            edges,
-            sink: node_count - 1,
+            edges: &graph.edges,
+            active,
+            parent,
+            parent_weight: vec![0; node_count],
+            delta: vec![0; node_count],
+            forced_source,
+            source_side: vec![false; node_count],
             cut: Vec::new(),
         }
     }
 
-    /// The cheapest set of cuttable edges whose removal disconnects the source
-    /// from the sink, as ascending indices into the edges supplied at construction.
-    /// `weight` prices cutting one edge and is consulted for cuttable edges only.
+    /// Return the cheapest cut as ascending indices into the graph's edges.
+    /// Among equal-cost cuts, choose the inclusion-minimal source side.
     ///
-    /// Every source-to-sink path must include a cuttable edge, and the sum of
-    /// finite weights plus one must fit in `u64`. The alignment builder and
-    /// planner guarantee these bounds.
-    /// `weight` must return the same value for an edge throughout this solve.
+    /// Weights must be nonnegative, with their sum fitting in `i64`.
+    /// The planner's existing bounds put that sum below 2^51.
+    /// Only cuttable edges are passed to `weight`.
     pub(in crate::search::substring) fn solve(&mut self, weight: impl Fn(&Edge) -> u64) -> &[u32] {
-        let edges = self.edges;
-        // More expensive than all cuttable edges together, so no minimum
-        // cut needs an edge whose token IDs are unenumerated.
-        let finite_sum: u64 = edges
-            .iter()
-            .filter(|edge| edge.cuttable())
-            .map(&weight)
-            .sum();
-        let infinite = finite_sum + 1;
-        self.flow.refill(edges.iter().map(|edge| {
-            if edge.cuttable() {
-                weight(edge)
+        let sink = self.parent.len() - 1;
+
+        // Source edges charge the sink side; terminal edges charge the source
+        // side. Internal edge weights are used when combining subtrees.
+        // Direct source-to-sink costs accumulate at the sink and do not affect
+        // assignments: those edges must be cut regardless.
+        self.delta.fill(0);
+        for edge in self.edges.iter().filter(|edge| edge.cuttable()) {
+            let from = edge.from as usize;
+            let to = edge.to as usize;
+            let cost = weight(edge) as i64;
+
+            if from == 0 {
+                self.delta[to] -= cost;
+            } else if to == sink {
+                self.delta[from] += cost;
             } else {
-                infinite
+                self.parent_weight[from] = cost;
             }
-        }));
+        }
 
-        self.flow.max_flow(0, self.sink);
+        // Children have smaller offsets than their parents. Moving a parent
+        // to the source side can save at most the connecting edge's weight;
+        // a child forced to the source side always saves that whole weight.
+        for &node in &self.active {
+            let edge_cost = self.parent_weight[node];
+            let contribution = if self.forced_source[node] {
+                -edge_cost
+            } else {
+                self.delta[node].min(0).max(-edge_cost)
+            };
+            self.delta[self.parent[node]] += contribution;
+        }
 
-        // The final BFS already marks nodes reachable from the source.
-        // Edges leaving that set form the cut; no extra traversal is needed.
+        // Parents are assigned first. Choosing the source side also pays
+        // for the outgoing edge when the parent belongs to the sink side.
+        self.source_side[0] = true;
+        self.source_side[sink] = false;
+        for &node in self.active.iter().rev() {
+            let threshold = if self.source_side[self.parent[node]] {
+                0
+            } else {
+                -self.parent_weight[node]
+            };
+            self.source_side[node] = self.forced_source[node] || self.delta[node] < threshold;
+        }
+
+        // Direct source-to-sink edges are included automatically.
         self.cut.clear();
         self.cut
-            .extend(edges.iter().enumerate().filter_map(|(at, edge)| {
+            .extend(self.edges.iter().enumerate().filter_map(|(index, edge)| {
                 (edge.cuttable()
-                    && self.flow.level[edge.from as usize] >= 0
-                    && self.flow.level[edge.to as usize] < 0)
-                    .then_some(at as u32)
+                    && self.source_side[edge.from as usize]
+                    && !self.source_side[edge.to as usize])
+                    .then_some(index as u32)
             }));
         &self.cut
     }
 }
 
-/// Build a solver for one test cut and return references to the selected edges.
-#[cfg(test)]
-pub(in crate::search::substring) fn min_cut(
-    edges: &[Edge],
-    node_count: usize,
-    weight: impl Fn(&Edge) -> u64,
-) -> Vec<&Edge> {
-    let mut solver = MinCut::new(edges, node_count);
-    solver
-        .solve(weight)
-        .iter()
-        .map(|&at| &edges[at as usize])
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::substring::alignment::graph::tests::synthetic_edge;
-
-    fn by_frequency(edge: &Edge) -> u64 {
-        u64::from(edge.frequency())
-    }
+    use crate::search::substring::alignment::graph::tests::{synthetic_edge, synthetic_graph};
 
     /// Return cut endpoints in edge order for readable test expectations.
-    fn steps(cut: &[&Edge]) -> Vec<(u32, u32)> {
-        cut.iter().map(|edge| (edge.from, edge.to)).collect()
-    }
-
-    /// All finite cuts of a four-node graph, with source 0 and sink 3.
-    fn partition_cuts(edges: &[Edge]) -> Vec<Vec<u32>> {
-        (1..8u32)
-            .step_by(2)
-            .map(|side| {
-                edges
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(at, edge)| {
-                        (side & (1 << edge.from) != 0 && side & (1 << edge.to) == 0)
-                            .then_some(at as u32)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|cut| cut.iter().all(|&at| edges[at as usize].cuttable()))
+    fn cut_steps(graph: &AlignmentGraph) -> Vec<(u32, u32)> {
+        MinCut::new(graph)
+            .solve(|edge| u64::from(edge.frequency()))
+            .iter()
+            .map(|&at| (graph.edges[at as usize].from, graph.edges[at as usize].to))
             .collect()
     }
 
-    /// Check all four-node DAGs over absent, uncuttable, and three weighted edges.
-    /// Reuse each solver with weights above `u32::MAX` to check capacity handling.
+    /// Enumerate all partitions and intersect the optimal source sides.
+    /// This checks both optimality and tie-breaking independently of the DP.
+    fn exhaustive_cut(graph: &AlignmentGraph, weight: impl Fn(&Edge) -> u64) -> Vec<u32> {
+        let mut best = u64::MAX;
+        let mut common = u64::MAX;
+        'partitions: for interior in 0..1u64 << (graph.node_count() - 2) {
+            let side = 1 | (interior << 1);
+            let mut cost = 0;
+            for edge in &graph.edges {
+                if side & (1 << edge.from) != 0 && side & (1 << edge.to) == 0 {
+                    if !edge.cuttable() {
+                        continue 'partitions;
+                    }
+                    cost += weight(edge);
+                }
+            }
+            if cost < best {
+                best = cost;
+                common = side;
+            } else if cost == best {
+                common &= side;
+            }
+        }
+        graph
+            .edges
+            .iter()
+            .enumerate()
+            .filter_map(|(at, edge)| {
+                (common & (1 << edge.from) != 0 && common & (1 << edge.to) == 0)
+                    .then_some(at as u32)
+            })
+            .collect()
+    }
+
+    /// Four-node alignment forests with absent, forbidden, zero and weighted
+    /// edges. Reuse each solver with changing weights, including above u32::MAX.
     #[test]
     fn cuts_agree_with_exhaustive_partitions() {
         const ARCS: [(u32, u32); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
-        for configuration in 0..5usize.pow(ARCS.len() as u32) {
+        'graphs: for configuration in 0..5usize.pow(ARCS.len() as u32) {
             let mut choices = configuration;
             let mut edges = Vec::new();
             for (from, to) in ARCS {
                 let choice = choices % 5;
                 choices /= 5;
+                if choice == 1 && (from != 0 || to == 3) {
+                    continue 'graphs;
+                }
                 if choice != 0 {
                     let frequency = [None, Some(0), Some(1), Some(3)][choice - 1];
                     edges.push(synthetic_edge(from, to, frequency));
                 }
             }
-            let cuts = partition_cuts(&edges);
-            // An all-uncuttable path violates the alignment builder's contract.
-            if cuts.is_empty() {
-                continue;
-            }
-            let mut solver = MinCut::new(&edges, 4);
-            for large in [false, true] {
+            let graph = synthetic_graph(4, edges);
+            let mut solver = MinCut::new(&graph);
+            for large in [false, true, false] {
                 let weight = |edge: &Edge| {
                     if large {
                         (1u64 << 32) + u64::from(u32::MAX - edge.frequency())
@@ -325,16 +228,11 @@ mod tests {
                         u64::from(edge.frequency())
                     }
                 };
-                let cost = |cut: &[u32]| -> u64 {
-                    cut.iter().map(|&at| weight(&edges[at as usize])).sum()
-                };
-                let cut = solver.solve(weight);
-                // Membership proves both disconnection and finite probe coverage.
-                assert!(
-                    cuts.iter().any(|c| c == cut),
+                assert_eq!(
+                    solver.solve(weight),
+                    exhaustive_cut(&graph, weight),
                     "graph={configuration}, large={large}"
                 );
-                assert_eq!(cost(cut), cuts.iter().map(|c| cost(c)).min().unwrap());
             }
         }
     }
@@ -342,47 +240,62 @@ mod tests {
     /// Cut a shared suffix once for 6 instead of two separate branches for 4 + 4.
     #[test]
     fn shared_suffix_beats_two_local_choices() {
-        // 0 -> 1 -(4)-> 3 -(6)-> 4  and  0 -> 2 -(4)-> 3 -(6)-> 4
-        let edges = [
-            synthetic_edge(0, 1, None),
-            synthetic_edge(0, 2, None),
-            synthetic_edge(1, 3, Some(4)),
-            synthetic_edge(2, 3, Some(4)),
-            synthetic_edge(3, 4, Some(6)),
-        ];
-        assert_eq!(steps(&min_cut(&edges, 5, by_frequency)), vec![(3, 4)]);
+        let graph = synthetic_graph(
+            5,
+            vec![
+                synthetic_edge(0, 1, None),
+                synthetic_edge(0, 2, None),
+                synthetic_edge(1, 3, Some(4)),
+                synthetic_edge(2, 3, Some(4)),
+                synthetic_edge(3, 4, Some(6)),
+            ],
+        );
+        assert_eq!(cut_steps(&graph), vec![(3, 4)]);
     }
 
     /// Separate paths both need a cut, including a path with a zero-weight edge.
     #[test]
     fn disjoint_paths_are_cut_separately() {
-        // 0 -> 1 -(5)-> 4  and  0 -> 2 -(9)-> 3 -(0)-> 4
-        let edges = [
-            synthetic_edge(0, 1, None),
-            synthetic_edge(1, 4, Some(5)),
-            synthetic_edge(0, 2, None),
-            synthetic_edge(2, 3, Some(9)),
-            synthetic_edge(3, 4, Some(0)),
-        ];
-        assert_eq!(
-            steps(&min_cut(&edges, 5, by_frequency)),
-            vec![(1, 4), (3, 4)]
+        let graph = synthetic_graph(
+            5,
+            vec![
+                synthetic_edge(0, 1, None),
+                synthetic_edge(1, 4, Some(5)),
+                synthetic_edge(0, 2, None),
+                synthetic_edge(2, 3, Some(9)),
+                synthetic_edge(3, 4, Some(0)),
+            ],
         );
+        assert_eq!(cut_steps(&graph), vec![(1, 4), (3, 4)]);
+    }
+
+    /// Cutting an internal continuation does not cover a parallel terminal path.
+    /// Direct source-to-sink edges are mandatory; unused offsets are harmless.
+    #[test]
+    fn terminal_edges_are_charged_alongside_internal_edges() {
+        let graph = synthetic_graph(
+            5,
+            vec![
+                synthetic_edge(0, 1, None),
+                synthetic_edge(1, 2, Some(2)),
+                synthetic_edge(1, 4, Some(5)),
+                synthetic_edge(2, 4, Some(3)),
+                synthetic_edge(0, 4, Some(7)),
+            ],
+        );
+        assert_eq!(cut_steps(&graph), vec![(1, 2), (1, 4), (0, 4)]);
     }
 
     /// A long path exercises the iterative solver without growing the call stack.
     #[test]
     fn deep_path_does_not_exhaust_the_stack() {
-        const LEN: u32 = 100_000;
-        let mut edges: Vec<Edge> = (0..LEN - 1)
+        const NODES: u32 = u16::MAX as u32 + 1;
+        let mut edges: Vec<Edge> = (0..NODES - 1)
             .map(|v| synthetic_edge(v, v + 1, Some(7)))
             .collect();
-        let cheapest = LEN / 2;
+        let cheapest = NODES / 2;
         edges[cheapest as usize] = synthetic_edge(cheapest, cheapest + 1, Some(3));
-
-        assert_eq!(
-            steps(&min_cut(&edges, LEN as usize, by_frequency)),
-            vec![(cheapest, cheapest + 1)]
-        );
+        let graph = synthetic_graph(NODES as usize, edges);
+        assert_eq!(cut_steps(&graph), vec![(cheapest, cheapest + 1)]);
     }
 }

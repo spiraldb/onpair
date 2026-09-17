@@ -5,8 +5,8 @@
 //! Matcher, resolver, walker and min-cut algorithms have their own unit tests.
 
 use super::alignment::cover::ProbeCover;
-use super::alignment::graph::{AlignmentGraph, Edge};
-use super::alignment::mincut::min_cut;
+use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
+use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
 use super::plan::cost::scan_ns;
 use super::plan::facts::RegionFacts;
@@ -84,6 +84,19 @@ fn check_graph(view: ColumnView<'_, u32>, frequencies: &TokenFrequencyIndex, nee
         !sink_reachable_avoiding(&graph, Edge::cuttable),
         "a path has no probe: {needle:?}"
     );
+    let mut has_successor = vec![false; graph.node_count()];
+    for edge in &graph.edges {
+        if edge.from != 0 && edge.to != graph.sink() {
+            assert!(matches!(edge.kind(), EdgeKind::Single(_)));
+            assert!(!std::mem::replace(
+                &mut has_successor[edge.from as usize],
+                true
+            ));
+        }
+        if !edge.cuttable() {
+            assert!(edge.from == 0 && edge.to != graph.sink());
+        }
+    }
     for edge in graph.edges.iter().filter(|edge| edge.cuttable()) {
         let cover = ProbeCover::from_edge_cut(&[edge]);
         let matched = view
@@ -433,9 +446,12 @@ fn sweep_cost_does_not_exceed_the_frequency_cut() {
         b"https://www.example.com",
     ] {
         let graph = AlignmentGraph::new(view.dict, pattern, freq).unwrap();
-        let cut = min_cut(&graph.edges, graph.node_count(), |edge| {
-            u64::from(edge.frequency())
-        });
+        let mut solver = MinCut::new(&graph);
+        let cut: Vec<&Edge> = solver
+            .solve(|edge| u64::from(edge.frequency()))
+            .iter()
+            .map(|&at| &graph.edges[at as usize])
+            .collect();
         let baseline = ProbeCover::from_edge_cut(&cut);
         let baseline_ns = scan_ns(caps, &baseline, cover_frequency(&baseline, freq), region);
         let (cover, covered, ns) = cheapest_cover(&graph, freq, region, caps);
@@ -449,7 +465,7 @@ fn sweep_cost_does_not_exceed_the_frequency_cut() {
 }
 
 #[test]
-fn planner_capacity_bound_fits_u64() {
+fn planner_weight_bound_fits_signed_differences() {
     // Calculate in u128 so a future limit increase fails instead of overflowing.
     let n = ContainsScan::MAX_PATTERN_LEN as u128;
     let frequency = u128::from(u32::MAX);
@@ -458,5 +474,6 @@ fn planner_capacity_bound_fits_u64() {
     let comparisons =
         3 * n + (MAX_TOKEN_SIZE - 1) as u128 * MAX_ENUMERATED_TOKENS as u128 + dictionary_size;
     let finite_capacity = edges * frequency + comparisons * (frequency + 1);
-    assert!(finite_capacity < u128::from(u64::MAX));
+    assert!(finite_capacity < 1u128 << 51);
+    assert!(finite_capacity < i64::MAX as u128);
 }

@@ -79,8 +79,11 @@ impl Edge {
 ///
 /// A needle of `n` bytes has `n + 1` logical nodes and at most
 /// `2n + MAX_TOKEN_SIZE` edges. Explicit token lists have separate storage.
+/// Edges advance to larger offsets. Each internal node has at most one internal
+/// successor, plus a possible terminal range to the sink. Removing the source
+/// and sink therefore leaves a forest, which the cut solver relies on.
 pub(in crate::search::substring) struct AlignmentGraph {
-    /// Parse steps in construction order, which also breaks minimum-cut ties.
+    /// Parse steps in construction order, also used to order selected cut edges.
     pub(in crate::search::substring) edges: Vec<Edge>,
     needle_len: usize,
 }
@@ -109,7 +112,7 @@ impl AlignmentGraph {
         builder.build_path(0)?;
 
         // Build each remaining path before its source edge to preserve the
-        // edge order used to break minimum-cut ties.
+        // construction order used by cut output and verification.
         for length in 1..needle.len().min(MAX_TOKEN_SIZE) {
             let Some(kind) = starts.overlap(length) else {
                 continue;
@@ -247,6 +250,17 @@ impl GraphBuilder<'_, '_, '_> {
 pub(super) mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
+
+    /// Test graph; callers supply edges satisfying the alignment topology.
+    pub(in crate::search::substring::alignment) fn synthetic_graph(
+        node_count: usize,
+        edges: Vec<Edge>,
+    ) -> AlignmentGraph {
+        AlignmentGraph {
+            edges,
+            needle_len: node_count - 1,
+        }
+    }
 
     /// Test edge; `None` makes it uncuttable.
     pub(in crate::search::substring::alignment) fn synthetic_edge(

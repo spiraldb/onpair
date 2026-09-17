@@ -52,7 +52,7 @@ pub(super) fn cheapest_cover(
             u64::from(edge.frequency()) + lambda * u64::from(comparisons)
         }
     };
-    let mut solver = MinCut::new(&graph.edges, graph.node_count());
+    let mut solver = MinCut::new(graph);
     let price = |cut: &[u32]| {
         let edges: Vec<&Edge> = cut.iter().map(|&at| &graph.edges[at as usize]).collect();
         let cover = ProbeCover::from_edge_cut(&edges);
