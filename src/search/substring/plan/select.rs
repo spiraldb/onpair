@@ -13,10 +13,7 @@
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherConfig, MatcherKind, PER_BATCH};
-use super::cost::{COVER_HIT_PENALTY, matcher_cost};
-
-/// Codes in the pair of mask words tested together before packing.
-const PACK_GROUP: f64 = 128.0;
+use super::cost::{candidate_cost, matcher_cost, packing_cost_delta};
 
 /// Whether this matcher is eligible for selection on the supplied target and cover.
 /// The caller supplies an available instruction set. Nibble batches are limited to
@@ -97,27 +94,14 @@ pub(in crate::search::substring) fn select_matcher_config(
     let kind = select_matcher(isa, cover);
     MatcherConfig {
         kind,
-        skip_empty_packing: kind != MatcherKind::Table && should_skip_packing(isa, probe_density),
+        skip_empty_packing: kind != MatcherKind::Table
+            && packing_cost_delta(isa, probe_density) < 0.0,
     }
-}
-
-/// Whether testing for empty groups is expected to save packing work.
-/// Balances a reduction on every group against packing saved on empty groups.
-/// `density` is the estimated fraction of codes covered by the probes.
-fn should_skip_packing(isa: Isa, density: f64) -> bool {
-    let (reduction, pack) = match isa {
-        // AVX-512 already produces a mask: skipping the pack only adds work.
-        Isa::Avx512Bw => (0.35, 0.0),
-        _ => (0.75, 1.01),
-    };
-    // Poisson estimate of empty groups. Clustered hits can change the savings.
-    let no_match = (-PACK_GROUP * density).exp();
-    (reduction - pack * no_match) / PACK_GROUP < 0.0
 }
 
 /// Rank normalized covers for the same indexed stream. Lower is better.
 ///
-/// `cost = code_count * matcher_cost + covered_frequency * COVER_HIT_PENALTY`.
+/// `cost = code_count * matcher_cost + candidate_cost(covered_frequency)`.
 ///
 /// Scanning pays the lowest eligible matcher cost for every token code.
 /// Candidate processing pays a fixed penalty per covered occurrence to
@@ -142,7 +126,7 @@ pub(in crate::search::substring) fn cover_cost(
     }
     let matcher = select_matcher(isa, cover);
     let scanning = f64::from(code_count) * matcher_cost(isa, matcher, cover);
-    let candidate_processing = f64::from(covered_frequency) * COVER_HIT_PENALTY;
+    let candidate_processing = candidate_cost(isa, covered_frequency);
     scanning + candidate_processing
 }
 
@@ -224,7 +208,7 @@ mod tests {
         let partial = probe_density(1, 400, 399);
         assert_eq!(whole, 1.0 / 400.0);
         assert_eq!(partial, 0.0);
-        assert!(!should_skip_packing(Isa::Neon, whole));
-        assert!(should_skip_packing(Isa::Neon, partial));
+        assert!(packing_cost_delta(Isa::Neon, whole) >= 0.0);
+        assert!(packing_cost_delta(Isa::Neon, partial) < 0.0);
     }
 }
