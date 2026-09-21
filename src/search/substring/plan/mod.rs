@@ -9,11 +9,11 @@
 //! Execution chooses mask packing separately for the selected cover.
 //!
 //! The types below describe planning inputs and results. `select` chooses eligible
-//! matchers and mask packing using the formulas in `cost`. Neither performs CPU
-//! detection or scanning.
+//! matchers using the formulas in `score` and chooses mask packing separately.
+//! Neither performs CPU detection or scanning.
 //! Frequencies guide these choices but never remove tokens from a cover.
 
-mod cost;
+mod score;
 mod select;
 
 use super::ProbeCover;
@@ -24,7 +24,7 @@ use crate::search::index::TokenFrequencyIndexView;
 pub(super) use select::supports_matcher;
 pub(super) use select::{probe_density, score_cover, select_matcher_config};
 
-/// Instruction-set family used for kernel selection and cost coefficients.
+/// Instruction-set family used for kernel selection and ranking weights.
 /// Production callers use the family returned by `scan::detect_isa`;
 /// planning tests can supply any family without executing its kernels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

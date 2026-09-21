@@ -12,8 +12,11 @@
 //! lowest eligible matcher score and a fixed penalty per covered token occurrence.
 
 use super::super::{ProbeCover, scan::PER_BATCH};
-use super::cost::{COVER_HIT_PENALTY, matcher_score, should_skip_packing};
+use super::score::{COVER_HIT_PENALTY, matcher_score};
 use super::{Isa, MatcherConfig, MatcherKind};
+
+/// Codes in the pair of mask words tested together before packing.
+const PACK_GROUP: f64 = 128.0;
 
 /// Whether this matcher supports the cover shape on the supplied target.
 /// The caller supplies an available instruction set. Nibble batches are limited to
@@ -96,6 +99,20 @@ pub(in crate::search::substring) fn select_matcher_config(
         kind,
         skip_empty_packing: kind != MatcherKind::Table && should_skip_packing(isa, probe_density),
     }
+}
+
+/// Whether testing for empty groups is expected to save packing work.
+/// Balances a reduction on every group against packing saved on empty groups.
+/// `density` is the estimated fraction of codes covered by the probes.
+fn should_skip_packing(isa: Isa, density: f64) -> bool {
+    let (reduction, pack) = match isa {
+        // AVX-512 already produces a mask: skipping the pack only adds work.
+        Isa::Avx512Bw => (0.35, 0.0),
+        _ => (0.75, 1.01),
+    };
+    // Poisson estimate of empty groups. Clustered hits can change the savings.
+    let no_match = (-PACK_GROUP * density).exp();
+    (reduction - pack * no_match) / PACK_GROUP < 0.0
 }
 
 /// Heuristic for comparing candidate covers for the same scan. Lower is better.

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Scores for cover and matcher ranking, plus the mask-packing decision.
+//! Relative scores for cover and matcher ranking.
 //!
 //! Cover ranking combines a matcher score with a fixed penalty per probe hit.
 //! Matcher weights depend on the instruction set and cover shape. They retain
 //! the scale of the original timing measurements and serve as relative weights;
 //! the resulting cover score is not a prediction of query latency.
 //!
-//! Mask packing uses a separate heuristic based on expected hit density.
-//! `select` compares eligible matchers and applies the packing decision.
+//! `select` compares eligible matchers and chooses mask packing separately.
 //! Measured and extrapolated weights are identified below.
 
 use super::super::{ProbeCover, scan::PER_BATCH};
@@ -87,23 +86,6 @@ fn avx512bw(matcher: MatcherKind, cover: &ProbeCover) -> f64 {
         MatcherKind::NibbleN8 => 0.0270 + 0.0141 * batches + 0.0119 * r,
         MatcherKind::Range => 0.0085 + 0.0112 * r,
     }
-}
-
-/// Codes in the pair of mask words tested together before packing.
-const PACK_GROUP: f64 = 128.0;
-
-/// Whether testing for empty groups is expected to save packing work.
-/// Balances a reduction on every group against packing saved on empty groups.
-/// `density` is the estimated fraction of codes covered by the probes.
-pub(in crate::search::substring) fn should_skip_packing(isa: Isa, density: f64) -> bool {
-    let (reduction, pack) = match isa {
-        // AVX-512 already produces a mask: skipping the pack only adds work.
-        Isa::Avx512Bw => (0.35, 0.0),
-        _ => (0.75, 1.01),
-    };
-    // Poisson estimate of empty groups. Clustered hits can change the savings.
-    let no_match = (-PACK_GROUP * density).exp();
-    (reduction - pack * no_match) / PACK_GROUP < 0.0
 }
 
 /// Ranking penalty per covered token occurrence, on the matcher-score scale.
