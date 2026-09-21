@@ -81,7 +81,7 @@ impl ContainsScan {
     pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
 
     /// Prepare an exact substring scan for `pattern` using the dictionary and index.
-    /// Select the sampled probe cover with the lowest ranking score and compile
+    /// Select the sampled probe cover with the lowest relative cost and compile
     /// the alignment walker used to verify its hits.
     ///
     /// This constructor prepares the checks and reports their frequency;

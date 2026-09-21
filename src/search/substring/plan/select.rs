@@ -4,16 +4,16 @@
 //! Select matcher configurations from cover shape, hit density, and instruction set.
 //!
 //! First restrict matchers to supported cover shapes, then compare their
-//! relative scores. Estimated hit density determines whether empty groups skip
+//! relative costs. Estimated hit density determines whether empty groups skip
 //! mask packing. `scan::dispatch` prepares and executes the selected matcher;
 //! selection performs no scanning or feature detection.
 //!
-//! During preparation, `score_cover` ranks candidate covers using the
-//! lowest eligible matcher score and a fixed penalty per covered token occurrence.
+//! During preparation, `cover_cost` ranks candidate covers using the
+//! lowest eligible matcher cost and a fixed penalty per covered token occurrence.
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherConfig, MatcherKind, PER_BATCH};
-use super::score::{COVER_HIT_PENALTY, matcher_score};
+use super::cost::{COVER_HIT_PENALTY, matcher_cost};
 
 /// Codes in the pair of mask words tested together before packing.
 const PACK_GROUP: f64 = 128.0;
@@ -43,21 +43,21 @@ pub(in crate::search::substring) fn is_eligible(
     }
 }
 
-/// Choose the eligible matcher with the lowest per-code score.
-/// The scalar table is always eligible; equal scores retain the earlier choice.
+/// Choose the eligible matcher with the lowest per-code cost.
+/// The scalar table is always eligible; equal costs retain the earlier choice.
 pub(super) fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     let mut best = MatcherKind::Table;
-    let mut best_score = matcher_score(isa, best, cover);
+    let mut best_cost = matcher_cost(isa, best, cover);
 
     for matcher in [MatcherKind::EqOr, MatcherKind::Range, MatcherKind::NibbleN8] {
         if !is_eligible(isa, matcher, cover) {
             continue;
         }
 
-        let score = matcher_score(isa, matcher, cover);
-        if score.total_cmp(&best_score).is_lt() {
+        let cost = matcher_cost(isa, matcher, cover);
+        if cost.total_cmp(&best_cost).is_lt() {
             best = matcher;
-            best_score = score;
+            best_cost = cost;
         }
     }
 
@@ -115,22 +115,35 @@ fn should_skip_packing(isa: Isa, density: f64) -> bool {
     (reduction - pack * no_match) / PACK_GROUP < 0.0
 }
 
-/// Heuristic for comparing candidate covers for the same scan. Lower is better.
-/// Combines the per-code matcher score with a fixed penalty per covered occurrence.
-/// The mask-packing policy is chosen separately at execution.
-/// An empty cover or index scores zero; callers handle empty patterns separately.
-pub(in crate::search::substring) fn score_cover(
+/// Rank normalized covers for the same indexed stream. Lower is better.
+///
+/// `cost = code_count * matcher_cost + covered_frequency * COVER_HIT_PENALTY`.
+///
+/// Scanning pays the lowest eligible matcher cost for every token code.
+/// Candidate processing pays a fixed penalty per covered occurrence to
+/// approximate row lookup and exact verification.
+///
+/// `code_count` is the index's total token count. `covered_frequency` counts
+/// occurrences of the cover's tokens in that same index, with each token
+/// position counted once after cover normalization.
+///
+/// The cost expresses relative work: verification lengths vary, and successful
+/// rows skip later hits. Preparation costs and the separately selected
+/// mask-packing policy are excluded.
+/// An empty cover or index has zero cost; callers handle empty patterns separately.
+pub(in crate::search::substring) fn cover_cost(
     isa: Isa,
     cover: &ProbeCover,
-    covered: u32,
+    covered_frequency: u32,
     code_count: u32,
 ) -> f64 {
     if cover.is_empty() || code_count == 0 {
         return 0.0;
     }
     let matcher = select_matcher(isa, cover);
-    let scan_score = matcher_score(isa, matcher, cover);
-    f64::from(code_count) * scan_score + f64::from(covered) * COVER_HIT_PENALTY
+    let scanning = f64::from(code_count) * matcher_cost(isa, matcher, cover);
+    let candidate_processing = f64::from(covered_frequency) * COVER_HIT_PENALTY;
+    scanning + candidate_processing
 }
 
 #[cfg(test)]

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Relative scores for cover and matcher ranking.
+//! Relative costs for cover and matcher selection.
 //!
-//! Cover ranking combines a matcher score with a fixed penalty per probe hit.
+//! Cover selection combines a matcher cost with a fixed penalty per probe hit.
 //! Matcher weights depend on the instruction set and cover shape. They retain
 //! the scale of the original timing measurements and serve as relative weights;
-//! the resulting cover score is not a prediction of query latency.
+//! the resulting cover cost is not a prediction of query latency.
 //!
 //! `select` compares eligible matchers and chooses mask packing separately.
 //! Measured and extrapolated weights are identified below.
@@ -14,10 +14,10 @@
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherKind, PER_BATCH};
 
-/// Relative matcher score per token code. Lower is preferred.
-/// Covers use the same scale when combining this score with the hit penalty.
-/// Empty-group packing is chosen separately and does not affect this score.
-pub(in crate::search::substring) fn matcher_score(
+/// Relative matcher cost per token code. Lower is preferred.
+/// Covers use the same scale when combining this cost with the hit penalty.
+/// Empty-group packing is chosen separately and does not affect this cost.
+pub(in crate::search::substring) fn matcher_cost(
     isa: Isa,
     matcher: MatcherKind,
     cover: &ProbeCover,
@@ -88,8 +88,8 @@ fn avx512bw(matcher: MatcherKind, cover: &ProbeCover) -> f64 {
     }
 }
 
-/// Ranking penalty per covered token occurrence, on the matcher-score scale.
+/// Penalty per covered token occurrence, on the matcher-cost scale.
 /// Represents row lookup and verification work with one fixed weight.
-/// The tested weight is 2048 times the NEON one-point score of 0.0187.
+/// The tested weight is 2048 times the NEON one-point cost of 0.0187.
 /// Keep it fixed across targets; it is independent of the cut-generation lambda.
 pub(super) const COVER_HIT_PENALTY: f64 = 2048.0 * 0.0187;

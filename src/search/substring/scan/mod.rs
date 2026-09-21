@@ -11,7 +11,7 @@
 //! `dispatch` connects the configuration to a concrete matcher. `matcher` owns token
 //! membership checks; `resolver` owns row lookup and duplicate suppression.
 //! This module defines the instruction sets and matcher configurations;
-//! `plan` selects a configuration using cover scores and hit density.
+//! `plan` selects a configuration using cover costs and hit density.
 //! Empty patterns and covers are handled by `ContainsScan::scan`, before this module.
 
 mod dispatch;

@@ -8,7 +8,7 @@ use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
-use super::plan::{score_cover, select_cover};
+use super::plan::{cover_cost, select_cover};
 use super::scan::{BLOCK, detect_isa};
 use super::{ContainsDfa, ContainsError, ContainsScan};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -460,7 +460,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
 }
 
 #[test]
-fn sweep_score_does_not_exceed_the_frequency_cut() {
+fn sweep_cost_does_not_exceed_the_frequency_cut() {
     let corpus = crate::test_corpus::user_strings(200);
     let rows: Vec<&[u8]> = corpus.iter().map(|row| row.as_bytes()).collect();
     let column = compress_rows(&rows);
@@ -483,13 +483,13 @@ fn sweep_score_does_not_exceed_the_frequency_cut() {
                 .iter()
                 .map(|&at| &graph.edges[at as usize]),
         );
-        let baseline_score = score_cover(isa, &baseline, baseline.frequency(freq), code_count);
+        let baseline_cost = cover_cost(isa, &baseline, baseline.frequency(freq), code_count);
         let (cover, covered) = select_cover(&graph, freq, isa);
         assert_eq!(covered, cover.frequency(freq));
-        let score = score_cover(isa, &cover, covered, code_count);
+        let cost = cover_cost(isa, &cover, covered, code_count);
         assert!(
-            score <= baseline_score,
-            "{pattern:?}: sweep {score} against {baseline_score}"
+            cost <= baseline_cost,
+            "{pattern:?}: sweep {cost} against {baseline_cost}"
         );
     }
 }
