@@ -34,7 +34,7 @@
 //! compilation. `alignment` owns the graph and cut solver; `plan` prices and
 //! selects covers and matcher configurations using explicit facts and capabilities.
 //! `scan` produces hits and resolves rows, calling the exact verifier in
-//! `verify::walk`. Profitability remains a caller decision.
+//! `verify::walk`.
 
 mod alignment;
 mod error;
