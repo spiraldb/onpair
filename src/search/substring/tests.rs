@@ -9,7 +9,7 @@ use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
 use super::plan::{score_cover, select_cover};
-use super::scan::{BLOCK, detect_target_caps};
+use super::scan::{BLOCK, detect_isa};
 use super::{ContainsDfa, ContainsError, ContainsScan};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
@@ -468,7 +468,7 @@ fn sweep_score_does_not_exceed_the_frequency_cut() {
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     let freq = frequencies.as_view();
     let code_count = freq.total_frequency();
-    let caps = detect_target_caps();
+    let isa = detect_isa();
     for pattern in [
         b"e".as_slice(),
         b"://",
@@ -483,10 +483,10 @@ fn sweep_score_does_not_exceed_the_frequency_cut() {
                 .iter()
                 .map(|&at| &graph.edges[at as usize]),
         );
-        let baseline_score = score_cover(caps, &baseline, baseline.frequency(freq), code_count);
-        let (cover, covered) = select_cover(&graph, freq, caps);
+        let baseline_score = score_cover(isa, &baseline, baseline.frequency(freq), code_count);
+        let (cover, covered) = select_cover(&graph, freq, isa);
         assert_eq!(covered, cover.frequency(freq));
-        let score = score_cover(caps, &cover, covered, code_count);
+        let score = score_cover(isa, &cover, covered, code_count);
         assert!(
             score <= baseline_score,
             "{pattern:?}: sweep {score} against {baseline_score}"

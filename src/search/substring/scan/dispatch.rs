@@ -12,7 +12,7 @@
 //! Runtime detection enables the compiled family when supported; otherwise
 //! selection uses the scalar table. Other architectures use the table too.
 
-use super::super::plan::{Isa, MatcherConfig, TargetCaps, VectorMatcher};
+use super::super::plan::{Isa, MatcherConfig, VectorMatcher};
 use super::matcher::{self, Matcher};
 use super::{Check, both_stages};
 use crate::core::offset::Offset;
@@ -117,9 +117,9 @@ pub(super) fn run<O: Offset>(
     }
 }
 
-/// Detect whether the kernel family compiled into this build is available.
+/// Return the compiled kernel family supported by this CPU, or the scalar fallback.
 /// AVX-512 requires compile-time enablement as well as runtime CPU support.
-pub(in crate::search::substring) fn detect_target_caps() -> TargetCaps {
+pub(in crate::search::substring) fn detect_isa() -> Isa {
     #[cfg(target_arch = "aarch64")]
     let isa = Isa::Neon;
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
@@ -137,5 +137,5 @@ pub(in crate::search::substring) fn detect_target_caps() -> TargetCaps {
     };
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let isa = Isa::Scalar;
-    TargetCaps { isa }
+    isa
 }

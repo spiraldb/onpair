@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Select matcher configurations from cover shape, hit density, and CPU capabilities.
+//! Select matcher configurations from cover shape, hit density, and instruction set.
 //!
 //! First restrict matchers to supported cover shapes, then compare their
 //! relative scores. Estimated hit density determines whether empty groups skip
@@ -13,17 +13,17 @@
 
 use super::super::{ProbeCover, scan::PER_BATCH};
 use super::cost::{COVER_HIT_PENALTY, matcher_score, should_skip_packing};
-use super::{Isa, MatcherConfig, MatcherKind, TargetCaps, VectorMatcher};
+use super::{Isa, MatcherConfig, MatcherKind, VectorMatcher};
 
 /// Whether this matcher supports the cover shape on the supplied target.
-/// The caller supplies available capabilities. Nibble batches are limited to
+/// The caller supplies an available instruction set. Nibble batches are limited to
 /// two on AVX2 and three on NEON or AVX-512 to bound register use.
 pub(in crate::search::substring) fn supports_matcher(
-    caps: TargetCaps,
+    isa: Isa,
     matcher: MatcherKind,
     cover: &ProbeCover,
 ) -> bool {
-    let vector = caps.isa != Isa::Scalar;
+    let vector = isa != Isa::Scalar;
     match matcher {
         MatcherKind::Table => true,
         MatcherKind::EqOr => vector && cover.n_points() > 0,
@@ -32,7 +32,7 @@ pub(in crate::search::substring) fn supports_matcher(
             vector
                 && cover.n_points() > 0
                 && cover.n_points().div_ceil(PER_BATCH)
-                    <= match caps.isa {
+                    <= match isa {
                         Isa::Avx2 => 2,
                         _ => 3,
                     }
@@ -42,20 +42,20 @@ pub(in crate::search::substring) fn supports_matcher(
 
 /// Choose the eligible matcher with the lowest per-code score.
 /// The scalar table is always eligible; equal scores retain the earlier choice.
-pub(super) fn select_matcher(caps: TargetCaps, cover: &ProbeCover) -> MatcherKind {
+pub(super) fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     let mut best = MatcherKind::Table;
-    let mut best_score = matcher_score(caps.isa, best, cover);
+    let mut best_score = matcher_score(isa, best, cover);
 
     for matcher in [
         MatcherKind::EqOr,
         MatcherKind::Range,
         MatcherKind::NibbleN8K,
     ] {
-        if !supports_matcher(caps, matcher, cover) {
+        if !supports_matcher(isa, matcher, cover) {
             continue;
         }
 
-        let score = matcher_score(caps.isa, matcher, cover);
+        let score = matcher_score(isa, matcher, cover);
         if score.total_cmp(&best_score).is_lt() {
             best = matcher;
             best_score = score;
@@ -92,14 +92,14 @@ pub(in crate::search::substring) fn probe_density(
 /// An empty cover needs no kernel. The caller supplies the estimated hit density
 /// and handles empty code and row buffers before selection.
 pub(in crate::search::substring) fn select_matcher_config(
-    caps: TargetCaps,
+    isa: Isa,
     cover: &ProbeCover,
     probe_density: f64,
 ) -> MatcherConfig {
     if cover.is_empty() {
         return MatcherConfig::Empty;
     }
-    let kind = select_matcher(caps, cover);
+    let kind = select_matcher(isa, cover);
     let matcher = match kind {
         MatcherKind::Table => return MatcherConfig::Table,
         MatcherKind::EqOr => VectorMatcher::EqOr,
@@ -108,8 +108,8 @@ pub(in crate::search::substring) fn select_matcher_config(
             batches: cover.n_points().div_ceil(PER_BATCH),
         },
     };
-    let skip = should_skip_packing(caps.isa, probe_density);
-    match caps.isa {
+    let skip = should_skip_packing(isa, probe_density);
+    match isa {
         Isa::Neon => MatcherConfig::Neon { matcher, skip },
         Isa::Avx2 => MatcherConfig::Avx2 { matcher, skip },
         Isa::Avx512Bw => MatcherConfig::Avx512Bw { matcher, skip },
@@ -122,7 +122,7 @@ pub(in crate::search::substring) fn select_matcher_config(
 /// The mask-packing policy is chosen separately at execution.
 /// An empty cover or index scores zero; callers handle empty patterns separately.
 pub(in crate::search::substring) fn score_cover(
-    caps: TargetCaps,
+    isa: Isa,
     cover: &ProbeCover,
     covered: u32,
     code_count: u32,
@@ -130,8 +130,8 @@ pub(in crate::search::substring) fn score_cover(
     if cover.is_empty() || code_count == 0 {
         return 0.0;
     }
-    let matcher = select_matcher(caps, cover);
-    let scan_score = matcher_score(caps.isa, matcher, cover);
+    let matcher = select_matcher(isa, cover);
+    let scan_score = matcher_score(isa, matcher, cover);
     f64::from(code_count) * scan_score + f64::from(covered) * COVER_HIT_PENALTY
 }
 
@@ -157,7 +157,7 @@ mod tests {
     fn empty_covers_do_not_require_a_kernel() {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
             assert_eq!(
-                select_matcher_config(TargetCaps { isa }, &cover(0, 0), 0.0),
+                select_matcher_config(isa, &cover(0, 0), 0.0),
                 MatcherConfig::Empty
             );
         }
@@ -173,11 +173,7 @@ mod tests {
         ] {
             for points in 0..=32 {
                 assert_eq!(
-                    supports_matcher(
-                        TargetCaps { isa },
-                        MatcherKind::NibbleN8K,
-                        &cover(points, 0)
-                    ),
+                    supports_matcher(isa, MatcherKind::NibbleN8K, &cover(points, 0)),
                     points > 0 && points <= limit
                 );
             }
@@ -189,8 +185,7 @@ mod tests {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
             for points in 0..=32 {
                 for ranges in 0..=4 {
-                    let config =
-                        select_matcher_config(TargetCaps { isa }, &cover(points, ranges), 0.01);
+                    let config = select_matcher_config(isa, &cover(points, ranges), 0.01);
                     match config {
                         MatcherConfig::Empty => assert_eq!((points, ranges), (0, 0)),
                         MatcherConfig::Table => {}

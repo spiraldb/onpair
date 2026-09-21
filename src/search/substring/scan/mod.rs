@@ -24,7 +24,7 @@ use super::verify::walk::Walk;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-pub(super) use dispatch::detect_target_caps;
+pub(super) use dispatch::detect_isa;
 use matcher::Matcher;
 pub(super) use matcher::PER_BATCH;
 use resolver::Resolver;
@@ -93,7 +93,7 @@ pub(super) fn scan<O: Offset>(
     let input = ScanInput::new(codes, row_offsets, cover);
     execute_check(
         select_matcher_config(
-            detect_target_caps(),
+            detect_isa(),
             cover,
             probe_density(covered_frequency, codes.len(), codes.len()),
         ),

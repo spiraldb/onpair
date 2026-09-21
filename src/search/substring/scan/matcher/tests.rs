@@ -45,7 +45,7 @@ fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
 
 /// Compare an eligible matcher with the independent mask oracle.
 fn agrees<M: Matcher>(kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
-    if !supports_matcher(detect_target_caps(), kind, cover) {
+    if !supports_matcher(detect_isa(), kind, cover) {
         return;
     }
     assert_eq!(
@@ -125,7 +125,7 @@ fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) 
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn eq_or_without_points_checks_ranges() {
-    if detect_target_caps().isa == Isa::Scalar {
+    if detect_isa() == Isa::Scalar {
         return;
     }
     let codes = block();
@@ -407,4 +407,4 @@ fn padding_makes_no_candidate() {
 }
 
 use crate::search::substring::plan::supports_matcher;
-use crate::search::substring::scan::detect_target_caps;
+use crate::search::substring::scan::detect_isa;

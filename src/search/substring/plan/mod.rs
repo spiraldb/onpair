@@ -25,6 +25,8 @@ pub(super) use select::supports_matcher;
 pub(super) use select::{probe_density, score_cover, select_matcher_config};
 
 /// Instruction-set family used for kernel selection and cost coefficients.
+/// Production callers use the family returned by `scan::detect_isa`;
+/// planning tests can supply any family without executing its kernels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // Some variants are only constructed on other build targets.
 pub(super) enum Isa {
@@ -32,13 +34,6 @@ pub(super) enum Isa {
     Neon,
     Avx2,
     Avx512Bw,
-}
-
-/// A kernel family compiled into this build and supported by the CPU.
-/// Dispatch detects production capabilities; planning tests can supply them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct TargetCaps {
-    pub(super) isa: Isa,
 }
 
 /// Matcher families considered during selection.
@@ -81,7 +76,7 @@ pub(super) enum MatcherConfig {
 pub(super) fn select_cover(
     graph: &AlignmentGraph,
     frequencies: TokenFrequencyIndexView<'_>,
-    caps: TargetCaps,
+    isa: Isa,
 ) -> (ProbeCover, u32) {
     let code_count = frequencies.total_frequency();
     let ceiling = u64::from(code_count);
@@ -89,7 +84,7 @@ pub(super) fn select_cover(
     let evaluate_cut = |cut: &[u32]| {
         let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| &graph.edges[at as usize]));
         let frequency = cover.frequency(frequencies);
-        let score = score_cover(caps, &cover, frequency, code_count);
+        let score = score_cover(isa, &cover, frequency, code_count);
         (cover, frequency, score)
     };
 
