@@ -44,7 +44,7 @@ fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
 
 /// Compare an eligible matcher with the independent mask oracle.
 fn agrees<M: Matcher>(kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
-    if !supports_matcher(detect_isa(), kind, cover) {
+    if !is_eligible(detect_isa(), kind, cover) {
         return;
     }
     assert_eq!(
@@ -405,5 +405,5 @@ fn padding_makes_no_candidate() {
     }
 }
 
-use crate::search::substring::plan::supports_matcher;
+use crate::search::substring::plan::is_eligible;
 use crate::search::substring::scan::detect_isa;

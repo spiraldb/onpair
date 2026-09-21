@@ -22,7 +22,7 @@ use super::alignment::mincut::MinCut;
 use super::scan::Isa;
 use crate::search::index::TokenFrequencyIndexView;
 #[cfg(test)]
-pub(super) use select::supports_matcher;
+pub(super) use select::is_eligible;
 pub(super) use select::{probe_density, score_cover, select_matcher_config};
 
 /// Select the sampled cover with the lowest ranking score.

@@ -18,10 +18,10 @@ use super::score::{COVER_HIT_PENALTY, matcher_score};
 /// Codes in the pair of mask words tested together before packing.
 const PACK_GROUP: f64 = 128.0;
 
-/// Whether this matcher supports the cover shape on the supplied target.
+/// Whether this matcher is eligible for selection on the supplied target and cover.
 /// The caller supplies an available instruction set. Nibble batches are limited to
 /// two on AVX2 and three on NEON or AVX-512 to bound register use.
-pub(in crate::search::substring) fn supports_matcher(
+pub(in crate::search::substring) fn is_eligible(
     isa: Isa,
     matcher: MatcherKind,
     cover: &ProbeCover,
@@ -50,7 +50,7 @@ pub(super) fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     let mut best_score = matcher_score(isa, best, cover);
 
     for matcher in [MatcherKind::EqOr, MatcherKind::Range, MatcherKind::NibbleN8] {
-        if !supports_matcher(isa, matcher, cover) {
+        if !is_eligible(isa, matcher, cover) {
             continue;
         }
 
@@ -161,7 +161,7 @@ mod tests {
         ] {
             for points in 0..=32 {
                 assert_eq!(
-                    supports_matcher(isa, MatcherKind::NibbleN8, &cover(points, 0)),
+                    is_eligible(isa, MatcherKind::NibbleN8, &cover(points, 0)),
                     points > 0 && points <= limit
                 );
             }
@@ -179,7 +179,7 @@ mod tests {
                     }
                     for density in [0.0, 0.01, 1.0] {
                         let config = select_matcher_config(isa, &cover, density);
-                        assert!(supports_matcher(isa, config.kind, &cover));
+                        assert!(is_eligible(isa, config.kind, &cover));
                         if config.kind == MatcherKind::Table || isa == Isa::Avx512Bw {
                             assert!(!config.skip_empty_packing);
                         } else {
