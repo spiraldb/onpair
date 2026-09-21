@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! One compare per token per vector, ORed, plus the ranges. L = 1, any K, any R.
+//! Match point probes with vector equality comparisons.
+//!
+//! Each point is broadcast across lanes, compared with the input codes, and
+//! ORed into the hit lanes. Inclusive-range results are then ORed into the
+//! same mask. Work grows with the number of points and ranges in the cover.
+//!
+//! The planner selects this kernel for covers with points. An empty point
+//! slice falls back to range matching. `shared::words` loads blocks and packs
+//! the hit lanes, optionally skipping the pack for groups with no hits.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -37,6 +45,7 @@ fn broadcast(code: Token) -> Broadcast {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     let mut hit = codes;
     for hit in &mut hit {
@@ -58,6 +67,7 @@ fn broadcast(code: Token) -> Broadcast {
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     let mut hit = codes;
     for hit in &mut hit {
@@ -80,6 +90,7 @@ fn broadcast(code: Token) -> Broadcast {
 /// Compares land in mask registers, so nothing to narrow.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
 unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     let mut hit = join(
         _mm512_cmpeq_epi16_mask(codes[0], *first),
@@ -94,8 +105,11 @@ unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     hit
 }
 
+/// Broadcast point probes and prepared ranges reused across scan blocks.
 pub(in crate::search::substring::scan) struct EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool> {
+    /// One broadcast vector per point in the cover.
     tokens: Vec<Broadcast>,
+    /// Range starts and widths, already broadcast for vector comparisons.
     ranges: Vec<Held>,
 }
 
@@ -108,12 +122,13 @@ impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for EqOr<SKIP_MOVEMASK_IF_NO
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: `plan::select::takes` answered for the set.
+        // SAFETY: planning selects this kernel only after CPU feature detection.
         unsafe { mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.tokens, &self.ranges, codes, bits) }
     }
 }
 
-/// Outside `check` so the closure inherits the target features and inlines.
+/// Fill the block mask with point and range matches.
+/// The target-feature boundary lets the comparison closure inline with its caller.
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
@@ -125,7 +140,10 @@ fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     let Some((first, rest)) = tokens.split_first() else {
         return range::mask::<SKIP_MOVEMASK_IF_NO_MATCH>(ranges, codes, bits);
     };
-    words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| unsafe {
-        check_ranges(hits(first, rest, codes), ranges, codes)
-    })
+    words::<SKIP_MOVEMASK_IF_NO_MATCH>(
+        codes,
+        bits,
+        #[inline(always)]
+        |codes| unsafe { check_ranges(hits(first, rest, codes), ranges, codes) },
+    )
 }
