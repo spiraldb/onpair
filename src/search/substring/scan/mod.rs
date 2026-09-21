@@ -253,7 +253,7 @@ mod tests {
             (vec![], vec![], vec![]),
         ] {
             let mut out = Vec::new();
-            scan(&codes, &rows, &ProbeCover { points, ranges }, 1, &mut out);
+            scan(&codes, &rows, &ProbeCover::new(points, ranges), 1, &mut out);
             assert_eq!(out, expected);
         }
     }
@@ -261,10 +261,7 @@ mod tests {
     /// Empty code or row buffers leave existing output untouched at either width.
     #[test]
     fn rows_without_codes_make_no_candidate() {
-        let cover = ProbeCover {
-            points: vec![7],
-            ranges: Vec::new(),
-        };
+        let cover = ProbeCover::new(vec![7], Vec::new());
         let mut out = vec![usize::MAX];
         scan(&[], &[0u32, 0, 0, 0], &cover, 0, &mut out);
         scan(&[], &[0u64, 0, 0, 0], &cover, 0, &mut out);

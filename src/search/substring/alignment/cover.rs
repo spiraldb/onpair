@@ -19,9 +19,9 @@ use crate::search::index::TokenFrequencyIndexView;
 #[derive(Debug, Clone)]
 pub struct ProbeCover {
     /// Individual token IDs.
-    pub(in crate::search::substring) points: Vec<Token>,
+    points: Vec<Token>,
     /// Inclusive ranges of token IDs.
-    pub(in crate::search::substring) ranges: Vec<TokenRange>,
+    ranges: Vec<TokenRange>,
 }
 
 impl ProbeCover {
