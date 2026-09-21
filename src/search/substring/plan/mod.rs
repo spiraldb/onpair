@@ -76,8 +76,7 @@ pub(super) fn select_cover(
     let ceiling = u64::from(frequencies.total_frequency());
     let mut solver = MinCut::new(graph);
     let build_cover = |cut: &[u32]| {
-        let edges: Vec<&Edge> = cut.iter().map(|&at| &graph.edges[at as usize]).collect();
-        let cover = ProbeCover::from_edge_cut(&edges);
+        let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| &graph.edges[at as usize]));
         let covered_frequency = cover_frequency(&cover, frequencies);
         SelectedCover {
             cover,

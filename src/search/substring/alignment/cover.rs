@@ -66,7 +66,9 @@ impl ProbeCover {
     ///
     /// Requires a cut that intersects every source-to-sink path and contains
     /// no unenumerated sets. The cut solver establishes these conditions.
-    pub(in crate::search::substring) fn from_edge_cut(cut: &[&Edge]) -> Self {
+    pub(in crate::search::substring) fn from_edge_cut<'a>(
+        cut: impl ExactSizeIterator<Item = &'a Edge>,
+    ) -> Self {
         let point = |id: Token| TokenRange {
             begin: id,
             last: id,

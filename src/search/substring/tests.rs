@@ -96,7 +96,7 @@ fn check_graph(view: ColumnView<'_, u32>, frequencies: &TokenFrequencyIndex, nee
         }
     }
     for edge in graph.edges.iter().filter(|edge| edge.cuttable()) {
-        let cover = ProbeCover::from_edge_cut(&[edge]);
+        let cover = ProbeCover::from_edge_cut(std::iter::once(edge));
         let matched = view
             .codes
             .iter()
@@ -444,12 +444,12 @@ fn sweep_score_does_not_exceed_the_frequency_cut() {
     ] {
         let graph = AlignmentGraph::new(view.dict, pattern, freq).unwrap();
         let mut solver = MinCut::new(&graph);
-        let cut: Vec<&Edge> = solver
-            .solve(|edge| u64::from(edge.frequency()))
-            .iter()
-            .map(|&at| &graph.edges[at as usize])
-            .collect();
-        let baseline = ProbeCover::from_edge_cut(&cut);
+        let baseline = ProbeCover::from_edge_cut(
+            solver
+                .solve(|edge| u64::from(edge.frequency()))
+                .iter()
+                .map(|&at| &graph.edges[at as usize]),
+        );
         let baseline_score = score_cover(caps, &baseline, cover_frequency(&baseline, freq), region);
         let super::plan::SelectedCover {
             cover,
