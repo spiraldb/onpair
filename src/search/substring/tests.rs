@@ -8,7 +8,7 @@ use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
-use super::plan::{cover_frequency, score_cover, select_cover};
+use super::plan::{score_cover, select_cover};
 use super::scan::{BLOCK, detect_target_caps};
 use super::{ContainsDfa, ContainsError, ContainsScan};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -483,17 +483,9 @@ fn sweep_score_does_not_exceed_the_frequency_cut() {
                 .iter()
                 .map(|&at| &graph.edges[at as usize]),
         );
-        let baseline_score = score_cover(
-            caps,
-            &baseline,
-            cover_frequency(&baseline, freq),
-            code_count,
-        );
-        let super::plan::SelectedCover {
-            cover,
-            covered_frequency: covered,
-        } = select_cover(&graph, freq, caps);
-        assert_eq!(covered, cover_frequency(&cover, freq));
+        let baseline_score = score_cover(caps, &baseline, baseline.frequency(freq), code_count);
+        let (cover, covered) = select_cover(&graph, freq, caps);
+        assert_eq!(covered, cover.frequency(freq));
         let score = score_cover(caps, &cover, covered, code_count);
         assert!(
             score <= baseline_score,

@@ -9,6 +9,7 @@
 
 use super::graph::{Edge, EdgeKind};
 use crate::core::types::{Token, TokenRange};
+use crate::search::index::TokenFrequencyIndexView;
 
 /// Token IDs that the scanner searches for.
 ///
@@ -48,6 +49,25 @@ impl ProbeCover {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.points.is_empty() && self.ranges.is_empty()
+    }
+
+    /// Sum the indexed occurrences of covered token IDs.
+    /// Disjoint points and ranges ensure each occurrence is counted once.
+    pub(in crate::search::substring) fn frequency(
+        &self,
+        frequencies: TokenFrequencyIndexView<'_>,
+    ) -> u32 {
+        let points: u32 = self
+            .points()
+            .iter()
+            .map(|&t| frequencies.frequency(t))
+            .sum();
+        let ranges: u32 = self
+            .ranges()
+            .iter()
+            .map(|&r| frequencies.range_frequency(r))
+            .sum();
+        points + ranges
     }
 
     /// Normalize inclusive ranges into points and ranges.

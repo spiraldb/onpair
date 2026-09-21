@@ -133,10 +133,8 @@ impl ContainsScan {
             });
         }
         let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
-        let plan::SelectedCover {
-            cover,
-            covered_frequency,
-        } = plan::select_cover(&graph, frequencies.as_view(), scan::detect_target_caps());
+        let (cover, covered_frequency) =
+            plan::select_cover(&graph, frequencies.as_view(), scan::detect_target_caps());
         Ok(Self {
             probe_cover: cover,
             covered_frequency,

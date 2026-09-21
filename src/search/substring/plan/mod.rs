@@ -41,12 +41,6 @@ pub(super) struct TargetCaps {
     pub(super) isa: Isa,
 }
 
-/// Selected probes and their indexed token occurrence count.
-pub(super) struct SelectedCover {
-    pub cover: ProbeCover,
-    pub covered_frequency: u32,
-}
-
 /// Matcher families considered during selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MatcherKind {
@@ -78,6 +72,7 @@ pub(super) enum MatcherConfig {
 }
 
 /// Select the sampled cover with the lowest ranking score.
+/// Return the cover and its indexed token occurrence count.
 ///
 /// First evaluate a large comparison penalty, then try lambda = 0, 1, 4, ...
 /// up to the indexed code count. Stop early when a cut matches the first one,
@@ -87,31 +82,20 @@ pub(super) fn select_cover(
     graph: &AlignmentGraph,
     frequencies: TokenFrequencyIndexView<'_>,
     caps: TargetCaps,
-) -> SelectedCover {
+) -> (ProbeCover, u32) {
     let code_count = frequencies.total_frequency();
     let ceiling = u64::from(code_count);
     let mut solver = MinCut::new(graph);
-    let build_cover = |cut: &[u32]| {
+    let evaluate_cut = |cut: &[u32]| {
         let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| &graph.edges[at as usize]));
-        let covered_frequency = cover_frequency(&cover, frequencies);
-        SelectedCover {
-            cover,
-            covered_frequency,
-        }
-    };
-    let rank = |candidate: &SelectedCover| {
-        score_cover(
-            caps,
-            &candidate.cover,
-            candidate.covered_frequency,
-            code_count,
-        )
+        let frequency = cover.frequency(frequencies);
+        let score = score_cover(caps, &cover, frequency, code_count);
+        (cover, frequency, score)
     };
 
     // Evaluate the comparison-heavy end before sampling lower penalties.
     let high_penalty_cut = solver.solve(edge_weight(ceiling + 1)).to_vec();
-    let mut best = build_cover(&high_penalty_cut);
-    let mut best_score = rank(&best);
+    let (mut best_cover, mut best_frequency, mut best_score) = evaluate_cut(&high_penalty_cut);
 
     let mut previous_cut: Vec<u32> = Vec::new();
     let mut lambda = 0u64;
@@ -122,16 +106,16 @@ pub(super) fn select_cover(
         }
         if cut != previous_cut {
             previous_cut = cut.to_vec();
-            let candidate = build_cover(&previous_cut);
-            let candidate_score = rank(&candidate);
-            if candidate_score < best_score {
-                best = candidate;
-                best_score = candidate_score;
+            let (cover, frequency, score) = evaluate_cut(&previous_cut);
+            if score < best_score {
+                best_cover = cover;
+                best_frequency = frequency;
+                best_score = score;
             }
         }
         lambda = (lambda * 4).max(1);
     }
-    best
+    (best_cover, best_frequency)
 }
 
 /// Additive cut weight: indexed frequency plus a comparison-count penalty.
@@ -145,20 +129,4 @@ fn edge_weight(lambda: u64) -> impl Fn(&Edge) -> u64 {
         let comparisons = edge.point_count() + 2 * edge.range_count();
         u64::from(edge.frequency()) + lambda * u64::from(comparisons)
     }
-}
-
-/// Sum the indexed frequencies of the normalized cover's tokens.
-/// Disjoint points and ranges ensure each token is counted once.
-pub(super) fn cover_frequency(cover: &ProbeCover, frequencies: TokenFrequencyIndexView<'_>) -> u32 {
-    let points: u32 = cover
-        .points()
-        .iter()
-        .map(|&t| frequencies.frequency(t))
-        .sum();
-    let ranges: u32 = cover
-        .ranges()
-        .iter()
-        .map(|&r| frequencies.range_frequency(r))
-        .sum();
-    points + ranges
 }
