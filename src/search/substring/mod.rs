@@ -229,11 +229,9 @@ impl ContainsScan {
     /// SIMD comparisons each vector of the code stream pays for this cover: one
     /// per point, two per inclusive range. Zero for an empty pattern.
     pub fn comparison_cost(&self) -> usize {
-        let cover = self.probe_cover();
-        cover
-            .points()
-            .len()
-            .saturating_add(cover.ranges().len().saturating_mul(2))
+        self.probe_cover
+            .n_points()
+            .saturating_add(self.probe_cover.n_ranges().saturating_mul(2))
     }
 
     /// Expected share of `row_count` rows the scan will admit for verification.
