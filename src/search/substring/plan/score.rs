@@ -11,8 +11,8 @@
 //! `select` compares eligible matchers and chooses mask packing separately.
 //! Measured and extrapolated weights are identified below.
 
-use super::super::{ProbeCover, scan::PER_BATCH};
-use super::{Isa, MatcherKind};
+use super::super::ProbeCover;
+use super::super::scan::{Isa, MatcherKind, PER_BATCH};
 
 /// Relative matcher score per token code. Lower is preferred.
 /// Covers use the same scale when combining this score with the hit penalty.

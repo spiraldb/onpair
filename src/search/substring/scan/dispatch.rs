@@ -12,13 +12,10 @@
 //! Runtime detection enables the compiled family when supported; otherwise
 //! selection uses the scalar table. Other architectures use the table too.
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::super::plan::MatcherKind;
-use super::super::plan::{Isa, MatcherConfig};
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::PER_BATCH;
 use super::matcher::{self, Matcher};
-use super::{Check, both_stages};
+use super::{Check, Isa, MatcherConfig, both_stages};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use super::{MatcherKind, PER_BATCH};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::substring::ProbeCover;

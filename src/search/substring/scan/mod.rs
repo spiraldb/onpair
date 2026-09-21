@@ -10,6 +10,8 @@
 //!
 //! `dispatch` connects the configuration to a concrete matcher. `matcher` owns token
 //! membership checks; `resolver` owns row lookup and duplicate suppression.
+//! This module defines the instruction sets and matcher configurations;
+//! `plan` selects a configuration using cover scores and hit density.
 //! Empty patterns and covers are handled by `ContainsScan::scan`, before this module.
 
 mod dispatch;
@@ -17,7 +19,6 @@ mod matcher;
 mod resolver;
 
 use super::ProbeCover;
-use super::plan::MatcherConfig;
 #[cfg(test)]
 use super::plan::{probe_density, select_matcher_config};
 use super::verify::walk::Walk;
@@ -28,6 +29,37 @@ pub(super) use dispatch::detect_isa;
 use matcher::Matcher;
 pub(super) use matcher::PER_BATCH;
 use resolver::Resolver;
+
+/// Instruction-set family used for kernel selection and ranking weights.
+/// Production callers use the family returned by `detect_isa`;
+/// planning tests can supply any family without executing its kernels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Some variants are only constructed on other build targets.
+pub(super) enum Isa {
+    Scalar,
+    Neon,
+    Avx2,
+    Avx512Bw,
+}
+
+/// Algorithm used to test token membership in the probe cover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MatcherKind {
+    Table,
+    EqOr,
+    Range,
+    NibbleN8,
+}
+
+/// Selected algorithm and its mask-packing policy.
+/// Dispatch derives nibble batches from the cover and specializes packing once,
+/// before scanning. The instruction set determines eligibility during selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct MatcherConfig {
+    pub(super) kind: MatcherKind,
+    /// Skip packing empty vector groups; always false for the scalar table.
+    pub(super) skip_empty_packing: bool,
+}
 
 /// Token codes processed in one matcher block.
 pub(super) const BLOCK: usize = 4096;

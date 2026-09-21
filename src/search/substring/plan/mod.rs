@@ -8,9 +8,9 @@
 //! lowest eligible matcher score plus a fixed penalty per covered occurrence.
 //! Execution chooses mask packing separately for the selected cover.
 //!
-//! The types below describe planning inputs and results. `select` chooses eligible
-//! matchers using the formulas in `score` and chooses mask packing separately.
-//! Neither performs CPU detection or scanning.
+//! `scan` defines the instruction sets and matcher configurations. `select`
+//! chooses eligible matchers using the formulas in `score` and chooses mask
+//! packing separately. Neither performs CPU detection or scanning.
 //! Frequencies guide these choices but never remove tokens from a cover.
 
 mod score;
@@ -19,41 +19,11 @@ mod select;
 use super::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge};
 use super::alignment::mincut::MinCut;
+use super::scan::Isa;
 use crate::search::index::TokenFrequencyIndexView;
 #[cfg(test)]
 pub(super) use select::supports_matcher;
 pub(super) use select::{probe_density, score_cover, select_matcher_config};
-
-/// Instruction-set family used for kernel selection and ranking weights.
-/// Production callers use the family returned by `scan::detect_isa`;
-/// planning tests can supply any family without executing its kernels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Some variants are only constructed on other build targets.
-pub(super) enum Isa {
-    Scalar,
-    Neon,
-    Avx2,
-    Avx512Bw,
-}
-
-/// Algorithm used to test token membership in the probe cover.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum MatcherKind {
-    Table,
-    EqOr,
-    Range,
-    NibbleN8,
-}
-
-/// Selected algorithm and its mask-packing policy.
-/// Dispatch derives nibble batches from the cover and specializes packing once,
-/// before scanning. The instruction set determines eligibility during selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct MatcherConfig {
-    pub(super) kind: MatcherKind,
-    /// Skip packing empty vector groups; always false for the scalar table.
-    pub(super) skip_empty_packing: bool,
-}
 
 /// Select the sampled cover with the lowest ranking score.
 /// Return the cover and its indexed token occurrence count.

@@ -11,9 +11,9 @@
 //! During preparation, `score_cover` ranks candidate covers using the
 //! lowest eligible matcher score and a fixed penalty per covered token occurrence.
 
-use super::super::{ProbeCover, scan::PER_BATCH};
+use super::super::ProbeCover;
+use super::super::scan::{Isa, MatcherConfig, MatcherKind, PER_BATCH};
 use super::score::{COVER_HIT_PENALTY, matcher_score};
-use super::{Isa, MatcherConfig, MatcherKind};
 
 /// Codes in the pair of mask words tested together before packing.
 const PACK_GROUP: f64 = 128.0;
