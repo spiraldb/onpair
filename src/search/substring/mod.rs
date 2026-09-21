@@ -50,7 +50,7 @@ pub use error::ContainsError;
 pub use verify::{ContainsDfa, row_contains};
 
 use alignment::graph::AlignmentGraph;
-use plan::{AnalysisFacts, CoverShape, RegionFacts, ScanFacts};
+use plan::CoverShape;
 use verify::walk::Walk;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -81,7 +81,7 @@ impl ContainsScan {
     /// Maximum pattern length, bounded by the compiled walker's `u16` node IDs.
     pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
 
-    /// Prepare an exact substring scan for `pattern` over `row_count` rows.
+    /// Prepare an exact substring scan for `pattern` using the dictionary and index.
     /// Select the sampled probe cover with the lowest ranking score and compile
     /// the alignment walker used to verify its hits.
     ///
@@ -112,7 +112,6 @@ impl ContainsScan {
         pattern: &[u8],
         dict: CompactDictionaryView<'_>,
         frequencies: &TokenFrequencyIndex<S>,
-        row_count: usize,
     ) -> Result<Self, ContainsError> {
         if pattern.len() > Self::MAX_PATTERN_LEN {
             return Err(ContainsError::PatternTooLong {
@@ -135,19 +134,10 @@ impl ContainsScan {
             });
         }
         let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
-        let region = RegionFacts {
-            code_count: frequencies.total_frequency() as usize,
-            row_count,
-        };
         let plan::SelectedCover {
             cover,
             covered_frequency,
-        } = plan::select_cover(
-            &graph,
-            frequencies.as_view(),
-            region,
-            scan::detect_target_caps(),
-        );
+        } = plan::select_cover(&graph, frequencies.as_view(), scan::detect_target_caps());
         Ok(Self {
             probe_cover: cover,
             covered_frequency,
@@ -187,19 +177,17 @@ impl ContainsScan {
             out.extend(0..row_offsets.len().saturating_sub(1));
             return;
         }
+        if codes.is_empty() || row_offsets.len() < 2 {
+            return;
+        }
         let config = plan::select_matcher_config(
             scan::detect_target_caps(),
-            ScanFacts {
-                analysis: AnalysisFacts {
-                    shape: CoverShape::of(&self.probe_cover),
-                    covered_codes: self.covered_frequency as usize,
-                    indexed_codes: self.total_frequency as usize,
-                },
-                region: RegionFacts {
-                    code_count: codes.len(),
-                    row_count: row_offsets.len().saturating_sub(1),
-                },
-            },
+            CoverShape::of(&self.probe_cover),
+            plan::probe_density(
+                self.covered_frequency as usize,
+                self.total_frequency as usize,
+                codes.len(),
+            ),
         );
         scan::matches(
             config,

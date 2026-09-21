@@ -8,22 +8,59 @@
 //! lowest eligible matcher score plus a fixed penalty per covered occurrence.
 //! Execution chooses mask packing separately for the selected cover.
 //!
-//! `facts` describes the inputs. `select` chooses eligible matchers and mask packing
-//! using the formulas in `cost`. Neither performs CPU detection or scanning.
+//! The types below describe planning inputs and results. `select` chooses eligible
+//! matchers and mask packing using the formulas in `cost`. Neither performs CPU
+//! detection or scanning.
 //! Frequencies guide these choices but never remove tokens from a cover.
 
 mod cost;
-mod facts;
 mod select;
 
 use super::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge};
 use super::alignment::mincut::MinCut;
 use crate::search::index::TokenFrequencyIndexView;
-pub(super) use facts::{AnalysisFacts, CoverShape, Isa, RegionFacts, ScanFacts, TargetCaps};
 #[cfg(test)]
 pub(super) use select::supports_matcher;
-pub(super) use select::{score_cover, select_matcher_config};
+pub(super) use select::{probe_density, score_cover, select_matcher_config};
+
+/// Instruction-set family used for kernel selection and cost coefficients.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Some variants are only constructed on other build targets.
+pub(super) enum Isa {
+    Scalar,
+    Neon,
+    Avx2,
+    Avx512Bw,
+}
+
+/// A kernel family compiled into this build and supported by the CPU.
+/// Dispatch detects production capabilities; planning tests can supply them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TargetCaps {
+    pub(super) isa: Isa,
+}
+
+/// Number of point probes and ranges after cover normalization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CoverShape {
+    pub(super) points: usize,
+    pub(super) ranges: usize,
+}
+impl CoverShape {
+    /// Read the normalized cover shape.
+    pub(super) fn of(cover: &ProbeCover) -> Self {
+        Self {
+            points: cover.points().len(),
+            ranges: cover.ranges().len(),
+        }
+    }
+
+    /// Whether neither kind of probe is present.
+    fn is_empty(self) -> bool {
+        self.points == 0 && self.ranges == 0
+    }
+}
 
 /// Selected probes and their indexed token occurrence count.
 pub(super) struct SelectedCover {
@@ -70,10 +107,10 @@ pub(super) enum MatcherConfig {
 pub(super) fn select_cover(
     graph: &AlignmentGraph,
     frequencies: TokenFrequencyIndexView<'_>,
-    region: RegionFacts,
     caps: TargetCaps,
 ) -> SelectedCover {
-    let ceiling = u64::from(frequencies.total_frequency());
+    let code_count = frequencies.total_frequency();
+    let ceiling = u64::from(code_count);
     let mut solver = MinCut::new(graph);
     let build_cover = |cut: &[u32]| {
         let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| &graph.edges[at as usize]));
@@ -84,7 +121,12 @@ pub(super) fn select_cover(
         }
     };
     let rank = |candidate: &SelectedCover| {
-        score_cover(caps, &candidate.cover, candidate.covered_frequency, region)
+        score_cover(
+            caps,
+            &candidate.cover,
+            candidate.covered_frequency,
+            code_count,
+        )
     };
 
     // Evaluate the comparison-heavy end before sampling lower penalties.

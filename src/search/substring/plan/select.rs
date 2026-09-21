@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Select matcher configurations from explicit facts and target capabilities.
+//! Select matcher configurations from cover shape, hit density, and CPU capabilities.
 //!
 //! First restrict matchers to supported cover shapes, then compare their
 //! relative scores. Estimated hit density determines whether empty groups skip
@@ -13,9 +13,7 @@
 
 use super::super::{ProbeCover, scan::PER_BATCH};
 use super::cost::{COVER_HIT_PENALTY, matcher_score, should_skip_packing};
-use super::{
-    CoverShape, Isa, MatcherConfig, MatcherKind, RegionFacts, ScanFacts, TargetCaps, VectorMatcher,
-};
+use super::{CoverShape, Isa, MatcherConfig, MatcherKind, TargetCaps, VectorMatcher};
 
 /// Whether this matcher supports the cover shape on the supplied target.
 /// The caller supplies available capabilities. Nibble batches are limited to
@@ -67,30 +65,50 @@ pub(super) fn select_matcher(caps: TargetCaps, shape: CoverShape) -> MatcherKind
     best
 }
 
-/// Choose the matcher and empty-group packing policy.
-/// An empty cover or region needs no kernel. Advisory hit counts are projected
-/// to the current region before estimating packing savings.
+/// Estimate hit density after projecting indexed counts onto the current scan.
+/// Round the projected hit count down before dividing by the scan's code count.
+/// Equal-sized scans retain the indexed count; empty scans or indexes return zero.
+/// Counts are advisory and affect packing only, never which tokens can match.
+#[inline]
+pub(in crate::search::substring) fn probe_density(
+    covered_codes: usize,
+    indexed_codes: usize,
+    code_count: usize,
+) -> f64 {
+    if code_count == 0 || indexed_codes == 0 {
+        return 0.0;
+    }
+    let expected_hits = if indexed_codes == code_count {
+        covered_codes
+    } else {
+        let projected =
+            (covered_codes as u128).saturating_mul(code_count as u128) / indexed_codes as u128;
+        usize::try_from(projected).unwrap_or(usize::MAX)
+    };
+    expected_hits as f64 / code_count as f64
+}
+
+/// Choose the matcher and empty-group packing policy for a nonempty scan.
+/// An empty cover needs no kernel. The caller supplies the estimated hit density
+/// and handles empty code and row buffers before selection.
 pub(in crate::search::substring) fn select_matcher_config(
     caps: TargetCaps,
-    facts: ScanFacts,
+    shape: CoverShape,
+    probe_density: f64,
 ) -> MatcherConfig {
-    if facts.analysis.shape.is_empty()
-        || facts.region.row_count == 0
-        || facts.region.code_count == 0
-    {
+    if shape.is_empty() {
         return MatcherConfig::Empty;
     }
-    let expected_hits = facts.expected_covered_codes() as f64;
-    let kind = select_matcher(caps, facts.analysis.shape);
+    let kind = select_matcher(caps, shape);
     let matcher = match kind {
         MatcherKind::Table => return MatcherConfig::Table,
         MatcherKind::EqOr => VectorMatcher::EqOr,
         MatcherKind::Range => VectorMatcher::Range,
         MatcherKind::NibbleN8K => VectorMatcher::NibbleN8 {
-            batches: facts.analysis.shape.points.div_ceil(PER_BATCH),
+            batches: shape.points.div_ceil(PER_BATCH),
         },
     };
-    let skip = should_skip_packing(caps.isa, expected_hits / facts.region.code_count as f64);
+    let skip = should_skip_packing(caps.isa, probe_density);
     match caps.isa {
         Isa::Neon => MatcherConfig::Neon { matcher, skip },
         Isa::Avx2 => MatcherConfig::Avx2 { matcher, skip },
@@ -102,67 +120,40 @@ pub(in crate::search::substring) fn select_matcher_config(
 /// Heuristic for comparing candidate covers for the same scan. Lower is better.
 /// Combines the per-code matcher score with a fixed penalty per covered occurrence.
 /// The mask-packing policy is chosen separately at execution.
-/// An empty cover or region scores zero; callers handle empty patterns separately.
+/// An empty cover or index scores zero; callers handle empty patterns separately.
 pub(in crate::search::substring) fn score_cover(
     caps: TargetCaps,
     cover: &ProbeCover,
     covered: u32,
-    region: RegionFacts,
+    code_count: u32,
 ) -> f64 {
-    if cover.is_empty() || region.code_count == 0 || region.row_count == 0 {
+    if cover.is_empty() || code_count == 0 {
         return 0.0;
     }
     let shape = CoverShape::of(cover);
     let matcher = select_matcher(caps, shape);
     let scan_score = matcher_score(caps.isa, matcher, shape);
-    region.code_count as f64 * scan_score + f64::from(covered) * COVER_HIT_PENALTY
+    f64::from(code_count) * scan_score + f64::from(covered) * COVER_HIT_PENALTY
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::AnalysisFacts;
     use super::*;
 
-    /// Sample preparation and region sizes for deterministic selection tests.
-    fn facts(points: usize, ranges: usize) -> ScanFacts {
-        ScanFacts {
-            analysis: AnalysisFacts {
-                shape: CoverShape { points, ranges },
-                covered_codes: 100,
-                indexed_codes: 10000,
-            },
-            region: RegionFacts {
-                code_count: 2000,
-                row_count: 200,
-            },
-        }
-    }
-
     #[test]
-    fn empty_regions_and_covers_do_not_require_a_kernel() {
+    fn empty_covers_do_not_require_a_kernel() {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
-            for f in [
-                facts(0, 0),
-                ScanFacts {
-                    region: RegionFacts {
-                        code_count: 0,
-                        row_count: 5,
+            assert_eq!(
+                select_matcher_config(
+                    TargetCaps { isa },
+                    CoverShape {
+                        points: 0,
+                        ranges: 0
                     },
-                    ..facts(1, 0)
-                },
-                ScanFacts {
-                    region: RegionFacts {
-                        code_count: 0,
-                        row_count: 0,
-                    },
-                    ..facts(1, 0)
-                },
-            ] {
-                assert_eq!(
-                    select_matcher_config(TargetCaps { isa }, f),
-                    MatcherConfig::Empty
-                );
-            }
+                    0.0
+                ),
+                MatcherConfig::Empty
+            );
         }
     }
 
@@ -192,7 +183,11 @@ mod tests {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
             for points in 0..=32 {
                 for ranges in 0..=4 {
-                    let config = select_matcher_config(TargetCaps { isa }, facts(points, ranges));
+                    let config = select_matcher_config(
+                        TargetCaps { isa },
+                        CoverShape { points, ranges },
+                        0.01,
+                    );
                     match config {
                         MatcherConfig::Empty => assert_eq!((points, ranges), (0, 0)),
                         MatcherConfig::Table => {}
@@ -209,16 +204,26 @@ mod tests {
     }
 
     #[test]
-    fn regional_projection_preserves_advisory_counts() {
-        let mut f = facts(1, 0);
-        assert_eq!(f.expected_covered_codes(), 20);
-        f.region.code_count = 10000;
-        assert_eq!(f.expected_covered_codes(), 100);
-        f.analysis.indexed_codes = 0;
-        assert_eq!(f.expected_covered_codes(), 0);
-        f.analysis.indexed_codes = 1;
-        f.analysis.covered_codes = 1;
-        f.region.code_count = usize::MAX;
-        assert_eq!(f.expected_covered_codes(), usize::MAX);
+    fn probe_density_preserves_projected_hit_counts() {
+        for (covered, indexed, scanned, expected) in [
+            (100, 10_000, 2_000, 0.01),
+            (100, 10_000, 10_000, 0.01),
+            (100, 0, 10_000, 0.0),
+            (100, 10_000, 0, 0.0),
+            (0, 0, 0, 0.0),
+            (1, 1, usize::MAX, 1.0),
+            (usize::MAX, 1, usize::MAX, 1.0),
+            (200, 100, 100, 2.0),
+        ] {
+            assert_eq!(probe_density(covered, indexed, scanned), expected);
+        }
+
+        // Rounding a partial scan down to zero hits changes its packing decision.
+        let whole = probe_density(1, 400, 400);
+        let partial = probe_density(1, 400, 399);
+        assert_eq!(whole, 1.0 / 400.0);
+        assert_eq!(partial, 0.0);
+        assert!(!should_skip_packing(Isa::Neon, whole));
+        assert!(should_skip_packing(Isa::Neon, partial));
     }
 }

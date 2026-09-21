@@ -19,7 +19,7 @@ mod resolver;
 use super::ProbeCover;
 use super::plan::MatcherConfig;
 #[cfg(test)]
-use super::plan::{AnalysisFacts, CoverShape, RegionFacts, ScanFacts, select_matcher_config};
+use super::plan::{CoverShape, probe_density, select_matcher_config};
 use super::verify::walk::Walk;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
@@ -78,26 +78,6 @@ pub(super) fn matches<O: Offset>(
     );
 }
 
-/// Combine prepared frequency counts with the actual code and row counts.
-#[cfg(test)]
-fn facts<O: Offset>(
-    input: ScanInput<'_, O>,
-    covered_codes: usize,
-    indexed_codes: usize,
-) -> ScanFacts {
-    ScanFacts {
-        analysis: AnalysisFacts {
-            shape: CoverShape::of(input.cover),
-            covered_codes,
-            indexed_codes,
-        },
-        region: RegionFacts {
-            code_count: input.codes.len(),
-            row_count: input.row_offsets.len().saturating_sub(1),
-        },
-    }
-}
-
 /// Scan a synthetic cover for tests, returning candidate rows without verification.
 #[cfg(test)]
 pub(super) fn scan<O: Offset>(
@@ -107,11 +87,15 @@ pub(super) fn scan<O: Offset>(
     covered_frequency: usize,
     out: &mut Vec<usize>,
 ) {
+    if codes.is_empty() || row_offsets.len() < 2 {
+        return;
+    }
     let input = ScanInput::new(codes, row_offsets, cover);
     execute_check(
         select_matcher_config(
             detect_target_caps(),
-            facts(input, covered_frequency, codes.len()),
+            CoverShape::of(cover),
+            probe_density(covered_frequency, codes.len(), codes.len()),
         ),
         input,
         Check::Superset,
@@ -224,82 +208,42 @@ mod tests {
     use super::*;
     use crate::core::types::TokenRange;
 
-    /// Nonempty covers need a kernel when both rows and codes are present.
+    /// Point, range, mixed, and empty covers select the expected candidate rows.
     #[test]
     fn the_scan_takes_a_cover_it_can_probe() {
-        let codes = [0 as Token; 8];
-        let rows = [0u32, 4, 8];
-        let takes = |points: Vec<Token>, ranges: Vec<TokenRange>| {
-            let cover = ProbeCover { points, ranges };
-            select_matcher_config(
-                detect_target_caps(),
-                facts(ScanInput::new(&codes, &rows, &cover), 1, codes.len()),
-            ) != MatcherConfig::Empty
+        let codes = [1, 7, 15];
+        let rows = [0u32, 1, 2, 3];
+        let range = TokenRange {
+            begin: 10,
+            last: 20,
         };
-        assert!(takes(vec![7], Vec::new()), "a point");
-        assert!(
-            takes(Vec::new(), vec![TokenRange { begin: 1, last: 9 }]),
-            "a range"
-        );
-        assert!(
-            takes(vec![7], vec![TokenRange { begin: 1, last: 9 }]),
-            "both"
-        );
-        assert!(!takes(Vec::new(), Vec::new()), "a cover with nothing in it");
-
-        let cover = ProbeCover {
-            points: vec![7],
-            ranges: Vec::new(),
-        };
-        let rowless: &[u32] = &[0];
-        assert!(
-            select_matcher_config(
-                detect_target_caps(),
-                facts(ScanInput::new(&codes, rowless, &cover), 1, 8)
-            ) == MatcherConfig::Empty
-        );
+        for (points, ranges, expected) in [
+            (vec![7], vec![], vec![1]),
+            (vec![], vec![range], vec![2]),
+            (vec![7], vec![range], vec![1, 2]),
+            (vec![], vec![], vec![]),
+        ] {
+            let mut out = Vec::new();
+            scan(&codes, &rows, &ProbeCover { points, ranges }, 1, &mut out);
+            assert_eq!(out, expected);
+        }
     }
 
-    /// Empty rows contain no candidate tokens at either offset width.
+    /// Empty code or row buffers leave existing output untouched at either width.
     #[test]
     fn rows_without_codes_make_no_candidate() {
         let cover = ProbeCover {
             points: vec![7],
             ranges: Vec::new(),
         };
-        let mut out = Vec::new();
+        let mut out = vec![usize::MAX];
         scan(&[], &[0u32, 0, 0, 0], &cover, 0, &mut out);
-        assert!(out.is_empty());
         scan(&[], &[0u64, 0, 0, 0], &cover, 0, &mut out);
-        assert!(out.is_empty());
-    }
-
-    /// Execution facts retain indexed counts alongside the actual region size.
-    #[test]
-    fn the_scan_is_handed_the_region_it_will_see() {
-        let codes = [0 as Token; 2_000];
-        let rows: Vec<u32> = (0..=200).map(|row| row * 10).collect();
-        let cover = ProbeCover {
-            points: vec![7],
-            ranges: Vec::new(),
-        };
-        assert_eq!(
-            facts(ScanInput::new(&codes, &rows, &cover), 500, 10_000),
-            ScanFacts {
-                analysis: AnalysisFacts {
-                    shape: CoverShape {
-                        points: 1,
-                        ranges: 0
-                    },
-                    covered_codes: 500,
-                    indexed_codes: 10000
-                },
-                region: RegionFacts {
-                    // Projection uses these actual sizes, not the index size.
-                    code_count: 2_000,
-                    row_count: 200,
-                }
-            }
-        );
+        for offsets in [&[][..], &[0u32][..]] {
+            scan(&[7], offsets, &cover, 1, &mut out);
+            let wide: Vec<u64> = offsets.iter().copied().map(u64::from).collect();
+            scan(&[7], &wide, &cover, 1, &mut out);
+        }
+        assert_eq!(out, [usize::MAX]);
     }
 }

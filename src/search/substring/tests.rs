@@ -8,7 +8,7 @@ use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
-use super::plan::{RegionFacts, cover_frequency, score_cover, select_cover};
+use super::plan::{cover_frequency, score_cover, select_cover};
 use super::scan::{BLOCK, detect_target_caps};
 use super::{ContainsDfa, ContainsError, ContainsScan};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -119,7 +119,7 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
             check_starts(view.dict, pattern);
             check_graph(view, &frequencies, pattern);
         }
-        let scan = ContainsScan::new(pattern, view.dict, &frequencies, rows.len()).unwrap();
+        let scan = ContainsScan::new(pattern, view.dict, &frequencies).unwrap();
         let covered = view
             .codes
             .iter()
@@ -206,7 +206,7 @@ fn missing_alphabet_does_not_produce_a_partial_cover() {
     let dict = CompactDictionaryView::validate_safety(&bytes, &[0u32, 1]).unwrap();
     let frequencies = build_token_frequency_index(&[0u16], 1).unwrap();
     assert_eq!(
-        ContainsScan::new(b"ab", dict, &frequencies, 1).unwrap_err(),
+        ContainsScan::new(b"ab", dict, &frequencies).unwrap_err(),
         ContainsError::InvalidData(InvalidColumn::IncompleteAlphabet)
     );
 }
@@ -219,7 +219,7 @@ fn empty_pattern_and_empty_cover_have_distinct_results() {
         let view = column.view();
         let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
         check(view, rows, &[b"", b"absent"]);
-        let scan = ContainsScan::new(b"", view.dict, &frequencies, rows.len()).unwrap();
+        let scan = ContainsScan::new(b"", view.dict, &frequencies).unwrap();
         assert!(scan.probe_cover().is_empty());
         assert_eq!(
             scan.expected_candidate_row_fraction(rows.len()),
@@ -234,6 +234,42 @@ fn empty_pattern_and_empty_cover_have_distinct_results() {
         let mut output = vec![usize::MAX];
         no_matches.scan(view.codes, view.row_offsets, view.dict, &mut output);
         assert_eq!(output, [usize::MAX]);
+    }
+}
+
+#[test]
+fn prepared_scan_handles_empty_and_partial_inputs() {
+    let rows: &[&[u8]] = &[b"", b"alpha", b"alphabet", b"beta", b""];
+    let column = compress_rows(rows);
+    let view = column.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    for pattern in [b"".as_slice(), b"alpha", b"absent"] {
+        let scan = ContainsScan::new(pattern, view.dict, &frequencies).unwrap();
+        for start in 0..=rows.len() {
+            for end in start..=rows.len() {
+                let first = view.row_offsets[start];
+                let last = view.row_offsets[end];
+                let offsets: Vec<u32> = view.row_offsets[start..=end]
+                    .iter()
+                    .map(|&offset| offset - first)
+                    .collect();
+                let mut out = vec![usize::MAX];
+                scan.scan(
+                    &view.codes[first as usize..last as usize],
+                    &offsets,
+                    view.dict,
+                    &mut out,
+                );
+                let mut expected = vec![usize::MAX];
+                expected.extend(
+                    rows[start..end]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, bytes)| byte_contains(bytes, pattern).then_some(row)),
+                );
+                assert_eq!(out, expected, "{pattern:?}: rows {start}..{end}");
+            }
+        }
     }
 }
 
@@ -377,8 +413,8 @@ fn borrowed_frequencies_preserve_the_plan_and_results() {
         view.dict.num_tokens(),
     )
     .unwrap();
-    let owned_scan = ContainsScan::new(b"alpha", view.dict, &owned, view.num_rows()).unwrap();
-    let borrowed_scan = ContainsScan::new(b"alpha", view.dict, &borrowed, view.num_rows()).unwrap();
+    let owned_scan = ContainsScan::new(b"alpha", view.dict, &owned).unwrap();
+    let borrowed_scan = ContainsScan::new(b"alpha", view.dict, &borrowed).unwrap();
     assert_eq!(
         borrowed_scan.probe_cover().points(),
         owned_scan.probe_cover().points()
@@ -415,7 +451,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
         view.codes.len(),
     )
     .unwrap();
-    let scan = ContainsScan::new(b"alpha", view.dict, &frequencies, view.num_rows()).unwrap();
+    let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
     assert!(!scan.probe_cover().is_empty());
     assert_eq!(scan.covered_frequency(), 0);
     let mut rows = Vec::new();
@@ -431,10 +467,7 @@ fn sweep_score_does_not_exceed_the_frequency_cut() {
     let view = column.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     let freq = frequencies.as_view();
-    let region = RegionFacts {
-        code_count: view.codes.len(),
-        row_count: rows.len(),
-    };
+    let code_count = freq.total_frequency();
     let caps = detect_target_caps();
     for pattern in [
         b"e".as_slice(),
@@ -450,13 +483,18 @@ fn sweep_score_does_not_exceed_the_frequency_cut() {
                 .iter()
                 .map(|&at| &graph.edges[at as usize]),
         );
-        let baseline_score = score_cover(caps, &baseline, cover_frequency(&baseline, freq), region);
+        let baseline_score = score_cover(
+            caps,
+            &baseline,
+            cover_frequency(&baseline, freq),
+            code_count,
+        );
         let super::plan::SelectedCover {
             cover,
             covered_frequency: covered,
-        } = select_cover(&graph, freq, region, caps);
+        } = select_cover(&graph, freq, caps);
         assert_eq!(covered, cover_frequency(&cover, freq));
-        let score = score_cover(caps, &cover, covered, region);
+        let score = score_cover(caps, &cover, covered, code_count);
         assert!(
             score <= baseline_score,
             "{pattern:?}: sweep {score} against {baseline_score}"
