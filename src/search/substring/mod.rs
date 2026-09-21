@@ -174,7 +174,7 @@ impl ContainsScan {
             out.extend(0..row_offsets.len().saturating_sub(1));
             return;
         }
-        if codes.is_empty() || row_offsets.len() < 2 {
+        if codes.is_empty() || row_offsets.len() < 2 || self.probe_cover.is_empty() {
             return;
         }
         let config = plan::select_matcher_config(

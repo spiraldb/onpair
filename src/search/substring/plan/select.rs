@@ -13,7 +13,7 @@
 
 use super::super::{ProbeCover, scan::PER_BATCH};
 use super::cost::{COVER_HIT_PENALTY, matcher_score, should_skip_packing};
-use super::{Isa, MatcherConfig, MatcherKind, VectorMatcher};
+use super::{Isa, MatcherConfig, MatcherKind};
 
 /// Whether this matcher supports the cover shape on the supplied target.
 /// The caller supplies an available instruction set. Nibble batches are limited to
@@ -28,7 +28,7 @@ pub(in crate::search::substring) fn supports_matcher(
         MatcherKind::Table => true,
         MatcherKind::EqOr => vector && cover.n_points() > 0,
         MatcherKind::Range => vector && cover.n_points() == 0 && cover.n_ranges() > 0,
-        MatcherKind::NibbleN8K => {
+        MatcherKind::NibbleN8 => {
             vector
                 && cover.n_points() > 0
                 && cover.n_points().div_ceil(PER_BATCH)
@@ -46,11 +46,7 @@ pub(super) fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     let mut best = MatcherKind::Table;
     let mut best_score = matcher_score(isa, best, cover);
 
-    for matcher in [
-        MatcherKind::EqOr,
-        MatcherKind::Range,
-        MatcherKind::NibbleN8K,
-    ] {
+    for matcher in [MatcherKind::EqOr, MatcherKind::Range, MatcherKind::NibbleN8] {
         if !supports_matcher(isa, matcher, cover) {
             continue;
         }
@@ -88,32 +84,17 @@ pub(in crate::search::substring) fn probe_density(
     expected_hits as f64 / code_count as f64
 }
 
-/// Choose the matcher and empty-group packing policy for a nonempty scan.
-/// An empty cover needs no kernel. The caller supplies the estimated hit density
-/// and handles empty code and row buffers before selection.
+/// Choose the matcher and empty-group packing policy for a nonempty scan and cover.
+/// The caller handles empty inputs and supplies the estimated hit density.
 pub(in crate::search::substring) fn select_matcher_config(
     isa: Isa,
     cover: &ProbeCover,
     probe_density: f64,
 ) -> MatcherConfig {
-    if cover.is_empty() {
-        return MatcherConfig::Empty;
-    }
     let kind = select_matcher(isa, cover);
-    let matcher = match kind {
-        MatcherKind::Table => return MatcherConfig::Table,
-        MatcherKind::EqOr => VectorMatcher::EqOr,
-        MatcherKind::Range => VectorMatcher::Range,
-        MatcherKind::NibbleN8K => VectorMatcher::NibbleN8 {
-            batches: cover.n_points().div_ceil(PER_BATCH),
-        },
-    };
-    let skip = should_skip_packing(isa, probe_density);
-    match isa {
-        Isa::Neon => MatcherConfig::Neon { matcher, skip },
-        Isa::Avx2 => MatcherConfig::Avx2 { matcher, skip },
-        Isa::Avx512Bw => MatcherConfig::Avx512Bw { matcher, skip },
-        Isa::Scalar => MatcherConfig::Table,
+    MatcherConfig {
+        kind,
+        skip_empty_packing: kind != MatcherKind::Table && should_skip_packing(isa, probe_density),
     }
 }
 
@@ -154,16 +135,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_covers_do_not_require_a_kernel() {
-        for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
-            assert_eq!(
-                select_matcher_config(isa, &cover(0, 0), 0.0),
-                MatcherConfig::Empty
-            );
-        }
-    }
-
-    #[test]
     fn target_admission_respects_nibble_register_budgets() {
         for (isa, limit) in [
             (Isa::Scalar, 0),
@@ -173,7 +144,7 @@ mod tests {
         ] {
             for points in 0..=32 {
                 assert_eq!(
-                    supports_matcher(isa, MatcherKind::NibbleN8K, &cover(points, 0)),
+                    supports_matcher(isa, MatcherKind::NibbleN8, &cover(points, 0)),
                     points > 0 && points <= limit
                 );
             }
@@ -181,19 +152,21 @@ mod tests {
     }
 
     #[test]
-    fn configurations_use_the_requested_target_and_legal_shapes() {
+    fn configurations_use_eligible_matchers_and_packing() {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
             for points in 0..=32 {
                 for ranges in 0..=4 {
-                    let config = select_matcher_config(isa, &cover(points, ranges), 0.01);
-                    match config {
-                        MatcherConfig::Empty => assert_eq!((points, ranges), (0, 0)),
-                        MatcherConfig::Table => {}
-                        MatcherConfig::Neon { .. } => assert_eq!(isa, Isa::Neon),
-                        MatcherConfig::Avx2 { .. } => assert_eq!(isa, Isa::Avx2),
-                        MatcherConfig::Avx512Bw { skip, .. } => {
-                            assert_eq!(isa, Isa::Avx512Bw);
-                            assert!(!skip);
+                    let cover = cover(points, ranges);
+                    if cover.is_empty() {
+                        continue;
+                    }
+                    for density in [0.0, 0.01, 1.0] {
+                        let config = select_matcher_config(isa, &cover, density);
+                        assert!(supports_matcher(isa, config.kind, &cover));
+                        if config.kind == MatcherKind::Table || isa == Isa::Avx512Bw {
+                            assert!(!config.skip_empty_packing);
+                        } else {
+                            assert_eq!(config.skip_empty_packing, density == 0.0);
                         }
                     }
                 }

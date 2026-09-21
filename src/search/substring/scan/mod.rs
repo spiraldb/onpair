@@ -10,7 +10,7 @@
 //!
 //! `dispatch` connects the configuration to a concrete matcher. `matcher` owns token
 //! membership checks; `resolver` owns row lookup and duplicate suppression.
-//! Empty-pattern handling belongs to `ContainsScan::scan`, before this module.
+//! Empty patterns and covers are handled by `ContainsScan::scan`, before this module.
 
 mod dispatch;
 mod matcher;
@@ -56,7 +56,7 @@ impl<'a, O> ScanInput<'a, O> {
 }
 
 /// Execute the selected matcher and append exact matching row indices.
-/// The caller supplies a cover and walker prepared for the same pattern and
+/// The caller supplies a nonempty cover and walker prepared for the same pattern and
 /// dictionary, and a configuration eligible for this cover and the current CPU.
 #[inline]
 pub(super) fn matches<O: Offset>(
@@ -87,7 +87,7 @@ pub(super) fn scan<O: Offset>(
     covered_frequency: usize,
     out: &mut Vec<usize>,
 ) {
-    if codes.is_empty() || row_offsets.len() < 2 {
+    if codes.is_empty() || row_offsets.len() < 2 || cover.is_empty() {
         return;
     }
     let input = ScanInput::new(codes, row_offsets, cover);
@@ -103,16 +103,13 @@ pub(super) fn scan<O: Offset>(
     );
 }
 
-/// Dispatch a nonempty matcher configuration with the requested hit verification.
+/// Dispatch the matcher with the requested hit verification.
 fn execute_check<O: Offset>(
     config: MatcherConfig,
     input: ScanInput<'_, O>,
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
-    if config == MatcherConfig::Empty {
-        return;
-    }
     dispatch::run(
         config,
         input.cover,

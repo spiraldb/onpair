@@ -53,7 +53,7 @@ fn neon(matcher: MatcherKind, cover: &ProbeCover) -> f64 {
     match matcher {
         MatcherKind::Table => 0.195,
         MatcherKind::EqOr => 0.0043 + 0.0144 * k + 0.0205 * r,
-        MatcherKind::NibbleN8K => 0.0228 + 0.0325 * batches + 0.0213 * r,
+        MatcherKind::NibbleN8 => 0.0228 + 0.0325 * batches + 0.0213 * r,
         MatcherKind::Range => 0.0043 + 0.0212 * r,
     }
 }
@@ -70,7 +70,7 @@ fn avx2(matcher: MatcherKind, cover: &ProbeCover) -> f64 {
         MatcherKind::EqOr => 0.0136 + 0.0105 * k + 0.0239 * r,
         // Unmeasured nibble terms: AVX-512 weights scaled by 2.2 for
         // narrower vectors and extra compares. The range slope is measured.
-        MatcherKind::NibbleN8K => 0.0594 + 0.0310 * batches + 0.0225 * r,
+        MatcherKind::NibbleN8 => 0.0594 + 0.0310 * batches + 0.0225 * r,
         MatcherKind::Range => 0.0084 + 0.0225 * r,
     }
 }
@@ -84,7 +84,7 @@ fn avx512bw(matcher: MatcherKind, cover: &ProbeCover) -> f64 {
     match matcher {
         MatcherKind::Table => 0.204,
         MatcherKind::EqOr => 0.0079 + 0.0113 * k + 0.0127 * r,
-        MatcherKind::NibbleN8K => 0.0270 + 0.0141 * batches + 0.0119 * r,
+        MatcherKind::NibbleN8 => 0.0270 + 0.0141 * batches + 0.0119 * r,
         MatcherKind::Range => 0.0085 + 0.0112 * r,
     }
 }

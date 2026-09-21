@@ -36,34 +36,23 @@ pub(super) enum Isa {
     Avx512Bw,
 }
 
-/// Matcher families considered during selection.
+/// Algorithm used to test token membership in the probe cover.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MatcherKind {
     Table,
     EqOr,
     Range,
-    NibbleN8K,
+    NibbleN8,
 }
 
-/// Vector matcher configuration; nibble matching also needs a batch count.
+/// Selected algorithm and its mask-packing policy.
+/// Dispatch derives nibble batches from the cover and specializes packing once,
+/// before scanning. The instruction set determines eligibility during selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum VectorMatcher {
-    EqOr,
-    Range,
-    NibbleN8 { batches: usize },
-}
-
-/// Matcher implementation and mask-packing policy for one scan.
-/// Dispatch prepares the concrete matcher from this configuration and the cover.
-/// Vector variants may skip packing empty groups.
-/// `Empty` requires no scan; `Table` uses scalar membership lookups.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum MatcherConfig {
-    Empty,
-    Table,
-    Neon { matcher: VectorMatcher, skip: bool },
-    Avx2 { matcher: VectorMatcher, skip: bool },
-    Avx512Bw { matcher: VectorMatcher, skip: bool },
+pub(super) struct MatcherConfig {
+    pub(super) kind: MatcherKind,
+    /// Skip packing empty vector groups; always false for the scalar table.
+    pub(super) skip_empty_packing: bool,
 }
 
 /// Select the sampled cover with the lowest ranking score.

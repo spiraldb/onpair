@@ -3,8 +3,8 @@
 
 //! Connect a matcher configuration to its concrete implementation.
 //!
-//! The configuration chooses the matcher family, nibble batch count, and empty-group
-//! packing policy. Dispatch resolves them once before scanning,
+//! The configuration chooses the matcher family and empty-group packing policy.
+//! Dispatch derives nibble batches from the cover and resolves them once before scanning,
 //! so the block loop runs with concrete type and const parameters.
 //!
 //! AArch64 uses NEON. On x86, this build contains AVX2 kernels unless `avx512bw`
@@ -12,7 +12,11 @@
 //! Runtime detection enables the compiled family when supported; otherwise
 //! selection uses the scalar table. Other architectures use the table too.
 
-use super::super::plan::{Isa, MatcherConfig, VectorMatcher};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use super::super::plan::MatcherKind;
+use super::super::plan::{Isa, MatcherConfig};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use super::PER_BATCH;
 use super::matcher::{self, Matcher};
 use super::{Check, both_stages};
 use crate::core::offset::Offset;
@@ -29,12 +33,7 @@ fn with_skip<O: Offset, S: Matcher, P: Matcher>(
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
-    if matches!(
-        config,
-        MatcherConfig::Neon { skip: true, .. }
-            | MatcherConfig::Avx2 { skip: true, .. }
-            | MatcherConfig::Avx512Bw { skip: true, .. }
-    ) {
+    if config.skip_empty_packing {
         both_stages::<S, O>(cover, codes, row_offsets, check, out)
     } else {
         both_stages::<P, O>(cover, codes, row_offsets, check, out)
@@ -52,24 +51,17 @@ pub(super) fn run<O: Offset>(
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
-    let selected = match config {
-        MatcherConfig::Empty => return,
-        MatcherConfig::Table => {
-            return both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out);
-        }
-        MatcherConfig::Neon { matcher, .. }
-        | MatcherConfig::Avx2 { matcher, .. }
-        | MatcherConfig::Avx512Bw { matcher, .. } => matcher,
-    };
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let _ = selected;
+        let _ = config;
         both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out);
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    match selected {
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        VectorMatcher::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
+    match config.kind {
+        MatcherKind::Table => {
+            both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out)
+        }
+        MatcherKind::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
             config,
             cover,
             codes,
@@ -77,8 +69,7 @@ pub(super) fn run<O: Offset>(
             check,
             out,
         ),
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        VectorMatcher::Range => with_skip::<O, matcher::Range<true>, matcher::Range<false>>(
+        MatcherKind::Range => with_skip::<O, matcher::Range<true>, matcher::Range<false>>(
             config,
             cover,
             codes,
@@ -86,8 +77,7 @@ pub(super) fn run<O: Offset>(
             check,
             out,
         ),
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        VectorMatcher::NibbleN8 { batches } => match batches {
+        MatcherKind::NibbleN8 => match cover.n_points().div_ceil(PER_BATCH) {
             1 => with_skip::<O, matcher::NibbleN8<1, true>, matcher::NibbleN8<1, false>>(
                 config,
                 cover,

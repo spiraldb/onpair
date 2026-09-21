@@ -74,7 +74,7 @@ fn every_matcher(cover: &ProbeCover, codes: &Block) {
         agrees::<Range<false>>(MatcherKind::Range, "range", cover, codes);
         agrees::<Range<true>>(MatcherKind::Range, "range_skip_empty", cover, codes);
         // Use the same point-to-batch mapping as production dispatch.
-        let n8k = MatcherKind::NibbleN8K;
+        let n8k = MatcherKind::NibbleN8;
         match cover.points().len().div_ceil(PER_BATCH) {
             1 => {
                 agrees::<NibbleN8<1, false>>(n8k, "nibble_n8", cover, codes);
