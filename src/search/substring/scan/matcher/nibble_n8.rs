@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Four nibble-table shuffles per code, ANDed: a token bit that survives all
-//! four matched the whole code. Eight tokens per batch, batches ORed, ranges
-//! beside them.
+//! Match point probes with four nibble tables per batch of up to eight IDs.
+//!
+//! Each token ID is a `u16`, split into four 4-bit nibbles. A point owns one
+//! bit in each table entry selected by its nibbles. Looking up the input code's
+//! four nibbles and ANDing their entries leaves a bit only if the same point
+//! matches all four positions. This is exact token membership.
+//!
+//! Batches are ORed together, then range matches are added. The planner limits
+//! batch counts to bound register use. `shared::words` handles block loading
+//! and mask packing, as it does for the other vector matchers.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -16,7 +23,7 @@ use super::{Block, Mask, Matcher};
 use crate::core::types::Token;
 use crate::search::substring::ProbeCover;
 
-use crate::search::substring::plan::facts::PER_BATCH;
+use super::PER_BATCH;
 
 /// A 16-byte shuffle row, broadcast into every 128-bit lane on x86 since
 /// `vpshufb` indexes within lanes.
@@ -27,10 +34,11 @@ type Table = __m256i;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 type Table = __m512i;
 
-/// One table per nibble of a code, low byte first, low nibble first.
+/// Four lookup tables ordered from the least to the most significant nibble.
 pub(in crate::search::substring::scan) struct Batch([Table; 4]);
 
-/// Token `k` owns bit `1 << k` in the row each of its nibbles indexes.
+/// Build tables for at most eight point IDs.
+/// Point `k` contributes bit `1 << k` at each of its four nibble positions.
 fn batch(tokens: &[Token]) -> Batch {
     let mut rows = [[0u8; 16]; 4];
     for (k, &token) in tokens.iter().enumerate() {
@@ -92,9 +100,8 @@ fn table(row: [u8; 16]) -> Table {
     unsafe { _mm256_broadcastsi128_si256(_mm_loadu_si128(row.as_ptr().cast())) }
 }
 
-/// No deinterleave on x86: saturating pack of the cleared halves, then a qword
-/// permute back into code order. No byte test either: a surviving lane is
-/// nonzero, not 0xFF, and the pack reads bit 7, so two compares widen it.
+/// Pack low and high bytes separately and restore their original code order.
+/// Convert surviving point bits to 0xFF lanes for the later movemask.
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
 unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
@@ -146,8 +153,8 @@ fn table(row: [u8; 16]) -> Table {
     unsafe { _mm512_broadcast_i32x4(_mm_loadu_si128(row.as_ptr().cast())) }
 }
 
-/// No deinterleave on x86: saturating pack of the cleared halves, then a qword
-/// permute back into code order.
+/// Pack low and high bytes separately and restore their original code order.
+/// AVX-512 tests surviving point bits directly into the output mask.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
@@ -198,11 +205,16 @@ unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors
     _mm512_test_epi8_mask(hit, hit)
 }
 
+/// Prepared point batches and ranges for repeated block checks.
+/// `BATCHES` must be positive and large enough to hold every point in the cover;
+/// planning and dispatch choose the supported specialization.
 pub(in crate::search::substring::scan) struct NibbleN8<
     const BATCHES: usize,
     const SKIP_MOVEMASK_IF_NO_MATCH: bool,
 > {
+    /// Up to eight point probes per batch; unused entries contribute no bits.
     batches: [Batch; BATCHES],
+    /// Prepared inclusive ranges, added after point matching.
     ranges: Vec<Held>,
 }
 
@@ -222,14 +234,16 @@ impl<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: `plan::select::takes` answered for the set.
+        // SAFETY: planning checks CPU features and the point count; dispatch
+        // supplies the matching nonzero batch specialization.
         unsafe {
             mask::<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>(&self.batches, &self.ranges, codes, bits)
         }
     }
 }
 
-/// Outside `check` so the closure inherits the target features and inlines.
+/// Fill a block mask with nibble-table and range matches.
+/// The target-feature boundary keeps the probe closure inside the vector loop.
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 fn mask<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>(

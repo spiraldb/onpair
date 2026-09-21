@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Every matcher against `ProbeCover::contains`.
+//! Check matcher masks against scalar probe-cover membership.
+//!
+//! Each eligible kernel receives the same cover and code block. The oracle
+//! calls `ProbeCover::contains` per code, independently of vector packing.
+//! Cases exercise point counts, ranges, code-width boundaries, and block tails.
+//! The block-driver checks also ensure padding cannot create candidate rows.
 
 use super::{Block, Mask, Matcher, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -11,14 +16,14 @@ use super::{NibbleN8, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use crate::search::substring::plan::facts::Isa;
-use crate::search::substring::plan::facts::{CoverShape, MatcherKind};
-use crate::search::substring::scan::{BLOCK, Check, both_stages, resolver};
+use crate::search::substring::plan::Isa;
+use crate::search::substring::plan::{CoverShape, MatcherKind};
+use crate::search::substring::scan::{BLOCK, Check, both_stages};
 
+/// Run one matcher and verify that a false return guarantees an empty mask.
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
     let mut bits = [0u64; BLOCK / 64];
-    // A cleared flag promises an empty mask. The other way round is allowed:
-    // a kernel that packs regardless never asked the question.
+    // A matcher may return true for an empty mask when it always packs.
     let any_hit = M::new(cover).check(codes, &mut bits);
     assert!(
         any_hit || bits.iter().all(|&set| set == 0),
@@ -27,9 +32,7 @@ fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
     bits
 }
 
-/// The mask the cover defines: bit `i` iff the probe matches at `codes[i]`.
-/// One code at a time, straight off `ProbeCover::contains`, so a kernel is checked
-/// against the contract and never against a sibling.
+/// Build the expected bit mask directly from scalar cover membership.
 fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
     let mut bits = [0u64; BLOCK / 64];
     for (at, &code) in codes.iter().enumerate() {
@@ -40,10 +43,9 @@ fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
     bits
 }
 
-/// Bit for bit with the definition, where the policy hands the kernel the
-/// cover at all.
+/// Compare an eligible matcher with the independent mask oracle.
 fn agrees<M: Matcher>(kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
-    if !takes(detect_target_caps(), kind, CoverShape::of(cover)) {
+    if !supports_matcher(detect_target_caps(), kind, CoverShape::of(cover)) {
         return;
     }
     assert_eq!(
@@ -53,8 +55,7 @@ fn agrees<M: Matcher>(kind: MatcherKind, name: &str, cover: &ProbeCover, codes: 
     );
 }
 
-/// A block whose codes are all distinct: 37 is invertible modulo 50021, so
-/// no value repeats over a block and a needle has exactly one hit.
+/// Create distinct codes so a selected point has exactly one hit per block.
 fn block() -> Block {
     let mut codes = [0 as Token; BLOCK];
     for (at, code) in codes.iter_mut().enumerate() {
@@ -63,7 +64,7 @@ fn block() -> Block {
     codes
 }
 
-/// Every matcher on one cover and one block.
+/// Check all kernels and packing variants eligible on this CPU.
 fn every_matcher(cover: &ProbeCover, codes: &Block) {
     agrees::<Table>(MatcherKind::Table, "table", cover, codes);
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -72,7 +73,7 @@ fn every_matcher(cover: &ProbeCover, codes: &Block) {
         agrees::<EqOr<true>>(MatcherKind::EqOr, "eq_or_skip_empty", cover, codes);
         agrees::<Range<false>>(MatcherKind::Range, "range", cover, codes);
         agrees::<Range<true>>(MatcherKind::Range, "range_skip_empty", cover, codes);
-        // At the batch count the dispatch compiles for K.
+        // Use the same point-to-batch mapping as production dispatch.
         let n8k = MatcherKind::NibbleN8K;
         match cover.points().len().div_ceil(PER_BATCH) {
             1 => {
@@ -92,8 +93,7 @@ fn every_matcher(cover: &ProbeCover, codes: &Block) {
     }
 }
 
-/// One cover as it comes, then with one range beside it and with two, so
-/// a kernel that stops after the first is caught.
+/// Check the point set alone, then with one and two ranges.
 fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) {
     every_matcher(&cover, codes);
     every_matcher(
@@ -180,8 +180,7 @@ fn agree_on_needles_the_block_does_not_hold() {
     every_matcher(&ProbeCover::new(needles.to_vec(), vec![]), &codes);
 }
 
-/// A hit at the last position of a block, which for L = 1 is the last code
-/// the mask covers rather than anything the lookahead reaches.
+/// A final-code hit must set the last bit in the block mask.
 #[test]
 fn agree_on_a_hit_at_the_seam() {
     let mut codes = [7 as Token; BLOCK];
@@ -195,8 +194,7 @@ fn agree_on_a_hit_at_the_seam() {
     every_matcher(&cover, &codes);
 }
 
-/// Narrowing keeps the low byte of each lane, so two codes that share one
-/// must not be confused for each other.
+/// Membership must use the entire u16 code before comparison lanes are narrowed.
 #[test]
 fn agree_on_codes_sharing_a_low_byte() {
     let mut codes = [0x0102 as Token; BLOCK];
@@ -207,13 +205,12 @@ fn agree_on_codes_sharing_a_low_byte() {
         1 << 6,
         "the definition missed the planted code"
     );
-    // A range whose codes share the low byte of every code in the block but
-    // are none of them: narrowing its compare has to keep the high byte.
+    // No block code lies in this range, even though both endpoints share
+    // the block codes' low byte.
     every_matcher_ranged(cover, 0x0302, 0x0402, &codes);
 }
 
-/// A range at both ends of the code space, and over a run the block holds
-/// nothing of: it holds nothing at or above 50021.
+/// Test full-domain, singleton, populated, and absent ranges.
 #[test]
 fn agree_on_ranges_of_wide_codes() {
     let codes = block();
@@ -265,9 +262,7 @@ fn agree_on_ranges_of_wide_codes() {
     );
 }
 
-/// Probes on both sides of 0x8000 and a range across it. AVX2 has no
-/// unsigned 16-bit compare, so a range written with the signed one would
-/// put 0x8000 below 0x7fff; the kernels must not.
+/// Values around 0x8000 must compare as unsigned codes, including on AVX2.
 #[test]
 fn agree_on_the_sign_boundary() {
     let mut codes = [0 as Token; BLOCK];
@@ -313,9 +308,7 @@ fn agree_on_the_sign_boundary() {
     );
 }
 
-/// Probes at the top of the code space, in a block that holds those codes:
-/// a range ending at `Token::MAX` has nothing above it to reject, and the
-/// width arithmetic must not wrap.
+/// Ranges ending at the maximum token ID must include it without wrapping.
 #[test]
 fn agree_at_the_top_of_the_code_space() {
     let mut codes = [0 as Token; BLOCK];
@@ -339,8 +332,7 @@ fn agree_at_the_top_of_the_code_space() {
     }
 }
 
-/// The codes just outside either end of what the cover admits, with a
-/// range setting one end.
+/// Probe endpoints are inclusive; neighboring codes outside them are rejected.
 #[test]
 fn table_rejects_the_codes_around_its_own() {
     let mut codes = [0 as Token; BLOCK];
@@ -360,8 +352,7 @@ fn table_rejects_the_codes_around_its_own() {
     assert_eq!(bits[0] & 0x3f, 0b000110);
 }
 
-/// One planted code, one hit and no more, through the kernel every target
-/// compiles.
+/// The portable table kernel must mark exactly the planted code.
 #[test]
 fn the_table_masks_one_code() {
     let codes = block();
@@ -374,8 +365,7 @@ fn the_table_masks_one_code() {
     );
 }
 
-/// And the same through the block driver, whose tail is zero-padded and
-/// trimmed to the codes the stream holds.
+/// Scan full blocks and a partial tail, using both row-offset widths.
 #[test]
 fn the_driver_scans_every_block() {
     // Two and a bit blocks, so both the whole-block and the padded tail path
@@ -387,30 +377,17 @@ fn the_driver_scans_every_block() {
     let at = 2 * BLOCK + 40;
     let cover = ProbeCover::new(codes[at..at + 1].to_vec(), vec![]);
     let mut found = Vec::new();
-    both_stages::<Table, resolver::LinearSeek<'_, u32>>(
-        &cover,
-        &codes,
-        &row_offsets,
-        Check::Superset,
-        &mut found,
-    );
+    both_stages::<Table, u32>(&cover, &codes, &row_offsets, Check::Superset, &mut found);
     assert_eq!(found, vec![at / 64]);
 
     // The same layer at the wide offset width.
     let wide: Vec<u64> = row_offsets.iter().map(|&o| u64::from(o)).collect();
     found.clear();
-    both_stages::<Table, resolver::GallopSeek<'_, u64>>(
-        &cover,
-        &codes,
-        &wide,
-        Check::Superset,
-        &mut found,
-    );
+    both_stages::<Table, u64>(&cover, &codes, &wide, Check::Superset, &mut found);
     assert_eq!(found, vec![at / 64]);
 }
 
-/// The tail is padded with zeros, so a zero the padding carries must not
-/// reach a resolver, whatever the stream length leaves in the last block.
+/// Zero padding in a partial block must not reach row resolution as a hit.
 #[test]
 fn padding_makes_no_candidate() {
     for length in [1, 2, 3, 5, BLOCK, BLOCK + 1, BLOCK + 2, BLOCK + 3] {
@@ -418,7 +395,7 @@ fn padding_makes_no_candidate() {
         let codes: Vec<Token> = (0..length).map(|at| (at % 255 + 1) as Token).collect();
         let row_offsets = vec![0, length as u32];
         let mut found = Vec::new();
-        both_stages::<Table, resolver::LinearSeek<'_, u32>>(
+        both_stages::<Table, u32>(
             &ProbeCover::new(vec![0 as Token], vec![]),
             &codes,
             &row_offsets,
@@ -429,5 +406,5 @@ fn padding_makes_no_candidate() {
     }
 }
 
-use crate::search::substring::plan::select::takes;
+use crate::search::substring::plan::supports_matcher;
 use crate::search::substring::scan::detect_target_caps;

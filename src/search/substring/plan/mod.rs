@@ -1,81 +1,112 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Pattern to probe cover: build the alignment DAG, cut it, price the cuts.
+//! Choose probe covers during preparation and matcher configurations before scanning.
 //!
-//! A minimum cut is linear in its edge weights and the scan's cost is not: a
-//! kernel takes eight tokens for the price of one, and a range costs the
-//! bitmap nothing. So the cut runs over `frequency + λ · comparisons` for a
-//! sweep of λ, which walks from the most selective cut to the narrowest, and
-//! each distinct cut is priced by [`scan_ns`] as the cover it becomes. The
-//! sweep sees the cuts on the lower hull of (frequency, comparisons); a flat
-//! kernel can make one off the hull cheaper, which is accepted.
+//! Minimum cuts use additive edge weights: frequency plus a penalty for the
+//! number of comparisons. Each sampled cut is normalized and ranked by its
+//! lowest eligible matcher score plus a fixed penalty per covered occurrence.
+//! Execution chooses mask packing separately for the selected cover.
 //!
-//! Frequencies weight the cut but never alter its selected membership:
-//! safety-valid stored weights may contain false zeroes, so pruning by
-//! frequency would be unsound. Profitability remains a caller decision.
+//! `facts` describes the inputs. `select` chooses eligible matchers and mask packing
+//! using the formulas in `cost`. Neither performs CPU detection or scanning.
+//! Frequencies guide these choices but never remove tokens from a cover.
 
-pub(super) mod cost;
-pub(super) mod facts;
-pub(super) mod select;
+mod cost;
+mod facts;
+mod select;
 
-use self::cost::scan_ns;
-use self::facts::{RegionFacts, TargetCaps};
 use super::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge};
 use super::alignment::mincut::MinCut;
 use crate::search::index::TokenFrequencyIndexView;
+pub(super) use facts::{AnalysisFacts, CoverShape, Isa, RegionFacts, ScanFacts, TargetCaps};
+#[cfg(test)]
+pub(super) use select::supports_matcher;
+pub(super) use select::{score_cover, select_matcher_config};
 
-/// The cut whose cover [`scan_ns`] prices lowest, with what it covers and
-/// costs.
+/// Selected probes and their indexed token occurrence count.
+pub(super) struct SelectedCover {
+    pub cover: ProbeCover,
+    pub covered_frequency: u32,
+}
+
+/// Matcher families considered during selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MatcherKind {
+    Table,
+    EqOr,
+    Range,
+    NibbleN8K,
+}
+
+/// Vector matcher configuration; nibble matching also needs a batch count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum VectorMatcher {
+    EqOr,
+    Range,
+    NibbleN8 { batches: usize },
+}
+
+/// Matcher implementation and mask-packing policy for one scan.
+/// Dispatch prepares the concrete matcher from this configuration and the cover.
+/// Vector variants may skip packing empty groups.
+/// `Empty` requires no scan; `Table` uses scalar membership lookups.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MatcherConfig {
+    Empty,
+    Table,
+    Neon { matcher: VectorMatcher, skip: bool },
+    Avx2 { matcher: VectorMatcher, skip: bool },
+    Avx512Bw { matcher: VectorMatcher, skip: bool },
+}
+
+/// Select the sampled cover with the lowest ranking score.
 ///
-/// λ trades a cut's frequency against its comparisons, and the cut it selects
-/// is piecewise constant in λ: it changes only where two cuts swap places, and
-/// in practice there are one or two such pieces. So the narrowest cut is priced
-/// first — no λ can go past it, since comparisons only fall as λ rises — and the
-/// ladder from zero stops as soon as it arrives there, rather than stepping to a
-/// ceiling set by the stream length.
-pub(super) fn cheapest_cover(
+/// First evaluate a large comparison penalty, then try lambda = 0, 1, 4, ...
+/// up to the indexed code count. Stop early when a cut matches the first one,
+/// and avoid repricing consecutive identical cuts. This samples alternatives;
+/// it does not enumerate every cut or guarantee the lowest possible score.
+pub(super) fn select_cover(
     graph: &AlignmentGraph,
     frequencies: TokenFrequencyIndexView<'_>,
     region: RegionFacts,
     caps: TargetCaps,
-) -> (ProbeCover, u32, f64) {
+) -> SelectedCover {
     let ceiling = u64::from(frequencies.total_frequency());
-    // With n <= u16::MAX and F <= u32::MAX, there are at most 2n + 16 edges.
-    // Their comparison counts sum to at most 3n + 15*512 + 65536: one point
-    // and range per offset, up to 15 entry sets, and one contained-token set.
-    // For lambda <= F + 1, total finite capacity is therefore below 2^51.
-    let by = |lambda: u64| {
-        move |edge: &Edge| {
-            let comparisons = edge.point_count() + 2 * edge.range_count();
-            u64::from(edge.frequency()) + lambda * u64::from(comparisons)
-        }
-    };
     let mut solver = MinCut::new(graph);
-    let price = |cut: &[u32]| {
+    let build_cover = |cut: &[u32]| {
         let edges: Vec<&Edge> = cut.iter().map(|&at| &graph.edges[at as usize]).collect();
         let cover = ProbeCover::from_edge_cut(&edges);
-        let covered = cover_frequency(&cover, frequencies);
-        let ns = scan_ns(caps, &cover, covered, region);
-        (cover, covered, ns)
+        let covered_frequency = cover_frequency(&cover, frequencies);
+        SelectedCover {
+            cover,
+            covered_frequency,
+        }
+    };
+    let rank = |candidate: &SelectedCover| {
+        score_cover(caps, &candidate.cover, candidate.covered_frequency, region)
     };
 
-    let narrowest = solver.solve(by(ceiling + 1)).to_vec();
-    let mut best = price(&narrowest);
+    // Evaluate the comparison-heavy end before sampling lower penalties.
+    let high_penalty_cut = solver.solve(edge_weight(ceiling + 1)).to_vec();
+    let mut best = build_cover(&high_penalty_cut);
+    let mut best_score = rank(&best);
 
-    let mut last: Vec<u32> = Vec::new();
+    let mut previous_cut: Vec<u32> = Vec::new();
     let mut lambda = 0u64;
     while lambda <= ceiling {
-        let cut = solver.solve(by(lambda));
-        if cut == narrowest {
+        let cut = solver.solve(edge_weight(lambda));
+        if cut == high_penalty_cut {
             break;
         }
-        if cut != last {
-            last = cut.to_vec();
-            let candidate = price(&last);
-            if candidate.2 < best.2 {
+        if cut != previous_cut {
+            previous_cut = cut.to_vec();
+            let candidate = build_cover(&previous_cut);
+            let candidate_score = rank(&candidate);
+            if candidate_score < best_score {
                 best = candidate;
+                best_score = candidate_score;
             }
         }
         lambda = (lambda * 4).max(1);
@@ -83,8 +114,21 @@ pub(super) fn cheapest_cover(
     best
 }
 
-/// Codes `cover` matches in the indexed stream. Points and ranges are
-/// disjoint, so each covered code is counted once.
+/// Additive cut weight: indexed frequency plus a comparison-count penalty.
+/// This proxy generates cuts; complete covers are scored after normalization.
+fn edge_weight(lambda: u64) -> impl Fn(&Edge) -> u64 {
+    // With n <= u16::MAX and F <= u32::MAX, there are at most 2n + 16 edges.
+    // Their comparison counts sum to at most 3n + 15*512 + 65536: one point
+    // and range per offset, up to 15 overlap sets, and one contained-token set.
+    // For lambda <= F + 1, total finite capacity is therefore below 2^51.
+    move |edge| {
+        let comparisons = edge.point_count() + 2 * edge.range_count();
+        u64::from(edge.frequency()) + lambda * u64::from(comparisons)
+    }
+}
+
+/// Sum the indexed frequencies of the normalized cover's tokens.
+/// Disjoint points and ranges ensure each token is counted once.
 pub(super) fn cover_frequency(cover: &ProbeCover, frequencies: TokenFrequencyIndexView<'_>) -> u32 {
     let points: u32 = cover
         .points()

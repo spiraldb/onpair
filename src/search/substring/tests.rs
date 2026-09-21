@@ -8,9 +8,7 @@ use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
-use super::plan::cost::scan_ns;
-use super::plan::facts::RegionFacts;
-use super::plan::{cheapest_cover, cover_frequency};
+use super::plan::{RegionFacts, cover_frequency, score_cover, select_cover};
 use super::scan::{BLOCK, detect_target_caps};
 use super::{ContainsDfa, ContainsError, ContainsScan};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -223,7 +221,6 @@ fn empty_pattern_and_empty_cover_have_distinct_results() {
         check(view, rows, &[b"", b"absent"]);
         let scan = ContainsScan::new(b"", view.dict, &frequencies, rows.len()).unwrap();
         assert!(scan.probe_cover().is_empty());
-        assert_eq!(scan.expected_scan_ns(), 0.0);
         assert_eq!(
             scan.expected_candidate_row_fraction(rows.len()),
             if rows.is_empty() { 0.0 } else { 1.0 }
@@ -427,7 +424,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
 }
 
 #[test]
-fn sweep_cost_does_not_exceed_the_frequency_cut() {
+fn sweep_score_does_not_exceed_the_frequency_cut() {
     let corpus = crate::test_corpus::user_strings(200);
     let rows: Vec<&[u8]> = corpus.iter().map(|row| row.as_bytes()).collect();
     let column = compress_rows(&rows);
@@ -453,13 +450,16 @@ fn sweep_cost_does_not_exceed_the_frequency_cut() {
             .map(|&at| &graph.edges[at as usize])
             .collect();
         let baseline = ProbeCover::from_edge_cut(&cut);
-        let baseline_ns = scan_ns(caps, &baseline, cover_frequency(&baseline, freq), region);
-        let (cover, covered, ns) = cheapest_cover(&graph, freq, region, caps);
+        let baseline_score = score_cover(caps, &baseline, cover_frequency(&baseline, freq), region);
+        let super::plan::SelectedCover {
+            cover,
+            covered_frequency: covered,
+        } = select_cover(&graph, freq, region, caps);
         assert_eq!(covered, cover_frequency(&cover, freq));
-        assert_eq!(ns, scan_ns(caps, &cover, covered, region));
+        let score = score_cover(caps, &cover, covered, region);
         assert!(
-            ns <= baseline_ns,
-            "{pattern:?}: sweep {ns} against {baseline_ns}"
+            score <= baseline_score,
+            "{pattern:?}: sweep {score} against {baseline_score}"
         );
     }
 }

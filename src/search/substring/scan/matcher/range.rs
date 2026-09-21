@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! `code - begin <= last - begin` unsigned, so the wrap rejects codes below
-//! `begin`; ORed over R ranges, folded into every kernel and run alone here.
+//! Vector membership checks for inclusive ranges of token IDs.
+//!
+//! For a valid range `[begin, last]`, unsigned wrapping subtraction turns
+//! membership into `code.wrapping_sub(begin) <= last - begin`. Values below
+//! `begin` wrap above the permitted width and are rejected.
+//!
+//! `Range` handles covers containing only ranges. Equality and nibble matchers
+//! reuse `check_ranges` to add range hits to their point results. All paths
+//! produce the same exact membership mask.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -21,7 +28,7 @@ use super::{Block, Mask, Matcher};
 use crate::core::types::TokenRange;
 use crate::search::substring::ProbeCover;
 
-/// `begin` and `last - begin`, each broadcast.
+/// Range start and width (`last - begin`), broadcast into vector lanes.
 #[cfg(target_arch = "aarch64")]
 pub(in crate::search::substring::scan) type Held = (uint16x8_t, uint16x8_t);
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
@@ -91,18 +98,20 @@ pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes
     join(inside(codes[0]), inside(codes[1]))
 }
 
+/// OR range membership into existing hit lanes.
+/// The caller must have enabled the compiled vector instruction set.
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 pub(super) unsafe fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
     for &held in held {
-        // SAFETY: the set, inherited from this function.
+        // SAFETY: the caller provides the instruction set required by these helpers.
         hit = unsafe { or(hit, inside(held, codes)) };
     }
     hit
 }
 
-/// For a cover with no tokens.
+/// Prepared matcher for a cover containing ranges and no individual points.
 pub(in crate::search::substring::scan) struct Range<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     Vec<Held>,
 );
@@ -113,12 +122,13 @@ impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for Range<SKIP_MOVEMASK_IF_N
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: `plan::select::takes` answered for the set.
+        // SAFETY: planning selects this kernel only after CPU feature detection.
         unsafe { mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.0, codes, bits) }
     }
 }
 
-/// Outside `check` so the closure inherits the target features and inlines.
+/// Fill a block mask from prepared ranges; an empty slice clears the mask.
+/// The target-feature boundary keeps range comparisons inside the vector loop.
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 pub(super) fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(

@@ -32,7 +32,7 @@
 //! # Responsibilities
 //! [`ContainsScan`] coordinates graph construction, cost-based cover selection and walk
 //! compilation. `alignment` owns the graph and cut solver; `plan` prices and
-//! selects covers and execution plans using explicit facts and capabilities.
+//! selects covers and matcher configurations using explicit facts and capabilities.
 //! `scan` produces hits and resolves rows, calling the exact verifier in
 //! `verify::walk`. Profitability remains a caller decision.
 
@@ -50,7 +50,7 @@ pub use error::ContainsError;
 pub use verify::{ContainsDfa, row_contains};
 
 use alignment::graph::AlignmentGraph;
-use plan::facts::RegionFacts;
+use plan::{AnalysisFacts, CoverShape, RegionFacts, ScanFacts};
 use verify::walk::Walk;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -61,7 +61,7 @@ use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
 /// Immutable prepared substring scan for one pattern and dictionary.
 ///
-/// Holds the probe cover, compiled walker and cost/selectivity metadata. Each
+/// Holds the probe cover, compiled walker and token frequencies. Each
 /// [`ContainsScan::scan`] call owns its execution state, so preparation can be reused
 /// across scans. The dictionary is supplied separately at execution.
 ///
@@ -72,7 +72,6 @@ pub struct ContainsScan {
     probe_cover: ProbeCover,
     covered_frequency: u32,
     total_frequency: u32,
-    scan_ns: f64,
     walk: Walk,
     /// Empty patterns admit even rows without codes, independently of the cover.
     matches_all: bool,
@@ -83,10 +82,10 @@ impl ContainsScan {
     pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
 
     /// Prepare an exact substring scan for `pattern` over `row_count` rows.
-    /// Select the sound probe cover with the lowest modeled scan cost and compile
+    /// Select the sampled probe cover with the lowest ranking score and compile
     /// the alignment walker used to verify its hits.
     ///
-    /// This constructor prepares the checks and reports their frequency and cost;
+    /// This constructor prepares the checks and reports their frequency;
     /// the caller decides whether executing them is profitable. An empty pattern
     /// produces a scan that admits every row without compiling probes.
     ///
@@ -131,7 +130,6 @@ impl ContainsScan {
                 probe_cover: ProbeCover::from_runs(Vec::new()),
                 covered_frequency: 0,
                 total_frequency: frequencies.total_frequency(),
-                scan_ns: 0.0,
                 walk: Walk::default(),
                 matches_all: true,
             });
@@ -141,7 +139,10 @@ impl ContainsScan {
             code_count: frequencies.total_frequency() as usize,
             row_count,
         };
-        let (cover, covered, scan_ns) = plan::cheapest_cover(
+        let plan::SelectedCover {
+            cover,
+            covered_frequency,
+        } = plan::select_cover(
             &graph,
             frequencies.as_view(),
             region,
@@ -149,9 +150,8 @@ impl ContainsScan {
         );
         Ok(Self {
             probe_cover: cover,
-            covered_frequency: covered,
+            covered_frequency,
             total_frequency: frequencies.total_frequency(),
-            scan_ns,
             walk: Walk::from_graph(&graph, pattern),
             matches_all: false,
         })
@@ -187,7 +187,27 @@ impl ContainsScan {
             out.extend(0..row_offsets.len().saturating_sub(1));
             return;
         }
-        scan::matches(codes, row_offsets, dict, self, out);
+        let config = plan::select_matcher_config(
+            scan::detect_target_caps(),
+            ScanFacts {
+                analysis: AnalysisFacts {
+                    shape: CoverShape::of(&self.probe_cover),
+                    covered_codes: self.covered_frequency as usize,
+                    indexed_codes: self.total_frequency as usize,
+                },
+                region: RegionFacts {
+                    code_count: codes.len(),
+                    row_count: row_offsets.len().saturating_sub(1),
+                },
+            },
+        );
+        scan::matches(
+            config,
+            scan::ScanInput::new(codes, row_offsets, &self.probe_cover),
+            dict,
+            &self.walk,
+            out,
+        );
     }
 
     /// The normalized checks the SIMD prefilter can execute.
@@ -196,14 +216,6 @@ impl ContainsScan {
     /// still returns every row.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
-    }
-
-    /// Expected nanoseconds to scan the cover over the analyzed stream and
-    /// verify the rows it admits, from the fitted kernel model. The number
-    /// the cover was chosen by, so alternatives compare against it directly.
-    /// Zero for an empty pattern, which scans nothing.
-    pub fn expected_scan_ns(&self) -> f64 {
-        self.scan_ns
     }
 
     /// Number of code positions whose token is covered by the probes.

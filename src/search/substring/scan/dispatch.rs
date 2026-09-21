@@ -1,39 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! A plan as the two type parameters [`both_stages`] wants.
+//! Connect a matcher configuration to its concrete implementation.
+//!
+//! The configuration chooses the matcher family, nibble batch count, and empty-group
+//! packing policy. Dispatch resolves them once before scanning,
+//! so the block loop runs with concrete type and const parameters.
+//!
+//! AArch64 uses NEON. On x86, this build contains AVX2 kernels unless `avx512bw`
+//! is enabled at compile time, in which case it contains the AVX-512 versions.
+//! Runtime detection enables the compiled family when supported; otherwise
+//! selection uses the scalar table. Other architectures use the table too.
 
-use super::super::plan::facts::{Isa, Kernel, ResolverKind, ScanPlan, TargetCaps, VectorMatcher};
+use super::super::plan::{Isa, MatcherConfig, TargetCaps, VectorMatcher};
 use super::matcher::{self, Matcher};
-use super::{Check, both_stages, resolver};
+use super::{Check, both_stages};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::substring::ProbeCover;
 
-/// The resolver half of the dispatch.
-fn with_resolver<O: Offset, M: Matcher>(
-    plan: ScanPlan,
-    cover: &ProbeCover,
-    codes: &[Token],
-    row_offsets: &[O],
-    check: Check<'_>,
-    out: &mut Vec<usize>,
-) {
-    match plan.resolver {
-        ResolverKind::LinearSeek => {
-            both_stages::<M, resolver::LinearSeek<'_, O>>(cover, codes, row_offsets, check, out)
-        }
-        ResolverKind::GallopSeek => {
-            both_stages::<M, resolver::GallopSeek<'_, O>>(cover, codes, row_offsets, check, out)
-        }
-    }
-}
-
-/// The flag half: the same kernel compiled with the pack skipped, `S`, and
-/// without, `P`.
+/// Select whether empty groups skip mask packing: `S` enables it, `P` disables it.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn with_skip<O: Offset, S: Matcher, P: Matcher>(
-    plan: ScanPlan,
+    config: MatcherConfig,
     cover: &ProbeCover,
     codes: &[Token],
     row_offsets: &[O],
@@ -41,46 +30,47 @@ fn with_skip<O: Offset, S: Matcher, P: Matcher>(
     out: &mut Vec<usize>,
 ) {
     if matches!(
-        plan.kernel,
-        Kernel::Neon { skip: true, .. }
-            | Kernel::Avx2 { skip: true, .. }
-            | Kernel::Avx512Bw { skip: true, .. }
+        config,
+        MatcherConfig::Neon { skip: true, .. }
+            | MatcherConfig::Avx2 { skip: true, .. }
+            | MatcherConfig::Avx512Bw { skip: true, .. }
     ) {
-        with_resolver::<O, S>(plan, cover, codes, row_offsets, check, out)
+        both_stages::<S, O>(cover, codes, row_offsets, check, out)
     } else {
-        with_resolver::<O, P>(plan, cover, codes, row_offsets, check, out)
+        both_stages::<P, O>(cover, codes, row_offsets, check, out)
     }
 }
 
-/// The planned kernel pair as the type parameters [`both_stages`] wants.
-/// Planning supplies a kernel supported by this cover and the current CPU.
+/// Execute the selected matcher with the shared row resolver.
+/// Planning must supply an eligible cover shape and an available instruction set;
+/// this function does not repeat those checks.
 pub(super) fn run<O: Offset>(
-    plan: ScanPlan,
+    config: MatcherConfig,
     cover: &ProbeCover,
     codes: &[Token],
     row_offsets: &[O],
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
-    let selected = match plan.kernel {
-        Kernel::Empty => return,
-        Kernel::Table => {
-            return with_resolver::<O, matcher::Table>(plan, cover, codes, row_offsets, check, out);
+    let selected = match config {
+        MatcherConfig::Empty => return,
+        MatcherConfig::Table => {
+            return both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out);
         }
-        Kernel::Neon { matcher, .. }
-        | Kernel::Avx2 { matcher, .. }
-        | Kernel::Avx512Bw { matcher, .. } => matcher,
+        MatcherConfig::Neon { matcher, .. }
+        | MatcherConfig::Avx2 { matcher, .. }
+        | MatcherConfig::Avx512Bw { matcher, .. } => matcher,
     };
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = selected;
-        with_resolver::<O, matcher::Table>(plan, cover, codes, row_offsets, check, out);
+        both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out);
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     match selected {
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         VectorMatcher::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
-            plan,
+            config,
             cover,
             codes,
             row_offsets,
@@ -89,7 +79,7 @@ pub(super) fn run<O: Offset>(
         ),
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         VectorMatcher::Range => with_skip::<O, matcher::Range<true>, matcher::Range<false>>(
-            plan,
+            config,
             cover,
             codes,
             row_offsets,
@@ -99,7 +89,7 @@ pub(super) fn run<O: Offset>(
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         VectorMatcher::NibbleN8 { batches } => match batches {
             1 => with_skip::<O, matcher::NibbleN8<1, true>, matcher::NibbleN8<1, false>>(
-                plan,
+                config,
                 cover,
                 codes,
                 row_offsets,
@@ -107,7 +97,7 @@ pub(super) fn run<O: Offset>(
                 out,
             ),
             2 => with_skip::<O, matcher::NibbleN8<2, true>, matcher::NibbleN8<2, false>>(
-                plan,
+                config,
                 cover,
                 codes,
                 row_offsets,
@@ -115,20 +105,20 @@ pub(super) fn run<O: Offset>(
                 out,
             ),
             3 => with_skip::<O, matcher::NibbleN8<3, true>, matcher::NibbleN8<3, false>>(
-                plan,
+                config,
                 cover,
                 codes,
                 row_offsets,
                 check,
                 out,
             ),
-            _ => with_resolver::<O, matcher::Table>(plan, cover, codes, row_offsets, check, out),
+            _ => both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out),
         },
     }
 }
 
-/// Detect only targets whose kernels this build contains. Optional AVX-512
-/// multiversion activation is deferred pending native x86 qualification.
+/// Detect whether the kernel family compiled into this build is available.
+/// AVX-512 requires compile-time enablement as well as runtime CPU support.
 pub(in crate::search::substring) fn detect_target_caps() -> TargetCaps {
     #[cfg(target_arch = "aarch64")]
     let isa = Isa::Neon;

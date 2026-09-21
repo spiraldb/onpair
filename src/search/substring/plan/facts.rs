@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Inputs and concrete choices shared by planning and execution.
+//! Cover statistics, region sizes, and capabilities supplied to planning.
+//!
+//! Analysis facts describe the prepared cover and its frequency index. Region
+//! facts describe the buffers being scanned, which may be a smaller region.
+//! Target capabilities name a compiled kernel family available on this CPU.
+//!
+//! Selection combines these inputs into a `MatcherConfig`. Dispatch prepares
+//! the corresponding matcher; these facts perform no CPU detection or scanning.
 
 use super::super::ProbeCover;
 
-pub(in crate::search::substring) const BLOCK: usize = 4096;
-pub(in crate::search::substring) const PER_BATCH: usize = 8;
-
-/// Targets also name coefficient sets in calibration files.
+/// Instruction-set family used for kernel selection and cost coefficients.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // Some variants are only constructed on other build targets.
 pub(in crate::search::substring) enum Isa {
@@ -18,48 +22,61 @@ pub(in crate::search::substring) enum Isa {
     Avx512Bw,
 }
 
-/// A target whose implementation is compiled and available to the caller.
-/// Production values come from scan dispatch; tests can supply synthetic targets.
+/// A kernel family compiled into this build and supported by the CPU.
+/// Dispatch detects production capabilities; planning tests can supply them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::substring) struct TargetCaps {
     pub(in crate::search::substring) isa: Isa,
 }
 
+/// Number of point probes and ranges after cover normalization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::substring) struct CoverShape {
     pub(in crate::search::substring) points: usize,
     pub(in crate::search::substring) ranges: usize,
 }
 impl CoverShape {
+    /// Read the normalized cover shape.
     pub(in crate::search::substring) fn of(cover: &ProbeCover) -> Self {
         Self {
             points: cover.points().len(),
             ranges: cover.ranges().len(),
         }
     }
+
+    /// Whether neither kind of probe is present.
     pub(super) fn is_empty(self) -> bool {
         self.points == 0 && self.ranges == 0
     }
 }
 
+/// Cover shape and advisory counts from the preparation frequency index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::substring) struct AnalysisFacts {
     pub(in crate::search::substring) shape: CoverShape,
+    /// Indexed occurrences of tokens in the cover.
     pub(in crate::search::substring) covered_codes: usize,
+    /// Total code count represented by the frequency index.
     pub(in crate::search::substring) indexed_codes: usize,
 }
+
+/// Size of the code stream and number of rows being planned or scanned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::substring) struct RegionFacts {
     pub(in crate::search::substring) code_count: usize,
     pub(in crate::search::substring) row_count: usize,
 }
+
+/// Prepared analysis paired with the current scan region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::substring) struct ScanFacts {
     pub(in crate::search::substring) analysis: AnalysisFacts,
     pub(in crate::search::substring) region: RegionFacts,
 }
 impl ScanFacts {
-    /// Preserve the PR projection, including advisory weights and saturation.
+    /// Project indexed covered-code counts onto this region by its relative size.
+    /// Equal-sized regions retain the original count; an empty index projects to
+    /// zero. The result is an estimate used for costs, not a filter on matches.
     pub(in crate::search::substring) fn expected_covered_codes(self) -> usize {
         let AnalysisFacts {
             covered_codes,
@@ -76,38 +93,4 @@ impl ScanFacts {
             / indexed_codes as u128;
         usize::try_from(projected).unwrap_or(usize::MAX)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring) enum MatcherKind {
-    Table,
-    EqOr,
-    Range,
-    NibbleN8K,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring) enum ResolverKind {
-    LinearSeek,
-    GallopSeek,
-}
-
-/// Only vector operations occur inside a vector target's configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring) enum VectorMatcher {
-    EqOr,
-    Range,
-    NibbleN8 { batches: usize },
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring) enum Kernel {
-    Empty,
-    Table,
-    Neon { matcher: VectorMatcher, skip: bool },
-    Avx2 { matcher: VectorMatcher, skip: bool },
-    Avx512Bw { matcher: VectorMatcher, skip: bool },
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::search::substring) struct ScanPlan {
-    pub(in crate::search::substring) kernel: Kernel,
-    pub(in crate::search::substring) resolver: ResolverKind,
 }

@@ -1,49 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Scans of the code stream against a compiled cover: codes to bit mask,
-//! bit mask to rows.
+//! Execute a prepared cover and append exact matching rows.
 //!
-//! The scan takes any cover with something in it - the points as tokens, the
-//! ranges beside them, or either alone - and picks its own two halves from a
-//! cost model. Every hit is verified against the alignment walk in the
-//! compressed domain, so the rows are exact.
+//! The caller supplies a matcher configuration for the current buffers. The matcher turns
+//! blocks of token codes into bit masks; the resolver maps set
+//! bits to rows and asks `verify::walk` to check each candidate occurrence.
+//! A row is appended on its first confirmed hit, then its later hits are skipped.
 //!
-//! Vector kernels are compiled for NEON, AVX2 and AVX-512; a target with
-//! none, or an x86 without AVX2, runs the byte table instead, which is
-//! scalar and portable.
+//! `dispatch` connects the configuration to a concrete matcher. `matcher` owns token
+//! membership checks; `resolver` owns row lookup and duplicate suppression.
+//! Empty-pattern handling belongs to `ContainsScan::scan`, before this module.
 
-#[cfg(test)]
-mod bench;
 mod dispatch;
 mod matcher;
 mod resolver;
 
-use super::ContainsScan;
 use super::ProbeCover;
-pub(super) use super::plan::facts::BLOCK;
+use super::plan::MatcherConfig;
 #[cfg(test)]
-use super::plan::facts::Isa;
-use super::plan::facts::{AnalysisFacts, CoverShape, Kernel, RegionFacts, ScanFacts, ScanPlan};
-use super::plan::select::select_scan_plan;
+use super::plan::{AnalysisFacts, CoverShape, RegionFacts, ScanFacts, select_matcher_config};
 use super::verify::walk::Walk;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 pub(super) use dispatch::detect_target_caps;
 use matcher::Matcher;
+pub(super) use matcher::PER_BATCH;
 use resolver::Resolver;
+
+/// Token codes processed in one matcher block.
+pub(super) const BLOCK: usize = 4096;
 
 /// Borrowed buffers for one scan region.
 #[derive(Clone, Copy)]
-struct ScanInput<'a, O> {
+pub(super) struct ScanInput<'a, O> {
     codes: &'a [Token],
     row_offsets: &'a [O],
     cover: &'a ProbeCover,
 }
 
 impl<'a, O> ScanInput<'a, O> {
-    const fn full(codes: &'a [Token], row_offsets: &'a [O], cover: &'a ProbeCover) -> Self {
+    /// Borrow the code stream, row boundaries, and prepared probe cover.
+    pub(super) const fn new(
+        codes: &'a [Token],
+        row_offsets: &'a [O],
+        cover: &'a ProbeCover,
+    ) -> Self {
         Self {
             codes,
             row_offsets,
@@ -52,36 +55,31 @@ impl<'a, O> ScanInput<'a, O> {
     }
 }
 
-/// Append exact matches while keeping region planning and execution private.
+/// Execute the selected matcher and append exact matching row indices.
+/// The caller supplies a cover and walker prepared for the same pattern and
+/// dictionary, and a configuration eligible for this cover and the current CPU.
 #[inline]
 pub(super) fn matches<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
+    config: MatcherConfig,
+    input: ScanInput<'_, O>,
     dict: CompactDictionaryView<'_>,
-    scan: &ContainsScan,
+    walk: &Walk,
     out: &mut Vec<usize>,
 ) {
-    let input = ScanInput::full(codes, row_offsets, scan.probe_cover());
-    let plan = select_scan_plan(
-        detect_target_caps(),
-        facts(
-            input,
-            scan.covered_frequency() as usize,
-            scan.total_frequency() as usize,
-        ),
-    );
     execute_check(
-        plan,
+        config,
         input,
         Check::Walk {
-            walk: &scan.walk,
+            walk,
             dict,
-            codes,
+            codes: input.codes,
         },
         out,
     );
 }
 
+/// Combine prepared frequency counts with the actual code and row counts.
+#[cfg(test)]
 fn facts<O: Offset>(
     input: ScanInput<'_, O>,
     covered_codes: usize,
@@ -100,8 +98,7 @@ fn facts<O: Offset>(
     }
 }
 
-/// Compatibility entry for tests that exercise dispatch with a synthetic
-/// cover, without constructing a complete scan.
+/// Scan a synthetic cover for tests, returning candidate rows without verification.
 #[cfg(test)]
 pub(super) fn scan<O: Offset>(
     codes: &[Token],
@@ -110,9 +107,9 @@ pub(super) fn scan<O: Offset>(
     covered_frequency: usize,
     out: &mut Vec<usize>,
 ) {
-    let input = ScanInput::full(codes, row_offsets, cover);
+    let input = ScanInput::new(codes, row_offsets, cover);
     execute_check(
-        select_scan_plan(
+        select_matcher_config(
             detect_target_caps(),
             facts(input, covered_frequency, codes.len()),
         ),
@@ -122,18 +119,18 @@ pub(super) fn scan<O: Offset>(
     );
 }
 
-/// The plan under whatever stage two asks of a hit.
+/// Dispatch a nonempty matcher configuration with the requested hit verification.
 fn execute_check<O: Offset>(
-    plan: ScanPlan,
+    config: MatcherConfig,
     input: ScanInput<'_, O>,
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
-    if plan.kernel == Kernel::Empty {
+    if config == MatcherConfig::Empty {
         return;
     }
     dispatch::run(
-        plan,
+        config,
         input.cover,
         input.codes,
         input.row_offsets,
@@ -142,21 +139,20 @@ fn execute_check<O: Offset>(
     );
 }
 
-/// One block of codes, exactly what a matcher is handed.
+/// Token codes passed to a matcher in one call.
 type Block = [Token; BLOCK];
-/// One block of mask, bit `i` for code `i` of the block.
+/// One bit per code in a block; bit `i` describes code `i`.
 type Mask = [u64; BLOCK / 64];
 
-/// What stage two asks of a hit before its row goes out. Every scan the
-/// planner drives applies the walk; `Superset` is how the benches time the
-/// two stages without the walk's per-hit cost inside them.
+/// Verification applied before a candidate row is appended.
+/// Production scans use the graph walker. Tests can accept all
+/// probe hits to exercise matching and row lookup independently.
 #[derive(Clone, Copy)]
 enum Check<'a> {
-    /// Nothing: every hit's row is a candidate.
+    /// Accept every probe hit without checking the substring.
     #[cfg(test)]
     Superset,
-    /// The alignment walk over the codes: only a hit some occurrence of the
-    /// needle parses through has its row emitted.
+    /// Confirm a complete occurrence through this hit using the alignment graph.
     Walk {
         walk: &'a Walk,
         dict: CompactDictionaryView<'a>,
@@ -165,8 +161,7 @@ enum Check<'a> {
 }
 
 impl Check<'_> {
-    /// Whether the hit at stream index `code`, inside the row
-    /// `[row_start, row_end)`, passes.
+    /// Check the hit at absolute code index `code` within `[row_start, row_end)`.
     #[inline]
     fn passes(&self, code: usize, row_start: usize, row_end: usize) -> bool {
         match *self {
@@ -177,19 +172,21 @@ impl Check<'_> {
     }
 }
 
-/// Both stages over a whole stream. Rows come out ascending and unique.
-fn both_stages<'a, M: Matcher, R: Resolver<'a>>(
+/// Match blocks, verify candidate hits, and append each matching row once.
+/// Matcher setup, mask storage, and resolver state are reused across blocks.
+/// Appended indices are ascending; existing output contents are preserved.
+fn both_stages<M: Matcher, O: Offset>(
     cover: &ProbeCover,
     codes: &[Token],
-    row_offsets: &'a [R::Offset],
+    row_offsets: &[O],
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
     let matcher = M::new(cover);
-    let mut resolver = R::new(row_offsets);
+    let mut resolver = Resolver::new(row_offsets);
     let mut bits = [0u64; BLOCK / 64];
     blocks(codes, &mut |block, at, valid| {
-        // A block the matcher reports empty costs stage two nothing.
+        // A false result guarantees no hits; true may still mean an empty mask.
         if matcher.check(block, &mut bits) {
             clear_from(&mut bits, valid);
             resolver.rows(&bits, at, check, out);
@@ -197,10 +194,9 @@ fn both_stages<'a, M: Matcher, R: Resolver<'a>>(
     });
 }
 
-/// Walks the stream in blocks, straight out of `codes` while a whole [`Block`]
-/// remains and through a zero-padded copy at the end. `step(block, at, valid)`
-/// gets the stream index of the block and how many of its codes are the
-/// stream's; bits past `valid` are the padding's and must go.
+/// Visit full blocks directly and copy the final partial block into zero padding.
+/// The callback receives the block, its absolute start, and its valid code count.
+/// It must discard mask bits beyond that count before resolving rows.
 fn blocks(codes: &[Token], step: &mut dyn FnMut(&Block, usize, usize)) {
     let (whole, rest) = codes.as_chunks::<BLOCK>();
     let mut at = 0;
@@ -215,7 +211,7 @@ fn blocks(codes: &[Token], step: &mut dyn FnMut(&Block, usize, usize)) {
     }
 }
 
-/// Clears the bits from position `valid` on.
+/// Clear mask bits at or beyond the valid code count, excluding padded tokens.
 fn clear_from(bits: &mut Mask, valid: usize) {
     if valid < BLOCK {
         bits[valid / 64] &= (1u64 << (valid % 64)) - 1;
@@ -228,19 +224,17 @@ mod tests {
     use super::*;
     use crate::core::types::TokenRange;
 
-    /// What the scan is handed, and what it declines.
+    /// Nonempty covers need a kernel when both rows and codes are present.
     #[test]
     fn the_scan_takes_a_cover_it_can_probe() {
         let codes = [0 as Token; 8];
         let rows = [0u32, 4, 8];
         let takes = |points: Vec<Token>, ranges: Vec<TokenRange>| {
             let cover = ProbeCover { points, ranges };
-            select_scan_plan(
+            select_matcher_config(
                 detect_target_caps(),
-                facts(ScanInput::full(&codes, &rows, &cover), 1, codes.len()),
-            )
-            .kernel
-                != Kernel::Empty
+                facts(ScanInput::new(&codes, &rows, &cover), 1, codes.len()),
+            ) != MatcherConfig::Empty
         };
         assert!(takes(vec![7], Vec::new()), "a point");
         assert!(
@@ -259,17 +253,14 @@ mod tests {
         };
         let rowless: &[u32] = &[0];
         assert!(
-            select_scan_plan(
+            select_matcher_config(
                 detect_target_caps(),
-                facts(ScanInput::full(&codes, rowless, &cover), 1, 8)
-            )
-            .kernel
-                == Kernel::Empty
+                facts(ScanInput::new(&codes, rowless, &cover), 1, 8)
+            ) == MatcherConfig::Empty
         );
     }
 
-    /// Rows but no codes: the block driver has nothing to hand the matcher,
-    /// and the empty rows must come out as no candidates rather than a panic.
+    /// Empty rows contain no candidate tokens at either offset width.
     #[test]
     fn rows_without_codes_make_no_candidate() {
         let cover = ProbeCover {
@@ -283,7 +274,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// The facts the scan plans its own halves from.
+    /// Execution facts retain indexed counts alongside the actual region size.
     #[test]
     fn the_scan_is_handed_the_region_it_will_see() {
         let codes = [0 as Token; 2_000];
@@ -293,7 +284,7 @@ mod tests {
             ranges: Vec::new(),
         };
         assert_eq!(
-            facts(ScanInput::full(&codes, &rows, &cover), 500, 10_000),
+            facts(ScanInput::new(&codes, &rows, &cover), 500, 10_000),
             ScanFacts {
                 analysis: AnalysisFacts {
                     shape: CoverShape {
@@ -304,8 +295,7 @@ mod tests {
                     indexed_codes: 10000
                 },
                 region: RegionFacts {
-                    // A twentieth of the indexed codes are covered, so a
-                    // twentieth of the region's.
+                    // Projection uses these actual sizes, not the index size.
                     code_count: 2_000,
                     row_count: 200,
                 }

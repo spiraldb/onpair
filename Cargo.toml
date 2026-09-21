@@ -47,8 +47,6 @@ arrow-schema = "59.1"
 parquet = "59.1"
 tpchgen = "3.0.0"
 tpchgen-arrow = "3.0.0"
-serde = { version = "1.0.229", features = ["derive"] }
-csv = "1.4.0"
 
 [[bench]]
 name = "tpch"

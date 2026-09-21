@@ -1,12 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Pure selection with PR's matcher, resolver and packing policy.
+//! Select matcher configurations from explicit facts and target capabilities.
+//!
+//! First restrict matchers to supported cover shapes, then compare their
+//! relative scores. Estimated hit density determines whether empty groups skip
+//! mask packing. `scan::dispatch` prepares and executes the selected matcher;
+//! selection performs no scanning or feature detection.
+//!
+//! During preparation, `score_cover` ranks candidate covers using the
+//! lowest eligible matcher score and a fixed penalty per covered token occurrence.
 
-use super::cost::{hit_rows, ns_per_code, seek_ns_per_row, skip_ns_per_code};
-use super::facts::*;
+use super::super::{ProbeCover, scan::PER_BATCH};
+use super::cost::{COVER_HIT_PENALTY, matcher_score, should_skip_packing};
+use super::{
+    CoverShape, Isa, MatcherConfig, MatcherKind, RegionFacts, ScanFacts, TargetCaps, VectorMatcher,
+};
 
-pub(in crate::search::substring) fn takes(
+/// Whether this matcher supports the cover shape on the supplied target.
+/// The caller supplies available capabilities. Nibble batches are limited to
+/// two on AVX2 and three on NEON or AVX-512 to bound register use.
+pub(in crate::search::substring) fn supports_matcher(
     caps: TargetCaps,
     matcher: MatcherKind,
     shape: CoverShape,
@@ -28,80 +42,88 @@ pub(in crate::search::substring) fn takes(
     }
 }
 
+/// Choose the eligible matcher with the lowest per-code score.
+/// The scalar table is always eligible; equal scores retain the earlier choice.
 pub(super) fn select_matcher(caps: TargetCaps, shape: CoverShape) -> MatcherKind {
     let mut best = MatcherKind::Table;
-    let mut best_cost = ns_per_code(caps.isa, best, shape);
+    let mut best_score = matcher_score(caps.isa, best, shape);
 
     for matcher in [
         MatcherKind::EqOr,
         MatcherKind::Range,
         MatcherKind::NibbleN8K,
     ] {
-        if !takes(caps, matcher, shape) {
+        if !supports_matcher(caps, matcher, shape) {
             continue;
         }
 
-        let cost = ns_per_code(caps.isa, matcher, shape);
-        if cost.total_cmp(&best_cost).is_lt() {
+        let score = matcher_score(caps.isa, matcher, shape);
+        if score.total_cmp(&best_score).is_lt() {
             best = matcher;
-            best_cost = cost;
+            best_score = score;
         }
     }
 
     best
 }
 
-pub(in crate::search::substring) fn select_scan_plan(
+/// Choose the matcher and empty-group packing policy.
+/// An empty cover or region needs no kernel. Advisory hit counts are projected
+/// to the current region before estimating packing savings.
+pub(in crate::search::substring) fn select_matcher_config(
     caps: TargetCaps,
     facts: ScanFacts,
-) -> ScanPlan {
+) -> MatcherConfig {
     if facts.analysis.shape.is_empty()
         || facts.region.row_count == 0
         || facts.region.code_count == 0
     {
-        return ScanPlan {
-            kernel: Kernel::Empty,
-            resolver: ResolverKind::LinearSeek,
-        };
+        return MatcherConfig::Empty;
     }
-    let rows = facts.region.row_count as f64;
     let expected_hits = facts.expected_covered_codes() as f64;
-    let g = rows / hit_rows(expected_hits, rows).max(1.0);
-    let resolver = if seek_ns_per_row(ResolverKind::GallopSeek, g)
-        < seek_ns_per_row(ResolverKind::LinearSeek, g)
-    {
-        ResolverKind::GallopSeek
-    } else {
-        ResolverKind::LinearSeek
-    };
     let kind = select_matcher(caps, facts.analysis.shape);
     let matcher = match kind {
-        MatcherKind::Table => {
-            return ScanPlan {
-                kernel: Kernel::Table,
-                resolver,
-            };
-        }
+        MatcherKind::Table => return MatcherConfig::Table,
         MatcherKind::EqOr => VectorMatcher::EqOr,
         MatcherKind::Range => VectorMatcher::Range,
         MatcherKind::NibbleN8K => VectorMatcher::NibbleN8 {
             batches: facts.analysis.shape.points.div_ceil(PER_BATCH),
         },
     };
-    let skip = skip_ns_per_code(caps.isa, expected_hits / facts.region.code_count as f64) < 0.0;
-    let kernel = match caps.isa {
-        Isa::Neon => Kernel::Neon { matcher, skip },
-        Isa::Avx2 => Kernel::Avx2 { matcher, skip },
-        Isa::Avx512Bw => Kernel::Avx512Bw { matcher, skip },
-        Isa::Scalar => Kernel::Table,
-    };
-    ScanPlan { kernel, resolver }
+    let skip = should_skip_packing(caps.isa, expected_hits / facts.region.code_count as f64);
+    match caps.isa {
+        Isa::Neon => MatcherConfig::Neon { matcher, skip },
+        Isa::Avx2 => MatcherConfig::Avx2 { matcher, skip },
+        Isa::Avx512Bw => MatcherConfig::Avx512Bw { matcher, skip },
+        Isa::Scalar => MatcherConfig::Table,
+    }
+}
+
+/// Heuristic for comparing candidate covers for the same scan. Lower is better.
+/// Combines the per-code matcher score with a fixed penalty per covered occurrence.
+/// The mask-packing policy is chosen separately at execution.
+/// An empty cover or region scores zero; callers handle empty patterns separately.
+pub(in crate::search::substring) fn score_cover(
+    caps: TargetCaps,
+    cover: &ProbeCover,
+    covered: u32,
+    region: RegionFacts,
+) -> f64 {
+    if cover.is_empty() || region.code_count == 0 || region.row_count == 0 {
+        return 0.0;
+    }
+    let shape = CoverShape::of(cover);
+    let matcher = select_matcher(caps, shape);
+    let scan_score = matcher_score(caps.isa, matcher, shape);
+    region.code_count as f64 * scan_score + f64::from(covered) * COVER_HIT_PENALTY
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::AnalysisFacts;
     use super::*;
 
+    /// Sample preparation and region sizes for deterministic selection tests.
     fn facts(points: usize, ranges: usize) -> ScanFacts {
         ScanFacts {
             analysis: AnalysisFacts {
@@ -137,8 +159,8 @@ mod tests {
                 },
             ] {
                 assert_eq!(
-                    select_scan_plan(TargetCaps { isa }, f).kernel,
-                    Kernel::Empty
+                    select_matcher_config(TargetCaps { isa }, f),
+                    MatcherConfig::Empty
                 );
             }
         }
@@ -154,7 +176,7 @@ mod tests {
         ] {
             for points in 0..=32 {
                 assert_eq!(
-                    takes(
+                    supports_matcher(
                         TargetCaps { isa },
                         MatcherKind::NibbleN8K,
                         CoverShape { points, ranges: 0 }
@@ -166,17 +188,17 @@ mod tests {
     }
 
     #[test]
-    fn plans_use_the_requested_target_and_legal_shapes() {
+    fn configurations_use_the_requested_target_and_legal_shapes() {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
             for points in 0..=32 {
                 for ranges in 0..=4 {
-                    let plan = select_scan_plan(TargetCaps { isa }, facts(points, ranges));
-                    match plan.kernel {
-                        Kernel::Empty => assert_eq!((points, ranges), (0, 0)),
-                        Kernel::Table => {}
-                        Kernel::Neon { .. } => assert_eq!(isa, Isa::Neon),
-                        Kernel::Avx2 { .. } => assert_eq!(isa, Isa::Avx2),
-                        Kernel::Avx512Bw { skip, .. } => {
+                    let config = select_matcher_config(TargetCaps { isa }, facts(points, ranges));
+                    match config {
+                        MatcherConfig::Empty => assert_eq!((points, ranges), (0, 0)),
+                        MatcherConfig::Table => {}
+                        MatcherConfig::Neon { .. } => assert_eq!(isa, Isa::Neon),
+                        MatcherConfig::Avx2 { .. } => assert_eq!(isa, Isa::Avx2),
+                        MatcherConfig::Avx512Bw { skip, .. } => {
                             assert_eq!(isa, Isa::Avx512Bw);
                             assert!(!skip);
                         }
