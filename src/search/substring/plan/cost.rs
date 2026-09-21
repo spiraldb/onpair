@@ -12,8 +12,8 @@
 //! `select` compares eligible matchers and applies the packing decision.
 //! Measured and extrapolated weights are identified below.
 
-use super::super::scan::PER_BATCH;
-use super::{CoverShape, Isa, MatcherKind};
+use super::super::{ProbeCover, scan::PER_BATCH};
+use super::{Isa, MatcherKind};
 
 /// Relative matcher score per token code. Lower is preferred.
 /// Covers use the same scale when combining this score with the hit penalty.
@@ -21,20 +21,20 @@ use super::{CoverShape, Isa, MatcherKind};
 pub(in crate::search::substring) fn matcher_score(
     isa: Isa,
     matcher: MatcherKind,
-    shape: CoverShape,
+    cover: &ProbeCover,
 ) -> f64 {
     match isa {
-        Isa::Neon => neon(matcher, shape),
-        Isa::Avx2 => avx2(matcher, shape),
-        Isa::Avx512Bw => avx512bw(matcher, shape),
+        Isa::Neon => neon(matcher, cover),
+        Isa::Avx2 => avx2(matcher, cover),
+        Isa::Avx512Bw => avx512bw(matcher, cover),
         Isa::Scalar => match matcher {
             // Scalar table weights follow the build architecture even
             // when that CPU cannot use its vector kernels.
             MatcherKind::Table => {
                 if cfg!(all(target_arch = "x86_64", target_feature = "avx512bw")) {
-                    avx512bw(matcher, shape)
+                    avx512bw(matcher, cover)
                 } else if cfg!(target_arch = "x86_64") {
-                    avx2(matcher, shape)
+                    avx2(matcher, cover)
                 } else {
                     0.195
                 }
@@ -46,10 +46,10 @@ pub(in crate::search::substring) fn matcher_score(
 
 /// NEON weights fitted on Apple M4 Pro using `ch/hits/URL_1m`
 /// on 2026-09-08. Point, range, and batch counts describe their respective work.
-fn neon(matcher: MatcherKind, shape: CoverShape) -> f64 {
-    let k = shape.points as f64;
-    let r = shape.ranges as f64;
-    let batches = shape.points.div_ceil(PER_BATCH) as f64;
+fn neon(matcher: MatcherKind, cover: &ProbeCover) -> f64 {
+    let k = cover.n_points() as f64;
+    let r = cover.n_ranges() as f64;
+    let batches = cover.n_points().div_ceil(PER_BATCH) as f64;
     match matcher {
         MatcherKind::Table => 0.195,
         MatcherKind::EqOr => 0.0043 + 0.0144 * k + 0.0205 * r,
@@ -61,10 +61,10 @@ fn neon(matcher: MatcherKind, shape: CoverShape) -> f64 {
 /// AVX2 weights fitted on Intel Xeon 6975P-C on 2026-09-08.
 /// The `ch/hits/URL_1m` stream was shortened to fit L2 so memory bandwidth
 /// did not dominate the kernel fit. The nibble weights are extrapolated.
-fn avx2(matcher: MatcherKind, shape: CoverShape) -> f64 {
-    let k = shape.points as f64;
-    let r = shape.ranges as f64;
-    let batches = shape.points.div_ceil(PER_BATCH) as f64;
+fn avx2(matcher: MatcherKind, cover: &ProbeCover) -> f64 {
+    let k = cover.n_points() as f64;
+    let r = cover.n_ranges() as f64;
+    let batches = cover.n_points().div_ceil(PER_BATCH) as f64;
     match matcher {
         MatcherKind::Table => 0.201,
         MatcherKind::EqOr => 0.0136 + 0.0105 * k + 0.0239 * r,
@@ -77,10 +77,10 @@ fn avx2(matcher: MatcherKind, shape: CoverShape) -> f64 {
 
 /// AVX-512 weights fitted on the same Xeon and L2-sized stream as AVX2.
 /// Comparisons produce mask bits directly, avoiding byte-lane mask packing.
-fn avx512bw(matcher: MatcherKind, shape: CoverShape) -> f64 {
-    let k = shape.points as f64;
-    let r = shape.ranges as f64;
-    let batches = shape.points.div_ceil(PER_BATCH) as f64;
+fn avx512bw(matcher: MatcherKind, cover: &ProbeCover) -> f64 {
+    let k = cover.n_points() as f64;
+    let r = cover.n_ranges() as f64;
+    let batches = cover.n_points().div_ceil(PER_BATCH) as f64;
     match matcher {
         MatcherKind::Table => 0.204,
         MatcherKind::EqOr => 0.0079 + 0.0113 * k + 0.0127 * r,

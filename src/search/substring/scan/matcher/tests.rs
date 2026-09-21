@@ -17,7 +17,7 @@ use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::search::substring::plan::Isa;
-use crate::search::substring::plan::{CoverShape, MatcherKind};
+use crate::search::substring::plan::MatcherKind;
 use crate::search::substring::scan::{BLOCK, Check, both_stages};
 
 /// Run one matcher and verify that a false return guarantees an empty mask.
@@ -45,7 +45,7 @@ fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
 
 /// Compare an eligible matcher with the independent mask oracle.
 fn agrees<M: Matcher>(kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
-    if !supports_matcher(detect_target_caps(), kind, CoverShape::of(cover)) {
+    if !supports_matcher(detect_target_caps(), kind, cover) {
         return;
     }
     assert_eq!(

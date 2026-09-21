@@ -50,7 +50,6 @@ pub use error::ContainsError;
 pub use verify::{ContainsDfa, row_contains};
 
 use alignment::graph::AlignmentGraph;
-use plan::CoverShape;
 use verify::walk::Walk;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -182,7 +181,7 @@ impl ContainsScan {
         }
         let config = plan::select_matcher_config(
             scan::detect_target_caps(),
-            CoverShape::of(&self.probe_cover),
+            &self.probe_cover,
             plan::probe_density(
                 self.covered_frequency as usize,
                 self.total_frequency as usize,

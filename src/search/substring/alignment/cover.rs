@@ -34,6 +34,16 @@ impl ProbeCover {
         &self.ranges
     }
 
+    /// Number of individual point probes.
+    pub fn n_points(&self) -> usize {
+        self.points.len()
+    }
+
+    /// Number of range probes, regardless of how many token IDs each covers.
+    pub fn n_ranges(&self) -> usize {
+        self.ranges.len()
+    }
+
     /// Whether the cover contains no token IDs.
     #[inline]
     pub fn is_empty(&self) -> bool {

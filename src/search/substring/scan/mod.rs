@@ -19,7 +19,7 @@ mod resolver;
 use super::ProbeCover;
 use super::plan::MatcherConfig;
 #[cfg(test)]
-use super::plan::{CoverShape, probe_density, select_matcher_config};
+use super::plan::{probe_density, select_matcher_config};
 use super::verify::walk::Walk;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
@@ -94,7 +94,7 @@ pub(super) fn scan<O: Offset>(
     execute_check(
         select_matcher_config(
             detect_target_caps(),
-            CoverShape::of(cover),
+            cover,
             probe_density(covered_frequency, codes.len(), codes.len()),
         ),
         input,

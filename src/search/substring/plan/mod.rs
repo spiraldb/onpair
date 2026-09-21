@@ -41,27 +41,6 @@ pub(super) struct TargetCaps {
     pub(super) isa: Isa,
 }
 
-/// Number of point probes and ranges after cover normalization.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CoverShape {
-    pub(super) points: usize,
-    pub(super) ranges: usize,
-}
-impl CoverShape {
-    /// Read the normalized cover shape.
-    pub(super) fn of(cover: &ProbeCover) -> Self {
-        Self {
-            points: cover.points().len(),
-            ranges: cover.ranges().len(),
-        }
-    }
-
-    /// Whether neither kind of probe is present.
-    fn is_empty(self) -> bool {
-        self.points == 0 && self.ranges == 0
-    }
-}
-
 /// Selected probes and their indexed token occurrence count.
 pub(super) struct SelectedCover {
     pub cover: ProbeCover,

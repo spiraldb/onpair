@@ -13,7 +13,7 @@
 
 use super::super::{ProbeCover, scan::PER_BATCH};
 use super::cost::{COVER_HIT_PENALTY, matcher_score, should_skip_packing};
-use super::{CoverShape, Isa, MatcherConfig, MatcherKind, TargetCaps, VectorMatcher};
+use super::{Isa, MatcherConfig, MatcherKind, TargetCaps, VectorMatcher};
 
 /// Whether this matcher supports the cover shape on the supplied target.
 /// The caller supplies available capabilities. Nibble batches are limited to
@@ -21,17 +21,17 @@ use super::{CoverShape, Isa, MatcherConfig, MatcherKind, TargetCaps, VectorMatch
 pub(in crate::search::substring) fn supports_matcher(
     caps: TargetCaps,
     matcher: MatcherKind,
-    shape: CoverShape,
+    cover: &ProbeCover,
 ) -> bool {
     let vector = caps.isa != Isa::Scalar;
     match matcher {
         MatcherKind::Table => true,
-        MatcherKind::EqOr => vector && shape.points > 0,
-        MatcherKind::Range => vector && shape.points == 0 && shape.ranges > 0,
+        MatcherKind::EqOr => vector && cover.n_points() > 0,
+        MatcherKind::Range => vector && cover.n_points() == 0 && cover.n_ranges() > 0,
         MatcherKind::NibbleN8K => {
             vector
-                && shape.points > 0
-                && shape.points.div_ceil(PER_BATCH)
+                && cover.n_points() > 0
+                && cover.n_points().div_ceil(PER_BATCH)
                     <= match caps.isa {
                         Isa::Avx2 => 2,
                         _ => 3,
@@ -42,20 +42,20 @@ pub(in crate::search::substring) fn supports_matcher(
 
 /// Choose the eligible matcher with the lowest per-code score.
 /// The scalar table is always eligible; equal scores retain the earlier choice.
-pub(super) fn select_matcher(caps: TargetCaps, shape: CoverShape) -> MatcherKind {
+pub(super) fn select_matcher(caps: TargetCaps, cover: &ProbeCover) -> MatcherKind {
     let mut best = MatcherKind::Table;
-    let mut best_score = matcher_score(caps.isa, best, shape);
+    let mut best_score = matcher_score(caps.isa, best, cover);
 
     for matcher in [
         MatcherKind::EqOr,
         MatcherKind::Range,
         MatcherKind::NibbleN8K,
     ] {
-        if !supports_matcher(caps, matcher, shape) {
+        if !supports_matcher(caps, matcher, cover) {
             continue;
         }
 
-        let score = matcher_score(caps.isa, matcher, shape);
+        let score = matcher_score(caps.isa, matcher, cover);
         if score.total_cmp(&best_score).is_lt() {
             best = matcher;
             best_score = score;
@@ -93,19 +93,19 @@ pub(in crate::search::substring) fn probe_density(
 /// and handles empty code and row buffers before selection.
 pub(in crate::search::substring) fn select_matcher_config(
     caps: TargetCaps,
-    shape: CoverShape,
+    cover: &ProbeCover,
     probe_density: f64,
 ) -> MatcherConfig {
-    if shape.is_empty() {
+    if cover.is_empty() {
         return MatcherConfig::Empty;
     }
-    let kind = select_matcher(caps, shape);
+    let kind = select_matcher(caps, cover);
     let matcher = match kind {
         MatcherKind::Table => return MatcherConfig::Table,
         MatcherKind::EqOr => VectorMatcher::EqOr,
         MatcherKind::Range => VectorMatcher::Range,
         MatcherKind::NibbleN8K => VectorMatcher::NibbleN8 {
-            batches: shape.points.div_ceil(PER_BATCH),
+            batches: cover.n_points().div_ceil(PER_BATCH),
         },
     };
     let skip = should_skip_packing(caps.isa, probe_density);
@@ -130,28 +130,34 @@ pub(in crate::search::substring) fn score_cover(
     if cover.is_empty() || code_count == 0 {
         return 0.0;
     }
-    let shape = CoverShape::of(cover);
-    let matcher = select_matcher(caps, shape);
-    let scan_score = matcher_score(caps.isa, matcher, shape);
+    let matcher = select_matcher(caps, cover);
+    let scan_score = matcher_score(caps.isa, matcher, cover);
     f64::from(code_count) * scan_score + f64::from(covered) * COVER_HIT_PENALTY
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::{Token, TokenRange};
+
+    /// Build separated points and ranges with the requested probe counts.
+    fn cover(points: usize, ranges: usize) -> ProbeCover {
+        ProbeCover::new(
+            (0..points).map(|i| (2 * i) as Token).collect(),
+            (0..ranges)
+                .map(|i| TokenRange {
+                    begin: (128 + 4 * i) as Token,
+                    last: (129 + 4 * i) as Token,
+                })
+                .collect(),
+        )
+    }
 
     #[test]
     fn empty_covers_do_not_require_a_kernel() {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
             assert_eq!(
-                select_matcher_config(
-                    TargetCaps { isa },
-                    CoverShape {
-                        points: 0,
-                        ranges: 0
-                    },
-                    0.0
-                ),
+                select_matcher_config(TargetCaps { isa }, &cover(0, 0), 0.0),
                 MatcherConfig::Empty
             );
         }
@@ -170,7 +176,7 @@ mod tests {
                     supports_matcher(
                         TargetCaps { isa },
                         MatcherKind::NibbleN8K,
-                        CoverShape { points, ranges: 0 }
+                        &cover(points, 0)
                     ),
                     points > 0 && points <= limit
                 );
@@ -183,11 +189,8 @@ mod tests {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
             for points in 0..=32 {
                 for ranges in 0..=4 {
-                    let config = select_matcher_config(
-                        TargetCaps { isa },
-                        CoverShape { points, ranges },
-                        0.01,
-                    );
+                    let config =
+                        select_matcher_config(TargetCaps { isa }, &cover(points, ranges), 0.01);
                     match config {
                         MatcherConfig::Empty => assert_eq!((points, ranges), (0, 0)),
                         MatcherConfig::Table => {}
