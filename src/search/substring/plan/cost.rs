@@ -3,22 +3,64 @@
 
 //! Relative costs for cover and matcher selection.
 //!
-//! Each instruction set has a coefficient profile, followed by shared formulas
-//! for scanning, candidate processing, and empty-group packing. Recalibration
-//! replaces the profile values without changing the formulas or selection logic.
+//! Matcher selection and cover ranking share the same scan costs. NEON uses
+//! small integer weights; other targets retain their calibrated scan costs.
+//! These costs express relative work, not predicted latency.
 //!
-//! Costs retain the scale of the original timing measurements and serve as
-//! relative weights, not predictions of query latency. `select` compares eligible
-//! matchers, combines scanning and candidate costs, and chooses packing separately.
+//! `select::cover_cost` combines scanning and candidate-processing work.
+//! NEON charges 4096 per covered token occurrence on the integer cost scale.
+//! Mask packing is chosen separately and retains its existing calibration.
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherKind, PER_BATCH};
 
-/// Coefficients on a common relative-cost scale.
+/// Relative matcher cost per scanned code, shared with cover ranking.
+///
+/// NEON uses Table = 22, EqOr = 2p + 3r, Range = 3r, and
+/// Nibble = 2 + 5 * ceil(p / 8) + 3r, where p and r count normalized probes.
+/// These are calibrated weights, not literal instruction counts. They were
+/// fitted on four datasets and checked on eight additional datasets with fixed
+/// covers. Other targets retain their original matcher calibration.
+pub(super) fn matcher_cost(isa: Isa, matcher: MatcherKind, cover: &ProbeCover) -> f64 {
+    let points = cover.n_points() as f64;
+    let ranges = cover.n_ranges() as f64;
+    let batches = cover.n_points().div_ceil(PER_BATCH) as f64;
+    let costs = match isa {
+        Isa::Neon => {
+            return match matcher {
+                MatcherKind::Table => 22.0,
+                MatcherKind::EqOr => 2.0 * points + 3.0 * ranges,
+                MatcherKind::Range => 3.0 * ranges,
+                MatcherKind::NibbleN8 => 2.0 + 5.0 * batches + 3.0 * ranges,
+            };
+        }
+        Isa::Scalar => {
+            return if matcher == MatcherKind::Table {
+                scalar_table_cost()
+            } else {
+                f64::INFINITY
+            };
+        }
+        Isa::Avx2 => AVX2,
+        Isa::Avx512Bw => AVX512BW,
+    };
+    match matcher {
+        MatcherKind::Table => costs.table_code,
+        MatcherKind::EqOr => {
+            costs.eq_or_base + costs.eq_or_point * points + costs.eq_or_range * ranges
+        }
+        MatcherKind::Range => costs.range_base + costs.range_range * ranges,
+        MatcherKind::NibbleN8 => {
+            costs.nibble_base + costs.nibble_batch * batches + costs.nibble_range * ranges
+        }
+    }
+}
+
+/// The existing x86 matcher calibration.
 ///
 /// Matcher terms describe cost per scanned code. Their base terms are
 /// independent of cover shape; they are not one-time setup costs.
-struct Coefficients {
+struct MatcherCosts {
     /// Table lookup cost per code.
     table_code: f64,
 
@@ -35,47 +77,12 @@ struct Coefficients {
     nibble_base: f64,
     nibble_batch: f64,
     nibble_range: f64,
-
-    /// Effective candidate-processing cost per covered occurrence.
-    /// Approximates row resolution and verification: an occurrence need not
-    /// cause a walker call, and traversal lengths vary.
-    covered_occurrence: f64,
-
-    /// Cost of checking whether a group has any hits.
-    empty_check_per_group: f64,
-    /// Packing cost avoided when a group has no hits.
-    packing_per_group: f64,
 }
-
-/// NEON matcher weights fitted on Apple M4 Pro using `ch/hits/URL_1m`
-/// on 2026-09-08. The candidate weight is separately tuned: 2048 times the
-/// one-point cost of 0.0187, independent of the cut-generation lambda.
-/// Packing weights retain the original empty-group calibration.
-const NEON: Coefficients = Coefficients {
-    table_code: 0.195,
-
-    eq_or_base: 0.0043,
-    eq_or_point: 0.0144,
-    eq_or_range: 0.0205,
-
-    range_base: 0.0043,
-    range_range: 0.0212,
-
-    nibble_base: 0.0228,
-    nibble_batch: 0.0325,
-    nibble_range: 0.0213,
-
-    covered_occurrence: 2048.0 * 0.0187,
-
-    empty_check_per_group: 0.75,
-    packing_per_group: 1.01,
-};
 
 /// AVX2 matcher weights fitted on Intel Xeon 6975P-C on 2026-09-08.
 /// The `ch/hits/URL_1m` stream was shortened to fit L2 so memory bandwidth
-/// did not dominate the kernel fit. Candidate and packing weights retain
-/// the shared values used before introducing profiles.
-const AVX2: Coefficients = Coefficients {
+/// did not dominate the kernel fit.
+const AVX2: MatcherCosts = MatcherCosts {
     table_code: 0.201,
 
     eq_or_base: 0.0136,
@@ -90,17 +97,11 @@ const AVX2: Coefficients = Coefficients {
     nibble_base: 0.0594,
     nibble_batch: 0.0310,
     nibble_range: 0.0225,
-
-    covered_occurrence: 2048.0 * 0.0187,
-
-    empty_check_per_group: 0.75,
-    packing_per_group: 1.01,
 };
 
 /// AVX-512 weights fitted on the same Xeon and L2-sized stream as AVX2.
 /// Comparisons produce mask bits directly, avoiding byte-lane mask packing.
-/// The candidate weight retains the shared value used before profiles.
-const AVX512BW: Coefficients = Coefficients {
+const AVX512BW: MatcherCosts = MatcherCosts {
     table_code: 0.204,
 
     eq_or_base: 0.0079,
@@ -113,64 +114,34 @@ const AVX512BW: Coefficients = Coefficients {
     nibble_base: 0.0270,
     nibble_batch: 0.0141,
     nibble_range: 0.0119,
-
-    covered_occurrence: 2048.0 * 0.0187,
-
-    empty_check_per_group: 0.35,
-    packing_per_group: 0.0,
 };
 
-/// Select a profile without detecting CPU features.
-/// Scalar table weights follow the build architecture, as in the original fit.
+/// Preserve the scalar table's original weight for the build architecture.
 #[inline]
-fn coefficients(isa: Isa) -> Coefficients {
-    match isa {
-        Isa::Neon => NEON,
-        Isa::Avx2 => AVX2,
-        Isa::Avx512Bw => AVX512BW,
-        Isa::Scalar => {
-            if cfg!(all(target_arch = "x86_64", target_feature = "avx512bw")) {
-                AVX512BW
-            } else if cfg!(target_arch = "x86_64") {
-                AVX2
-            } else {
-                NEON
-            }
-        }
-    }
-}
-
-/// Relative matcher cost per token code. Lower is preferred.
-/// Empty-group packing is chosen separately and does not affect this cost.
-pub(in crate::search::substring) fn matcher_cost(
-    isa: Isa,
-    matcher: MatcherKind,
-    cover: &ProbeCover,
-) -> f64 {
-    if isa == Isa::Scalar && matcher != MatcherKind::Table {
-        return f64::INFINITY;
-    }
-
-    let costs = coefficients(isa);
-    let points = cover.n_points() as f64;
-    let ranges = cover.n_ranges() as f64;
-    let batches = cover.n_points().div_ceil(PER_BATCH) as f64;
-    match matcher {
-        MatcherKind::Table => costs.table_code,
-        MatcherKind::EqOr => {
-            costs.eq_or_base + costs.eq_or_point * points + costs.eq_or_range * ranges
-        }
-        MatcherKind::Range => costs.range_base + costs.range_range * ranges,
-        MatcherKind::NibbleN8 => {
-            costs.nibble_base + costs.nibble_batch * batches + costs.nibble_range * ranges
-        }
+fn scalar_table_cost() -> f64 {
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512bw")) {
+        AVX512BW.table_code
+    } else if cfg!(target_arch = "x86_64") {
+        AVX2.table_code
+    } else {
+        0.195
     }
 }
 
 /// Approximate row-resolution and verification cost.
 /// Frequency counts covered token occurrences, not matching rows or walker calls.
+///
+/// NEON's 4096 weight balances candidate work against its integer matcher costs.
+/// It was selected to minimize the worst training slowdown on four datasets,
+/// then evaluated on eight others. It is independent of the cut-generation lambda;
+/// traversal lengths and successful-row skipping are not modeled explicitly.
+/// Other targets retain their original candidate weight.
 pub(super) fn candidate_cost(isa: Isa, covered_frequency: u32) -> f64 {
-    f64::from(covered_frequency) * coefficients(isa).covered_occurrence
+    let weight = match isa {
+        Isa::Neon => 4096.0,
+        _ => 2048.0 * 0.0187,
+    };
+    f64::from(covered_frequency) * weight
 }
 
 /// Codes processed together by the scanner's packing loop.
@@ -183,7 +154,13 @@ const PACK_GROUP: f64 = 128.0;
 /// probability uses a Poisson approximation; clustered hits can change the savings.
 /// Scalar tables do not pack masks and do not use this estimate.
 pub(super) fn packing_cost_delta(isa: Isa, density: f64) -> f64 {
-    let costs = coefficients(isa);
+    let (empty_check, packing) = match isa {
+        Isa::Avx512Bw => (0.35, 0.0),
+        Isa::Scalar if cfg!(all(target_arch = "x86_64", target_feature = "avx512bw")) => {
+            (0.35, 0.0)
+        }
+        _ => (0.75, 1.01),
+    };
     let empty_probability = (-PACK_GROUP * density).exp();
-    (costs.empty_check_per_group - costs.packing_per_group * empty_probability) / PACK_GROUP
+    (empty_check - packing * empty_probability) / PACK_GROUP
 }

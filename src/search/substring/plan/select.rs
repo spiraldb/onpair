@@ -9,7 +9,7 @@
 //! selection performs no scanning or feature detection.
 //!
 //! During preparation, `cover_cost` ranks candidate covers using the
-//! lowest eligible matcher cost and a fixed penalty per covered token occurrence.
+//! same matcher costs and a fixed penalty per covered token occurrence.
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherConfig, MatcherKind, PER_BATCH};
@@ -40,7 +40,7 @@ pub(in crate::search::substring) fn is_eligible(
     }
 }
 
-/// Choose the eligible matcher with the lowest per-code cost.
+/// Choose the eligible matcher with the lowest selection cost.
 /// The scalar table is always eligible; equal costs retain the earlier choice.
 pub(super) fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     let mut best = MatcherKind::Table;
@@ -101,11 +101,13 @@ pub(in crate::search::substring) fn select_matcher_config(
 
 /// Rank normalized covers for the same indexed stream. Lower is better.
 ///
-/// `cost = code_count * matcher_cost + candidate_cost(covered_frequency)`.
+/// `cost = code_count * min(matcher_cost) + candidate_cost(covered_frequency)`.
 ///
 /// Scanning pays the lowest eligible matcher cost for every token code.
 /// Candidate processing pays a fixed penalty per covered occurrence to
 /// approximate row lookup and exact verification.
+/// For NEON this is `N * m(C) + 4096 * F(C)`, equivalent to ranking by
+/// `m(C) + 4096 * F(C) / N` for a fixed stream, without a division.
 ///
 /// `code_count` is the index's total token count. `covered_frequency` counts
 /// occurrences of the cover's tokens in that same index, with each token
