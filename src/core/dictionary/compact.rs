@@ -35,19 +35,31 @@ use crate::core::validate::InvalidColumn;
 
 /// Storage for a compact dictionary's serialized buffers.
 ///
-/// Implementations must keep the returned slices immutable and stable for as
-/// long as the storage value is alive. In particular, repeated calls must
-/// refer to the same logical buffers, and an implementation must not expose a
-/// mutable alias that can change either buffer while the storage is alive.
+/// The buffers need not form a valid dictionary;
+/// [`CompactDictionary::validate_safety`] checks their structural invariants.
 ///
-/// This is what lets a validated [`CompactDictionary`] retain `S` and lend the
-/// same zero-copy view as the default owned representation. The storage itself
-/// is only a raw buffer carrier; [`CompactDictionary::validate_safety`]
-/// is the safe boundary that establishes the structural decoder invariants.
-/// Validation does not freeze, copy, or snapshot the buffers. Violating this
-/// contract after validation can cause undefined behavior in the unchecked
-/// decoder, even if validation initially succeeds.
-pub trait DictionaryStorage<D> {
+/// # Safety
+/// Each accessor must return the same lengths and contents, including padding,
+/// across calls and moves. Safe operations through shared references or aliases
+/// must not change them. If the storage implements [`Clone`], cloning must
+/// preserve both buffers' lengths and contents without changing the source.
+/// Allocation addresses may differ.
+///
+/// [`CompactDictionary`] relies on this contract to validate once and lend
+/// zero-copy views; it does not snapshot the buffers or revalidate clones.
+///
+/// Implementations require `unsafe impl`:
+///
+/// ```compile_fail,E0200
+/// use onpair::DictionaryStorage;
+///
+/// struct Storage;
+/// impl DictionaryStorage<u32> for Storage {
+///     fn bytes(&self) -> &[u8] { &[] }
+///     fn offsets(&self) -> &[u32] { &[] }
+/// }
+/// ```
+pub unsafe trait DictionaryStorage<D> {
     /// The concatenated, read-padded token bytes.
     fn bytes(&self) -> &[u8];
 
@@ -74,7 +86,10 @@ impl OwnedDictionaryStorage {
     }
 }
 
-impl DictionaryStorage<u32> for OwnedDictionaryStorage {
+// SAFETY: the private Vecs are only exposed as shared slices until the storage
+// is consumed. Moving them preserves their contents, and derived Clone copies
+// both buffers, including read-padding, without changing the source.
+unsafe impl DictionaryStorage<u32> for OwnedDictionaryStorage {
     #[inline]
     fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -401,6 +416,8 @@ where
         S: 'a;
     #[inline]
     fn as_view(&self) -> CompactDictionaryView<'_> {
+        // DictionaryStorage guarantees that these are still the validated
+        // buffers, including after moving or cloning the storage.
         CompactDictionaryView {
             bytes: self.storage.bytes(),
             offsets: self.storage.offsets(),
@@ -591,7 +608,9 @@ mod tests {
         offsets: Arc<[u32]>,
     }
 
-    impl DictionaryStorage<u32> for SharedStorage {
+    // SAFETY: the immutable Arc slices always expose the same buffers. Moving
+    // or cloning the storage preserves their contents and keeps them alive.
+    unsafe impl DictionaryStorage<u32> for SharedStorage {
         fn bytes(&self) -> &[u8] {
             &self.bytes
         }
@@ -635,9 +654,38 @@ mod tests {
         assert_eq!(dictionary.offsets().as_ptr(), offsets.as_ptr());
         assert_eq!(dictionary.as_view().token(0), &[0]);
 
+        let cloned = dictionary.clone();
+        assert_eq!(cloned.bytes().as_ptr(), bytes.as_ptr());
+        assert_eq!(cloned.offsets().as_ptr(), offsets.as_ptr());
+
         let storage = dictionary.into_storage();
         assert!(Arc::ptr_eq(&storage.bytes, &bytes));
         assert!(Arc::ptr_eq(&storage.offsets, &offsets));
+        drop(storage);
+        drop(bytes);
+        drop(offsets);
+
+        // Conversion reads the full token width, including padding, after the
+        // other owners have dropped.
+        assert_eq!(cloned.to_wide().as_view().token(0), &[0]);
+    }
+
+    #[test]
+    fn owned_dictionary_clone_preserves_validated_buffers() {
+        let (bytes, offsets) = padded(&[b"a", b"bc"]);
+        let dictionary = CompactDictionary::validate_safety(OwnedDictionaryStorage::new(
+            bytes.clone(),
+            offsets.clone(),
+        ))
+        .unwrap();
+        let cloned = dictionary.clone();
+        drop(dictionary);
+
+        assert_eq!(cloned.bytes(), bytes);
+        assert_eq!(cloned.offsets(), offsets);
+        let wide = cloned.to_wide();
+        assert_eq!(wide.as_view().token(0), b"a");
+        assert_eq!(wide.as_view().token(1), b"bc");
     }
 
     #[test]
