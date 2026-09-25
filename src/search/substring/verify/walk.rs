@@ -22,6 +22,8 @@
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{Token, TokenRange};
+use crate::search::index::TokenFrequencyIndexView;
+use crate::search::substring::ProbeCover;
 use crate::search::substring::alignment::graph::{AlignmentGraph, EdgeKind};
 
 /// Needle offset before any bytes have matched.
@@ -274,6 +276,82 @@ impl Walk {
             }
         }
         false
+    }
+
+    /// Frequency-weighted upper bound on uncertain verification work.
+    /// Counts role lookup predicates, role trials and walk iterations, assuming
+    /// every covered occurrence is visited and every uncertain role is tried.
+    /// Whole-token matches need only the constant acceptance check above.
+    pub(in crate::search::substring) fn verification_work_bound(
+        &self,
+        cover: &ProbeCover,
+        frequencies: TokenFrequencyIndexView<'_>,
+    ) -> u64 {
+        if self.nodes.is_empty() || cover.is_empty() || frequencies.total_frequency() == 0 {
+            return 0;
+        }
+        let (backward, forward) = self.walk_step_bounds();
+        let alignment_work = |edge: Edge| {
+            backward[usize::from(edge.from)]
+                .saturating_add(forward[usize::from(edge.to)])
+                .saturating_add(1) // Try this alignment.
+        };
+        // For M listed roles, partition_point uses ceil(log2(M)) + 1
+        // comparisons. One more pays the final failing lazy-list predicate.
+        let list_len = self.edges.edges_of_tokens.len();
+        let listed_lookup_work = list_len
+            .checked_sub(1)
+            .map_or(0, |last| u64::from(usize::BITS - last.leading_zeros()) + 2);
+        let tokens = cover.points().iter().copied().chain(
+            cover
+                .ranges()
+                .iter()
+                .flat_map(|range| range.begin..=range.last),
+        );
+        let mut total = 0u64;
+        for token in tokens {
+            let frequency = u64::from(frequencies.frequency(token));
+            if frequency == 0 || self.edges.contains_whole_needle(token) {
+                continue;
+            }
+            let at = usize::from(token.wrapping_sub(self.edges.first_token));
+            let edge = self.edges.edge_of_token.get(at).copied().unwrap_or(NONE);
+            let work = match edge {
+                NONE => 0,
+                LISTED => self
+                    .edges
+                    .of(token)
+                    .fold(listed_lookup_work, |total, edge| {
+                        total
+                            .saturating_add(1) // Read this role from the list.
+                            .saturating_add(alignment_work(edge))
+                    }),
+                edge => alignment_work(edge),
+            };
+            total = total.saturating_add(frequency.saturating_mul(work));
+        }
+        total
+    }
+
+    /// Maximum backward and forward loop iterations from each needle offset.
+    /// Greedy steps advance offsets, so each direction needs one linear pass.
+    fn walk_step_bounds(&self) -> (Vec<u64>, Vec<u64>) {
+        // A backward check can stop at a source overlap or a row boundary.
+        let mut backward = vec![1u64; self.nodes.len()];
+        backward[SOURCE as usize] = 0;
+        for (from, node) in self.nodes.iter().enumerate() {
+            if let Some((_, to)) = node.greedy_step {
+                backward[to as usize] = backward[to as usize].max(backward[from] + 1);
+            }
+        }
+        // A forward check can stop at a terminal range or follow its one step.
+        let mut forward = vec![0u64; self.nodes.len()];
+        for from in (0..self.sink() as usize).rev() {
+            forward[from] = 1 + self.nodes[from]
+                .greedy_step
+                .map_or(0, |(_, to)| forward[to as usize]);
+        }
+        (backward, forward)
     }
 
     /// Follow greedy transitions through following row codes until a terminal match.

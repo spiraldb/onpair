@@ -195,6 +195,40 @@ impl ContainsScan {
         );
     }
 
+    /// Whether repeated verification work warrants falling back to another search.
+    ///
+    /// Returns `true` when `sum(frequency(token) * maximum work(token))` over
+    /// probe tokens exceeds the encoded token count. Work counts uncertain lookups,
+    /// alignment trials and forward/backward walk steps. Tokens containing the
+    /// whole pattern are accepted directly and contribute no uncertain work.
+    ///
+    /// For example, a row repeating `(a × 255 + b)` cannot contain `a × 256`,
+    /// yet frequent `a` tokens can trigger many long, unsuccessful walks. A caller
+    /// can use this method to choose decompression followed by a byte search.
+    /// [`Self::scan`] never calls this method or falls back automatically.
+    ///
+    /// The bound assumes every probe occurrence needs all its uncertain checks;
+    /// early failures and matches can make actual work much smaller. It excludes
+    /// constant hit handling, scanning, row resolution and preparation, so it is
+    /// not a latency prediction or a guarantee of a speedup over another search.
+    /// Empty patterns, empty covers and empty streams return `false`.
+    ///
+    /// The bound is computed only on request, using temporary arrays proportional
+    /// to the pattern length and visiting the uncertain covered tokens' roles.
+    ///
+    /// # Precondition
+    /// `frequencies` must use this scan's dictionary token IDs and count exact
+    /// occurrences in the code stream to be scanned, even if planning used a
+    /// different stream. This correspondence is not checked here.
+    pub fn should_fallback<S: TokenFrequencyIndexStorage>(
+        &self,
+        frequencies: &TokenFrequencyIndex<S>,
+    ) -> bool {
+        self.walk
+            .verification_work_bound(&self.probe_cover, frequencies.as_view())
+            > u64::from(frequencies.total_frequency())
+    }
+
     /// The normalized checks the SIMD prefilter can execute.
     ///
     /// For an empty pattern this cover is empty, but [`ContainsScan::scan`]

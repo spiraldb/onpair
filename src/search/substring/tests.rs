@@ -221,6 +221,7 @@ fn empty_pattern_and_empty_cover_have_distinct_results() {
         check(view, rows, &[b"", b"absent"]);
         let scan = ContainsScan::new(b"", view.dict, &frequencies).unwrap();
         assert!(scan.probe_cover().is_empty());
+        assert!(!scan.should_fallback(&frequencies));
         assert_eq!(
             scan.expected_candidate_row_fraction(rows.len()),
             if rows.is_empty() { 0.0 } else { 1.0 }
