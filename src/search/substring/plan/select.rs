@@ -8,8 +8,9 @@
 //! mask packing. `scan::dispatch` prepares and executes the selected matcher;
 //! selection performs no scanning or feature detection.
 //!
-//! During preparation, `cover_cost` ranks candidate covers using the
-//! same matcher costs and a fixed penalty per covered token occurrence.
+//! During preparation, `cover_cost` ranks candidate covers using scan costs
+//! balanced against a fixed penalty per covered token occurrence. The same
+//! matcher costs choose the kernel that will execute each cover.
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherConfig, MatcherKind, PER_BATCH};
@@ -40,9 +41,9 @@ pub(in crate::search::substring) fn is_eligible(
     }
 }
 
-/// Choose the eligible matcher with the lowest selection cost.
+/// Choose the eligible matcher with the lowest cost.
 /// The scalar table is always eligible; equal costs retain the earlier choice.
-pub(super) fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
+fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     let mut best = MatcherKind::Table;
     let mut best_cost = matcher_cost(isa, best, cover);
 
@@ -101,15 +102,14 @@ pub(in crate::search::substring) fn select_matcher_config(
 
 /// Rank normalized covers for the same indexed stream. Lower is better.
 ///
-/// `cost = code_count * min(matcher_cost) + candidate_cost(covered_frequency)`.
+/// `cost = N * min(matcher_cost) + gamma * F`.
 ///
-/// Scanning pays the lowest eligible matcher cost for every token code.
-/// Candidate processing pays a fixed penalty per covered occurrence to
-/// approximate row lookup and exact verification.
-/// For NEON this is `N * m(C) + 4096 * F(C)`, equivalent to ranking by
-/// `m(C) + 4096 * F(C) / N` for a fixed stream, without a division.
+/// Scanning pays the cost of the selected matcher for every token code. Candidate
+/// processing pays the profile's fixed penalty per covered occurrence to approximate
+/// row lookup and exact verification. For a fixed nonempty stream, this is equivalent
+/// to ranking by `min(matcher_cost) + gamma * F / N`, without a division.
 ///
-/// `code_count` is the index's total token count. `covered_frequency` counts
+/// `N = code_count` is the index's total token count. `F = covered_frequency` counts
 /// occurrences of the cover's tokens in that same index, with each token
 /// position counted once after cover normalization.
 ///

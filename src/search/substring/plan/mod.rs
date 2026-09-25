@@ -5,9 +5,10 @@
 //!
 //! Minimum cuts use additive edge weights: frequency plus a penalty for the
 //! number of comparisons. Each sampled cut is normalized and ranked by its
-//! lowest eligible matcher cost plus a fixed penalty per covered occurrence.
-//! NEON shares its integer matcher costs between both decisions and charges
-//! 4096 per covered occurrence. Execution chooses mask packing separately.
+//! lowest eligible scan cost plus a fixed penalty per covered occurrence.
+//! A single cost profile per instruction set serves both decisions. It combines
+//! matcher work per code with candidate processing per covered occurrence.
+//! Execution chooses mask packing separately.
 //!
 //! `scan` defines the instruction sets and matcher configurations. `select`
 //! chooses eligible matchers using the formulas in `cost` and chooses mask
