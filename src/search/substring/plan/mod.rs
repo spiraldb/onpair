@@ -40,7 +40,6 @@ pub(super) fn select_cover(
     isa: Isa,
 ) -> (ProbeCover, u32) {
     let code_count = frequencies.total_frequency();
-    let ceiling = u64::from(code_count);
     let mut solver = MinCut::new(graph);
     let evaluate_cut = |cut: &[u32]| {
         let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| &graph.edges[at as usize]));
@@ -50,12 +49,14 @@ pub(super) fn select_cover(
     };
 
     // Evaluate the comparison-heavy end before sampling lower penalties.
-    let high_penalty_cut = solver.solve(edge_weight(ceiling + 1)).to_vec();
+    let high_penalty_cut = solver
+        .solve(edge_weight(u64::from(code_count) + 1))
+        .to_vec();
     let (mut best_cover, mut best_frequency, mut best_cost) = evaluate_cut(&high_penalty_cut);
 
     let mut previous_cut: Vec<u32> = Vec::new();
     let mut lambda = 0u64;
-    while lambda <= ceiling {
+    while lambda <= u64::from(code_count) {
         let cut = solver.solve(edge_weight(lambda));
         if cut == high_penalty_cut {
             break;
