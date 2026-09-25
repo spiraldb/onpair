@@ -6,7 +6,9 @@
 //! Preparation compiles the alignment graph into per-offset continuation
 //! checks and a token-to-edges lookup. A hit token can belong to several edges;
 //! verification tries each role, checking the remaining codes forward and
-//! the preceding codes backward within the same row.
+//! the preceding codes backward within the same row. Tokens with a source-to-sink
+//! role already prove a match and are accepted before looking up their roles.
+//! Other role lists are traversed lazily and stop as soon as a trial succeeds.
 //!
 //! Forward checks follow greedy steps until a terminal range finishes the
 //! needle. Backward checks use the preceding token's single edge when possible;
@@ -91,7 +93,7 @@ impl Edge {
 
 /// Enumerated graph edges indexed by token ID.
 /// The dense array stores one edge, `NONE`, or `LISTED`. Tokens with several
-/// roles keep their edges in a separate sorted list. Real edges advance the
+/// roles keep their edges in a list sorted by token ID. Real edges advance the
 /// needle offset, so equal-endpoint sentinels cannot collide with them.
 #[derive(Debug, Clone, Default)]
 struct EdgesByToken {
@@ -99,7 +101,9 @@ struct EdgesByToken {
     first_token: Token,
     /// One edge or sentinel per ID between the first and last indexed token.
     edge_of_token: Vec<Edge>,
-    /// Sorted `(token, edge)` entries for tokens with more than one role.
+    /// Tokens containing the whole needle; allocated only if at least one exists.
+    complete: Vec<bool>,
+    /// Grouped by token ID, with complete matches before partial roles.
     edges_of_tokens: Vec<(Token, Edge)>,
 }
 
@@ -113,8 +117,9 @@ const LISTED: Edge = Edge {
 };
 
 impl EdgesByToken {
-    /// Deduplicate token-edge pairs and separate single-edge from multi-edge tokens.
-    fn new(mut token_edges: Vec<(Token, Edge)>) -> Self {
+    /// Deduplicate roles, placing complete matches first within each token group.
+    fn new(mut token_edges: Vec<(Token, Edge)>, sink: u32) -> Self {
+        let complete = Edge::new(SOURCE, sink);
         token_edges.sort_unstable();
         token_edges.dedup();
         let (Some(&(first_token, _)), Some(&(last_token, _))) =
@@ -125,42 +130,56 @@ impl EdgesByToken {
         let mut edges = Self {
             first_token,
             edge_of_token: vec![NONE; usize::from(last_token - first_token) + 1],
+            complete: Vec::new(),
             edges_of_tokens: Vec::new(),
         };
-        for same_token in token_edges.chunk_by(|a, b| a.0 == b.0) {
+        for same_token in token_edges.chunk_by_mut(|a, b| a.0 == b.0) {
             let (token, edge) = same_token[0];
             edges.edge_of_token[usize::from(token - first_token)] = if same_token.len() == 1 {
                 edge
             } else {
+                // A complete occurrence needs no walking; try it first.
+                if let Some(at) = same_token.iter().position(|&(_, edge)| edge == complete) {
+                    same_token.swap(0, at);
+                }
                 edges.edges_of_tokens.extend_from_slice(same_token);
                 LISTED
             };
+            if same_token[0].1 == complete {
+                if edges.complete.is_empty() {
+                    edges.complete.resize(edges.edge_of_token.len(), false);
+                }
+                edges.complete[usize::from(token - first_token)] = true;
+            }
         }
         edges
     }
 
-    /// Iterate every enumerated graph role for this token, or none if absent.
+    /// A source-to-sink role proves a match without inspecting neighboring codes.
+    #[inline]
+    fn contains_whole_needle(&self, token: Token) -> bool {
+        let at = usize::from(token.wrapping_sub(self.first_token));
+        self.complete.get(at).copied().unwrap_or(false)
+    }
+
+    /// Visit this token's roles lazily, starting with a complete match if present.
     #[inline]
     fn of(&self, token: Token) -> impl Iterator<Item = Edge> + '_ {
         let at = usize::from(token.wrapping_sub(self.first_token));
         let (single, listed) = match self.edge_of_token.get(at).copied().unwrap_or(NONE) {
             NONE => (None, &self.edges_of_tokens[..0]),
-            LISTED => (None, self.listed_for(token)),
+            LISTED => {
+                let first = self.edges_of_tokens.partition_point(|&(t, _)| t < token);
+                (None, &self.edges_of_tokens[first..])
+            }
             edge => (Some(edge), &self.edges_of_tokens[..0]),
         };
-        single
-            .into_iter()
-            .chain(listed.iter().map(|&(_, edge)| edge))
-    }
-
-    /// Locate the contiguous edge list for a token with multiple roles.
-    fn listed_for(&self, token: Token) -> &[(Token, Edge)] {
-        let first = self.edges_of_tokens.partition_point(|&(t, _)| t < token);
-        let count = self.edges_of_tokens[first..]
-            .iter()
-            .take_while(|&&(t, _)| t == token)
-            .count();
-        &self.edges_of_tokens[first..first + count]
+        single.into_iter().chain(
+            listed
+                .iter()
+                .take_while(move |&&(t, _)| t == token)
+                .map(|&(_, edge)| edge),
+        )
     }
 }
 
@@ -216,7 +235,7 @@ impl Walk {
                 }
             }
         }
-        let edges = EdgesByToken::new(token_edges);
+        let edges = EdgesByToken::new(token_edges, graph.sink());
         Self {
             nodes,
             edges,
@@ -243,6 +262,9 @@ impl Walk {
         hit_code_index: usize,
     ) -> bool {
         let hit = codes[hit_code_index];
+        if self.edges.contains_whole_needle(hit) {
+            return true;
+        }
         for edge in self.edges.of(hit) {
             let (from, to) = (u32::from(edge.from), u32::from(edge.to));
             if (to == self.sink() || self.forward(to, hit_code_index + 1, codes, row_end))
