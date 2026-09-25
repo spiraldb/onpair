@@ -4,8 +4,8 @@
 //! Select matcher configurations from cover shape, hit density, and instruction set.
 //!
 //! First restrict matchers to supported cover shapes, then compare their
-//! relative costs. Estimated hit density determines whether empty groups skip
-//! mask packing. `scan::dispatch` prepares and executes the selected matcher;
+//! relative costs. A shared hit-density threshold determines whether empty groups
+//! skip mask packing. `scan::dispatch` prepares and executes the selected matcher;
 //! selection performs no scanning or feature detection.
 //!
 //! During preparation, `cover_cost` ranks candidate covers using scan costs
@@ -14,7 +14,13 @@
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherConfig, MatcherKind, PER_BATCH};
-use super::cost::{candidate_cost, matcher_cost, packing_cost_delta};
+use super::cost::{candidate_cost, matcher_cost};
+
+/// Probe density below which vector matchers skip packing empty groups.
+/// This conservative empirical cutoff (0.0075%) is shared by NEON, AVX2 and
+/// AVX-512. Sparse hits also leave whole blocks empty, avoiding row resolution.
+/// Clustered hits can make skipping profitable above the cutoff too.
+const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 7.5e-5;
 
 /// Whether this matcher is eligible for selection on the supplied target and cover.
 /// The caller supplies an available instruction set. Nibble batches are limited to
@@ -96,7 +102,7 @@ pub(in crate::search::substring) fn select_matcher_config(
     MatcherConfig {
         kind,
         skip_empty_packing: kind != MatcherKind::Table
-            && packing_cost_delta(isa, probe_density) < 0.0,
+            && probe_density < SKIP_PACKING_DENSITY_THRESHOLD,
     }
 }
 
@@ -176,13 +182,20 @@ mod tests {
                     if cover.is_empty() {
                         continue;
                     }
-                    for density in [0.0, 0.01, 1.0] {
+                    for (density, skip) in [
+                        (0.0, true),
+                        (0.000075_f64.next_down(), true),
+                        (0.000075, false),
+                        (0.000075_f64.next_up(), false),
+                        (0.01, false),
+                        (1.0, false),
+                    ] {
                         let config = select_matcher_config(isa, &cover, density);
                         assert!(is_eligible(isa, config.kind, &cover));
-                        if config.kind == MatcherKind::Table || isa == Isa::Avx512Bw {
+                        if config.kind == MatcherKind::Table {
                             assert!(!config.skip_empty_packing);
                         } else {
-                            assert_eq!(config.skip_empty_packing, density == 0.0);
+                            assert_eq!(config.skip_empty_packing, skip);
                         }
                     }
                 }
@@ -210,7 +223,8 @@ mod tests {
         let partial = probe_density(1, 400, 399);
         assert_eq!(whole, 1.0 / 400.0);
         assert_eq!(partial, 0.0);
-        assert!(packing_cost_delta(Isa::Neon, whole) >= 0.0);
-        assert!(packing_cost_delta(Isa::Neon, partial) < 0.0);
+        let cover = cover(1, 0);
+        assert!(!select_matcher_config(Isa::Neon, &cover, whole).skip_empty_packing);
+        assert!(select_matcher_config(Isa::Neon, &cover, partial).skip_empty_packing);
     }
 }

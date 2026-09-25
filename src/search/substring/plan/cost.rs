@@ -115,24 +115,3 @@ pub(super) fn candidate_cost(isa: Isa, covered_frequency: u32) -> f64 {
     };
     f64::from(covered_frequency) * weight
 }
-
-/// Codes processed together by the scanner's packing loop.
-/// This is an implementation constant, not a fitted coefficient.
-const PACK_GROUP: f64 = 128.0;
-
-/// Extra cost per code when checking for empty groups before vector mask packing.
-///
-/// Negative means avoided packing outweighs the empty-group check. The empty-group
-/// probability uses a Poisson approximation; clustered hits can change the savings.
-/// Scalar tables do not pack masks and do not use this estimate.
-pub(super) fn packing_cost_delta(isa: Isa, density: f64) -> f64 {
-    let (empty_check, packing) = match isa {
-        Isa::Avx512Bw => (0.35, 0.0),
-        Isa::Scalar if cfg!(all(target_arch = "x86_64", target_feature = "avx512bw")) => {
-            (0.35, 0.0)
-        }
-        _ => (0.75, 1.01),
-    };
-    let empty_probability = (-PACK_GROUP * density).exp();
-    (empty_check - packing * empty_probability) / PACK_GROUP
-}
