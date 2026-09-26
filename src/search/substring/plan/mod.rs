@@ -25,7 +25,7 @@ use super::scan::Isa;
 use crate::search::index::TokenFrequencyIndexView;
 #[cfg(test)]
 pub(super) use select::is_eligible;
-pub(super) use select::{cover_cost, probe_density, select_matcher_config};
+pub(super) use select::{cover_cost, select_matcher_config};
 
 /// Select the sampled cover with the lowest relative cost.
 /// Return the cover and its indexed token occurrence count.

@@ -180,11 +180,8 @@ impl ContainsScan {
         let config = plan::select_matcher_config(
             scan::detect_isa(),
             &self.probe_cover,
-            plan::probe_density(
-                self.covered_frequency as usize,
-                self.total_frequency as usize,
-                codes.len(),
-            ),
+            self.covered_fraction(),
+            codes.len(),
         );
         scan::matches(
             config,

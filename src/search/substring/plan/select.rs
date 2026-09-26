@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Select matcher configurations from cover shape, hit density, and instruction set.
+//! Select matcher configurations from cover shape, hit density, scan size, and ISA.
 //!
 //! First restrict matchers to supported cover shapes, then compare their
-//! relative costs. A shared hit-density threshold determines whether empty groups
-//! skip mask packing. `scan::dispatch` prepares and executes the selected matcher;
+//! relative costs. Sparse probes or small scans skip packing empty mask groups.
+//! `scan::dispatch` prepares and executes the selected matcher;
 //! selection performs no scanning or feature detection.
 //!
 //! During preparation, `cover_cost` ranks candidate covers using scan costs
@@ -17,10 +17,10 @@ use super::super::scan::{Isa, MatcherConfig, MatcherKind, PER_BATCH};
 use super::cost::{candidate_cost, matcher_cost};
 
 /// Probe density below which vector matchers skip packing empty groups.
-/// This conservative empirical cutoff (0.0075%) is shared by NEON, AVX2 and
+/// This empirical cutoff (0.025%) is shared by NEON, AVX2 and
 /// AVX-512. Sparse hits also leave whole blocks empty, avoiding row resolution.
 /// Clustered hits can make skipping profitable above the cutoff too.
-const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 7.5e-5;
+const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 2.5e-4;
 
 /// Whether this matcher is eligible for selection on the supplied target and cover.
 /// The caller supplies an available instruction set. Nibble batches are limited to
@@ -68,41 +68,24 @@ fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     best
 }
 
-/// Estimate hit density after projecting indexed counts onto the current scan.
-/// Round the projected hit count down before dividing by the scan's code count.
-/// Equal-sized scans retain the indexed count; empty scans or indexes return zero.
-/// Counts are advisory and affect packing only, never which tokens can match.
-#[inline]
-pub(in crate::search::substring) fn probe_density(
-    covered_codes: usize,
-    indexed_codes: usize,
-    code_count: usize,
-) -> f64 {
-    if code_count == 0 || indexed_codes == 0 {
-        return 0.0;
-    }
-    let expected_hits = if indexed_codes == code_count {
-        covered_codes
-    } else {
-        let projected =
-            (covered_codes as u128).saturating_mul(code_count as u128) / indexed_codes as u128;
-        usize::try_from(projected).unwrap_or(usize::MAX)
-    };
-    expected_hits as f64 / code_count as f64
-}
-
 /// Choose the matcher and empty-group packing policy for a nonempty scan and cover.
-/// The caller handles empty inputs and supplies the estimated hit density.
+///
+/// `probe_density` is the covered fraction of the indexed stream; `code_count`
+/// is the number of codes in this scan. Skip packing empty groups when probes
+/// are sparse or the scan has fewer than one projected hit. Keep this decision
+/// for the entire scan. The caller handles empty inputs.
 pub(in crate::search::substring) fn select_matcher_config(
     isa: Isa,
     cover: &ProbeCover,
     probe_density: f64,
+    code_count: usize,
 ) -> MatcherConfig {
     let kind = select_matcher(isa, cover);
     MatcherConfig {
         kind,
         skip_empty_packing: kind != MatcherKind::Table
-            && probe_density < SKIP_PACKING_DENSITY_THRESHOLD,
+            && (probe_density < SKIP_PACKING_DENSITY_THRESHOLD
+                || probe_density * (code_count as f64) < 1.0),
     }
 }
 
@@ -182,15 +165,19 @@ mod tests {
                     if cover.is_empty() {
                         continue;
                     }
-                    for (density, skip) in [
-                        (0.0, true),
-                        (0.000075_f64.next_down(), true),
-                        (0.000075, false),
-                        (0.000075_f64.next_up(), false),
-                        (0.01, false),
-                        (1.0, false),
+                    for (density, code_count, skip) in [
+                        (0.0, 1_000_000, true),
+                        (0.00025_f64.next_down(), 1_000_000, true),
+                        (0.00025, 1_000_000, false),
+                        (0.00025_f64.next_up(), 1_000_000, false),
+                        (0.01, 1_000_000, false),
+                        (1.0, 1_000_000, false),
+                        // Partial scans use the same density but project fewer hits.
+                        (1.0 / 400.0, 399, true),
+                        (1.0 / 400.0, 400, false),
+                        (1.0 / 400.0, 401, false),
                     ] {
-                        let config = select_matcher_config(isa, &cover, density);
+                        let config = select_matcher_config(isa, &cover, density, code_count);
                         assert!(is_eligible(isa, config.kind, &cover));
                         if config.kind == MatcherKind::Table {
                             assert!(!config.skip_empty_packing);
@@ -201,30 +188,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn probe_density_preserves_projected_hit_counts() {
-        for (covered, indexed, scanned, expected) in [
-            (100, 10_000, 2_000, 0.01),
-            (100, 10_000, 10_000, 0.01),
-            (100, 0, 10_000, 0.0),
-            (100, 10_000, 0, 0.0),
-            (0, 0, 0, 0.0),
-            (1, 1, usize::MAX, 1.0),
-            (usize::MAX, 1, usize::MAX, 1.0),
-            (200, 100, 100, 2.0),
-        ] {
-            assert_eq!(probe_density(covered, indexed, scanned), expected);
-        }
-
-        // Rounding a partial scan down to zero hits changes its packing decision.
-        let whole = probe_density(1, 400, 400);
-        let partial = probe_density(1, 400, 399);
-        assert_eq!(whole, 1.0 / 400.0);
-        assert_eq!(partial, 0.0);
-        let cover = cover(1, 0);
-        assert!(!select_matcher_config(Isa::Neon, &cover, whole).skip_empty_packing);
-        assert!(select_matcher_config(Isa::Neon, &cover, partial).skip_empty_packing);
     }
 }

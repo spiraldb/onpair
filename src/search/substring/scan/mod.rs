@@ -20,7 +20,7 @@ mod resolver;
 
 use super::ProbeCover;
 #[cfg(test)]
-use super::plan::{probe_density, select_matcher_config};
+use super::plan::select_matcher_config;
 use super::verify::walk::Walk;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
@@ -127,7 +127,8 @@ pub(super) fn scan<O: Offset>(
         select_matcher_config(
             detect_isa(),
             cover,
-            probe_density(covered_frequency, codes.len(), codes.len()),
+            covered_frequency as f64 / codes.len() as f64,
+            codes.len(),
         ),
         input,
         Check::Superset,
