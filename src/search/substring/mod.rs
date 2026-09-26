@@ -260,19 +260,27 @@ impl ContainsScan {
         self.total_frequency
     }
 
-    /// SIMD comparisons each vector of the code stream pays for this cover: one
-    /// per point, two per inclusive range. Zero for an empty pattern.
+    /// Comparison-count proxy for the cover: one per point, two per inclusive
+    /// range. Zero for an empty pattern.
+    ///
+    /// Counts comparisons for a direct comparison strategy. The selected matcher
+    /// may use different operations, such as nibble lookups or a membership table.
     pub fn comparison_cost(&self) -> usize {
         self.probe_cover
             .n_points()
             .saturating_add(self.probe_cover.n_ranges().saturating_mul(2))
     }
 
-    /// Expected share of `row_count` rows the scan will admit for verification.
+    /// Upper bound on the fraction of indexed rows containing a probe token.
     ///
-    /// Verification is charged per row, so the estimate is covered codes per
-    /// row: exact when no row holds two covered codes, an over-estimate
-    /// otherwise. Returns `0.0` for an empty region and never exceeds `1.0`.
+    /// Computes `min(1, covered_frequency / row_count)`. Each candidate row holds
+    /// at least one covered code, but multiple covered codes may share a row,
+    /// making the bound loose. A row may require several verification attempts,
+    /// so this fraction does not measure verifier calls.
+    ///
+    /// The bound assumes the preparation frequency index counts exact occurrences
+    /// in the same region whose rows are counted by `row_count`.
+    /// Returns `0.0` for zero rows and never exceeds `1.0`.
     /// An empty pattern admits every row, so its fraction is `1.0` for any
     /// non-empty region, even one consisting entirely of empty rows.
     pub fn expected_candidate_row_fraction(&self, row_count: usize) -> f64 {
