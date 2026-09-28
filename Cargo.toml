@@ -35,12 +35,12 @@ unwrap_in_result = { level = "deny" }
 use_debug = { level = "deny" }
 
 [dependencies]
-hashbrown = "0.16.1"
+hashbrown = "0.17.0"
 rand = "0.10.3"
 
 [dev-dependencies]
 divan = { package = "codspeed-divan-compat", version = "5.0.0" }
-rstest = "0.26.1"
+rstest = "0.27.0"
 arrow-array = "59.1"
 arrow-schema = "59.1"
 parquet = "59.1"
