@@ -6,7 +6,7 @@
 // `decoder`, and `search` all draw from the same data and can be compared
 // head-to-head against the upstream test suite.
 
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 
 /// Arrow-style flat representation of a list of byte strings.
