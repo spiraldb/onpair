@@ -2,5 +2,19 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "local>spiraldb/renovate-config"
+  ],
+  "addLabels": [
+    "changelog/chore"
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["pinDigest"],
+      "automerge": true
+    },
+    {
+      "matchManagers": ["rust-toolchain"],
+      "automerge": false
+    }
   ]
 }
