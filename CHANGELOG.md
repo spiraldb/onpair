@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Make `DictionaryStorage` an unsafe trait. Custom implementations
+  must use `unsafe impl` and uphold the documented buffer stability and cloning
+  contract.
 - Scan dynamic training samples sequentially without changing their contents or
   order.
 - Speed up matching for large dictionaries.
@@ -24,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Close a soundness hole where a safe `DictionaryStorage` implementation could
+  switch buffers after validation and cause out-of-bounds reads through safe
+  dictionary methods ([#36](https://github.com/spiraldb/onpair/issues/36)).
 - Train on the randomly selected rows returned by partial shuffling, expanding
   the selection when needed to cover the sampling budget.
 - Ignore bytes outside the row offsets when calculating the training budget.

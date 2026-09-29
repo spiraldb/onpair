@@ -23,6 +23,9 @@
 //! A `DictionaryView` guarantees the structural invariants required for bounded
 //! token access. Sortedness, uniqueness, and alphabet completeness are separate
 //! semantic properties used by search and tokenization.
+//! Custom compact storage implements the unsafe [`DictionaryStorage`] trait,
+//! which guarantees that validation remains valid across subsequent buffer
+//! accesses, moves, and clones.
 //!
 //! Raw deserialized buffers cross into the trusted forms through
 //! [`CompactDictionary::validate_safety`] / [`CompactDictionary::validate`] or
