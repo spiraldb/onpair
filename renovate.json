@@ -9,8 +9,12 @@
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["digest", "pinDigest"],
+      "matchUpdateTypes": ["pinDigest"],
       "automerge": true
+    },
+    {
+      "matchManagers": ["rust-toolchain"],
+      "automerge": false
     }
   ]
 }
