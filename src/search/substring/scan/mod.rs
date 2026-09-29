@@ -47,7 +47,6 @@ pub(super) enum Isa {
 pub(super) enum MatcherKind {
     Table,
     EqOr,
-    Range,
     NibbleN8,
 }
 

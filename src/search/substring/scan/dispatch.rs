@@ -58,15 +58,17 @@ pub(super) fn run<O: Offset>(
         MatcherKind::Table => {
             both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out)
         }
+        MatcherKind::EqOr if cover.n_points() == 0 => {
+            with_skip::<O, matcher::EqOr<true, false>, matcher::EqOr<false, false>>(
+                config,
+                cover,
+                codes,
+                row_offsets,
+                check,
+                out,
+            )
+        }
         MatcherKind::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
-            config,
-            cover,
-            codes,
-            row_offsets,
-            check,
-            out,
-        ),
-        MatcherKind::Range => with_skip::<O, matcher::Range<true>, matcher::Range<false>>(
             config,
             cover,
             codes,

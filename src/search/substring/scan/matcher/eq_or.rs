@@ -7,8 +7,8 @@
 //! ORed into the hit lanes. Inclusive-range results are then ORed into the
 //! same mask. Work grows with the number of points and ranges in the cover.
 //!
-//! The planner selects this kernel for covers with points. An empty point
-//! slice falls back to range matching. `shared::words` loads blocks and packs
+//! Dispatch specializes covers without points before scanning. The general
+//! kernel also supports empty point slices. `shared::words` loads blocks and packs
 //! the hit lanes, optionally skipping the pack for groups with no hits.
 
 #[cfg(target_arch = "aarch64")]
@@ -106,24 +106,40 @@ unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
 }
 
 /// Broadcast point probes and prepared ranges reused across scan blocks.
-pub(in crate::search::substring::scan) struct EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool> {
+pub(in crate::search::substring::scan) struct EqOr<
+    const SKIP_MOVEMASK_IF_NO_MATCH: bool,
+    const HAS_POINTS: bool = true,
+> {
     /// One broadcast vector per point in the cover.
     tokens: Vec<Broadcast>,
     /// Range starts and widths, already broadcast for vector comparisons.
     ranges: Vec<Held>,
 }
 
-impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for EqOr<SKIP_MOVEMASK_IF_NO_MATCH> {
+impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool, const HAS_POINTS: bool> Matcher
+    for EqOr<SKIP_MOVEMASK_IF_NO_MATCH, HAS_POINTS>
+{
     fn new(cover: &ProbeCover) -> Self {
+        debug_assert!(HAS_POINTS || cover.points().is_empty());
         Self {
-            tokens: cover.points().iter().copied().map(broadcast).collect(),
+            tokens: if HAS_POINTS {
+                cover.points().iter().copied().map(broadcast).collect()
+            } else {
+                Vec::new()
+            },
             ranges: cover.ranges().iter().copied().map(hold).collect(),
         }
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
         // SAFETY: planning selects this kernel only after CPU feature detection.
-        unsafe { mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.tokens, &self.ranges, codes, bits) }
+        unsafe {
+            if HAS_POINTS {
+                mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.tokens, &self.ranges, codes, bits)
+            } else {
+                range::mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.ranges, codes, bits)
+            }
+        }
     }
 }
 

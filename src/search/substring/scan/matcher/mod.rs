@@ -32,8 +32,6 @@ pub(in crate::search::substring) const PER_BATCH: usize = 8;
 pub(in crate::search::substring::scan) use eq_or::EqOr;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(in crate::search::substring::scan) use nibble_n8::NibbleN8;
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(in crate::search::substring::scan) use range::Range;
 pub(in crate::search::substring::scan) use table::Table;
 
 /// Prepared membership checks with one output bit per input token code.

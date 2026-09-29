@@ -16,7 +16,6 @@ use super::super::scan::{Isa, MatcherKind, PER_BATCH};
 /// With `p` points, `r` ranges, and `b = ceil(p / PER_BATCH)`:
 /// - Table: `table`.
 /// - EqOr: `point * p + range * r`.
-/// - Range: `range * r`.
 /// - Nibble: `nibble_base + nibble_batch * b + range * r`.
 ///
 /// The weights are calibrated relative costs, not literal instruction counts.
@@ -40,7 +39,6 @@ pub(super) fn matcher_cost(isa: Isa, matcher: MatcherKind, cover: &ProbeCover) -
     match matcher {
         MatcherKind::Table => weights.table,
         MatcherKind::EqOr => weights.point * points + weights.range * ranges,
-        MatcherKind::Range => weights.range * ranges,
         MatcherKind::NibbleN8 => {
             weights.nibble_base + weights.nibble_batch * batches + weights.range * ranges
         }

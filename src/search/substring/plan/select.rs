@@ -33,8 +33,7 @@ pub(in crate::search::substring) fn is_eligible(
     let vector = isa != Isa::Scalar;
     match matcher {
         MatcherKind::Table => true,
-        MatcherKind::EqOr => vector && cover.n_points() > 0,
-        MatcherKind::Range => vector && cover.n_points() == 0 && cover.n_ranges() > 0,
+        MatcherKind::EqOr => vector && !cover.is_empty(),
         MatcherKind::NibbleN8 => {
             vector
                 && cover.n_points() > 0
@@ -53,7 +52,7 @@ fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     let mut best = MatcherKind::Table;
     let mut best_cost = matcher_cost(isa, best, cover);
 
-    for matcher in [MatcherKind::EqOr, MatcherKind::Range, MatcherKind::NibbleN8] {
+    for matcher in [MatcherKind::EqOr, MatcherKind::NibbleN8] {
         if !is_eligible(isa, matcher, cover) {
             continue;
         }

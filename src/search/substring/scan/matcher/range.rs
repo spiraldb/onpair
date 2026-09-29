@@ -7,7 +7,7 @@
 //! membership into `code.wrapping_sub(begin) <= last - begin`. Values below
 //! `begin` wrap above the permitted width and are rejected.
 //!
-//! `Range` handles covers containing only ranges. Equality and nibble matchers
+//! EqOr uses `mask` for covers containing only ranges. Equality and nibble matchers
 //! reuse `check_ranges` to add range hits to their point results. All paths
 //! produce the same exact membership mask.
 
@@ -24,9 +24,8 @@ use super::shared::join;
 ))]
 use super::shared::narrow;
 use super::shared::{Hits, Vectors, or, words};
-use super::{Block, Mask, Matcher};
+use super::{Block, Mask};
 use crate::core::types::TokenRange;
-use crate::search::substring::ProbeCover;
 
 /// Range start and width (`last - begin`), broadcast into vector lanes.
 #[cfg(target_arch = "aarch64")]
@@ -109,22 +108,6 @@ pub(super) unsafe fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) 
         hit = unsafe { or(hit, inside(held, codes)) };
     }
     hit
-}
-
-/// Prepared matcher for a cover containing ranges and no individual points.
-pub(in crate::search::substring::scan) struct Range<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
-    Vec<Held>,
-);
-
-impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for Range<SKIP_MOVEMASK_IF_NO_MATCH> {
-    fn new(cover: &ProbeCover) -> Self {
-        Self(cover.ranges().iter().copied().map(hold).collect())
-    }
-
-    fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: planning selects this kernel only after CPU feature detection.
-        unsafe { mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.0, codes, bits) }
-    }
 }
 
 /// Fill a block mask from prepared ranges; an empty slice clears the mask.

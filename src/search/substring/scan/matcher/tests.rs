@@ -8,9 +8,9 @@
 //! Cases exercise point counts, ranges, code-width boundaries, and block tails.
 //! The block-driver checks also ensure padding cannot create candidate rows.
 
-use super::{Block, Mask, Matcher, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::{EqOr, Range};
+use super::EqOr;
+use super::{Block, Mask, Matcher, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::{NibbleN8, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
@@ -70,8 +70,10 @@ fn every_matcher(cover: &ProbeCover, codes: &Block) {
     {
         agrees::<EqOr<false>>(MatcherKind::EqOr, "eq_or", cover, codes);
         agrees::<EqOr<true>>(MatcherKind::EqOr, "eq_or_skip_empty", cover, codes);
-        agrees::<Range<false>>(MatcherKind::Range, "range", cover, codes);
-        agrees::<Range<true>>(MatcherKind::Range, "range_skip_empty", cover, codes);
+        if cover.n_points() == 0 {
+            agrees::<EqOr<false, false>>(MatcherKind::EqOr, "eq_or_ranges", cover, codes);
+            agrees::<EqOr<true, false>>(MatcherKind::EqOr, "eq_or_ranges_skip_empty", cover, codes);
+        }
         // Use the same point-to-batch mapping as production dispatch.
         let n8k = MatcherKind::NibbleN8;
         match cover.points().len().div_ceil(PER_BATCH) {
@@ -150,6 +152,8 @@ fn eq_or_without_points_checks_ranges() {
         let any_hit = EqOr::<true>::new(&cover).check(&codes, &mut bits);
         assert_eq!(bits, want);
         assert!(any_hit || bits.iter().all(|&word| word == 0));
+        assert_eq!(mask::<EqOr<false, false>>(&cover, &codes), want);
+        assert_eq!(mask::<EqOr<true, false>>(&cover, &codes), want);
     }
 }
 
