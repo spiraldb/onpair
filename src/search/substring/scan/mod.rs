@@ -3,10 +3,11 @@
 
 //! Execute a prepared cover and append exact matching rows.
 //!
-//! The caller supplies the prepared matcher and its mask-packing policy. The matcher
-//! turns blocks of token codes into bit masks; the resolver maps set
-//! bits to rows and asks `verify::walk` to check each candidate occurrence.
-//! A row is appended on its first confirmed hit, then its later hits are skipped.
+//! The caller supplies the prepared matcher, its mask-packing policy and the scan
+//! input: the encoded region plus the prepared cover and walker. The matcher turns
+//! blocks of token codes into bit masks; the resolver maps set bits to rows and
+//! verifies each candidate occurrence with the walker. A row is appended on its
+//! first verified hit, then its later hits are skipped.
 //!
 //! `dispatch` connects the matcher and packing policy to a concrete implementation.
 //! `matcher` owns token membership checks; `resolver` owns row lookup and duplicate
@@ -19,13 +20,11 @@ mod matcher;
 mod resolver;
 
 use super::ProbeCover;
-#[cfg(test)]
-use super::plan::{select_matcher, skip_empty_packing};
 use super::verify::walk::Walk;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-pub(super) use dispatch::detect_isa;
+pub(super) use dispatch::{detect_isa, run};
 use matcher::Matcher;
 pub(super) use matcher::PER_BATCH;
 use resolver::Resolver;
@@ -53,94 +52,33 @@ pub(super) enum MatcherKind {
 /// Token codes processed in one matcher block.
 pub(super) const BLOCK: usize = 4096;
 
-/// Borrowed buffers for one scan region.
+/// Everything one scan borrows: the encoded region and the prepared query.
 #[derive(Clone, Copy)]
 pub(super) struct ScanInput<'a, O> {
     codes: &'a [Token],
     row_offsets: &'a [O],
+    dict: CompactDictionaryView<'a>,
     cover: &'a ProbeCover,
+    walk: &'a Walk,
 }
 
 impl<'a, O> ScanInput<'a, O> {
-    /// Borrow the code stream, row boundaries, and prepared probe cover.
+    /// Borrow the encoded region and the cover and walker prepared for it.
     pub(super) const fn new(
         codes: &'a [Token],
         row_offsets: &'a [O],
+        dict: CompactDictionaryView<'a>,
         cover: &'a ProbeCover,
+        walk: &'a Walk,
     ) -> Self {
         Self {
             codes,
             row_offsets,
+            dict,
             cover,
+            walk,
         }
     }
-}
-
-/// Execute the prepared matcher and append exact matching row indices.
-/// The caller supplies a nonempty cover and walker prepared for the same pattern and
-/// dictionary, a matcher eligible for this cover and the current CPU, and whether
-/// vector matchers skip packing empty groups.
-#[inline]
-pub(super) fn matches<O: Offset>(
-    matcher: MatcherKind,
-    skip_empty_packing: bool,
-    input: ScanInput<'_, O>,
-    dict: CompactDictionaryView<'_>,
-    walk: &Walk,
-    out: &mut Vec<usize>,
-) {
-    execute_check(
-        matcher,
-        skip_empty_packing,
-        input,
-        Check::Walk {
-            walk,
-            dict,
-            codes: input.codes,
-        },
-        out,
-    );
-}
-
-/// Scan a synthetic cover for tests, returning candidate rows without verification.
-#[cfg(test)]
-pub(super) fn scan<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
-    cover: &ProbeCover,
-    covered_frequency: usize,
-    out: &mut Vec<usize>,
-) {
-    if codes.is_empty() || row_offsets.len() < 2 || cover.is_empty() {
-        return;
-    }
-    let input = ScanInput::new(codes, row_offsets, cover);
-    execute_check(
-        select_matcher(detect_isa(), cover),
-        skip_empty_packing(covered_frequency as f64 / codes.len() as f64, codes.len()),
-        input,
-        Check::Superset,
-        out,
-    );
-}
-
-/// Dispatch the matcher with the requested hit verification.
-fn execute_check<O: Offset>(
-    matcher: MatcherKind,
-    skip_empty_packing: bool,
-    input: ScanInput<'_, O>,
-    check: Check<'_>,
-    out: &mut Vec<usize>,
-) {
-    dispatch::run(
-        matcher,
-        skip_empty_packing,
-        input.cover,
-        input.codes,
-        input.row_offsets,
-        check,
-        out,
-    );
 }
 
 /// Token codes passed to a matcher in one call.
@@ -148,52 +86,18 @@ type Block = [Token; BLOCK];
 /// One bit per code in a block; bit `i` describes code `i`.
 type Mask = [u64; BLOCK / 64];
 
-/// Verification applied before a candidate row is appended.
-/// Production scans use the graph walker. Tests can accept all
-/// probe hits to exercise matching and row lookup independently.
-#[derive(Clone, Copy)]
-enum Check<'a> {
-    /// Accept every probe hit without checking the substring.
-    #[cfg(test)]
-    Superset,
-    /// Confirm a complete occurrence through this hit using the alignment graph.
-    Walk {
-        walk: &'a Walk,
-        dict: CompactDictionaryView<'a>,
-        codes: &'a [Token],
-    },
-}
-
-impl Check<'_> {
-    /// Check the hit at absolute code index `code` within `[row_start, row_end)`.
-    #[inline]
-    fn passes(&self, code: usize, row_start: usize, row_end: usize) -> bool {
-        match *self {
-            #[cfg(test)]
-            Self::Superset => true,
-            Self::Walk { walk, dict, codes } => walk.check(dict, codes, row_start, row_end, code),
-        }
-    }
-}
-
 /// Match blocks, verify candidate hits, and append each matching row once.
 /// Matcher setup, mask storage, and resolver state are reused across blocks.
 /// Appended indices are ascending; existing output contents are preserved.
-fn both_stages<M: Matcher, O: Offset>(
-    cover: &ProbeCover,
-    codes: &[Token],
-    row_offsets: &[O],
-    check: Check<'_>,
-    out: &mut Vec<usize>,
-) {
-    let matcher = M::new(cover);
-    let mut resolver = Resolver::new(row_offsets);
+fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usize>) {
+    let matcher = M::new(input.cover);
+    let mut resolver = Resolver::new(input);
     let mut bits = [0u64; BLOCK / 64];
-    blocks(codes, &mut |block, at, valid| {
+    blocks(input.codes, &mut |block, at, valid| {
         // A false result guarantees no hits; true may still mean an empty mask.
         if matcher.check(block, &mut bits) {
             clear_from(&mut bits, valid);
-            resolver.rows(&bits, at, check, out);
+            resolver.rows(&bits, at, out);
         }
     });
 }
@@ -226,41 +130,38 @@ fn clear_from(bits: &mut Mask, valid: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::TokenRange;
 
-    /// Point, range, mixed, and empty covers select the expected candidate rows.
+    /// Every code is visited once at its absolute index, and a partial tail is
+    /// zero-padded to a full block.
     #[test]
-    fn the_scan_takes_a_cover_it_can_probe() {
-        let codes = [1, 7, 15];
-        let rows = [0u32, 1, 2, 3];
-        let range = TokenRange {
-            begin: 10,
-            last: 20,
-        };
-        for (points, ranges, expected) in [
-            (vec![7], vec![], vec![1]),
-            (vec![], vec![range], vec![2]),
-            (vec![7], vec![range], vec![1, 2]),
-            (vec![], vec![], vec![]),
-        ] {
-            let mut out = Vec::new();
-            scan(&codes, &rows, &ProbeCover::new(points, ranges), 1, &mut out);
-            assert_eq!(out, expected);
+    fn blocks_visit_every_code_once() {
+        for len in [0, 1, 63, 64, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK + 100] {
+            let codes: Vec<Token> = (1..=len).map(|code| code as Token).collect();
+            let mut seen = Vec::new();
+            blocks(&codes, &mut |block, at, valid| {
+                assert!(block[valid..].iter().all(|&code| code == 0), "{len} codes");
+                seen.extend(
+                    (at..)
+                        .zip(&block[..valid])
+                        .map(|(index, &code)| (index, code)),
+                );
+            });
+            let expected: Vec<_> = codes.iter().copied().enumerate().collect();
+            assert_eq!(seen, expected, "{len} codes");
         }
     }
 
-    /// Empty code or row buffers leave existing output untouched at either width.
+    /// Bits at or past the valid count are cleared, so tail padding never reaches
+    /// row resolution; earlier bits are kept.
     #[test]
-    fn rows_without_codes_make_no_candidate() {
-        let cover = ProbeCover::new(vec![7], Vec::new());
-        let mut out = vec![usize::MAX];
-        scan(&[], &[0u32, 0, 0, 0], &cover, 0, &mut out);
-        scan(&[], &[0u64, 0, 0, 0], &cover, 0, &mut out);
-        for offsets in [&[][..], &[0u32][..]] {
-            scan(&[7], offsets, &cover, 1, &mut out);
-            let wide: Vec<u64> = offsets.iter().copied().map(u64::from).collect();
-            scan(&[7], &wide, &cover, 1, &mut out);
+    fn clear_from_drops_the_padding() {
+        for valid in [1, 63, 64, 65, BLOCK - 1, BLOCK] {
+            let mut bits = [u64::MAX; BLOCK / 64];
+            clear_from(&mut bits, valid);
+            for code in 0..BLOCK {
+                let set = bits[code / 64] >> (code % 64) & 1 == 1;
+                assert_eq!(set, code < valid, "valid {valid}, code {code}");
+            }
         }
-        assert_eq!(out, [usize::MAX]);
     }
 }

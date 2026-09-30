@@ -9,7 +9,7 @@ use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
 use super::plan::{cover_cost, select_cover};
-use super::scan::{BLOCK, detect_isa};
+use super::scan::detect_isa;
 use super::{ContainsDfa, ContainsError, ContainsScan};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
@@ -361,27 +361,6 @@ fn boundary_match_with_a_maximal_first_token_is_covered() {
     // Internal entry alignments stop at 15 bytes; this needs the source path.
     assert!((0..dict.num_tokens()).any(|id| dict.token(id as Token) == &needle[..MAX_TOKEN_SIZE]));
     check(column.view(), &rows, &[needle]);
-}
-
-#[test]
-fn probe_scan_appends_each_row_once_across_blocks_and_tail() {
-    let mut codes = vec![1u16; BLOCK + 3];
-    codes.resize(2 * BLOCK + 6, 0);
-    codes.push(1); // A hit in the padded tail, after a nonmatching row.
-    let offsets = [
-        0,
-        0,
-        BLOCK + 3,
-        BLOCK + 3,
-        2 * BLOCK + 6,
-        codes.len(),
-        codes.len(),
-    ]
-    .map(|offset| offset as u32);
-    let cover = ProbeCover::from_runs(vec![TokenRange { begin: 1, last: 2 }]);
-    let mut rows = vec![usize::MAX];
-    super::scan::scan(&codes, &offsets, &cover, BLOCK + 4, &mut rows);
-    assert_eq!(rows, [usize::MAX, 1, 4]);
 }
 
 #[test]

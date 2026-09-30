@@ -17,7 +17,7 @@ use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::search::substring::scan::Isa;
-use crate::search::substring::scan::{BLOCK, Check, MatcherKind, both_stages};
+use crate::search::substring::scan::{BLOCK, MatcherKind};
 
 /// Run one matcher and verify that a false return guarantees an empty mask.
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
@@ -366,47 +366,6 @@ fn the_table_masks_one_code() {
         1,
         "extra hits"
     );
-}
-
-/// Scan full blocks and a partial tail, using both row-offset widths.
-#[test]
-fn the_driver_scans_every_block() {
-    // Two and a bit blocks, so both the whole-block and the padded tail path
-    // run, with the planted hit inside the tail.
-    let codes: Vec<Token> = (0..2 * BLOCK + 100)
-        .map(|at| (at * 37 % 50021) as Token)
-        .collect();
-    let row_offsets: Vec<u32> = (0..=codes.len() as u32).step_by(64).collect();
-    let at = 2 * BLOCK + 40;
-    let cover = ProbeCover::new(codes[at..at + 1].to_vec(), vec![]);
-    let mut found = Vec::new();
-    both_stages::<Table, u32>(&cover, &codes, &row_offsets, Check::Superset, &mut found);
-    assert_eq!(found, vec![at / 64]);
-
-    // The same layer at the wide offset width.
-    let wide: Vec<u64> = row_offsets.iter().map(|&o| u64::from(o)).collect();
-    found.clear();
-    both_stages::<Table, u64>(&cover, &codes, &wide, Check::Superset, &mut found);
-    assert_eq!(found, vec![at / 64]);
-}
-
-/// Zero padding in a partial block must not reach row resolution as a hit.
-#[test]
-fn padding_makes_no_candidate() {
-    for length in [1, 2, 3, 5, BLOCK, BLOCK + 1, BLOCK + 2, BLOCK + 3] {
-        // No zero in the stream, so every zero a token matches is padding.
-        let codes: Vec<Token> = (0..length).map(|at| (at % 255 + 1) as Token).collect();
-        let row_offsets = vec![0, length as u32];
-        let mut found = Vec::new();
-        both_stages::<Table, u32>(
-            &ProbeCover::new(vec![0 as Token], vec![]),
-            &codes,
-            &row_offsets,
-            Check::Superset,
-            &mut found,
-        );
-        assert!(found.is_empty(), "over {length} codes: {found:?}");
-    }
 }
 
 use crate::search::substring::plan::is_eligible;

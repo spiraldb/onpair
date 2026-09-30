@@ -7,17 +7,24 @@
 //! later hits use one-sided galloping from the next row, followed by binary
 //! search within the bracket. Lookup takes logarithmic work in the row gap.
 //!
-//! A failed check advances to the next hit. A successful check appends the row
+//! A rejected hit advances to the next one. A verified hit appends the row
 //! and skips its remaining codes, including across blocks, so output is unique.
 //! Blocks arrive in stream order, and every set bit must name a valid code.
 
-use super::{Check, Mask};
+use super::{Mask, ScanInput};
+use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
+use crate::core::types::Token;
+use crate::search::substring::verify::walk::Walk;
 
 /// Row position and confirmed-output boundary retained across mask blocks.
 pub(super) struct Resolver<'a, O> {
     /// Boundaries of rows in absolute code indices.
     row_offsets: &'a [O],
+    /// Codes, dictionary and walker used to verify each hit.
+    codes: &'a [Token],
+    dict: CompactDictionaryView<'a>,
+    walk: &'a Walk,
     /// Last row located for a hit, initially zero.
     row: usize,
     /// Exclusive end of the current row, initialized from the first row boundary.
@@ -27,26 +34,23 @@ pub(super) struct Resolver<'a, O> {
 }
 
 impl<'a, O: Offset> Resolver<'a, O> {
-    /// Create an unadvanced cursor over the row boundaries.
-    pub(super) fn new(row_offsets: &'a [O]) -> Self {
+    /// Create an unadvanced cursor over the input's rows.
+    pub(super) fn new(input: ScanInput<'a, O>) -> Self {
         Self {
-            row_offsets,
+            row_offsets: input.row_offsets,
+            codes: input.codes,
+            dict: input.dict,
+            walk: input.walk,
             row: 0,
-            row_end: row_offsets.get(1).map_or(0, |x| x.to_usize()),
+            row_end: input.row_offsets.get(1).map_or(0, |x| x.to_usize()),
             resolved_code: 0,
         }
     }
 
-    /// Visit candidate bits, locate their rows, and append confirmed matches.
+    /// Visit candidate bits, locate their rows, and append verified matches.
     /// Blocks arrive in increasing code order. Search starts after an exhausted row.
     #[inline]
-    pub(super) fn rows(
-        &mut self,
-        bits: &Mask,
-        first_code: usize,
-        check: Check<'_>,
-        out: &mut Vec<usize>,
-    ) {
+    pub(super) fn rows(&mut self, bits: &Mask, first_code: usize, out: &mut Vec<usize>) {
         let mut at = self.resolved_code.saturating_sub(first_code);
         while let Some(hit) = next_set(bits, at) {
             let code = first_code + hit;
@@ -54,7 +58,11 @@ impl<'a, O: Offset> Resolver<'a, O> {
                 self.row = find_row(self.row_offsets, self.row + 1, code);
                 self.row_end = self.row_offsets[self.row + 1].to_usize();
             }
-            if check.passes(code, self.row_offsets[self.row].to_usize(), self.row_end) {
+            let row_start = self.row_offsets[self.row].to_usize();
+            if self
+                .walk
+                .check(self.dict, self.codes, row_start, self.row_end, code)
+            {
                 out.push(self.row);
                 self.resolved_code = self.row_end;
                 at = self.row_end - first_code;
@@ -108,21 +116,34 @@ mod tests {
     //! span blocks. These tests accept all probe hits to isolate row resolution.
 
     use super::{Mask, Resolver, find_row};
+    use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
     use crate::core::offset::Offset;
-    use crate::search::substring::scan::{BLOCK, Check};
+    use crate::core::types::Token;
+    use crate::search::substring::ProbeCover;
+    use crate::search::substring::scan::{BLOCK, ScanInput};
+    use crate::search::substring::verify::walk::tests::accepting_walk;
 
     /// Enough blocks to place a row across an entire intervening block.
     const BLOCKS: usize = 4;
     const CODES: usize = BLOCKS * BLOCK;
 
     /// Resolve a whole mask in block order, omitting blocks without hits.
+    /// The walker accepts every hit, so rows depend only on lookup and deduplication.
     fn resolve<O: Offset>(mask: &[u64], row_offsets: &[O]) -> Vec<usize> {
+        let codes = [0 as Token; CODES];
+        let cover = ProbeCover::new(Vec::new(), Vec::new());
+        let walk = accepting_walk();
+        let mut bytes: Vec<u8> = (0..=255).collect();
+        let offsets: Vec<u32> = (0..=256).collect();
+        pad_raw(&mut bytes, &offsets);
+        let dict = CompactDictionary::from_raw(bytes, offsets);
+        let input = ScanInput::new(&codes, row_offsets, dict.as_view(), &cover, &walk);
         let mut out = Vec::new();
-        let mut resolver = Resolver::new(row_offsets);
+        let mut resolver = Resolver::new(input);
         for (block, bits) in mask.chunks_exact(BLOCK / 64).enumerate() {
             let bits: &Mask = bits.try_into().unwrap();
             if bits.iter().any(|&set| set != 0) {
-                resolver.rows(bits, block * BLOCK, Check::Superset, &mut out);
+                resolver.rows(bits, block * BLOCK, &mut out);
             }
         }
         out

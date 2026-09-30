@@ -33,8 +33,8 @@
 //! [`ContainsScan`] coordinates graph construction, cost-based cover selection and walk
 //! compilation. `alignment` owns the graph and cut solver; `plan` prices and
 //! selects covers and their matchers using explicit facts and capabilities.
-//! `scan` produces hits and resolves rows, calling the exact verifier in
-//! `verify::walk`.
+//! `scan` produces hits, resolves rows and verifies each hit with the exact walker
+//! from `verify::walk`.
 
 mod alignment;
 mod error;
@@ -50,7 +50,7 @@ pub use error::ContainsError;
 pub use verify::{ContainsDfa, row_contains};
 
 use alignment::graph::AlignmentGraph;
-use scan::MatcherKind;
+use scan::{MatcherKind, ScanInput};
 use verify::walk::Walk;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -181,12 +181,10 @@ impl ContainsScan {
         if codes.is_empty() || row_offsets.len() < 2 || self.probe_cover.is_empty() {
             return;
         }
-        scan::matches(
+        scan::run(
             self.matcher,
             plan::skip_empty_packing(self.covered_fraction(), codes.len()),
-            scan::ScanInput::new(codes, row_offsets, &self.probe_cover),
-            dict,
-            &self.walk,
+            ScanInput::new(codes, row_offsets, dict, &self.probe_cover, &self.walk),
             out,
         );
     }

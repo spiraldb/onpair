@@ -433,12 +433,27 @@ impl Walk {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::search::substring) mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
     use crate::search::index::build_token_frequency_index;
     use crate::search::substring::alignment::graph::AlignmentGraph;
     use crate::search::tokenize;
+
+    /// A walker that accepts every hit: each token counts as containing the whole
+    /// needle, so scan tests can exercise matching and row lookup on their own.
+    pub(in crate::search::substring) fn accepting_walk() -> Walk {
+        Walk {
+            nodes: vec![Node::default()],
+            edges: EdgesByToken {
+                first_token: 0,
+                edge_of_token: vec![NONE; 1 << 16],
+                complete: vec![true; 1 << 16],
+                edges_of_tokens: Vec::new(),
+            },
+            overlaps: Vec::new(),
+        }
+    }
 
     #[test]
     fn needle_prefix_matches_token_suffixes() {

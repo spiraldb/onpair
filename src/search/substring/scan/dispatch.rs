@@ -15,95 +15,71 @@
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::PER_BATCH;
 use super::matcher::{self, Matcher};
-use super::{Check, Isa, MatcherKind, both_stages};
+use super::{Isa, MatcherKind, ScanInput, both_stages};
+
 use crate::core::offset::Offset;
-use crate::core::types::Token;
-use crate::search::substring::ProbeCover;
 
 /// Select whether empty groups skip mask packing: `S` enables it, `P` disables it.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn with_skip<O: Offset, S: Matcher, P: Matcher>(
     skip_empty_packing: bool,
-    cover: &ProbeCover,
-    codes: &[Token],
-    row_offsets: &[O],
-    check: Check<'_>,
+    input: ScanInput<'_, O>,
     out: &mut Vec<usize>,
 ) {
     if skip_empty_packing {
-        both_stages::<S, O>(cover, codes, row_offsets, check, out)
+        both_stages::<S, O>(input, out)
     } else {
-        both_stages::<P, O>(cover, codes, row_offsets, check, out)
+        both_stages::<P, O>(input, out)
     }
 }
 
-/// Execute the prepared matcher with the shared row resolver.
+/// Execute the prepared matcher and append the rows the input's walker verifies.
 /// `skip_empty_packing` applies to vector matchers. Preparation must supply a
 /// matcher eligible for the cover and the current CPU; this function does not
 /// repeat those checks.
-pub(super) fn run<O: Offset>(
+pub(in crate::search::substring) fn run<O: Offset>(
     kind: MatcherKind,
     skip_empty_packing: bool,
-    cover: &ProbeCover,
-    codes: &[Token],
-    row_offsets: &[O],
-    check: Check<'_>,
+    input: ScanInput<'_, O>,
     out: &mut Vec<usize>,
 ) {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = (kind, skip_empty_packing);
-        both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out);
+        both_stages::<matcher::Table, O>(input, out);
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     match kind {
-        MatcherKind::Table => {
-            both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out)
-        }
-        MatcherKind::EqOr if cover.n_points() == 0 => {
+        MatcherKind::Table => both_stages::<matcher::Table, O>(input, out),
+        MatcherKind::EqOr if input.cover.n_points() == 0 => {
             with_skip::<O, matcher::EqOr<true, false>, matcher::EqOr<false, false>>(
                 skip_empty_packing,
-                cover,
-                codes,
-                row_offsets,
-                check,
+                input,
                 out,
             )
         }
         MatcherKind::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
             skip_empty_packing,
-            cover,
-            codes,
-            row_offsets,
-            check,
+            input,
             out,
         ),
-        MatcherKind::NibbleN8 => match cover.n_points().div_ceil(PER_BATCH) {
+        MatcherKind::NibbleN8 => match input.cover.n_points().div_ceil(PER_BATCH) {
             1 => with_skip::<O, matcher::NibbleN8<1, true>, matcher::NibbleN8<1, false>>(
                 skip_empty_packing,
-                cover,
-                codes,
-                row_offsets,
-                check,
+                input,
                 out,
             ),
             2 => with_skip::<O, matcher::NibbleN8<2, true>, matcher::NibbleN8<2, false>>(
                 skip_empty_packing,
-                cover,
-                codes,
-                row_offsets,
-                check,
+                input,
                 out,
             ),
             3 => with_skip::<O, matcher::NibbleN8<3, true>, matcher::NibbleN8<3, false>>(
                 skip_empty_packing,
-                cover,
-                codes,
-                row_offsets,
-                check,
+                input,
                 out,
             ),
-            _ => both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out),
+            _ => both_stages::<matcher::Table, O>(input, out),
         },
     }
 }

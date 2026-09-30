@@ -5,7 +5,7 @@
 //!
 //! Each matcher writes the same exact mask: bit `i` is set when code `i`
 //! belongs to a point or range in the cover. This establishes a candidate
-//! token, not a complete substring match; row resolution invokes the walker.
+//! token, not a complete substring match; row resolution verifies each hit.
 //!
 //! `eq_or` compares each point, `nibble_n8` groups points into shuffle tables,
 //! `range` checks inclusive intervals, and `table` uses scalar lookups.
