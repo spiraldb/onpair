@@ -3,15 +3,15 @@
 
 //! Execute a prepared cover and append exact matching rows.
 //!
-//! The caller supplies a matcher configuration for the current buffers. The matcher turns
-//! blocks of token codes into bit masks; the resolver maps set
+//! The caller supplies the prepared matcher and its mask-packing policy. The matcher
+//! turns blocks of token codes into bit masks; the resolver maps set
 //! bits to rows and asks `verify::walk` to check each candidate occurrence.
 //! A row is appended on its first confirmed hit, then its later hits are skipped.
 //!
-//! `dispatch` connects the configuration to a concrete matcher. `matcher` owns token
-//! membership checks; `resolver` owns row lookup and duplicate suppression.
-//! This module defines the instruction sets and matcher configurations;
-//! `plan` selects a configuration using cover costs and hit density.
+//! `dispatch` connects the matcher and packing policy to a concrete implementation.
+//! `matcher` owns token membership checks; `resolver` owns row lookup and duplicate
+//! suppression. This module defines the instruction sets and matchers; `plan`
+//! selects the matcher during preparation and the packing policy for each scan.
 //! Empty patterns and covers are handled by `ContainsScan::scan`, before this module.
 
 mod dispatch;
@@ -20,7 +20,7 @@ mod resolver;
 
 use super::ProbeCover;
 #[cfg(test)]
-use super::plan::select_matcher_config;
+use super::plan::{select_matcher, skip_empty_packing};
 use super::verify::walk::Walk;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
@@ -50,16 +50,6 @@ pub(super) enum MatcherKind {
     NibbleN8,
 }
 
-/// Selected algorithm and its mask-packing policy.
-/// Dispatch derives nibble batches from the cover and specializes packing once,
-/// before scanning. The instruction set determines eligibility during selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct MatcherConfig {
-    pub(super) kind: MatcherKind,
-    /// Skip packing empty vector groups; always false for the scalar table.
-    pub(super) skip_empty_packing: bool,
-}
-
 /// Token codes processed in one matcher block.
 pub(super) const BLOCK: usize = 4096;
 
@@ -86,19 +76,22 @@ impl<'a, O> ScanInput<'a, O> {
     }
 }
 
-/// Execute the selected matcher and append exact matching row indices.
+/// Execute the prepared matcher and append exact matching row indices.
 /// The caller supplies a nonempty cover and walker prepared for the same pattern and
-/// dictionary, and a configuration eligible for this cover and the current CPU.
+/// dictionary, a matcher eligible for this cover and the current CPU, and whether
+/// vector matchers skip packing empty groups.
 #[inline]
 pub(super) fn matches<O: Offset>(
-    config: MatcherConfig,
+    matcher: MatcherKind,
+    skip_empty_packing: bool,
     input: ScanInput<'_, O>,
     dict: CompactDictionaryView<'_>,
     walk: &Walk,
     out: &mut Vec<usize>,
 ) {
     execute_check(
-        config,
+        matcher,
+        skip_empty_packing,
         input,
         Check::Walk {
             walk,
@@ -123,12 +116,8 @@ pub(super) fn scan<O: Offset>(
     }
     let input = ScanInput::new(codes, row_offsets, cover);
     execute_check(
-        select_matcher_config(
-            detect_isa(),
-            cover,
-            covered_frequency as f64 / codes.len() as f64,
-            codes.len(),
-        ),
+        select_matcher(detect_isa(), cover),
+        skip_empty_packing(covered_frequency as f64 / codes.len() as f64, codes.len()),
         input,
         Check::Superset,
         out,
@@ -137,13 +126,15 @@ pub(super) fn scan<O: Offset>(
 
 /// Dispatch the matcher with the requested hit verification.
 fn execute_check<O: Offset>(
-    config: MatcherConfig,
+    matcher: MatcherKind,
+    skip_empty_packing: bool,
     input: ScanInput<'_, O>,
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
     dispatch::run(
-        config,
+        matcher,
+        skip_empty_packing,
         input.cover,
         input.codes,
         input.row_offsets,

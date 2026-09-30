@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Choose probe covers during preparation and matcher configurations before scanning.
+//! Choose probe covers and their matchers during preparation, and mask packing per scan.
 //!
 //! Minimum cuts use additive edge weights: frequency plus a penalty for the
 //! number of comparisons. Each sampled cut is normalized and ranked by its
 //! lowest eligible scan cost plus a fixed penalty per covered occurrence.
 //! A single cost profile per instruction set serves both decisions. It combines
 //! matcher work per code with candidate processing per covered occurrence.
-//! Execution chooses mask packing separately.
+//! Mask packing follows a separate density rule, chosen for each scan.
 //!
-//! `scan` defines the instruction sets and matcher configurations. `select`
-//! chooses eligible matchers using the formulas in `cost` and chooses mask
-//! packing separately. Neither performs CPU detection or scanning.
+//! `scan` defines the instruction sets and matchers. `select` chooses eligible
+//! matchers using the formulas in `cost`, and the packing policy from hit density.
+//! Neither performs CPU detection or scanning.
 //! Frequencies guide these choices but never remove tokens from a cover.
 
 mod cost;
@@ -25,7 +25,7 @@ use super::scan::Isa;
 use crate::search::index::TokenFrequencyIndexView;
 #[cfg(test)]
 pub(super) use select::is_eligible;
-pub(super) use select::{cover_cost, select_matcher_config};
+pub(super) use select::{cover_cost, select_matcher, skip_empty_packing};
 
 /// Select the sampled cover with the lowest relative cost.
 /// Return the cover and its indexed token occurrence count.

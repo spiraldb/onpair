@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Connect a matcher configuration to its concrete implementation.
+//! Connect a prepared matcher and packing policy to their concrete implementation.
 //!
-//! The configuration chooses the matcher family and empty-group packing policy.
-//! Dispatch derives nibble batches from the cover and resolves them once before scanning,
-//! so the block loop runs with concrete type and const parameters.
+//! Dispatch derives nibble batches from the cover and resolves them, together
+//! with the packing policy, once before scanning, so the block loop runs with
+//! concrete type and const parameters.
 //!
 //! AArch64 uses NEON. On x86, this build contains AVX2 kernels unless `avx512bw`
 //! is enabled at compile time, in which case it contains the AVX-512 versions.
 //! Runtime detection enables the compiled family when supported; otherwise
 //! selection uses the scalar table. Other architectures use the table too.
 
-use super::matcher::{self, Matcher};
-use super::{Check, Isa, MatcherConfig, both_stages};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::{MatcherKind, PER_BATCH};
+use super::PER_BATCH;
+use super::matcher::{self, Matcher};
+use super::{Check, Isa, MatcherKind, both_stages};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::substring::ProbeCover;
@@ -23,25 +23,27 @@ use crate::search::substring::ProbeCover;
 /// Select whether empty groups skip mask packing: `S` enables it, `P` disables it.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn with_skip<O: Offset, S: Matcher, P: Matcher>(
-    config: MatcherConfig,
+    skip_empty_packing: bool,
     cover: &ProbeCover,
     codes: &[Token],
     row_offsets: &[O],
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
-    if config.skip_empty_packing {
+    if skip_empty_packing {
         both_stages::<S, O>(cover, codes, row_offsets, check, out)
     } else {
         both_stages::<P, O>(cover, codes, row_offsets, check, out)
     }
 }
 
-/// Execute the selected matcher with the shared row resolver.
-/// Planning must supply an eligible cover shape and an available instruction set;
-/// this function does not repeat those checks.
+/// Execute the prepared matcher with the shared row resolver.
+/// `skip_empty_packing` applies to vector matchers. Preparation must supply a
+/// matcher eligible for the cover and the current CPU; this function does not
+/// repeat those checks.
 pub(super) fn run<O: Offset>(
-    config: MatcherConfig,
+    kind: MatcherKind,
+    skip_empty_packing: bool,
     cover: &ProbeCover,
     codes: &[Token],
     row_offsets: &[O],
@@ -50,17 +52,17 @@ pub(super) fn run<O: Offset>(
 ) {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let _ = config;
+        let _ = (kind, skip_empty_packing);
         both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out);
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    match config.kind {
+    match kind {
         MatcherKind::Table => {
             both_stages::<matcher::Table, O>(cover, codes, row_offsets, check, out)
         }
         MatcherKind::EqOr if cover.n_points() == 0 => {
             with_skip::<O, matcher::EqOr<true, false>, matcher::EqOr<false, false>>(
-                config,
+                skip_empty_packing,
                 cover,
                 codes,
                 row_offsets,
@@ -69,7 +71,7 @@ pub(super) fn run<O: Offset>(
             )
         }
         MatcherKind::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
-            config,
+            skip_empty_packing,
             cover,
             codes,
             row_offsets,
@@ -78,7 +80,7 @@ pub(super) fn run<O: Offset>(
         ),
         MatcherKind::NibbleN8 => match cover.n_points().div_ceil(PER_BATCH) {
             1 => with_skip::<O, matcher::NibbleN8<1, true>, matcher::NibbleN8<1, false>>(
-                config,
+                skip_empty_packing,
                 cover,
                 codes,
                 row_offsets,
@@ -86,7 +88,7 @@ pub(super) fn run<O: Offset>(
                 out,
             ),
             2 => with_skip::<O, matcher::NibbleN8<2, true>, matcher::NibbleN8<2, false>>(
-                config,
+                skip_empty_packing,
                 cover,
                 codes,
                 row_offsets,
@@ -94,7 +96,7 @@ pub(super) fn run<O: Offset>(
                 out,
             ),
             3 => with_skip::<O, matcher::NibbleN8<3, true>, matcher::NibbleN8<3, false>>(
-                config,
+                skip_empty_packing,
                 cover,
                 codes,
                 row_offsets,

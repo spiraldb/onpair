@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Select matcher configurations from cover shape, hit density, scan size, and ISA.
+//! Select matchers from cover shape and ISA, and their mask-packing policy from
+//! hit density and scan size.
 //!
 //! First restrict matchers to supported cover shapes, then compare their
 //! relative costs. Sparse probes or small scans skip packing empty mask groups.
@@ -13,7 +14,7 @@
 //! matcher costs choose the kernel that will execute each cover.
 
 use super::super::ProbeCover;
-use super::super::scan::{Isa, MatcherConfig, MatcherKind, PER_BATCH};
+use super::super::scan::{Isa, MatcherKind, PER_BATCH};
 use super::cost::{candidate_cost, matcher_cost};
 
 /// Probe density below which vector matchers skip packing empty groups.
@@ -48,7 +49,7 @@ pub(in crate::search::substring) fn is_eligible(
 
 /// Choose the eligible matcher with the lowest cost.
 /// The scalar table is always eligible; equal costs retain the earlier choice.
-fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
+pub(in crate::search::substring) fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     let mut best = MatcherKind::Table;
     let mut best_cost = matcher_cost(isa, best, cover);
 
@@ -67,25 +68,16 @@ fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
     best
 }
 
-/// Choose the matcher and empty-group packing policy for a nonempty scan and cover.
+/// Whether vector matchers skip packing empty groups for a whole scan.
 ///
 /// `probe_density` is the covered fraction of the indexed stream; `code_count`
-/// is the number of codes in this scan. Skip packing empty groups when probes
-/// are sparse or the scan has fewer than one projected hit. Keep this decision
-/// for the entire scan. The caller handles empty inputs.
-pub(in crate::search::substring) fn select_matcher_config(
-    isa: Isa,
-    cover: &ProbeCover,
+/// is the number of codes in this scan. Skip when probes are sparse or the scan
+/// has fewer than one projected hit. The scalar table ignores the policy.
+pub(in crate::search::substring) fn skip_empty_packing(
     probe_density: f64,
     code_count: usize,
-) -> MatcherConfig {
-    let kind = select_matcher(isa, cover);
-    MatcherConfig {
-        kind,
-        skip_empty_packing: kind != MatcherKind::Table
-            && (probe_density < SKIP_PACKING_DENSITY_THRESHOLD
-                || probe_density * (code_count as f64) < 1.0),
-    }
+) -> bool {
+    probe_density < SKIP_PACKING_DENSITY_THRESHOLD || probe_density * (code_count as f64) < 1.0
 }
 
 /// Rank normalized covers for the same indexed stream. Lower is better.
@@ -156,33 +148,33 @@ mod tests {
     }
 
     #[test]
-    fn configurations_use_eligible_matchers_and_packing() {
+    fn sparse_probes_or_few_projected_hits_skip_packing() {
+        for (density, code_count, skip) in [
+            // The density threshold is strict.
+            (0.00025_f64.next_down(), 1_000_000, true),
+            (0.00025, 1_000_000, false),
+            (0.00025_f64.next_up(), 1_000_000, false),
+            // Partial scans use the same density but project fewer hits.
+            (1.0 / 400.0, 399, true),
+            (1.0 / 400.0, 400, false),
+            (1.0 / 400.0, 401, false),
+        ] {
+            assert_eq!(
+                skip_empty_packing(density, code_count),
+                skip,
+                "density {density}, {code_count} codes"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_matchers_are_eligible() {
         for isa in [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw] {
             for points in 0..=32 {
                 for ranges in 0..=4 {
                     let cover = cover(points, ranges);
-                    if cover.is_empty() {
-                        continue;
-                    }
-                    for (density, code_count, skip) in [
-                        (0.0, 1_000_000, true),
-                        (0.00025_f64.next_down(), 1_000_000, true),
-                        (0.00025, 1_000_000, false),
-                        (0.00025_f64.next_up(), 1_000_000, false),
-                        (0.01, 1_000_000, false),
-                        (1.0, 1_000_000, false),
-                        // Partial scans use the same density but project fewer hits.
-                        (1.0 / 400.0, 399, true),
-                        (1.0 / 400.0, 400, false),
-                        (1.0 / 400.0, 401, false),
-                    ] {
-                        let config = select_matcher_config(isa, &cover, density, code_count);
-                        assert!(is_eligible(isa, config.kind, &cover));
-                        if config.kind == MatcherKind::Table {
-                            assert!(!config.skip_empty_packing);
-                        } else {
-                            assert_eq!(config.skip_empty_packing, skip);
-                        }
+                    if !cover.is_empty() {
+                        assert!(is_eligible(isa, select_matcher(isa, &cover), &cover));
                     }
                 }
             }

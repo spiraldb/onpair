@@ -32,7 +32,7 @@
 //! # Responsibilities
 //! [`ContainsScan`] coordinates graph construction, cost-based cover selection and walk
 //! compilation. `alignment` owns the graph and cut solver; `plan` prices and
-//! selects covers and matcher configurations using explicit facts and capabilities.
+//! selects covers and their matchers using explicit facts and capabilities.
 //! `scan` produces hits and resolves rows, calling the exact verifier in
 //! `verify::walk`.
 
@@ -50,6 +50,7 @@ pub use error::ContainsError;
 pub use verify::{ContainsDfa, row_contains};
 
 use alignment::graph::AlignmentGraph;
+use scan::MatcherKind;
 use verify::walk::Walk;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -60,7 +61,7 @@ use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
 /// Immutable prepared substring scan for one pattern and dictionary.
 ///
-/// Holds the probe cover, compiled walker and token frequencies. Each
+/// Holds the probe cover, its matcher, compiled walker and token frequencies. Each
 /// [`ContainsScan::scan`] call owns its execution state, so preparation can be reused
 /// across scans. The dictionary is supplied separately at execution.
 ///
@@ -69,6 +70,7 @@ use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 #[derive(Debug, Clone)]
 pub struct ContainsScan {
     probe_cover: ProbeCover,
+    matcher: MatcherKind,
     covered_frequency: u32,
     total_frequency: u32,
     walk: Walk,
@@ -126,16 +128,18 @@ impl ContainsScan {
         if pattern.is_empty() {
             return Ok(Self {
                 probe_cover: ProbeCover::from_runs(Vec::new()),
+                matcher: MatcherKind::Table,
                 covered_frequency: 0,
                 total_frequency: frequencies.total_frequency(),
                 walk: Walk::default(),
                 matches_all: true,
             });
         }
+        let isa = scan::detect_isa();
         let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
-        let (cover, covered_frequency) =
-            plan::select_cover(&graph, frequencies.as_view(), scan::detect_isa());
+        let (cover, covered_frequency) = plan::select_cover(&graph, frequencies.as_view(), isa);
         Ok(Self {
+            matcher: plan::select_matcher(isa, &cover),
             probe_cover: cover,
             covered_frequency,
             total_frequency: frequencies.total_frequency(),
@@ -177,14 +181,9 @@ impl ContainsScan {
         if codes.is_empty() || row_offsets.len() < 2 || self.probe_cover.is_empty() {
             return;
         }
-        let config = plan::select_matcher_config(
-            scan::detect_isa(),
-            &self.probe_cover,
-            self.covered_fraction(),
-            codes.len(),
-        );
         scan::matches(
-            config,
+            self.matcher,
+            plan::skip_empty_packing(self.covered_fraction(), codes.len()),
             scan::ScanInput::new(codes, row_offsets, &self.probe_cover),
             dict,
             &self.walk,
