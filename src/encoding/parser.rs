@@ -10,8 +10,8 @@ use crate::core::dictionary::CompactDictionary;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::encoding::config::{Config, Error, TrainingConfig};
+use crate::encoding::dictionary_matcher::DictionaryMatcher;
 use crate::encoding::lanes::{self, LaneBuffers};
-use crate::encoding::lpm::DictionaryMatcher;
 use crate::encoding::rows::{ArrowRows, Rows};
 use crate::encoding::trainer::{TrainResult, train};
 
