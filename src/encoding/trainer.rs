@@ -17,7 +17,7 @@ use rand::seq::SliceRandom;
 use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
 use crate::core::types::MAX_TOKEN_SIZE;
 use crate::encoding::config::{ThresholdSpec, TrainingConfig};
-use crate::encoding::lpm::LongestPrefixMatcher;
+use crate::encoding::lpm::{DictionaryMatcher, LongestPrefixMatcher};
 use crate::encoding::rows::Rows;
 
 #[inline(always)]
@@ -74,7 +74,7 @@ impl PairFrequencies {
 #[derive(Debug, Clone)]
 pub(crate) struct TrainResult {
     pub(crate) dict: CompactDictionary,
-    pub(crate) lpm: LongestPrefixMatcher,
+    pub(crate) lpm: DictionaryMatcher,
 }
 
 /// Largest dictionary size for a training budget: `2^max_dict_bits`.
@@ -420,7 +420,7 @@ fn discover_tokens<'a>(
     let (mut bytes, offsets) = sort_tokens(&dict_bytes, &dict_offsets);
     pad_raw(&mut bytes, &offsets);
     let dict = CompactDictionary::from_raw(bytes, offsets);
-    let lpm = LongestPrefixMatcher::from_dictionary(dict.as_view());
+    let lpm = DictionaryMatcher::from_dictionary(dict.as_view());
     TrainResult { dict, lpm }
 }
 
