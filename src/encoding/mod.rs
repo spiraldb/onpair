@@ -8,6 +8,7 @@
 //! matcher over the input to produce a column.
 
 pub(crate) mod config;
+pub(crate) mod lanes;
 pub(crate) mod lpm;
 pub(crate) mod parser;
 pub(crate) mod rows;

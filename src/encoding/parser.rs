@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The trained encoder: pairs a [`CompactDictionary`] with a [`LongestPrefixMatcher`]
+//! The trained encoder: pairs a [`CompactDictionary`] with a [`DictionaryMatcher`]
 //! that drives encoding. Build with [`Parser::train`]; encode with
 //! [`Parser::parse`].
 
@@ -10,7 +10,8 @@ use crate::core::dictionary::CompactDictionary;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::encoding::config::{Config, Error, TrainingConfig};
-use crate::encoding::lpm::LongestPrefixMatcher;
+use crate::encoding::lanes::{self, LaneBuffers};
+use crate::encoding::lpm::DictionaryMatcher;
 use crate::encoding::rows::{ArrowRows, Rows};
 use crate::encoding::trainer::{TrainResult, train};
 
@@ -21,7 +22,7 @@ use crate::encoding::trainer::{TrainResult, train};
 pub struct Parser {
     /// The trained dictionary: sorted and read-padded.
     pub dict: CompactDictionary,
-    pub(crate) lpm: LongestPrefixMatcher,
+    pub(crate) lpm: DictionaryMatcher,
 }
 
 impl Parser {
@@ -68,9 +69,13 @@ impl Parser {
     /// guarantees as [`Parser::train_unchecked`].
     pub(crate) fn parse_unchecked<O: Offset>(&self, bytes: &[u8], offsets: &[O]) -> Column<O> {
         let mut codes = Vec::new();
-        let mut row_offsets = Vec::new();
-        self.parse_rows_into(
-            &ArrowRows::new(bytes, offsets),
+        let mut row_offsets = Vec::with_capacity(offsets.len());
+        row_offsets.push(O::from_usize(0));
+        lanes::parse_arrow(
+            &self.lpm,
+            bytes,
+            offsets,
+            &mut LaneBuffers::default(),
             &mut codes,
             &mut row_offsets,
         );
@@ -97,16 +102,13 @@ impl Parser {
         row_offsets.reserve(n + 1);
         row_offsets.push(O::from_usize(0));
 
-        for i in 0..n {
-            let row = rows.row(i);
-            let mut pos = 0;
-            while pos < row.len() {
-                let (tok, mlen) = self.lpm.find_longest_match(&row[pos..]);
-                codes.push(tok);
-                pos += mlen;
-            }
-            row_offsets.push(O::from_usize(codes.len()));
-        }
+        lanes::parse_rows(
+            &self.lpm,
+            rows,
+            &mut LaneBuffers::default(),
+            codes,
+            row_offsets,
+        );
     }
 
     /// Encode any [`Rows`] input into a self-contained [`Column`].
@@ -152,7 +154,7 @@ mod tests {
     fn encode_strings<O: Offset>(
         bytes: &[u8],
         offsets: &[O],
-        lpm: &LongestPrefixMatcher,
+        lpm: &DictionaryMatcher,
     ) -> (Vec<Token>, Vec<O>) {
         let rows = ArrowRows::new(bytes, offsets);
         let mut codes = Vec::new();
@@ -231,7 +233,7 @@ mod tests {
 
     #[test]
     fn zero_strings_produces_no_codes() {
-        let lpm = LongestPrefixMatcher::new();
+        let lpm = DictionaryMatcher::from_dictionary(make_base_dict().as_view());
         let (codes, row_offsets) = encode_strings::<u32>(&[], &[0], &lpm);
         assert!(codes.is_empty());
         assert_eq!(row_offsets, vec![0u32]);
@@ -239,7 +241,7 @@ mod tests {
 
     #[test]
     fn single_empty_string_produces_no_codes() {
-        let lpm = LongestPrefixMatcher::new();
+        let lpm = DictionaryMatcher::from_dictionary(make_base_dict().as_view());
         let (codes, row_offsets) = encode_strings::<u32>(&[], &[0, 0], &lpm);
         assert!(codes.is_empty());
         assert_eq!(row_offsets, vec![0u32, 0]);
@@ -247,7 +249,7 @@ mod tests {
 
     #[test]
     fn row_offsets_delimit_each_row() {
-        let lpm = LongestPrefixMatcher::new();
+        let lpm = DictionaryMatcher::from_dictionary(make_base_dict().as_view());
         let d = make_base_dict();
         let strings: &[&[u8]] = &[b"alpha", b"", b"beta beta", b"gamma"];
         let raw = make_raw(strings);
@@ -266,7 +268,7 @@ mod tests {
 
     #[test]
     fn base_tokens_single_known_string() {
-        let lpm = LongestPrefixMatcher::new();
+        let lpm = DictionaryMatcher::from_dictionary(make_base_dict().as_view());
         let d = make_base_dict();
         let raw = make_raw(&["Hello, World!"]);
         let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
