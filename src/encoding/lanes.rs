@@ -16,7 +16,7 @@ use std::hint::select_unpredictable;
 
 use crate::core::offset::Offset;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
-use crate::encoding::lpm::DictionaryMatcher;
+use crate::encoding::dictionary_matcher::DictionaryMatcher;
 use crate::encoding::rows::Rows;
 
 /// Number of lanes that advance together. Measured best: 4 on x86-64 (Sapphire

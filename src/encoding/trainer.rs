@@ -17,7 +17,8 @@ use rand::seq::SliceRandom;
 use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
 use crate::core::types::MAX_TOKEN_SIZE;
 use crate::encoding::config::{ThresholdSpec, TrainingConfig};
-use crate::encoding::lpm::{DictionaryMatcher, LongestPrefixMatcher};
+use crate::encoding::dictionary_matcher::DictionaryMatcher;
+use crate::encoding::lpm::LongestPrefixMatcher;
 use crate::encoding::rows::Rows;
 
 #[inline(always)]
