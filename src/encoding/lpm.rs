@@ -15,10 +15,13 @@
 //!
 //! Matching loads up to 16 bytes once, probes the long-token bucket, then checks
 //! short tokens from longest to shortest.
+//!
+//! [`LongestPrefixMatcher`] accepts inserts and drives training. Encoding uses
+//! [`DictionaryMatcher`](crate::encoding::dictionary_matcher::DictionaryMatcher),
+//! a frozen form built from the final, sorted dictionary.
 
 use hashbrown::HashMap;
 
-use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 
 /// Tokens of this length or shorter live in the short map; longer tokens are
@@ -211,27 +214,6 @@ impl LongestPrefixMatcher {
             .reserve(long_capacity.saturating_sub(self.long_map.len()));
     }
 
-    /// Build a matcher from a complete dictionary: token at index `i` receives
-    /// id `i`. The caller guarantees the dictionary contains every single-byte
-    /// token so [`find_longest_match`](Self::find_longest_match) stays total.
-    pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
-        let n = dict.num_tokens();
-        let long_capacity = (0..n)
-            .filter(|&i| dict.token(i as Token).len() > BUCKET_PREFIX_LEN)
-            .count();
-        let mut me = Self {
-            short_map: HashMap::with_capacity(n),
-            long_map: HashMap::with_capacity(long_capacity),
-            max_short_len: 1,
-            next_id: n as u32,
-        };
-        for i in 0..n {
-            let id = i as Token;
-            me.insert_internal(dict.token(id), id);
-        }
-        me
-    }
-
     /// Insert `data` and assign it the next available token id.
     ///
     /// Precondition: `1 <= data.len() <= MAX_TOKEN_SIZE` and `size() < 65_536`.
@@ -281,8 +263,7 @@ impl LongestPrefixMatcher {
     /// length.
     ///
     /// Precondition: `!data.is_empty()` and the matcher contains every
-    /// single-byte token (always true after [`new`](Self::new) or
-    /// [`from_dictionary`](Self::from_dictionary) with a complete dictionary).
+    /// single-byte token (always true after [`new`](Self::new)).
     #[inline]
     pub(crate) fn find_longest_match(&self, data: &[u8]) -> (Token, usize) {
         let (lo64, hi64) = load_window(data);
@@ -323,7 +304,6 @@ impl LongestPrefixMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, Dictionary};
 
     fn insert_str(lpm: &mut LongestPrefixMatcher, s: &str) -> Token {
         lpm.insert(s.as_bytes())
@@ -332,22 +312,6 @@ mod tests {
     fn find_str(lpm: &LongestPrefixMatcher, s: &str) -> (Token, usize) {
         lpm.find_longest_match(s.as_bytes())
     }
-
-    fn make_test_dictionary(extra: &[&str]) -> CompactDictionary {
-        let mut bytes = Vec::new();
-        let mut offsets = vec![0u32];
-        for i in 0u16..=255 {
-            bytes.push(i as u8);
-            offsets.push(bytes.len() as u32);
-        }
-        for &s in extra {
-            bytes.extend_from_slice(s.as_bytes());
-            offsets.push(bytes.len() as u32);
-        }
-        CompactDictionary::from_raw(bytes, offsets)
-    }
-
-    // ── Construction ─────────────────────────────────────────────────────────
 
     #[test]
     fn default_constructor_size_is_256() {
@@ -500,39 +464,5 @@ mod tests {
             let (tok, len) = lpm.find_longest_match(&buf);
             assert_eq!((tok, len), (inserted[i as usize], 10), "token index {i}");
         }
-    }
-
-    // ── from_dictionary ──────────────────────────────────────────────────────
-
-    #[test]
-    fn from_dict_size_matches_extra_tokens() {
-        let d = make_test_dictionary(&["ab", "abcde"]);
-        assert_eq!(
-            LongestPrefixMatcher::from_dictionary(d.as_view()).size(),
-            258
-        );
-    }
-
-    #[test]
-    fn from_dict_multi_byte_token_found_with_correct_id() {
-        let d = make_test_dictionary(&["ab", "abcde"]);
-        let lpm = LongestPrefixMatcher::from_dictionary(d.as_view());
-        assert_eq!(find_str(&lpm, "abcde"), (257, 5));
-        assert_eq!(find_str(&lpm, "abc"), (256, 2));
-    }
-
-    #[test]
-    fn from_dict_long_token_from_dictionary() {
-        let d = make_test_dictionary(&["ABCDEFGHI"]);
-        let lpm = LongestPrefixMatcher::from_dictionary(d.as_view());
-        assert_eq!(find_str(&lpm, "ABCDEFGHIX"), (256, 9));
-    }
-
-    #[test]
-    fn from_dict_insert_continues_id() {
-        let d = make_test_dictionary(&["ab", "cd"]);
-        let mut lpm = LongestPrefixMatcher::from_dictionary(d.as_view());
-        assert_eq!(insert_str(&mut lpm, "ef"), 258);
-        assert_eq!(lpm.size(), 259);
     }
 }
