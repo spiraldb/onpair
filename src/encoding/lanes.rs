@@ -12,12 +12,18 @@
 //! writes its codes to its own buffer; the buffers are joined in row order
 //! after the batch.
 
+use std::hint::select_unpredictable;
+
 use crate::core::offset::Offset;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::encoding::lpm::DictionaryMatcher;
 use crate::encoding::rows::Rows;
 
-/// Number of lanes that advance together.
+/// Number of lanes that advance together. Measured best: 4 on x86-64 (Sapphire
+/// Rapids), 6 on Apple Silicon. Beyond that, lane state spills from registers.
+#[cfg(target_arch = "x86_64")]
+const LANES: usize = 4;
+#[cfg(not(target_arch = "x86_64"))]
 const LANES: usize = 6;
 
 /// Approximate input bytes per batch. Large enough that the lanes of a batch
@@ -205,27 +211,21 @@ fn parse_batch<I: OffsetLike, O: Offset>(
             let (token, len) = found[j];
             buffers.codes[j][count[j]] = token;
             count[j] += active as usize;
-            at[j] += if active { len } else { 0 };
+            at[j] += select_unpredictable(active, len, 0);
 
             // A row ends when its bytes are used up. The next row starts where
             // this one ends.
             let done = at[j] == row_end[j] && running;
-            let slot = if done {
-                row[j] - bounds[j]
-            } else {
-                buffers.row_ends[j].len() - 1
-            };
+            let slot =
+                select_unpredictable(done, row[j] - bounds[j], buffers.row_ends[j].len() - 1);
             buffers.row_ends[j][slot] = count[j];
             row[j] += done as usize;
 
             // After its last row a lane keeps `row_end == at`, so it stays
             // inactive.
-            let next_end = if row[j] < last_row[j] {
-                offsets[row[j] + 1].to_usize()
-            } else {
-                at[j]
-            };
-            row_end[j] = if done { next_end } else { row_end[j] };
+            let next_end = offsets[(row[j] + 1).min(n)].to_usize();
+            let next_end = select_unpredictable(row[j] < last_row[j], next_end, at[j]);
+            row_end[j] = select_unpredictable(done, next_end, row_end[j]);
         }
 
         if !busy {
