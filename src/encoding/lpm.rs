@@ -21,6 +21,8 @@
 //! dictionary. It matches several inputs at once without data-dependent
 //! branches.
 
+use std::hint::select_unpredictable;
+
 use hashbrown::HashMap;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -327,7 +329,7 @@ const PREFIX_SLOTS: usize = 1 << 16;
 /// block of `q`, and three more steps inside that block find `q`. So a search
 /// reads one block that may miss the cache.
 /// All inputs of one call search with the same number of steps, so the loop has
-/// no branch that depends on the data.
+/// no branch that depends on the data; see [`advance_if_le`].
 #[derive(Debug, Clone)]
 pub(crate) struct DictionaryMatcher {
     /// Token keys in dictionary order, then `u128::MAX` up to a whole block.
@@ -494,11 +496,7 @@ impl DictionaryMatcher {
             for j in 0..K {
                 let half = size[j] / 2;
                 let mid = base[j] + half;
-                base[j] = if self.samples[mid] <= key[j] {
-                    mid
-                } else {
-                    base[j]
-                };
+                base[j] = advance_if_le(self.samples[mid], key[j], base[j], half);
                 size[j] -= half;
             }
         }
@@ -511,11 +509,7 @@ impl DictionaryMatcher {
         while half > 0 {
             for j in 0..K {
                 let block = &self.blocks[base[j]].0;
-                slot[j] = if block[slot[j] + half] <= key[j] {
-                    slot[j] + half
-                } else {
-                    slot[j]
-                };
+                slot[j] = advance_if_le(block[slot[j] + half], key[j], slot[j], half);
             }
             half /= 2;
         }
@@ -536,8 +530,30 @@ impl DictionaryMatcher {
             // Rank 0 is the single-byte token of the first input byte.
             let longer = chain.ids[rank.saturating_sub(1)];
             let single = self.singles[(key[j] >> 120) as usize];
-            (if rank == 0 { single } else { longer }, len)
+            (select_unpredictable(rank == 0, single, longer), len)
         })
+    }
+}
+
+/// `at + step` if `a <= b`, else `at`, without a branch: one step of a binary
+/// search whose outcome is unpredictable.
+#[inline(always)]
+fn advance_if_le(a: u128, b: u128, at: usize, step: usize) -> usize {
+    // On x86-64, LLVM turns a select on this comparison into a branch, even
+    // through `select_unpredictable`. The borrow bit of `b - a`, computed with
+    // plain arithmetic, stays branch-free.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let diff = b.wrapping_sub(a);
+        let borrow = ((!b & a) | (!(b ^ a) & diff)) >> 127;
+        at + step * (1 - borrow as usize)
+    }
+
+    // Elsewhere the select becomes a conditional select, which costs fewer
+    // instructions than the arithmetic.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        select_unpredictable(a <= b, at + step, at)
     }
 }
 
