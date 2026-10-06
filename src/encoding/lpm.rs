@@ -539,19 +539,19 @@ impl DictionaryMatcher {
 /// search whose outcome is unpredictable.
 #[inline(always)]
 fn advance_if_le(a: u128, b: u128, at: usize, step: usize) -> usize {
-    // On x86-64, LLVM turns a select on this comparison into a branch, even
-    // through `select_unpredictable`. The borrow bit of `b - a`, computed with
-    // plain arithmetic, stays branch-free.
-    #[cfg(target_arch = "x86_64")]
+    // On x86-64 and on generic aarch64 (Graviton), LLVM turns a select on this
+    // comparison into a branch, even through `select_unpredictable`. The borrow
+    // bit of `b - a`, computed with plain arithmetic, stays branch-free.
+    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
     {
         let diff = b.wrapping_sub(a);
         let borrow = ((!b & a) | (!(b ^ a) & diff)) >> 127;
         at + step * (1 - borrow as usize)
     }
 
-    // Elsewhere the select becomes a conditional select, which costs fewer
-    // instructions than the arithmetic.
-    #[cfg(not(target_arch = "x86_64"))]
+    // On Apple Silicon the select becomes a conditional select, which costs
+    // fewer instructions than the arithmetic.
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     {
         select_unpredictable(a <= b, at + step, at)
     }

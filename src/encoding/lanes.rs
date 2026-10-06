@@ -20,7 +20,8 @@ use crate::encoding::lpm::DictionaryMatcher;
 use crate::encoding::rows::Rows;
 
 /// Number of lanes that advance together. Measured best: 4 on x86-64 (Sapphire
-/// Rapids), 6 on Apple Silicon. Beyond that, lane state spills from registers.
+/// Rapids, Zen 4, Zen 5), 6 on Apple Silicon, 5 on Graviton4 (6 is within 3%).
+/// Beyond that, lane state spills from registers.
 #[cfg(target_arch = "x86_64")]
 const LANES: usize = 4;
 #[cfg(not(target_arch = "x86_64"))]
