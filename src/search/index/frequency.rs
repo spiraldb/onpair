@@ -164,7 +164,7 @@ where
 
     /// Total number of codes represented by the index.
     #[inline]
-    pub(crate) fn total_frequency(&self) -> u32 {
+    pub fn total_frequency(&self) -> u32 {
         self.as_view().total_frequency()
     }
 }

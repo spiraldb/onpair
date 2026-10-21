@@ -4,14 +4,11 @@
 //! Substring query preparation, planning, scanning and verification.
 //!
 //! [`ContainsDfa`] prepares a token-level KMP automaton for [`row_contains`].
-//! [`ContainsScan`] compiles a **sound probe cover** from the pattern — dictionary token ids
-//! and id ranges chosen so that *any* row containing the pattern holds at least
-//! one probe token — then scans the flat code stream for the rows holding one
-//! ([`ContainsScan::scan`]).
-//!
-//! Every hit is then checked against the alignment graph in the compressed
-//! domain (`walk`), so the rows [`ContainsScan::scan`] returns are exactly
-//! the rows containing the pattern and no caller-side verification is needed.
+//! [`ContainsScan`] compiles a **sound probe cover** from the pattern — dictionary
+//! token ids and id ranges chosen so that *any* row containing the pattern holds at
+//! least one probe token — then scans the flat code stream for the rows holding one
+//! ([`ContainsScan::scan`]). Every hit is then checked against the alignment graph
+//! in the compressed domain (`walk`).
 //!
 //! An empty pattern matches every row, including rows without codes. Its
 //! preparation needs no probes, and execution appends all rows without scanning.
@@ -59,22 +56,20 @@ use crate::core::types::Token;
 use crate::core::validate::InvalidFrequencyIndex;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
-/// Immutable prepared substring scan for one pattern and dictionary.
+/// A prepared substring query, ready to scan any chunk encoded with its dictionary.
 ///
-/// Holds the probe cover, its matcher, compiled walker and token frequencies. Each
-/// [`ContainsScan::scan`] call owns its execution state, so preparation can be reused
-/// across scans. The dictionary is supplied separately at execution.
-///
-/// Points and ranges are disjoint, so each covered token occurrence is counted
-/// exactly once. An empty pattern matches all rows and needs no probes.
+/// Holds the probe cover, its matcher, the compiled walker and the probe density
+/// of the stream used for planning. Each [`ContainsScan::scan`] call owns its
+/// execution state, so one preparation can scan many chunks and be shared between
+/// concurrent calls. The dictionary is supplied separately at execution, and
+/// coverage statistics take the frequency index of the chunk they describe.
+/// An empty pattern matches all rows and needs no probes.
 #[derive(Debug, Clone)]
 pub struct ContainsScan {
     probe_cover: ProbeCover,
     matcher: MatcherKind,
-    covered_frequency: u32,
-    total_frequency: u32,
     walk: Walk,
-    /// Empty patterns admit even rows without codes, independently of the cover.
+    probe_density: f64,
     matches_all: bool,
 }
 
@@ -86,9 +81,9 @@ impl ContainsScan {
     /// Select the sampled probe cover with the lowest relative cost and compile
     /// the alignment walker used to verify its hits.
     ///
-    /// This constructor prepares the checks and reports their frequency;
-    /// the caller decides whether executing them is profitable. An empty pattern
-    /// produces a scan that admits every row without compiling probes.
+    /// This constructor prepares the checks; the caller decides whether executing
+    /// them is profitable, using the coverage statistics for the chunk at hand.
+    /// An empty pattern produces a scan that admits every row without compiling probes.
     ///
     /// # Precondition
     /// `dict` is conformant: sorted, complete, and unique. These properties are
@@ -129,9 +124,8 @@ impl ContainsScan {
             return Ok(Self {
                 probe_cover: ProbeCover::from_runs(Vec::new()),
                 matcher: MatcherKind::Table,
-                covered_frequency: 0,
-                total_frequency: frequencies.total_frequency(),
                 walk: Walk::default(),
+                probe_density: 0.0,
                 matches_all: true,
             });
         }
@@ -141,9 +135,8 @@ impl ContainsScan {
         Ok(Self {
             matcher: plan::select_matcher(isa, &cover),
             probe_cover: cover,
-            covered_frequency,
-            total_frequency: frequencies.total_frequency(),
             walk: Walk::from_graph(&graph, pattern),
+            probe_density: fraction(covered_frequency, frequencies.total_frequency()),
             matches_all: false,
         })
     }
@@ -183,7 +176,7 @@ impl ContainsScan {
         }
         scan::run(
             self.matcher,
-            plan::skip_empty_packing(self.covered_fraction(), codes.len()),
+            plan::skip_empty_packing(self.probe_density, codes.len()),
             ScanInput::new(codes, row_offsets, dict, &self.probe_cover, &self.walk),
             out,
         );
@@ -231,59 +224,70 @@ impl ContainsScan {
         &self.probe_cover
     }
 
-    /// Number of code positions whose token is covered by the probes.
+    /// Number of code positions in the indexed stream whose token is covered by
+    /// the probes. Points and ranges are disjoint, so each occurrence counts once.
     /// Zero for an empty pattern, which needs no probes.
-    pub fn covered_frequency(&self) -> u32 {
-        self.covered_frequency
-    }
-
-    /// Fraction of code positions whose token is covered by the probes.
     ///
-    /// Returns `0.0` when the indexed code stream is empty or the pattern is
-    /// empty and needs no probes.
-    pub fn covered_fraction(&self) -> f64 {
-        if self.total_frequency == 0 {
-            0.0
-        } else {
-            f64::from(self.covered_frequency) / f64::from(self.total_frequency)
-        }
+    /// # Panics
+    /// Panics if a probe token lies outside `frequencies`, which must use this
+    /// scan's dictionary token IDs.
+    pub fn covered_frequency<S: TokenFrequencyIndexStorage>(
+        &self,
+        frequencies: &TokenFrequencyIndex<S>,
+    ) -> u32 {
+        self.probe_cover.frequency(frequencies.as_view())
     }
 
-    /// Number of code positions represented by the frequency index.
-    pub fn total_frequency(&self) -> u32 {
-        self.total_frequency
-    }
-
-    /// Comparison-count proxy for the cover: one per point, two per inclusive
-    /// range. Zero for an empty pattern.
+    /// Fraction of code positions in the indexed stream whose token is covered by
+    /// the probes. Returns `0.0` when that stream is empty or the pattern is empty
+    /// and needs no probes.
     ///
-    /// Counts comparisons for a direct comparison strategy. The selected matcher
-    /// may use different operations, such as nibble lookups or a membership table.
-    pub fn comparison_cost(&self) -> usize {
-        self.probe_cover
-            .n_points()
-            .saturating_add(self.probe_cover.n_ranges().saturating_mul(2))
+    /// # Panics
+    /// Panics under the same condition as [`Self::covered_frequency`].
+    pub fn covered_fraction<S: TokenFrequencyIndexStorage>(
+        &self,
+        frequencies: &TokenFrequencyIndex<S>,
+    ) -> f64 {
+        fraction(
+            self.covered_frequency(frequencies),
+            frequencies.total_frequency(),
+        )
     }
 
-    /// Upper bound on the fraction of indexed rows containing a probe token.
+    /// Upper bound on the fraction of a chunk's rows containing a probe token.
     ///
     /// Computes `min(1, covered_frequency / row_count)`. Each candidate row holds
     /// at least one covered code, but multiple covered codes may share a row,
     /// making the bound loose. A row may require several verification attempts,
     /// so this fraction does not measure verifier calls.
     ///
-    /// The bound assumes the preparation frequency index counts exact occurrences
-    /// in the same region whose rows are counted by `row_count`.
-    /// Returns `0.0` for zero rows and never exceeds `1.0`.
+    /// `frequencies` must count exact occurrences in the chunk whose rows are
+    /// counted by `row_count`. Returns `0.0` for zero rows and never exceeds `1.0`.
     /// An empty pattern admits every row, so its fraction is `1.0` for any
-    /// non-empty region, even one consisting entirely of empty rows.
-    pub fn expected_candidate_row_fraction(&self, row_count: usize) -> f64 {
+    /// non-empty chunk, even one consisting entirely of empty rows.
+    ///
+    /// # Panics
+    /// Panics under the same condition as [`Self::covered_frequency`].
+    pub fn expected_candidate_row_fraction<S: TokenFrequencyIndexStorage>(
+        &self,
+        frequencies: &TokenFrequencyIndex<S>,
+        row_count: usize,
+    ) -> f64 {
         if row_count == 0 {
             return 0.0;
         }
         if self.matches_all {
             return 1.0;
         }
-        (f64::from(self.covered_frequency) / row_count as f64).min(1.0)
+        (f64::from(self.covered_frequency(frequencies)) / row_count as f64).min(1.0)
+    }
+}
+
+/// `covered / total`, or `0.0` for an empty stream.
+fn fraction(covered: u32, total: u32) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        f64::from(covered) / f64::from(total)
     }
 }

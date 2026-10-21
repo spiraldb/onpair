@@ -125,14 +125,19 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
             .iter()
             .filter(|&&code| scan.probe_cover().contains(code))
             .count();
-        assert_eq!(scan.covered_frequency() as usize, covered, "{pattern:?}");
-        assert_eq!(scan.total_frequency() as usize, view.codes.len());
+        assert_eq!(
+            scan.covered_frequency(&frequencies) as usize,
+            covered,
+            "{pattern:?}"
+        );
         let fraction = if view.codes.is_empty() {
             0.0
         } else {
             covered as f64 / view.codes.len() as f64
         };
-        assert_eq!(scan.covered_fraction(), fraction, "{pattern:?}");
+        assert_eq!(scan.covered_fraction(&frequencies), fraction, "{pattern:?}");
+        // Packing uses the planning stream's density, which this index describes.
+        assert_eq!(scan.probe_density, fraction, "{pattern:?}");
         let mut actual = vec![usize::MAX];
         let mut appended = actual.clone();
         for _ in 0..2 {
@@ -223,7 +228,7 @@ fn empty_pattern_and_empty_cover_have_distinct_results() {
         assert!(scan.probe_cover().is_empty());
         assert!(!scan.should_fallback(&frequencies));
         assert_eq!(
-            scan.expected_candidate_row_fraction(rows.len()),
+            scan.expected_candidate_row_fraction(&frequencies, rows.len()),
             if rows.is_empty() { 0.0 } else { 1.0 }
         );
         // An empty cover without the empty-pattern flag must leave output alone.
@@ -231,7 +236,10 @@ fn empty_pattern_and_empty_cover_have_distinct_results() {
             matches_all: false,
             ..scan
         };
-        assert_eq!(no_matches.expected_candidate_row_fraction(rows.len()), 0.0);
+        assert_eq!(
+            no_matches.expected_candidate_row_fraction(&frequencies, rows.len()),
+            0.0
+        );
         let mut output = vec![usize::MAX];
         no_matches.scan(view.codes, view.row_offsets, view.dict, &mut output);
         assert_eq!(output, [usize::MAX]);
@@ -404,13 +412,10 @@ fn borrowed_frequencies_preserve_the_plan_and_results() {
         owned_scan.probe_cover().ranges()
     );
     assert_eq!(
-        borrowed_scan.covered_frequency(),
-        owned_scan.covered_frequency()
+        borrowed_scan.covered_frequency(&borrowed),
+        owned_scan.covered_frequency(&owned)
     );
-    assert_eq!(
-        borrowed_scan.covered_fraction(),
-        owned_scan.covered_fraction()
-    );
+    assert_eq!(borrowed_scan.probe_density, owned_scan.probe_density);
     assert_eq!(
         view.rows_containing_with_scan(b"alpha", &borrowed).unwrap(),
         [0, 2]
@@ -433,7 +438,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
     .unwrap();
     let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
     assert!(!scan.probe_cover().is_empty());
-    assert_eq!(scan.covered_frequency(), 0);
+    assert_eq!(scan.covered_frequency(&frequencies), 0);
     let mut rows = Vec::new();
     scan.scan(view.codes, view.row_offsets, view.dict, &mut rows);
     assert_eq!(rows, [0, 2]);
