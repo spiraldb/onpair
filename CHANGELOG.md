@@ -9,13 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add a SIMD substring prefilter with frequency-aware min-cut probe planning
-  and exact compressed-domain or decoded-byte verification.
+- Add `ContainsScan`, a substring search over the compressed codes. A
+  frequency-aware min-cut cover chooses the probe tokens, SIMD matchers find
+  them (NEON, AVX2, or AVX-512BW when compiled with it; scalar on other
+  targets), and every hit is verified exactly in the compressed domain.
+  `ColumnView::rows_containing_with_scan` runs it over a column view, including
+  a view sliced from a larger column.
+- Add `search::index::TokenFrequencyIndex`, the per-token frequency index used
+  for probe planning, built with `build_token_frequency_index` or validated
+  from stored buffers.
 - Add row-based training and compression without flattening input first.
 - Add encoding into reusable caller-owned buffers.
 
 ### Changed
 
+- **Breaking:** Replace `search::contains` and `ContainsTable` with
+  `row_contains` and `ContainsDfa`. `ContainsDfa::new` returns
+  `ContainsError::PatternTooLong` for patterns longer than
+  `ContainsDfa::MAX_PATTERN_LEN` (255 bytes) instead of panicking.
+- **Breaking:** `ColumnView::rows_containing` returns
+  `Result<Vec<usize>, ContainsError>`.
+- **Breaking:** Add `InvalidColumn::FrequencyIndex` for invalid token frequency
+  indexes, so exhaustive matches on `InvalidColumn` need a new arm.
 - Scan dynamic training samples sequentially without changing their contents or
   order.
 - Speed up matching for large dictionaries.
