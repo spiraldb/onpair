@@ -141,7 +141,7 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
         let mut actual = vec![usize::MAX];
         let mut appended = actual.clone();
         for _ in 0..2 {
-            scan.scan(view.codes, view.row_offsets, view.dict, &mut actual);
+            scan.scan(view.codes, view.row_offsets, &mut actual);
             appended.extend_from_slice(&expected);
             assert_eq!(actual, appended, "scan: {pattern:?}");
         }
@@ -241,7 +241,7 @@ fn empty_pattern_and_empty_cover_have_distinct_results() {
             0.0
         );
         let mut output = vec![usize::MAX];
-        no_matches.scan(view.codes, view.row_offsets, view.dict, &mut output);
+        no_matches.scan(view.codes, view.row_offsets, &mut output);
         assert_eq!(output, [usize::MAX]);
     }
 }
@@ -266,7 +266,6 @@ fn prepared_scan_handles_empty_and_partial_inputs() {
                 scan.scan(
                     &view.codes[first as usize..last as usize],
                     &offsets,
-                    view.dict,
                     &mut out,
                 );
                 let mut expected = vec![usize::MAX];
@@ -440,7 +439,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
     assert!(!scan.probe_cover().is_empty());
     assert_eq!(scan.covered_frequency(&frequencies), 0);
     let mut rows = Vec::new();
-    scan.scan(view.codes, view.row_offsets, view.dict, &mut rows);
+    scan.scan(view.codes, view.row_offsets, &mut rows);
     assert_eq!(rows, [0, 2]);
 }
 

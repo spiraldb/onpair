@@ -58,14 +58,15 @@ use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
 /// A prepared substring query, ready to scan any chunk encoded with its dictionary.
 ///
-/// Holds the probe cover, its matcher, the compiled walker and the probe density
-/// of the stream used for planning. Each [`ContainsScan::scan`] call owns its
-/// execution state, so one preparation can scan many chunks and be shared between
-/// concurrent calls. The dictionary is supplied separately at execution, and
-/// coverage statistics take the frequency index of the chunk they describe.
+/// Borrows the dictionary it was prepared with, and holds the probe cover, its
+/// matcher, the compiled walker and the probe density of the stream used for
+/// planning. Each [`ContainsScan::scan`] call owns its execution state, so one
+/// preparation can scan many chunks and be shared between concurrent calls.
+/// Coverage statistics take the frequency index of the chunk they describe.
 /// An empty pattern matches all rows and needs no probes.
 #[derive(Debug, Clone)]
-pub struct ContainsScan {
+pub struct ContainsScan<'d> {
+    dict: CompactDictionaryView<'d>,
     probe_cover: ProbeCover,
     matcher: MatcherKind,
     walk: Walk,
@@ -73,7 +74,7 @@ pub struct ContainsScan {
     matches_all: bool,
 }
 
-impl ContainsScan {
+impl<'d> ContainsScan<'d> {
     /// Maximum pattern length, bounded by the compiled walker's `u16` node IDs.
     pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
 
@@ -106,7 +107,7 @@ impl ContainsScan {
     /// a missing dictionary token.
     pub fn new<S: TokenFrequencyIndexStorage>(
         pattern: &[u8],
-        dict: CompactDictionaryView<'_>,
+        dict: CompactDictionaryView<'d>,
         frequencies: &TokenFrequencyIndex<S>,
     ) -> Result<Self, ContainsError> {
         if pattern.len() > Self::MAX_PATTERN_LEN {
@@ -122,6 +123,7 @@ impl ContainsScan {
         }
         if pattern.is_empty() {
             return Ok(Self {
+                dict,
                 probe_cover: ProbeCover::from_runs(Vec::new()),
                 matcher: MatcherKind::Table,
                 walk: Walk::default(),
@@ -133,6 +135,7 @@ impl ContainsScan {
         let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
         let (cover, covered_frequency) = plan::select_cover(&graph, frequencies.as_view(), isa);
         Ok(Self {
+            dict,
             matcher: plan::select_matcher(isa, &cover),
             probe_cover: cover,
             walk: Walk::from_graph(&graph, pattern),
@@ -153,20 +156,14 @@ impl ContainsScan {
     /// can be reused or shared between concurrent calls.
     ///
     /// # Precondition
-    /// `row_offsets` are valid delimiters for `codes`, every code lies in the
-    /// token domain of the prepared cover, and `dict` is the dictionary this
-    /// scan was built over. Rows must be greedily tokenized with that same
-    /// conformant dictionary, as produced by [`Column::compress`](crate::Column::compress).
+    /// `row_offsets` are valid delimiters for `codes`, and every code lies in the
+    /// token domain of the prepared cover. Rows must be greedily tokenized with
+    /// the conformant dictionary this scan was prepared with, as produced by
+    /// [`Column::compress`](crate::Column::compress).
     /// Validating a dictionary or externally supplied column buffers alone does not
     /// establish greedy tokenization. Each scan appends each matching row once in
     /// ascending order, preserving all prior contents of `out`.
-    pub fn scan<O: Offset>(
-        &self,
-        codes: &[Token],
-        row_offsets: &[O],
-        dict: CompactDictionaryView<'_>,
-        out: &mut Vec<usize>,
-    ) {
+    pub fn scan<O: Offset>(&self, codes: &[Token], row_offsets: &[O], out: &mut Vec<usize>) {
         if self.matches_all {
             out.extend(0..row_offsets.len().saturating_sub(1));
             return;
@@ -177,7 +174,7 @@ impl ContainsScan {
         scan::run(
             self.matcher,
             plan::skip_empty_packing(self.probe_density, codes.len()),
-            ScanInput::new(codes, row_offsets, dict, &self.probe_cover, &self.walk),
+            ScanInput::new(codes, row_offsets, self.dict, &self.probe_cover, &self.walk),
             out,
         );
     }

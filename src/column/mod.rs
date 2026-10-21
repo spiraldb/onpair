@@ -227,7 +227,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     ) -> Result<Vec<usize>, ContainsError> {
         let scan = ContainsScan::new(pattern, self.dict, frequencies)?;
         let mut rows = Vec::new();
-        scan.scan(self.codes, self.row_offsets, self.dict, &mut rows);
+        scan.scan(self.codes, self.row_offsets, &mut rows);
         Ok(rows)
     }
 
