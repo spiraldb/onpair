@@ -55,7 +55,3 @@ harness = false
 [[bench]]
 name = "clickbench"
 harness = false
-
-[profile.profiling]
-inherits = "release"
-debug = "line-tables-only"

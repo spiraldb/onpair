@@ -46,4 +46,3 @@ perf.data.old
 # Local Claude / agent state
 .claude/settings.local.json
 
-/bench/
