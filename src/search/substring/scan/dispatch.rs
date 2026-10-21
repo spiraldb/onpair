@@ -13,8 +13,8 @@
 //! selection uses the scalar table. Other architectures use the table too.
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::PER_BATCH;
-use super::matcher::{self, Matcher};
+use super::{PER_BATCH, matcher::Matcher};
+use super::matcher;
 use super::{Isa, MatcherKind, ScanInput, both_stages};
 
 use crate::core::offset::Offset;

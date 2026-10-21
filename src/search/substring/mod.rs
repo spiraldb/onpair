@@ -53,7 +53,7 @@ use verify::walk::Walk;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-use crate::core::validate::InvalidFrequencyIndex;
+use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex, panic_malformed};
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
 /// A prepared substring query, ready to scan any chunk encoded with its dictionary.
@@ -155,8 +155,16 @@ impl<'d> ContainsScan<'d> {
     /// scanning. Execution state is local to this call, so the same preparation
     /// can be reused or shared between concurrent calls.
     ///
+    /// Rows cover `codes[row_offsets[0]..row_offsets[R]]`. A view sliced from a
+    /// larger column keeps the codes before and after that range; they belong to
+    /// no row and are not scanned.
+    ///
+    /// # Panics
+    /// With [`InvalidColumn::BadRowOffsets`] if the first offset exceeds the last,
+    /// or the last exceeds `codes.len()`.
+    ///
     /// # Precondition
-    /// `row_offsets` are valid delimiters for `codes`, and every code lies in the
+    /// `row_offsets` are non-decreasing, and every code lies in the
     /// token domain of the prepared cover. Rows must be greedily tokenized with
     /// the conformant dictionary this scan was prepared with, as produced by
     /// [`Column::compress`](crate::Column::compress).
@@ -168,13 +176,20 @@ impl<'d> ContainsScan<'d> {
             out.extend(0..row_offsets.len().saturating_sub(1));
             return;
         }
-        if codes.is_empty() || row_offsets.len() < 2 || self.probe_cover.is_empty() {
+        let (Some(first), Some(last)) = (row_offsets.first(), row_offsets.last()) else {
+            return;
+        };
+        let (first, last) = (first.to_usize(), last.to_usize());
+        if first > last || last > codes.len() {
+            panic_malformed(InvalidColumn::BadRowOffsets);
+        }
+        if first == last || self.probe_cover.is_empty() {
             return;
         }
         scan::run(
             self.matcher,
-            plan::skip_empty_packing(self.probe_density, codes.len()),
-            ScanInput::new(codes, row_offsets, self.dict, &self.probe_cover, &self.walk),
+            plan::skip_empty_packing(self.probe_density, last - first),
+            ScanInput::new(&codes[..last], row_offsets, self.dict, &self.probe_cover, &self.walk),
             out,
         );
     }

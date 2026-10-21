@@ -276,6 +276,11 @@ fn prepared_scan_handles_empty_and_partial_inputs() {
                         .filter_map(|(row, bytes)| byte_contains(bytes, pattern).then_some(row)),
                 );
                 assert_eq!(out, expected, "{pattern:?}: rows {start}..{end}");
+                // A slice that keeps the whole code stream and narrows only the
+                // offsets, as Vortex slices, selects the same rows.
+                let mut out = vec![usize::MAX];
+                scan.scan(view.codes, &view.row_offsets[start..=end], &mut out);
+                assert_eq!(out, expected, "{pattern:?}: unrebased rows {start}..{end}");
             }
         }
     }

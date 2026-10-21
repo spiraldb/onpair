@@ -93,7 +93,7 @@ fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usi
     let matcher = M::new(input.cover);
     let mut resolver = Resolver::new(input);
     let mut bits = [0u64; BLOCK / 64];
-    blocks(input.codes, &mut |block, at, valid| {
+    blocks(input.codes, input.row_offsets[0].to_usize(), &mut |block, at, valid| {
         // A false result guarantees no hits; true may still mean an empty mask.
         if matcher.check(block, &mut bits) {
             clear_from(&mut bits, valid);
@@ -102,12 +102,12 @@ fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usi
     });
 }
 
-/// Visit full blocks directly and copy the final partial block into zero padding.
-/// The callback receives the block, its absolute start, and its valid code count.
-/// It must discard mask bits beyond that count before resolving rows.
-fn blocks(codes: &[Token], step: &mut dyn FnMut(&Block, usize, usize)) {
-    let (whole, rest) = codes.as_chunks::<BLOCK>();
-    let mut at = 0;
+/// Visit the codes from `first` in full blocks, and copy the final partial block
+/// into zero padding. The callback receives the block, its absolute start, and its
+/// valid code count. It must discard mask bits beyond that count before resolving rows.
+fn blocks(codes: &[Token], first: usize, step: &mut dyn FnMut(&Block, usize, usize)) {
+    let (whole, rest) = codes[first..].as_chunks::<BLOCK>();
+    let mut at = first;
     for block in whole {
         step(block, at, BLOCK);
         at += BLOCK;
@@ -131,23 +131,25 @@ fn clear_from(bits: &mut Mask, valid: usize) {
 mod tests {
     use super::*;
 
-    /// Every code is visited once at its absolute index, and a partial tail is
-    /// zero-padded to a full block.
+    /// Every code from `first` is visited once at its absolute index, and a partial
+    /// tail is zero-padded to a full block.
     #[test]
     fn blocks_visit_every_code_once() {
         for len in [0, 1, 63, 64, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK + 100] {
             let codes: Vec<Token> = (1..=len).map(|code| code as Token).collect();
-            let mut seen = Vec::new();
-            blocks(&codes, &mut |block, at, valid| {
-                assert!(block[valid..].iter().all(|&code| code == 0), "{len} codes");
-                seen.extend(
-                    (at..)
-                        .zip(&block[..valid])
-                        .map(|(index, &code)| (index, code)),
-                );
-            });
-            let expected: Vec<_> = codes.iter().copied().enumerate().collect();
-            assert_eq!(seen, expected, "{len} codes");
+            for first in [0, len / 2] {
+                let mut seen = Vec::new();
+                blocks(&codes, first, &mut |block, at, valid| {
+                    assert!(block[valid..].iter().all(|&code| code == 0), "{len} codes");
+                    seen.extend(
+                        (at..)
+                            .zip(&block[..valid])
+                            .map(|(index, &code)| (index, code)),
+                    );
+                });
+                let expected: Vec<_> = codes.iter().copied().enumerate().skip(first).collect();
+                assert_eq!(seen, expected, "{len} codes from {first}");
+            }
         }
     }
 
