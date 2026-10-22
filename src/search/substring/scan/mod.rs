@@ -93,13 +93,17 @@ fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usi
     let matcher = M::new(input.cover);
     let mut resolver = Resolver::new(input);
     let mut bits = [0u64; BLOCK / 64];
-    blocks(input.codes, input.row_offsets[0].to_usize(), &mut |block, at, valid| {
-        // A false result guarantees no hits; true may still mean an empty mask.
-        if matcher.check(block, &mut bits) {
-            clear_from(&mut bits, valid);
-            resolver.rows(&bits, at, out);
-        }
-    });
+    blocks(
+        input.codes,
+        input.row_offsets[0].to_usize(),
+        &mut |block, at, valid| {
+            // A false result guarantees no hits; true may still mean an empty mask.
+            if matcher.check(block, &mut bits) {
+                clear_from(&mut bits, valid);
+                resolver.rows(&bits, at, out);
+            }
+        },
+    );
 }
 
 /// Visit the codes from `first` in full blocks, and copy the final partial block

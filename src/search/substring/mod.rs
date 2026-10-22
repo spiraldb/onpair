@@ -189,7 +189,13 @@ impl<'d> ContainsScan<'d> {
         scan::run(
             self.matcher,
             plan::skip_empty_packing(self.probe_density, last - first),
-            ScanInput::new(&codes[..last], row_offsets, self.dict, &self.probe_cover, &self.walk),
+            ScanInput::new(
+                &codes[..last],
+                row_offsets,
+                self.dict,
+                &self.probe_cover,
+                &self.walk,
+            ),
             out,
         );
     }

@@ -12,10 +12,10 @@
 //! Runtime detection enables the compiled family when supported; otherwise
 //! selection uses the scalar table. Other architectures use the table too.
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::{PER_BATCH, matcher::Matcher};
 use super::matcher;
 use super::{Isa, MatcherKind, ScanInput, both_stages};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use super::{PER_BATCH, matcher::Matcher};
 
 use crate::core::offset::Offset;
 
