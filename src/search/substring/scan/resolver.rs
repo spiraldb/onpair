@@ -15,16 +15,16 @@ use super::{Mask, ScanInput};
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-use crate::search::substring::verify::walk::Walk;
+use crate::search::substring::verify::hit::HitVerifier;
 
 /// Row position and confirmed-output boundary retained across mask blocks.
 pub(super) struct Resolver<'a, O> {
     /// Boundaries of rows in absolute code indices.
     row_offsets: &'a [O],
-    /// Codes, dictionary and walker used to verify each hit.
+    /// Codes, dictionary and hit verifier used to check each hit.
     codes: &'a [Token],
     dict: CompactDictionaryView<'a>,
-    walk: &'a Walk,
+    verifier: &'a HitVerifier,
     /// Last row located for a hit, initially zero.
     row: usize,
     /// Exclusive end of the current row, initialized from the first row boundary.
@@ -40,7 +40,7 @@ impl<'a, O: Offset> Resolver<'a, O> {
             row_offsets: input.row_offsets,
             codes: input.codes,
             dict: input.dict,
-            walk: input.walk,
+            verifier: input.verifier,
             row: 0,
             row_end: input.row_offsets.get(1).map_or(0, |x| x.to_usize()),
             resolved_code: 0,
@@ -60,7 +60,7 @@ impl<'a, O: Offset> Resolver<'a, O> {
             }
             let row_start = self.row_offsets[self.row].to_usize();
             if self
-                .walk
+                .verifier
                 .check(self.dict, self.codes, row_start, self.row_end, code)
             {
                 out.push(self.row);
@@ -121,23 +121,23 @@ mod tests {
     use crate::core::types::Token;
     use crate::search::substring::ProbeCover;
     use crate::search::substring::scan::{BLOCK, ScanInput};
-    use crate::search::substring::verify::walk::tests::accepting_walk;
+    use crate::search::substring::verify::hit::tests::accepting_verifier;
 
     /// Enough blocks to place a row across an entire intervening block.
     const BLOCKS: usize = 4;
     const CODES: usize = BLOCKS * BLOCK;
 
     /// Resolve a whole mask in block order, omitting blocks without hits.
-    /// The walker accepts every hit, so rows depend only on lookup and deduplication.
+    /// The hit verifier accepts every hit, so rows depend only on lookup and deduplication.
     fn resolve<O: Offset>(mask: &[u64], row_offsets: &[O]) -> Vec<usize> {
         let codes = [0 as Token; CODES];
         let cover = ProbeCover::new(Vec::new(), Vec::new());
-        let walk = accepting_walk();
+        let verifier = accepting_verifier();
         let mut bytes: Vec<u8> = (0..=255).collect();
         let offsets: Vec<u32> = (0..=256).collect();
         pad_raw(&mut bytes, &offsets);
         let dict = CompactDictionary::from_raw(bytes, offsets);
-        let input = ScanInput::new(&codes, row_offsets, dict.as_view(), &cover, &walk);
+        let input = ScanInput::new(&codes, row_offsets, dict.as_view(), &cover, &verifier);
         let mut out = Vec::new();
         let mut resolver = Resolver::new(input);
         for (block, bits) in mask.chunks_exact(BLOCK / 64).enumerate() {

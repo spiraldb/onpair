@@ -12,7 +12,7 @@
 //! base. A lookup searches those ranges before falling back to the base entry.
 //!
 //! This path searches the entire row independently of the bulk scan's cover
-//! and graph walker. KMP failure links preserve overlapping partial matches;
+//! and hit verifier. KMP failure links preserve overlapping partial matches;
 //! they are folded into token transitions during preparation.
 
 use crate::core::dictionary::DictionaryView;

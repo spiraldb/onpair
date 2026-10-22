@@ -8,7 +8,7 @@
 //! token ids and id ranges chosen so that *any* row containing the pattern holds at
 //! least one probe token — then scans the flat code stream for the rows holding one
 //! ([`ContainsScan::scan`]). Every hit is then checked against the alignment graph
-//! in the compressed domain (`walk`).
+//! in the compressed domain by the hit verifier.
 //!
 //! An empty pattern matches every row, including rows without codes. Its
 //! preparation needs no probes, and execution appends all rows without scanning.
@@ -27,11 +27,11 @@
 //!   occurrence takes, it runs into a probe.
 //!
 //! # Responsibilities
-//! [`ContainsScan`] coordinates graph construction, cost-based cover selection and walk
-//! compilation. `alignment` owns the graph and cut solver; `plan` prices and
-//! selects covers and their matchers using explicit facts and capabilities.
-//! `scan` produces hits, resolves rows and verifies each hit with the exact walker
-//! from `verify::walk`.
+//! [`ContainsScan`] coordinates graph construction, cost-based cover selection and
+//! hit verifier compilation. `alignment` owns the graph and cut solver; `plan` prices
+//! and selects covers and their matchers using explicit facts and capabilities.
+//! `scan` produces hits, resolves rows and checks each hit with the exact
+//! `HitVerifier` from `verify::hit`.
 
 mod alignment;
 mod error;
@@ -48,7 +48,7 @@ pub use verify::{ContainsDfa, row_contains};
 
 use alignment::graph::AlignmentGraph;
 use scan::{MatcherKind, ScanInput};
-use verify::walk::Walk;
+use verify::hit::HitVerifier;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::offset::Offset;
@@ -59,7 +59,7 @@ use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 /// A prepared substring query, ready to scan any chunk encoded with its dictionary.
 ///
 /// Borrows the dictionary it was prepared with, and holds the probe cover, its
-/// matcher, the compiled walker and the probe density of the stream used for
+/// matcher, the compiled hit verifier and the probe density of the stream used for
 /// planning. Each [`ContainsScan::scan`] call owns its execution state, so one
 /// preparation can scan many chunks and be shared between concurrent calls.
 /// Coverage statistics take the frequency index of the chunk they describe.
@@ -69,18 +69,18 @@ pub struct ContainsScan<'d> {
     dict: CompactDictionaryView<'d>,
     probe_cover: ProbeCover,
     matcher: MatcherKind,
-    walk: Walk,
+    verifier: HitVerifier,
     probe_density: f64,
     matches_all: bool,
 }
 
 impl<'d> ContainsScan<'d> {
-    /// Maximum pattern length, bounded by the compiled walker's `u16` node IDs.
+    /// Maximum pattern length, bounded by the compiled hit verifier's `u16` node IDs.
     pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
 
     /// Prepare an exact substring scan for `pattern` using the dictionary and index.
     /// Select the sampled probe cover with the lowest relative cost and compile
-    /// the alignment walker used to verify its hits.
+    /// the hit verifier that checks its hits.
     ///
     /// This constructor prepares the checks; the caller decides whether executing
     /// them is profitable, using the coverage statistics for the chunk at hand.
@@ -126,7 +126,7 @@ impl<'d> ContainsScan<'d> {
                 dict,
                 probe_cover: ProbeCover::from_runs(Vec::new()),
                 matcher: MatcherKind::Table,
-                walk: Walk::default(),
+                verifier: HitVerifier::default(),
                 probe_density: 0.0,
                 matches_all: true,
             });
@@ -138,7 +138,7 @@ impl<'d> ContainsScan<'d> {
             dict,
             matcher: plan::select_matcher(isa, &cover),
             probe_cover: cover,
-            walk: Walk::from_graph(&graph, pattern),
+            verifier: HitVerifier::from_graph(&graph, pattern),
             probe_density: fraction(covered_frequency, frequencies.total_frequency()),
             matches_all: false,
         })
@@ -194,7 +194,7 @@ impl<'d> ContainsScan<'d> {
                 row_offsets,
                 self.dict,
                 &self.probe_cover,
-                &self.walk,
+                &self.verifier,
             ),
             out,
         );
@@ -229,7 +229,7 @@ impl<'d> ContainsScan<'d> {
         &self,
         frequencies: &TokenFrequencyIndex<S>,
     ) -> bool {
-        self.walk
+        self.verifier
             .verification_work_bound(&self.probe_cover, frequencies.as_view())
             > u64::from(frequencies.total_frequency())
     }

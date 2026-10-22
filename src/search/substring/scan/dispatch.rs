@@ -33,7 +33,7 @@ fn with_skip<O: Offset, S: Matcher, P: Matcher>(
     }
 }
 
-/// Execute the prepared matcher and append the rows the input's walker verifies.
+/// Execute the prepared matcher and append the rows the input's hit verifier accepts.
 /// `skip_empty_packing` applies to vector matchers. Preparation must supply a
 /// matcher eligible for the cover and the current CPU; this function does not
 /// repeat those checks.

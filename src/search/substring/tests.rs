@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Scan contracts, alignment regressions, and planning invariants.
-//! Matcher, resolver, walker and min-cut algorithms have their own unit tests.
+//! Matcher, resolver, hit verifier and min-cut algorithms have their own unit tests.
 
 use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
@@ -67,7 +67,7 @@ fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: impl Fn(&Edge) -> bo
     false
 }
 
-/// Builder guarantees relied on by the infallible cut solver and walker.
+/// Builder guarantees relied on by the infallible cut solver and hit verifier.
 fn check_graph(view: ColumnView<'_, u32>, frequencies: &TokenFrequencyIndex, needle: &[u8]) {
     let graph = AlignmentGraph::new(view.dict, needle, frequencies.as_view()).unwrap();
     assert_eq!(graph.node_count(), needle.len() + 1);

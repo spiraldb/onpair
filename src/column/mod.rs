@@ -481,7 +481,7 @@ mod tests {
     }
 
     /// The prefilter takes patterns `ContainsDfa` rejects: its own cap is the
-    /// walk's node ids, not the KMP table's 255-byte state width.
+    /// hit verifier's node ids, not the KMP table's 255-byte state width.
     #[test]
     fn prefiltered_takes_patterns_the_kmp_table_rejects() {
         use crate::DictionaryView;

@@ -5,8 +5,8 @@
 //!
 //! Preparation compiles the alignment graph into per-offset continuation
 //! checks and a token-to-edges lookup. A hit token can belong to several edges;
-//! verification tries each role, checking the remaining codes forward and
-//! the preceding codes backward within the same row. Tokens with a source-to-sink
+//! verification tries each role, walking the graph forward over the remaining
+//! codes and backward over the preceding codes within the same row. Tokens with a source-to-sink
 //! role already prove a match and are accepted before looking up their roles.
 //! Other role lists are traversed lazily and stop as soon as a trial succeeds.
 //!
@@ -188,7 +188,7 @@ impl EdgesByToken {
 /// Immutable verification tables compiled from an alignment graph.
 /// The empty default is used for empty patterns and is never executed.
 #[derive(Debug, Clone, Default)]
-pub(in crate::search::substring) struct Walk {
+pub(in crate::search::substring) struct HitVerifier {
     /// Forward transitions and unenumerated starts, indexed by needle offset.
     nodes: Vec<Node>,
     /// Roles to try for a candidate token and predecessor edges for backward checks.
@@ -198,7 +198,7 @@ pub(in crate::search::substring) struct Walk {
     overlaps: Vec<Option<NeedlePrefix>>,
 }
 
-impl Walk {
+impl HitVerifier {
     /// Compile the graph for the same nonempty needle used to build it.
     /// Preparation bounds needle offsets to `u16`. Enumerated ranges and sets are
     /// expanded into token-edge pairs; unenumerated starts retain a prefix check.
@@ -440,10 +440,10 @@ pub(in crate::search::substring) mod tests {
     use crate::search::substring::alignment::graph::AlignmentGraph;
     use crate::search::tokenize;
 
-    /// A walker that accepts every hit: each token counts as containing the whole
+    /// A hit verifier that accepts every hit: each token counts as containing the whole
     /// needle, so scan tests can exercise matching and row lookup on their own.
-    pub(in crate::search::substring) fn accepting_walk() -> Walk {
-        Walk {
+    pub(in crate::search::substring) fn accepting_verifier() -> HitVerifier {
+        HitVerifier {
             nodes: vec![Node::default()],
             edges: EdgesByToken {
                 first_token: 0,
@@ -535,18 +535,18 @@ pub(in crate::search::substring) mod tests {
     }
 
     /// Try every row code as a hit and compare the result with byte containment.
-    fn assert_walk_decides(extra: &[&[u8]], rows: &[&[u8]], needle: &[u8]) {
+    fn assert_verifier_decides(extra: &[&[u8]], rows: &[&[u8]], needle: &[u8]) {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
         let frequencies = build_token_frequency_index(&codes, dict.num_tokens()).unwrap();
         let graph = AlignmentGraph::new(dict, needle, frequencies.as_view()).unwrap();
-        let walk = Walk::from_graph(&graph, needle);
+        let verifier = HitVerifier::from_graph(&graph, needle);
         for (row, text) in rows.iter().enumerate() {
             let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);
-            let walked = (start..end).any(|hit| walk.check(dict, &codes, start, end, hit));
+            let verified = (start..end).any(|hit| verifier.check(dict, &codes, start, end, hit));
             let contains = text.windows(needle.len()).any(|window| window == needle);
             assert_eq!(
-                walked,
+                verified,
                 contains,
                 "row {row} {:?}",
                 String::from_utf8_lossy(text)
@@ -561,12 +561,12 @@ pub(in crate::search::substring) mod tests {
         let dict = dict.as_view();
         let frequencies = build_token_frequency_index(&codes, dict.num_tokens()).unwrap();
         let graph = AlignmentGraph::new(dict, needle, frequencies.as_view()).unwrap();
-        let walk = Walk::from_graph(&graph, needle);
+        let verifier = HitVerifier::from_graph(&graph, needle);
         for (row, text) in rows.iter().enumerate() {
             let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);
-            let walked = start < end && walk.check(dict, &codes, start, end, end - 1);
+            let verified = start < end && verifier.check(dict, &codes, start, end, end - 1);
             let contains = text.windows(needle.len()).any(|window| window == needle);
-            assert_eq!(walked, contains, "row {row}: {text:?}");
+            assert_eq!(verified, contains, "row {row}: {text:?}");
         }
     }
 
@@ -607,7 +607,7 @@ pub(in crate::search::substring) mod tests {
     /// and `gogle` hit the same tokens and must fail.
     #[test]
     fn interior_entry_and_exit_layouts() {
-        assert_walk_decides(
+        assert_verifier_decides(
             &[b"goo", b"gl", b"es", b"agoo", b"oo"],
             &[
                 b"google",
@@ -626,7 +626,7 @@ pub(in crate::search::substring) mod tests {
     /// prefix of, are both a single step from source to sink.
     #[test]
     fn whole_needle_inside_one_token() {
-        assert_walk_decides(
+        assert_verifier_decides(
             &[b"xgooglex", b"googlez", b"goo", b"gl"],
             &[b"xgooglex", b"googlez", b"xgoogle", b"goog"],
             b"google",
@@ -637,7 +637,7 @@ pub(in crate::search::substring) mod tests {
     /// node 2, so each hit tries both roles; only one of them confirms.
     #[test]
     fn a_token_on_two_edges() {
-        assert_walk_decides(
+        assert_verifier_decides(
             &[b"ab"],
             &[b"abab", b"xabab", b"ababx", b"abxab", b"ab", b"aabb"],
             b"abab",
@@ -648,7 +648,7 @@ pub(in crate::search::substring) mod tests {
     /// `gle` starting the next is no match, and the walk stops at the row.
     #[test]
     fn walk_stops_at_the_row() {
-        assert_walk_decides(&[b"goo", b"gl"], &[b"goo", b"gle", b"google"], b"google");
+        assert_verifier_decides(&[b"goo", b"gl"], &[b"goo", b"gle", b"google"], b"google");
     }
 
     /// A failed trial at one hit must not cost the occurrence starting inside
@@ -668,10 +668,10 @@ pub(in crate::search::substring) mod tests {
             b"appapp",
             b"apple",
         ];
-        assert_walk_decides(&[b"app", b"le"], rows, b"appapple");
-        assert_walk_decides(&[b"app", b"apple", b"le"], rows, b"appapple");
-        assert_walk_decides(&[b"appa", b"pp", b"pple", b"le"], rows, b"appapple");
-        assert_walk_decides(
+        assert_verifier_decides(&[b"app", b"le"], rows, b"appapple");
+        assert_verifier_decides(&[b"app", b"apple", b"le"], rows, b"appapple");
+        assert_verifier_decides(&[b"appa", b"pp", b"pple", b"le"], rows, b"appapple");
+        assert_verifier_decides(
             &[b"aa", b"aab", b"aabaaabaa"],
             &[b"aabaaabaa", b"aabaab", b"aaa", b"baaab"],
             b"aaa",
@@ -679,13 +679,13 @@ pub(in crate::search::substring) mod tests {
     }
 
     /// More than 16 tokens end with `g`, so the one-byte overlap is unenumerated
-    /// and the walker checks the token suffix directly.
+    /// and the hit verifier checks the token suffix directly.
     #[test]
     fn entry_through_a_set() {
         let tails: Vec<Vec<u8>> = (b'a'..=b'z').map(|b| vec![b, b'g']).collect();
         let mut extra: Vec<&[u8]> = tails.iter().map(Vec::as_slice).collect();
         extra.extend_from_slice(&[b"oo", b"gl"]);
-        assert_walk_decides(
+        assert_verifier_decides(
             &extra,
             &[b"zgoogle", b"zgoogl", b"google", b"zg oogle"],
             b"google",

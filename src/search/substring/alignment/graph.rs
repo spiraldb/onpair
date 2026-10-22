@@ -91,7 +91,7 @@ pub(in crate::search::substring) struct AlignmentGraph {
 impl AlignmentGraph {
     /// Build the graph and attach indexed token frequencies.
     ///
-    /// Requires a nonempty needle fitting the walker's `u16` node IDs, a
+    /// Requires a nonempty needle fitting the hit verifier's `u16` node IDs, a
     /// conformant dictionary, and an index using that dictionary's token IDs.
     /// Query preparation checks the needle length and index size.
     pub(in crate::search::substring) fn new(

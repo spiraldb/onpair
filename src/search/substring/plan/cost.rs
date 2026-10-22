@@ -98,7 +98,7 @@ const AVX512BW_COSTS: CostWeights = CostWeights {
 };
 
 /// Approximate row-resolution and verification cost.
-/// Frequency counts covered token occurrences, not matching rows or walker calls.
+/// Frequency counts covered token occurrences, not matching rows or hit verifier calls.
 ///
 /// Each profile balances this term against its matcher costs. The weight is
 /// independent of the cut-generation lambda; traversal lengths and successful-row

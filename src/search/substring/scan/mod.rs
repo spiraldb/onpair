@@ -4,9 +4,9 @@
 //! Execute a prepared cover and append exact matching rows.
 //!
 //! The caller supplies the prepared matcher, its mask-packing policy and the scan
-//! input: the encoded region plus the prepared cover and walker. The matcher turns
+//! input: the encoded region plus the prepared cover and hit verifier. The matcher turns
 //! blocks of token codes into bit masks; the resolver maps set bits to rows and
-//! verifies each candidate occurrence with the walker. A row is appended on its
+//! verifies each candidate occurrence with the hit verifier. A row is appended on its
 //! first verified hit, then its later hits are skipped.
 //!
 //! `dispatch` connects the matcher and packing policy to a concrete implementation.
@@ -20,7 +20,7 @@ mod matcher;
 mod resolver;
 
 use super::ProbeCover;
-use super::verify::walk::Walk;
+use super::verify::hit::HitVerifier;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
@@ -59,24 +59,24 @@ pub(super) struct ScanInput<'a, O> {
     row_offsets: &'a [O],
     dict: CompactDictionaryView<'a>,
     cover: &'a ProbeCover,
-    walk: &'a Walk,
+    verifier: &'a HitVerifier,
 }
 
 impl<'a, O> ScanInput<'a, O> {
-    /// Borrow the encoded region and the cover and walker prepared for it.
+    /// Borrow the encoded region and the cover and hit verifier prepared for it.
     pub(super) const fn new(
         codes: &'a [Token],
         row_offsets: &'a [O],
         dict: CompactDictionaryView<'a>,
         cover: &'a ProbeCover,
-        walk: &'a Walk,
+        verifier: &'a HitVerifier,
     ) -> Self {
         Self {
             codes,
             row_offsets,
             dict,
             cover,
-            walk,
+            verifier,
         }
     }
 }
