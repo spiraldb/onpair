@@ -38,9 +38,6 @@ mod plan;
 mod scan;
 mod verify;
 
-#[cfg(test)]
-mod tests;
-
 pub use alignment::cover::ProbeCover;
 pub use error::ContainsError;
 pub use verify::{ContainsDfa, row_contains};
@@ -274,3 +271,6 @@ fn fraction(covered: u32, total: u32) -> f64 {
         f64::from(covered) / f64::from(total)
     }
 }
+
+#[cfg(test)]
+mod tests;

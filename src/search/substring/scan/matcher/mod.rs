@@ -20,8 +20,6 @@ mod range;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod shared;
 mod table;
-#[cfg(test)]
-mod tests;
 
 use super::{Block, Mask};
 use crate::search::substring::ProbeCover;
@@ -48,3 +46,6 @@ pub(in crate::search::substring::scan) trait Matcher:
     /// skipped. `true` allows an empty mask when the matcher omits that test.
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool;
 }
+
+#[cfg(test)]
+mod tests;
