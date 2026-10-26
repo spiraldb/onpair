@@ -71,7 +71,8 @@ pub struct ContainsScan<'d> {
 }
 
 impl<'d> ContainsScan<'d> {
-    /// Maximum pattern length, bounded by the compiled hit verifier's `u16` node IDs.
+    /// Maximum pattern length, bounded by the `u16` needle offsets used during
+    /// preparation and verification.
     pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
 
     /// Prepare an exact substring scan for `pattern` using the dictionary and index.

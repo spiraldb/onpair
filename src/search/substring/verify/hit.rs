@@ -25,13 +25,13 @@ use crate::core::types::{Token, TokenRange};
 use crate::search::substring::alignment::graph::{AlignmentGraph, EdgeKind};
 
 /// Needle offset before any bytes have matched.
-const SOURCE: u32 = 0;
+const SOURCE: u16 = 0;
 
 /// Continuation checks at one needle offset in the compiled graph.
 #[derive(Debug, Clone, Default)]
 struct Node {
     /// Token and destination for the next interior step, if one exists.
-    greedy_step: Option<(Token, u32)>,
+    greedy_step: Option<(Token, u16)>,
     /// Tokens that finish the needle from this offset.
     terminal_range: Option<TokenRange>,
     /// Needle prefix for an unenumerated source edge ending here.
@@ -81,16 +81,6 @@ struct Edge {
     to: u16,
 }
 
-impl Edge {
-    /// Graph edges advance needle offsets, bounded by the public pattern limit.
-    fn new(from: u32, to: u32) -> Self {
-        Self {
-            from: from as u16,
-            to: to as u16,
-        }
-    }
-}
-
 /// Enumerated graph edges indexed by token ID.
 /// The dense array stores one edge, `NONE`, or `LISTED`. Tokens with several
 /// roles keep their edges in a list sorted by token ID. Real edges advance the
@@ -118,8 +108,11 @@ const LISTED: Edge = Edge {
 
 impl EdgesByToken {
     /// Deduplicate roles, placing complete matches first within each token group.
-    fn new(mut token_edges: Vec<(Token, Edge)>, sink: u32) -> Self {
-        let complete = Edge::new(SOURCE, sink);
+    fn new(mut token_edges: Vec<(Token, Edge)>, sink: u16) -> Self {
+        let complete = Edge {
+            from: SOURCE,
+            to: sink,
+        };
         token_edges.sort_unstable();
         token_edges.dedup();
         let (Some(&(first_token, _)), Some(&(last_token, _))) =
@@ -198,15 +191,15 @@ pub(in crate::search::substring) struct HitVerifier {
 
 impl HitVerifier {
     /// Compile the graph for the same nonempty needle used to build it.
-    /// Preparation bounds needle offsets to `u16`. Enumerated ranges and sets are
-    /// expanded into token-edge pairs; unenumerated starts retain a prefix check.
+    /// Enumerated ranges and sets are expanded into token-edge pairs;
+    /// unenumerated starts retain a prefix check.
     pub(in crate::search::substring) fn from_graph(graph: &AlignmentGraph, needle: &[u8]) -> Self {
         let mut nodes = vec![Node::default(); graph.node_count()];
         let mut overlaps = vec![None; needle.len().min(16)];
         let mut token_edges: Vec<(Token, Edge)> = Vec::new();
         for edge in &graph.edges {
             let (from, to) = (edge.from, edge.to);
-            let compiled_edge = Edge::new(from, to);
+            let compiled_edge = Edge { from, to };
             match edge.kind() {
                 EdgeKind::Single(token) => {
                     let token = *token;
@@ -244,8 +237,8 @@ impl HitVerifier {
     }
 
     /// Needle offset reached when the complete pattern has matched.
-    fn sink(&self) -> u32 {
-        (self.nodes.len() - 1) as u32
+    fn sink(&self) -> u16 {
+        (self.nodes.len() - 1) as u16
     }
 
     /// Whether a complete occurrence passes through this hit in this row.
@@ -265,8 +258,7 @@ impl HitVerifier {
         if self.edges.contains_whole_needle(hit) {
             return true;
         }
-        for edge in self.edges.of(hit) {
-            let (from, to) = (u32::from(edge.from), u32::from(edge.to));
+        for Edge { from, to } in self.edges.of(hit) {
             if (to == self.sink() || self.forward(to, hit_code_index + 1, codes, row_end))
                 && (from == SOURCE || self.backward(from, hit_code_index, codes, row_start, dict))
             {
@@ -280,7 +272,7 @@ impl HitVerifier {
     /// Failure or the row boundary ends the trial.
     fn forward(
         &self,
-        mut node: u32,
+        mut node: u16,
         mut code_index: usize,
         codes: &[Token],
         row_end: usize,
@@ -306,7 +298,7 @@ impl HitVerifier {
     /// The search never reads before `row_start`.
     fn backward(
         &self,
-        mut node: u32,
+        mut node: u16,
         mut code_end: usize,
         codes: &[Token],
         row_start: usize,
@@ -324,7 +316,7 @@ impl HitVerifier {
             let at = usize::from(code.wrapping_sub(self.edges.first_token));
             let edge = self.edges.edge_of_token.get(at).copied().unwrap_or(NONE);
             if edge == LISTED {
-                let length = dict.token_len(code) as u32;
+                let length = dict.token_len(code) as u16;
                 if length > node {
                     // The match starts inside this token, so check its suffix.
                     return self
@@ -339,8 +331,8 @@ impl HitVerifier {
                     Some((expected, _)) if expected == code => node = from,
                     _ => return false,
                 }
-            } else if edge != NONE && u32::from(edge.to) == node {
-                node = u32::from(edge.from);
+            } else if edge != NONE && edge.to == node {
+                node = edge.from;
             } else {
                 // An unenumerated source edge may still match this token's suffix.
                 return self.nodes[node as usize]

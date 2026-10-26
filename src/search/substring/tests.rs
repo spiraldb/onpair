@@ -4,6 +4,9 @@
 //! Scan contracts, alignment regressions, and planning invariants.
 //! Matcher, resolver, hit verifier and min-cut algorithms have their own unit tests.
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
 use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
@@ -183,6 +186,31 @@ fn pattern_limits_are_independent() {
             length: oversized.len(),
             max: ContainsScan::MAX_PATTERN_LEN,
         })
+    );
+}
+
+/// The longest accepted pattern places the sink at `u16::MAX`, the largest
+/// needle offset that graph edges and the hit verifier can store.
+#[test]
+fn longest_pattern_reaches_the_largest_offset() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let pattern: Vec<u8> = (0..ContainsScan::MAX_PATTERN_LEN)
+        .map(|_| rng.random_range(b'a'..=b'z'))
+        .collect();
+    let mut wrong_first = pattern.clone();
+    wrong_first[0] = b'0';
+    let mut wrong_last = pattern.clone();
+    wrong_last[pattern.len() - 1] = b'0';
+    let padded = [b"xx".as_slice(), &pattern, b"yy"].concat();
+    let rows: &[&[u8]] = &[&padded, &wrong_first, &pattern[1..], &pattern, &wrong_last];
+    let column = compress_rows(rows);
+    let view = column.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let graph = AlignmentGraph::new(view.dict, &pattern, frequencies.as_view()).unwrap();
+    assert_eq!(graph.sink(), u16::MAX);
+    assert_eq!(
+        view.rows_containing_with_scan(&pattern, &frequencies),
+        Ok(vec![0, 3])
     );
 }
 

@@ -36,9 +36,9 @@ pub(in crate::search::substring) enum EdgeKind {
 #[derive(Clone, Debug)]
 pub(in crate::search::substring) struct Edge {
     /// Needle offset before this token.
-    pub(in crate::search::substring) from: u32,
+    pub(in crate::search::substring) from: u16,
     /// Needle offset reached after this token.
-    pub(in crate::search::substring) to: u32,
+    pub(in crate::search::substring) to: u16,
     kind: EdgeKind,
     /// Indexed frequency of the accepted tokens; zero for unenumerated sets.
     frequency: u32,
@@ -61,17 +61,17 @@ impl Edge {
     }
 
     /// Number of point probes before cover normalization.
-    pub(in crate::search::substring) fn point_count(&self) -> u32 {
+    pub(in crate::search::substring) fn point_count(&self) -> usize {
         match &self.kind {
             EdgeKind::Single(_) => 1,
-            EdgeKind::Set(ids) => ids.len() as u32,
+            EdgeKind::Set(ids) => ids.len(),
             EdgeKind::Range(_) | EdgeKind::UnenumeratedSet => 0,
         }
     }
 
     /// Number of range probes before cover normalization.
-    pub(in crate::search::substring) fn range_count(&self) -> u32 {
-        u32::from(matches!(self.kind, EdgeKind::Range(_)))
+    pub(in crate::search::substring) fn range_count(&self) -> usize {
+        usize::from(matches!(self.kind, EdgeKind::Range(_)))
     }
 }
 
@@ -85,13 +85,14 @@ impl Edge {
 pub(in crate::search::substring) struct AlignmentGraph {
     /// Parse steps in construction order, also used to order selected cut edges.
     pub(in crate::search::substring) edges: Vec<Edge>,
-    needle_len: usize,
+    /// Offset after the whole needle has matched.
+    sink: u16,
 }
 
 impl AlignmentGraph {
     /// Build the graph and attach indexed token frequencies.
     ///
-    /// Requires a nonempty needle fitting the hit verifier's `u16` node IDs, a
+    /// Requires a nonempty needle whose offsets fit the edges' `u16` node IDs, a
     /// conformant dictionary, and an index using that dictionary's token IDs.
     /// Query preparation checks the needle length and index size.
     pub(in crate::search::substring) fn new(
@@ -118,33 +119,29 @@ impl AlignmentGraph {
                 continue;
             };
             builder.build_path(length)?;
-            builder.add_edge(0, length as u32, kind);
+            builder.add_edge(0, length, kind);
         }
 
         // Whole matches inside a token go directly to the sink. Tokens starting
         // with the needle are already covered by the range from the source.
         if !starts.contained.is_empty() {
-            builder.add_edge(
-                0,
-                needle.len() as u32,
-                EdgeKind::Set(starts.contained.into()),
-            );
+            builder.add_edge(0, needle.len(), EdgeKind::Set(starts.contained.into()));
         }
 
         Ok(Self {
             edges: builder.edges,
-            needle_len: needle.len(),
+            sink: needle.len() as u16,
         })
     }
 
     /// Logical node count, including offsets no edge reaches.
     pub(in crate::search::substring) fn node_count(&self) -> usize {
-        self.sink() as usize + 1
+        usize::from(self.sink()) + 1
     }
 
     /// Offset after the whole needle has matched. The source is always 0.
-    pub(in crate::search::substring) fn sink(&self) -> u32 {
-        self.needle_len as u32
+    pub(in crate::search::substring) fn sink(&self) -> u16 {
+        self.sink
     }
 }
 
@@ -171,11 +168,12 @@ impl GraphBuilder<'_, '_, '_> {
     }
 
     /// Append an edge with the frequency of its accepted tokens.
-    fn add_edge(&mut self, from: u32, to: u32, kind: EdgeKind) {
+    /// Offsets are at most the needle length, which fits `u16`.
+    fn add_edge(&mut self, from: usize, to: usize, kind: EdgeKind) {
         let frequency = self.frequency_of(&kind);
         self.edges.push(Edge {
-            from,
-            to,
+            from: from as u16,
+            to: to as u16,
             kind,
             frequency,
         });
@@ -226,9 +224,8 @@ impl GraphBuilder<'_, '_, '_> {
         }
 
         // If the whole remainder fits, this range finishes the match.
-        let from = offset as u32;
         if remaining.len() <= MAX_TOKEN_SIZE && !range.is_empty() {
-            self.add_edge(from, self.needle.len() as u32, EdgeKind::Range(range));
+            self.add_edge(offset, self.needle.len(), EdgeKind::Range(range));
         }
 
         let Some((token, token_length)) = longest else {
@@ -239,7 +236,7 @@ impl GraphBuilder<'_, '_, '_> {
 
         let next_offset = offset + token_length;
         if next_offset < self.needle.len() {
-            self.add_edge(from, next_offset as u32, EdgeKind::Single(token));
+            self.add_edge(offset, next_offset, EdgeKind::Single(token));
         }
         // An exact match of the remainder is already in the range above.
         Ok(next_offset)
@@ -258,14 +255,14 @@ pub(super) mod tests {
     ) -> AlignmentGraph {
         AlignmentGraph {
             edges,
-            needle_len: node_count - 1,
+            sink: (node_count - 1) as u16,
         }
     }
 
     /// Test edge; `None` makes it uncuttable.
     pub(in crate::search::substring::alignment) fn synthetic_edge(
-        from: u32,
-        to: u32,
+        from: u16,
+        to: u16,
         frequency: Option<u32>,
     ) -> Edge {
         Edge {
@@ -330,12 +327,12 @@ pub(super) mod tests {
 
         let mut expected = Vec::new();
         if !terminal.is_empty() {
-            expected.push((offset as u32, needle.len() as u32, terminal));
+            expected.push((offset as u16, needle.len() as u16, terminal));
         }
         if let Some(id) = next.filter(|&id| dict.token_len(id) < remaining.len()) {
             expected.push((
-                offset as u32,
-                (offset + dict.token_len(id)) as u32,
+                offset as u16,
+                (offset + dict.token_len(id)) as u16,
                 vec![id],
             ));
         }

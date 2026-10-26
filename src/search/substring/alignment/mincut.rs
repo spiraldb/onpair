@@ -18,9 +18,9 @@ use super::graph::{AlignmentGraph, Edge};
 pub(in crate::search::substring) struct MinCut<'g> {
     edges: &'g [Edge],
     /// Internal nodes incident to edges, in increasing needle-offset order.
-    active: Vec<usize>,
+    active: Vec<u16>,
     /// Next internal node, or the sink for a forest root. Zero means unused.
-    parent: Vec<usize>,
+    parent: Vec<u16>,
     /// Weight of the internal edge to the parent; zero for forest roots.
     parent_weight: Vec<i64>,
     /// Cost of choosing the source side minus the cost of choosing the sink
@@ -42,34 +42,31 @@ impl<'g> MinCut<'g> {
     /// internal node. Nodes are needle offsets, with source 0 and sink last.
     pub(in crate::search::substring) fn new(graph: &'g AlignmentGraph) -> Self {
         let node_count = graph.node_count();
-        let sink = graph.sink() as usize;
+        let sink = graph.sink();
         let mut parent = vec![0; node_count];
         let mut forced_source = vec![false; node_count];
 
         for edge in &graph.edges {
-            let from = edge.from as usize;
-            let to = edge.to as usize;
+            let (from, to) = (edge.from, edge.to);
 
             // Mark incident internal nodes. Until a continuation is found,
             // treat each as a root with a zero-cost virtual edge to the sink.
-            if from != 0 && parent[from] == 0 {
-                parent[from] = sink;
+            if from != 0 && parent[usize::from(from)] == 0 {
+                parent[usize::from(from)] = sink;
             }
-            if to != sink && parent[to] == 0 {
-                parent[to] = sink;
+            if to != sink && parent[usize::from(to)] == 0 {
+                parent[usize::from(to)] = sink;
             }
 
             if !edge.cuttable() {
-                forced_source[to] = true;
+                forced_source[usize::from(to)] = true;
             } else if from != 0 && to != sink {
-                parent[from] = to;
+                parent[usize::from(from)] = to;
             }
         }
 
-        let active = parent
-            .iter()
-            .enumerate()
-            .filter_map(|(node, &next)| (next != 0).then_some(node))
+        let active = (0..=sink)
+            .filter(|&node| parent[usize::from(node)] != 0)
             .collect();
 
         Self {
@@ -116,13 +113,14 @@ impl<'g> MinCut<'g> {
         // to the source side can save at most the connecting edge's weight;
         // a child forced to the source side always saves that whole weight.
         for &node in &self.active {
+            let node = usize::from(node);
             let edge_cost = self.parent_weight[node];
             let contribution = if self.forced_source[node] {
                 -edge_cost
             } else {
                 self.delta[node].min(0).max(-edge_cost)
             };
-            self.delta[self.parent[node]] += contribution;
+            self.delta[usize::from(self.parent[node])] += contribution;
         }
 
         // Parents are assigned first. Choosing the source side also pays
@@ -130,7 +128,8 @@ impl<'g> MinCut<'g> {
         self.source_side[0] = true;
         self.source_side[sink] = false;
         for &node in self.active.iter().rev() {
-            let threshold = if self.source_side[self.parent[node]] {
+            let node = usize::from(node);
+            let threshold = if self.source_side[usize::from(self.parent[node])] {
                 0
             } else {
                 -self.parent_weight[node]
@@ -157,7 +156,7 @@ mod tests {
     use crate::search::substring::alignment::graph::tests::{synthetic_edge, synthetic_graph};
 
     /// Return cut endpoints in edge order for readable test expectations.
-    fn cut_steps(graph: &AlignmentGraph) -> Vec<(u32, u32)> {
+    fn cut_steps(graph: &AlignmentGraph) -> Vec<(u16, u16)> {
         MinCut::new(graph)
             .solve(|edge| u64::from(edge.frequency()))
             .iter()
@@ -203,7 +202,7 @@ mod tests {
     /// edges. Reuse each solver with changing weights, including above u32::MAX.
     #[test]
     fn cuts_agree_with_exhaustive_partitions() {
-        const ARCS: [(u32, u32); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+        const ARCS: [(u16, u16); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
         'graphs: for configuration in 0..5usize.pow(ARCS.len() as u32) {
             let mut choices = configuration;
             let mut edges = Vec::new();
@@ -289,13 +288,14 @@ mod tests {
     /// A long path exercises the iterative solver without growing the call stack.
     #[test]
     fn deep_path_does_not_exhaust_the_stack() {
-        const NODES: u32 = u16::MAX as u32 + 1;
-        let mut edges: Vec<Edge> = (0..NODES - 1)
+        // The longest pattern: its sink is the largest `u16` offset.
+        const NODES: usize = u16::MAX as usize + 1;
+        let mut edges: Vec<Edge> = (0..u16::MAX)
             .map(|v| synthetic_edge(v, v + 1, Some(7)))
             .collect();
-        let cheapest = NODES / 2;
-        edges[cheapest as usize] = synthetic_edge(cheapest, cheapest + 1, Some(3));
-        let graph = synthetic_graph(NODES as usize, edges);
+        let cheapest = u16::MAX / 2;
+        edges[usize::from(cheapest)] = synthetic_edge(cheapest, cheapest + 1, Some(3));
+        let graph = synthetic_graph(NODES, edges);
         assert_eq!(cut_steps(&graph), vec![(cheapest, cheapest + 1)]);
     }
 }

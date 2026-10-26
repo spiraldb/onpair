@@ -84,6 +84,6 @@ fn edge_weight(lambda: u64) -> impl Fn(&Edge) -> u64 {
     // For lambda <= F + 1, total finite capacity is therefore below 2^51.
     move |edge| {
         let comparisons = edge.point_count() + 2 * edge.range_count();
-        u64::from(edge.frequency()) + lambda * u64::from(comparisons)
+        u64::from(edge.frequency()) + lambda * comparisons as u64
     }
 }
