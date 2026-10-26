@@ -9,19 +9,12 @@
 //! Once a row is appended, its remaining hits are skipped, even in later blocks.
 
 use super::{Mask, ScanInput};
-use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
-use crate::core::types::Token;
-use crate::search::substring::probe::verify::HitVerifier;
 
 /// Row lookup and verification state, kept across blocks.
 pub(super) struct Resolver<'a, O> {
-    /// Boundaries of rows in absolute code indices.
-    row_offsets: &'a [O],
-    /// Codes, dictionary and hit verifier used to check each hit.
-    codes: &'a [Token],
-    dict: CompactDictionaryView<'a>,
-    verifier: &'a HitVerifier,
+    /// The codes, row offsets, dictionary and hit verifier of the scan.
+    input: ScanInput<'a, O>,
     /// Last row located for a hit, initially zero.
     row: usize,
     /// Exclusive end of the current row, initialized from the first row boundary.
@@ -34,10 +27,7 @@ impl<'a, O: Offset> Resolver<'a, O> {
     /// Starts at the first row of `input`.
     pub(super) fn new(input: ScanInput<'a, O>) -> Self {
         Self {
-            row_offsets: input.row_offsets,
-            codes: input.codes,
-            dict: input.dict,
-            verifier: input.verifier,
+            input,
             row: 0,
             row_end: input.row_offsets.get(1).map_or(0, |x| x.to_usize()),
             resolved_code: 0,
@@ -48,18 +38,22 @@ impl<'a, O: Offset> Resolver<'a, O> {
     /// and appends their rows. Blocks must arrive in increasing code order.
     #[inline]
     pub(super) fn rows(&mut self, bits: &Mask, first_code: usize, out: &mut Vec<usize>) {
+        let ScanInput {
+            codes,
+            row_offsets,
+            dict,
+            verifier,
+            ..
+        } = self.input;
         let mut at = self.resolved_code.saturating_sub(first_code);
         while let Some(hit) = next_set(bits, at) {
             let code = first_code + hit;
             if code >= self.row_end {
-                self.row = find_row(self.row_offsets, self.row + 1, code);
-                self.row_end = self.row_offsets[self.row + 1].to_usize();
+                self.row = find_row(row_offsets, self.row + 1, code);
+                self.row_end = row_offsets[self.row + 1].to_usize();
             }
-            let row_start = self.row_offsets[self.row].to_usize();
-            if self
-                .verifier
-                .check(self.dict, self.codes, row_start, self.row_end, code)
-            {
+            let row_start = row_offsets[self.row].to_usize();
+            if verifier.check(dict, codes, row_start, self.row_end, code) {
                 out.push(self.row);
                 self.resolved_code = self.row_end;
                 at = self.row_end - first_code;
