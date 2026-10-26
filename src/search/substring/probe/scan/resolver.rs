@@ -15,7 +15,7 @@ use super::{Mask, ScanInput};
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-use crate::search::substring::verify::hit::HitVerifier;
+use crate::search::substring::probe::verify::HitVerifier;
 
 /// Row position and confirmed-output boundary retained across mask blocks.
 pub(super) struct Resolver<'a, O> {
@@ -120,8 +120,8 @@ mod tests {
     use crate::core::offset::Offset;
     use crate::core::types::Token;
     use crate::search::substring::ProbeCover;
-    use crate::search::substring::scan::{BLOCK, ScanInput};
-    use crate::search::substring::verify::hit::tests::accepting_verifier;
+    use crate::search::substring::probe::scan::{BLOCK, ScanInput};
+    use crate::search::substring::probe::verify::tests::accepting_verifier;
 
     /// Enough blocks to place a row across an entire intervening block.
     const BLOCKS: usize = 4;

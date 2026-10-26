@@ -26,7 +26,7 @@ const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 2.5e-4;
 /// Whether this matcher is eligible for selection on the supplied target and cover.
 /// The caller supplies an available instruction set. Nibble batches are limited to
 /// two on AVX2 and three on NEON or AVX-512 to bound register use.
-pub(in crate::search::substring) fn is_eligible(
+pub(in crate::search::substring::probe) fn is_eligible(
     isa: Isa,
     matcher: MatcherKind,
     cover: &ProbeCover,
@@ -49,7 +49,10 @@ pub(in crate::search::substring) fn is_eligible(
 
 /// Choose the eligible matcher with the lowest cost.
 /// The scalar table is always eligible; equal costs retain the earlier choice.
-pub(in crate::search::substring) fn select_matcher(isa: Isa, cover: &ProbeCover) -> MatcherKind {
+pub(in crate::search::substring::probe) fn select_matcher(
+    isa: Isa,
+    cover: &ProbeCover,
+) -> MatcherKind {
     let mut best = MatcherKind::Table;
     let mut best_cost = matcher_cost(isa, best, cover);
 
@@ -73,7 +76,7 @@ pub(in crate::search::substring) fn select_matcher(isa: Isa, cover: &ProbeCover)
 /// `probe_density` is the covered fraction of the indexed stream; `code_count`
 /// is the number of codes in this scan. Skip when probes are sparse or the scan
 /// has fewer than one projected hit. The scalar table ignores the policy.
-pub(in crate::search::substring) fn skip_empty_packing(
+pub(in crate::search::substring::probe) fn skip_empty_packing(
     probe_density: f64,
     code_count: usize,
 ) -> bool {
@@ -97,7 +100,7 @@ pub(in crate::search::substring) fn skip_empty_packing(
 /// rows skip later hits. Preparation costs and the separately selected
 /// mask-packing policy are excluded.
 /// An empty cover or index has zero cost; callers handle empty patterns separately.
-pub(in crate::search::substring) fn cover_cost(
+pub(in crate::search::substring::probe) fn cover_cost(
     isa: Isa,
     cover: &ProbeCover,
     covered_frequency: u32,

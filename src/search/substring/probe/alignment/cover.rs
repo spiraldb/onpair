@@ -53,7 +53,7 @@ impl ProbeCover {
 
     /// Sum the indexed occurrences of covered token IDs.
     /// Disjoint points and ranges ensure each occurrence is counted once.
-    pub(in crate::search::substring) fn frequency(
+    pub(in crate::search::substring::probe) fn frequency(
         &self,
         frequencies: TokenFrequencyIndexView<'_>,
     ) -> u32 {
@@ -75,7 +75,7 @@ impl ProbeCover {
     /// Input may be unsorted and contain duplicates. Overlapping and adjacent
     /// ranges are merged; ranges containing one ID become points.
     /// For example, `[10, 20]` and `[15, 30]` become `[10, 30]`.
-    pub(in crate::search::substring) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
+    pub(in crate::search::substring::probe) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
         runs.sort_unstable_by_key(|run| run.begin);
         let mut merged: Vec<TokenRange> = Vec::with_capacity(runs.len());
         for run in runs {
@@ -96,7 +96,7 @@ impl ProbeCover {
     ///
     /// Requires a cut that intersects every source-to-sink path and contains
     /// no unenumerated sets. The cut solver establishes these conditions.
-    pub(in crate::search::substring) fn from_edge_cut<'a>(
+    pub(in crate::search::substring::probe) fn from_edge_cut<'a>(
         cut: impl ExactSizeIterator<Item = &'a Edge>,
     ) -> Self {
         let point = |id: Token| TokenRange {
@@ -118,7 +118,10 @@ impl ProbeCover {
 
     /// Build a test cover without normalization. Ranges must be disjoint.
     #[cfg(test)]
-    pub(in crate::search::substring) fn new(points: Vec<Token>, ranges: Vec<TokenRange>) -> Self {
+    pub(in crate::search::substring::probe) fn new(
+        points: Vec<Token>,
+        ranges: Vec<TokenRange>,
+    ) -> Self {
         Self { points, ranges }
     }
 

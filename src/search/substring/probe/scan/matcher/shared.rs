@@ -29,11 +29,11 @@ pub(super) type Hits = u64;
 
 /// 64 token codes split across this target's vector registers.
 #[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::scan) type Vectors = [uint16x8_t; 8];
+pub(in crate::search::substring::probe::scan) type Vectors = [uint16x8_t; 8];
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::substring::scan) type Vectors = [__m256i; 4];
+pub(in crate::search::substring::probe::scan) type Vectors = [__m256i; 4];
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(in crate::search::substring::scan) type Vectors = [__m512i; 2];
+pub(in crate::search::substring::probe::scan) type Vectors = [__m512i; 2];
 
 /// Load 64 codes without requiring aligned pointers.
 /// The caller must provide 64 readable tokens and the required CPU features.

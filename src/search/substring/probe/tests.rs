@@ -7,19 +7,20 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use super::ContainsScan;
 use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
 use super::plan::{cover_cost, select_cover};
 use super::scan::detect_isa;
-use super::{ContainsDfa, ContainsError, ContainsScan};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex};
 use crate::search::index::{
     TokenFrequencyIndex, TokenFrequencyIndexStorage, build_token_frequency_index,
 };
+use crate::search::substring::{ContainsDfa, ContainsError};
 use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
 
 struct BorrowedFrequencies<'a>(&'a [u32]);

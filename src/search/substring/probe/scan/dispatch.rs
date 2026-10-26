@@ -37,7 +37,7 @@ fn with_skip<O: Offset, S: Matcher, P: Matcher>(
 /// `skip_empty_packing` applies to vector matchers. Preparation must supply a
 /// matcher eligible for the cover and the current CPU; this function does not
 /// repeat those checks.
-pub(in crate::search::substring) fn run<O: Offset>(
+pub(in crate::search::substring::probe) fn run<O: Offset>(
     kind: MatcherKind,
     skip_empty_packing: bool,
     input: ScanInput<'_, O>,
@@ -86,7 +86,7 @@ pub(in crate::search::substring) fn run<O: Offset>(
 
 /// Return the compiled kernel family supported by this CPU, or the scalar fallback.
 /// AVX-512 requires compile-time enablement as well as runtime CPU support.
-pub(in crate::search::substring) fn detect_isa() -> Isa {
+pub(in crate::search::substring::probe) fn detect_isa() -> Isa {
     #[cfg(target_arch = "aarch64")]
     let isa = Isa::Neon;
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]

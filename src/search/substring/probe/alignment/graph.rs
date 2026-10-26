@@ -20,7 +20,7 @@ use crate::search::substring::ContainsError;
 
 /// How the tokens accepted by an edge are represented.
 #[derive(Clone, Debug)]
-pub(in crate::search::substring) enum EdgeKind {
+pub(in crate::search::substring::probe) enum EdgeKind {
     /// One token ID.
     Single(Token),
     /// A contiguous range of token IDs.
@@ -34,11 +34,11 @@ pub(in crate::search::substring) enum EdgeKind {
 
 /// A token step between two needle offsets.
 #[derive(Clone, Debug)]
-pub(in crate::search::substring) struct Edge {
+pub(in crate::search::substring::probe) struct Edge {
     /// Needle offset before this token.
-    pub(in crate::search::substring) from: u16,
+    pub(in crate::search::substring::probe) from: u16,
     /// Needle offset reached after this token.
-    pub(in crate::search::substring) to: u16,
+    pub(in crate::search::substring::probe) to: u16,
     kind: EdgeKind,
     /// Indexed frequency of the accepted tokens; zero for unenumerated sets.
     frequency: u32,
@@ -46,22 +46,22 @@ pub(in crate::search::substring) struct Edge {
 
 impl Edge {
     /// Whether the edge's tokens can be selected as scan probes.
-    pub(in crate::search::substring) fn cuttable(&self) -> bool {
+    pub(in crate::search::substring::probe) fn cuttable(&self) -> bool {
         !matches!(self.kind, EdgeKind::UnenumeratedSet)
     }
 
     /// Representation of the tokens accepted by this edge.
-    pub(in crate::search::substring) fn kind(&self) -> &EdgeKind {
+    pub(in crate::search::substring::probe) fn kind(&self) -> &EdgeKind {
         &self.kind
     }
 
     /// Indexed frequency of the accepted tokens.
-    pub(in crate::search::substring) fn frequency(&self) -> u32 {
+    pub(in crate::search::substring::probe) fn frequency(&self) -> u32 {
         self.frequency
     }
 
     /// Number of point probes before cover normalization.
-    pub(in crate::search::substring) fn point_count(&self) -> usize {
+    pub(in crate::search::substring::probe) fn point_count(&self) -> usize {
         match &self.kind {
             EdgeKind::Single(_) => 1,
             EdgeKind::Set(ids) => ids.len(),
@@ -70,7 +70,7 @@ impl Edge {
     }
 
     /// Number of range probes before cover normalization.
-    pub(in crate::search::substring) fn range_count(&self) -> usize {
+    pub(in crate::search::substring::probe) fn range_count(&self) -> usize {
         usize::from(matches!(self.kind, EdgeKind::Range(_)))
     }
 }
@@ -82,9 +82,9 @@ impl Edge {
 /// Edges advance to larger offsets. Each internal node has at most one internal
 /// successor, plus a possible terminal range to the sink. Removing the source
 /// and sink therefore leaves a forest, which the cut solver relies on.
-pub(in crate::search::substring) struct AlignmentGraph {
+pub(in crate::search::substring::probe) struct AlignmentGraph {
     /// Parse steps in construction order, also used to order selected cut edges.
-    pub(in crate::search::substring) edges: Vec<Edge>,
+    pub(in crate::search::substring::probe) edges: Vec<Edge>,
     /// Offset after the whole needle has matched.
     sink: u16,
 }
@@ -95,7 +95,7 @@ impl AlignmentGraph {
     /// Requires a nonempty needle whose offsets fit the edges' `u16` node IDs, a
     /// conformant dictionary, and an index using that dictionary's token IDs.
     /// Query preparation checks the needle length and index size.
-    pub(in crate::search::substring) fn new(
+    pub(in crate::search::substring::probe) fn new(
         dict: CompactDictionaryView<'_>,
         needle: &[u8],
         frequencies: TokenFrequencyIndexView<'_>,
@@ -135,12 +135,12 @@ impl AlignmentGraph {
     }
 
     /// Logical node count, including offsets no edge reaches.
-    pub(in crate::search::substring) fn node_count(&self) -> usize {
+    pub(in crate::search::substring::probe) fn node_count(&self) -> usize {
         usize::from(self.sink()) + 1
     }
 
     /// Offset after the whole needle has matched. The source is always 0.
-    pub(in crate::search::substring) fn sink(&self) -> u16 {
+    pub(in crate::search::substring::probe) fn sink(&self) -> u16 {
         self.sink
     }
 }
@@ -249,7 +249,7 @@ pub(super) mod tests {
     use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
 
     /// Test graph; callers supply edges satisfying the alignment topology.
-    pub(in crate::search::substring::alignment) fn synthetic_graph(
+    pub(in crate::search::substring::probe::alignment) fn synthetic_graph(
         node_count: usize,
         edges: Vec<Edge>,
     ) -> AlignmentGraph {
@@ -260,7 +260,7 @@ pub(super) mod tests {
     }
 
     /// Test edge; `None` makes it uncuttable.
-    pub(in crate::search::substring::alignment) fn synthetic_edge(
+    pub(in crate::search::substring::probe::alignment) fn synthetic_edge(
         from: u16,
         to: u16,
         frequency: Option<u32>,

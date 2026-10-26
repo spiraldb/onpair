@@ -13,7 +13,7 @@ use crate::core::dictionary::CompactDictionaryView;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 
 /// Maximum number of token IDs retained for one overlap.
-pub(in crate::search::substring) const MAX_ENUMERATED_TOKENS: usize = 512;
+pub(in crate::search::substring::probe) const MAX_ENUMERATED_TOKENS: usize = 512;
 
 /// One-byte overlaps use a smaller limit because they are often common.
 const MAX_SINGLE_BYTE_TOKENS: usize = 16;
@@ -135,7 +135,7 @@ impl MatchStarts {
 }
 
 #[cfg(test)]
-pub(in crate::search::substring) mod tests {
+pub(in crate::search::substring::probe) mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
     use crate::test_corpus::make_raw;
@@ -149,7 +149,7 @@ pub(in crate::search::substring) mod tests {
     }
 
     /// Compare the collected starts against independent per-token searches.
-    pub(in crate::search::substring) fn check_starts(
+    pub(in crate::search::substring::probe) fn check_starts(
         dict: CompactDictionaryView<'_>,
         needle: &[u8],
     ) {

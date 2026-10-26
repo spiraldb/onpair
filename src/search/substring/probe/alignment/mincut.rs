@@ -15,7 +15,7 @@ use super::graph::{AlignmentGraph, Edge};
 
 /// A cut solver reusable with different weights on the same alignment graph.
 /// Each solve takes linear time and reuses the topology and scratch buffers.
-pub(in crate::search::substring) struct MinCut<'g> {
+pub(in crate::search::substring::probe) struct MinCut<'g> {
     edges: &'g [Edge],
     /// Internal nodes incident to edges, in increasing needle-offset order.
     active: Vec<u16>,
@@ -40,7 +40,7 @@ impl<'g> MinCut<'g> {
     /// Alignment construction guarantees forward edges, at most one internal
     /// successor per node, and unenumerated edges only from the source to an
     /// internal node. Nodes are needle offsets, with source 0 and sink last.
-    pub(in crate::search::substring) fn new(graph: &'g AlignmentGraph) -> Self {
+    pub(in crate::search::substring::probe) fn new(graph: &'g AlignmentGraph) -> Self {
         let node_count = graph.node_count();
         let sink = graph.sink();
         let mut parent = vec![0; node_count];
@@ -87,7 +87,10 @@ impl<'g> MinCut<'g> {
     /// Weights must be nonnegative, with their sum fitting in `i64`.
     /// The planner's existing bounds put that sum below 2^51.
     /// Only cuttable edges are passed to `weight`.
-    pub(in crate::search::substring) fn solve(&mut self, weight: impl Fn(&Edge) -> u64) -> &[u32] {
+    pub(in crate::search::substring::probe) fn solve(
+        &mut self,
+        weight: impl Fn(&Edge) -> u64,
+    ) -> &[u32] {
         let sink = self.parent.len() - 1;
 
         // Source edges charge the sink side; terminal edges charge the source
@@ -153,7 +156,9 @@ impl<'g> MinCut<'g> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::substring::alignment::graph::tests::{synthetic_edge, synthetic_graph};
+    use crate::search::substring::probe::alignment::graph::tests::{
+        synthetic_edge, synthetic_graph,
+    };
 
     /// Return cut endpoints in edge order for readable test expectations.
     fn cut_steps(graph: &AlignmentGraph) -> Vec<(u16, u16)> {

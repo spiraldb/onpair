@@ -12,7 +12,7 @@ use super::{Block, Mask, Matcher};
 use crate::search::substring::ProbeCover;
 
 /// Membership table prepared once and reused across scan blocks.
-pub(in crate::search::substring::scan) struct Table {
+pub(in crate::search::substring::probe::scan) struct Table {
     /// 0xFF for covered IDs and zero otherwise; packing extracts the low bit.
     admits: Vec<u8>,
 }

@@ -22,7 +22,7 @@
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{Token, TokenRange};
-use crate::search::substring::alignment::graph::{AlignmentGraph, EdgeKind};
+use crate::search::substring::probe::alignment::graph::{AlignmentGraph, EdgeKind};
 
 /// Needle offset before any bytes have matched.
 const SOURCE: u16 = 0;
@@ -179,7 +179,7 @@ impl EdgesByToken {
 /// Immutable verification tables compiled from an alignment graph.
 /// The empty default is used for empty patterns and is never executed.
 #[derive(Debug, Clone, Default)]
-pub(in crate::search::substring) struct HitVerifier {
+pub(in crate::search::substring::probe) struct HitVerifier {
     /// Forward transitions and unenumerated starts, indexed by needle offset.
     nodes: Vec<Node>,
     /// Roles to try for a candidate token and predecessor edges for backward checks.
@@ -193,7 +193,10 @@ impl HitVerifier {
     /// Compile the graph for the same nonempty needle used to build it.
     /// Enumerated ranges and sets are expanded into token-edge pairs;
     /// unenumerated starts retain a prefix check.
-    pub(in crate::search::substring) fn from_graph(graph: &AlignmentGraph, needle: &[u8]) -> Self {
+    pub(in crate::search::substring::probe) fn from_graph(
+        graph: &AlignmentGraph,
+        needle: &[u8],
+    ) -> Self {
         let mut nodes = vec![Node::default(); graph.node_count()];
         let mut overlaps = vec![None; needle.len().min(16)];
         let mut token_edges: Vec<(Token, Edge)> = Vec::new();
@@ -246,7 +249,7 @@ impl HitVerifier {
     /// bounds, a hit inside them, and codes greedily encoded with the prepared
     /// dictionary. Both directions must succeed for the same edge.
     #[inline]
-    pub(in crate::search::substring) fn check(
+    pub(in crate::search::substring::probe) fn check(
         &self,
         dict: CompactDictionaryView<'_>,
         codes: &[Token],
@@ -347,16 +350,16 @@ impl HitVerifier {
 }
 
 #[cfg(test)]
-pub(in crate::search::substring) mod tests {
+pub(in crate::search::substring::probe) mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
     use crate::search::index::build_token_frequency_index;
-    use crate::search::substring::alignment::graph::AlignmentGraph;
+    use crate::search::substring::probe::alignment::graph::AlignmentGraph;
     use crate::search::tokenize;
 
     /// A hit verifier that accepts every hit: each token counts as containing the whole
     /// needle, so scan tests can exercise matching and row lookup on their own.
-    pub(in crate::search::substring) fn accepting_verifier() -> HitVerifier {
+    pub(in crate::search::substring::probe) fn accepting_verifier() -> HitVerifier {
         HitVerifier {
             nodes: vec![Node::default()],
             edges: EdgesByToken {

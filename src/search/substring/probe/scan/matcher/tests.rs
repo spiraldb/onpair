@@ -16,8 +16,8 @@ use super::{NibbleN8, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use crate::search::substring::scan::Isa;
-use crate::search::substring::scan::{BLOCK, MatcherKind};
+use crate::search::substring::probe::scan::Isa;
+use crate::search::substring::probe::scan::{BLOCK, MatcherKind};
 
 /// Run one matcher and verify that a false return guarantees an empty mask.
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
@@ -368,5 +368,5 @@ fn the_table_masks_one_code() {
     );
 }
 
-use crate::search::substring::plan::is_eligible;
-use crate::search::substring::scan::detect_isa;
+use crate::search::substring::probe::plan::is_eligible;
+use crate::search::substring::probe::scan::detect_isa;

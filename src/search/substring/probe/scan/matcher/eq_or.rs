@@ -106,7 +106,7 @@ unsafe fn hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
 }
 
 /// Broadcast point probes and prepared ranges reused across scan blocks.
-pub(in crate::search::substring::scan) struct EqOr<
+pub(in crate::search::substring::probe::scan) struct EqOr<
     const SKIP_MOVEMASK_IF_NO_MATCH: bool,
     const HAS_POINTS: bool = true,
 > {

@@ -35,7 +35,7 @@ type Table = __m256i;
 type Table = __m512i;
 
 /// Four lookup tables ordered from the least to the most significant nibble.
-pub(in crate::search::substring::scan) struct Batch([Table; 4]);
+pub(in crate::search::substring::probe::scan) struct Batch([Table; 4]);
 
 /// Build tables for at most eight point IDs.
 /// Point `k` contributes bit `1 << k` at each of its four nibble positions.
@@ -208,7 +208,7 @@ unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors
 /// Prepared point batches and ranges for repeated block checks.
 /// `BATCHES` must be positive and large enough to hold every point in the cover;
 /// planning and dispatch choose the supported specialization.
-pub(in crate::search::substring::scan) struct NibbleN8<
+pub(in crate::search::substring::probe::scan) struct NibbleN8<
     const BATCHES: usize,
     const SKIP_MOVEMASK_IF_NO_MATCH: bool,
 > {

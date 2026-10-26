@@ -20,7 +20,7 @@ mod matcher;
 mod resolver;
 
 use super::ProbeCover;
-use super::verify::hit::HitVerifier;
+use super::verify::HitVerifier;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;

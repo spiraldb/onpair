@@ -29,14 +29,14 @@ use crate::core::types::TokenRange;
 
 /// Range start and width (`last - begin`), broadcast into vector lanes.
 #[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::scan) type Held = (uint16x8_t, uint16x8_t);
+pub(in crate::search::substring::probe::scan) type Held = (uint16x8_t, uint16x8_t);
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::substring::scan) type Held = (__m256i, __m256i);
+pub(in crate::search::substring::probe::scan) type Held = (__m256i, __m256i);
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(in crate::search::substring::scan) type Held = (__m512i, __m512i);
+pub(in crate::search::substring::probe::scan) type Held = (__m512i, __m512i);
 
 #[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
+pub(in crate::search::substring::probe::scan) fn hold(range: TokenRange) -> Held {
     // SAFETY: neon is baseline on aarch64.
     unsafe {
         (
@@ -48,7 +48,10 @@ pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
+pub(in crate::search::substring::probe::scan) unsafe fn inside(
+    (lo, width): Held,
+    codes: Vectors,
+) -> Hits {
     let mut hit = codes;
     for hit in &mut hit {
         *hit = vcleq_u16(vsubq_u16(*hit, lo), width);
@@ -57,7 +60,7 @@ pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
+pub(in crate::search::substring::probe::scan) fn hold(range: TokenRange) -> Held {
     // SAFETY: avx2, checked by `detect_isa` before planning.
     unsafe {
         (
@@ -70,7 +73,10 @@ pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
 /// No unsigned u16 compare below AVX-512: `min(x, width) == x` is `x <= width`.
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
-pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
+pub(in crate::search::substring::probe::scan) unsafe fn inside(
+    (lo, width): Held,
+    codes: Vectors,
+) -> Hits {
     let mut hit = codes;
     for hit in &mut hit {
         let inside = _mm256_sub_epi16(*hit, lo);
@@ -80,7 +86,7 @@ pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
+pub(in crate::search::substring::probe::scan) fn hold(range: TokenRange) -> Held {
     // SAFETY: avx512bw, enabled by the build and checked by `detect_isa`.
     unsafe {
         (
@@ -92,7 +98,10 @@ pub(in crate::search::substring::scan) fn hold(range: TokenRange) -> Held {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[target_feature(enable = "avx512f,avx512bw")]
-pub(in crate::search::substring::scan) unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
+pub(in crate::search::substring::probe::scan) unsafe fn inside(
+    (lo, width): Held,
+    codes: Vectors,
+) -> Hits {
     let inside = |codes| _mm512_cmple_epu16_mask(_mm512_sub_epi16(codes, lo), width);
     join(inside(codes[0]), inside(codes[1]))
 }
