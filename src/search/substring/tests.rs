@@ -226,19 +226,11 @@ fn empty_pattern_and_empty_cover_have_distinct_results() {
         check(view, rows, &[b"", b"absent"]);
         let scan = ContainsScan::new(b"", view.dict, &frequencies).unwrap();
         assert!(scan.probe_cover().is_empty());
-        assert_eq!(
-            scan.expected_candidate_row_fraction(&frequencies, rows.len()),
-            if rows.is_empty() { 0.0 } else { 1.0 }
-        );
         // An empty cover without the empty-pattern flag must leave output alone.
         let no_matches = ContainsScan {
             matches_all: false,
             ..scan
         };
-        assert_eq!(
-            no_matches.expected_candidate_row_fraction(&frequencies, rows.len()),
-            0.0
-        );
         let mut output = vec![usize::MAX];
         no_matches.scan(view.codes, view.row_offsets, &mut output);
         assert_eq!(output, [usize::MAX]);

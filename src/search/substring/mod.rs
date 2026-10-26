@@ -233,34 +233,6 @@ impl<'d> ContainsScan<'d> {
             frequencies.total_frequency(),
         )
     }
-
-    /// Upper bound on the fraction of a chunk's rows containing a probe token.
-    ///
-    /// Computes `min(1, covered_frequency / row_count)`. Each candidate row holds
-    /// at least one covered code, but multiple covered codes may share a row,
-    /// making the bound loose. A row may require several verification attempts,
-    /// so this fraction does not measure verifier calls.
-    ///
-    /// `frequencies` must count exact occurrences in the chunk whose rows are
-    /// counted by `row_count`. Returns `0.0` for zero rows and never exceeds `1.0`.
-    /// An empty pattern admits every row, so its fraction is `1.0` for any
-    /// non-empty chunk, even one consisting entirely of empty rows.
-    ///
-    /// # Panics
-    /// Panics under the same condition as [`Self::covered_frequency`].
-    pub fn expected_candidate_row_fraction<S: TokenFrequencyIndexStorage>(
-        &self,
-        frequencies: &TokenFrequencyIndex<S>,
-        row_count: usize,
-    ) -> f64 {
-        if row_count == 0 {
-            return 0.0;
-        }
-        if self.matches_all {
-            return 1.0;
-        }
-        (f64::from(self.covered_frequency(frequencies)) / row_count as f64).min(1.0)
-    }
 }
 
 /// `covered / total`, or `0.0` for an empty stream.
