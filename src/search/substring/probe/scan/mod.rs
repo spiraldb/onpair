@@ -132,6 +132,85 @@ fn clear_from(bits: &mut Mask, valid: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
+    use crate::core::types::TokenRange;
+    use crate::search::substring::probe::plan::is_eligible;
+    use crate::search::substring::probe::verify::tests::accepting_verifier;
+
+    /// A dictionary of the 256 single-byte tokens, for scans whose verifier never
+    /// reads it.
+    pub(super) fn byte_dictionary() -> CompactDictionary {
+        let mut bytes: Vec<u8> = (0..=255).collect();
+        let offsets: Vec<u32> = (0..=256).collect();
+        pad_raw(&mut bytes, &offsets);
+        CompactDictionary::from_raw(bytes, offsets)
+    }
+
+    /// Runs every kernel eligible on this CPU, in both packing modes, with a verifier
+    /// that accepts every hit, and checks that each appends exactly `expected`.
+    fn check_every_kernel<O: Offset>(
+        cover: &ProbeCover,
+        codes: &[Token],
+        row_offsets: &[O],
+        expected: &[usize],
+    ) {
+        let dict = byte_dictionary();
+        let verifier = accepting_verifier();
+        for kind in [MatcherKind::Table, MatcherKind::EqOr, MatcherKind::NibbleN8] {
+            if !is_eligible(detect_isa(), kind, cover) {
+                continue;
+            }
+            for skip_empty_packing in [false, true] {
+                let input = ScanInput::new(codes, row_offsets, dict.as_view(), cover, &verifier);
+                let mut out = Vec::new();
+                run(kind, skip_empty_packing, input, &mut out);
+                assert_eq!(
+                    out, expected,
+                    "{kind:?}, skip_empty_packing={skip_empty_packing}"
+                );
+            }
+        }
+    }
+
+    /// Rows that start partway into the codes, as in a sliced view, ignore the hits
+    /// before them, while a hit in the zero-padded last block is still found. Checked
+    /// for every kernel, at both offset widths.
+    #[test]
+    fn scan_ignores_codes_before_the_first_row() {
+        // Distinct codes, so each planted point occurs exactly once.
+        let codes: Vec<Token> = (0..2 * BLOCK + 100)
+            .map(|at| (at * 37 % 50021) as Token)
+            .collect();
+        let (early, late) = (50, 2 * BLOCK + 40);
+        let cover = ProbeCover::new(vec![codes[early], codes[late]], Vec::new());
+        // Rows of 64 codes from code 0, or from code 100 on.
+        for (first, expected) in [
+            (0, vec![early / 64, late / 64]),
+            (100, vec![(late - 100) / 64]),
+        ] {
+            let offsets: Vec<u32> = (first as u32..=codes.len() as u32).step_by(64).collect();
+            let codes = &codes[..*offsets.last().unwrap() as usize];
+            check_every_kernel(&cover, codes, &offsets, &expected);
+            let wide: Vec<u64> = offsets.iter().map(|&offset| u64::from(offset)).collect();
+            check_every_kernel(&cover, codes, &wide, &expected);
+        }
+    }
+
+    /// Zero padding never becomes a hit, even when the filter contains token 0.
+    #[test]
+    fn padding_never_becomes_a_hit() {
+        let low = TokenRange { begin: 0, last: 3 };
+        for cover in [
+            ProbeCover::new(vec![0], Vec::new()),
+            ProbeCover::new(Vec::new(), vec![low]),
+        ] {
+            for len in [1, 2, 63, 64, 65, BLOCK - 1, BLOCK, BLOCK + 1] {
+                // Codes start at 4, so only padding could match the filter.
+                let codes: Vec<Token> = (0..len).map(|at| (at % 1000 + 4) as Token).collect();
+                check_every_kernel(&cover, &codes, &[0u32, len as u32], &[]);
+            }
+        }
+    }
 
     /// Every code from `first` is visited once at its absolute index, and a partial
     /// tail is zero-padded to a full block.

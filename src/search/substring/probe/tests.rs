@@ -5,6 +5,8 @@
 //! and planning invariants. Matchers, the resolver, the hit verifier and the cut
 //! solver have their own unit tests.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -214,6 +216,30 @@ fn longest_pattern_reaches_the_largest_offset() {
         view.rows_containing_with_scan(&pattern, &frequencies),
         Ok(vec![0, 3])
     );
+}
+
+/// Malformed row offsets panic with `BadRowOffsets`, whatever the pattern.
+#[test]
+fn scan_rejects_malformed_row_offsets() {
+    let column = compress_rows(&[b"alpha", b"beta"]);
+    let view = column.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let past_end = view.codes.len() as u32 + 1;
+    for pattern in [b"".as_slice(), b"alpha"] {
+        let scan = ContainsScan::new(pattern, view.dict, &frequencies).unwrap();
+        // The first offset after the last, and the last past the code stream.
+        for offsets in [[2u32, 1], [0, past_end]] {
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                scan.scan(view.codes, &offsets, &mut Vec::new());
+            }))
+            .expect_err("malformed offsets must panic");
+            let message = panic.downcast_ref::<String>().unwrap();
+            assert!(
+                message.contains("row offsets must be non-decreasing"),
+                "{pattern:?}, {offsets:?}: {message}"
+            );
+        }
+    }
 }
 
 #[test]

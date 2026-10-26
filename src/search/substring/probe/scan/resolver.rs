@@ -114,10 +114,11 @@ mod tests {
     //! span blocks. These tests accept every hit to isolate row resolution.
 
     use super::{Mask, Resolver, find_row};
-    use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
+    use crate::core::dictionary::Dictionary;
     use crate::core::offset::Offset;
     use crate::core::types::Token;
     use crate::search::substring::ProbeCover;
+    use crate::search::substring::probe::scan::tests::byte_dictionary;
     use crate::search::substring::probe::scan::{BLOCK, ScanInput};
     use crate::search::substring::probe::verify::tests::accepting_verifier;
 
@@ -131,10 +132,7 @@ mod tests {
         let codes = [0 as Token; CODES];
         let cover = ProbeCover::new(Vec::new(), Vec::new());
         let verifier = accepting_verifier();
-        let mut bytes: Vec<u8> = (0..=255).collect();
-        let offsets: Vec<u32> = (0..=256).collect();
-        pad_raw(&mut bytes, &offsets);
-        let dict = CompactDictionary::from_raw(bytes, offsets);
+        let dict = byte_dictionary();
         let input = ScanInput::new(&codes, row_offsets, dict.as_view(), &cover, &verifier);
         let mut out = Vec::new();
         let mut resolver = Resolver::new(input);
