@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Test token membership in a probe cover, one block at a time.
+//! Membership kernels: mark the codes of a block that belong to the filter.
 //!
-//! Each matcher writes the same exact mask: bit `i` is set when code `i`
-//! belongs to a point or range in the cover. This establishes a candidate
-//! token, not a complete substring match; row resolution verifies each hit.
-//!
-//! `eq_or` compares each point, `nibble_n8` groups points into shuffle tables,
-//! `range` checks inclusive intervals, and `table` uses scalar lookups.
-//! `shared` handles vector loads and packing their results into mask words.
+//! Every kernel computes the same mask, with bit `i` set iff code `i` is covered:
+//! `table` with a scalar lookup table, `eq_or` with one vector comparison per point,
+//! and `nibble_n8` with shuffle tables for up to eight points at once. `range` adds
+//! the cover's ranges to the vector kernels, and `shared` holds their loads and
+//! mask packing.
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod eq_or;
@@ -24,7 +22,7 @@ mod table;
 use super::{Block, Mask};
 use crate::search::substring::ProbeCover;
 
-/// Point probes represented by one batch of nibble tables.
+/// Number of points in one batch of nibble tables.
 pub(in crate::search::substring::probe) const PER_BATCH: usize = 8;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(in crate::search::substring::probe::scan) use eq_or::EqOr;
@@ -32,18 +30,16 @@ pub(in crate::search::substring::probe::scan) use eq_or::EqOr;
 pub(in crate::search::substring::probe::scan) use nibble_n8::NibbleN8;
 pub(in crate::search::substring::probe::scan) use table::Table;
 
-/// Prepared membership checks with one output bit per input token code.
+/// A cover membership test, prepared once and run on every block.
 pub(in crate::search::substring::probe::scan) trait Matcher:
     Sized
 {
-    /// Prepare the selected cover for repeated block checks.
-    /// The caller must establish the supported shape and CPU features through
-    /// planning and capability detection before constructing a vector matcher.
+    /// Prepares `cover`. A vector matcher may only be built for a cover and CPU
+    /// that planning found eligible.
     fn new(cover: &ProbeCover) -> Self;
 
-    /// Overwrite every mask word for this block.
-    /// `false` guarantees that all bits are zero, allowing row lookup to be
-    /// skipped. `true` allows an empty mask when the matcher omits that test.
+    /// Overwrites `bits` with the block's mask. Returns `false` only if the mask is
+    /// empty, so the caller can skip row lookup; `true` does not imply a hit.
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool;
 }
 

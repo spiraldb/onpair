@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Vector loading and mask packing shared by the membership kernels.
+//! Code loading and mask packing shared by the vector kernels.
 //!
-//! `Vectors` holds 64 token codes. A kernel turns those codes into `Hits`:
-//! 0xFF/0x00 byte lanes on NEON and AVX2, or a `u64` mask on AVX-512.
-//! Narrowing comparison lanes preserves one result per original code.
-//!
-//! `words` processes two groups of 64 codes at a time and writes their mask
-//! words in code order. With skipping enabled, an empty group pair is cleared
-//! without packing. The caller has already selected an available instruction set.
+//! A kernel maps `Vectors`, 64 codes, to `Hits`: one 0xFF/0x00 byte per code on
+//! NEON and AVX2, or a `u64` mask on AVX-512. `words` runs a kernel over a block,
+//! 128 codes at a time, and packs the hits into mask words; when skipping is
+//! enabled, groups without hits are zeroed without packing.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;

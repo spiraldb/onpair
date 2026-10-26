@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Map candidate-token masks to rows and append verified matches.
+//! Row resolution: map hit bits to rows and append the verified ones.
 //!
-//! Keep the last located row across blocks. Hits within it need no lookup;
-//! later hits use one-sided galloping from the next row, followed by binary
-//! search within the bracket. Lookup takes logarithmic work in the row gap.
-//!
-//! A rejected hit advances to the next one. A verified hit appends the row
-//! and skips its remaining codes, including across blocks, so output is unique.
-//! Blocks arrive in stream order, and every set bit must name a valid code.
+//! Blocks arrive in stream order, so the resolver keeps the current row across
+//! blocks. A hit in a later row is located by galloping forward from the next row
+//! and binary-searching the last step, in time logarithmic in the rows skipped.
+//! Once a row is appended, its remaining hits are skipped, even in later blocks.
 
 use super::{Mask, ScanInput};
 use crate::core::dictionary::CompactDictionaryView;
@@ -17,7 +14,7 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::substring::probe::verify::HitVerifier;
 
-/// Row position and confirmed-output boundary retained across mask blocks.
+/// Row lookup and verification state, kept across blocks.
 pub(super) struct Resolver<'a, O> {
     /// Boundaries of rows in absolute code indices.
     row_offsets: &'a [O],
@@ -29,12 +26,12 @@ pub(super) struct Resolver<'a, O> {
     row: usize,
     /// Exclusive end of the current row, initialized from the first row boundary.
     row_end: usize,
-    /// Exclusive end of the last emitted row; earlier hits are already resolved.
+    /// End of the last appended row; hits before it are skipped.
     resolved_code: usize,
 }
 
 impl<'a, O: Offset> Resolver<'a, O> {
-    /// Create an unadvanced cursor over the input's rows.
+    /// Starts at the first row of `input`.
     pub(super) fn new(input: ScanInput<'a, O>) -> Self {
         Self {
             row_offsets: input.row_offsets,
@@ -47,8 +44,8 @@ impl<'a, O: Offset> Resolver<'a, O> {
         }
     }
 
-    /// Visit candidate bits, locate their rows, and append verified matches.
-    /// Blocks arrive in increasing code order. Search starts after an exhausted row.
+    /// Verifies the hits in `bits`, the mask of the block starting at `first_code`,
+    /// and appends their rows. Blocks must arrive in increasing code order.
     #[inline]
     pub(super) fn rows(&mut self, bits: &Mask, first_code: usize, out: &mut Vec<usize>) {
         let mut at = self.resolved_code.saturating_sub(first_code);
@@ -73,7 +70,7 @@ impl<'a, O: Offset> Resolver<'a, O> {
     }
 }
 
-/// Find the first set bit at or after `from`, or return `None` past the last hit.
+/// The first set bit at or after `from`, if any.
 #[inline]
 fn next_set(bits: &Mask, from: usize) -> Option<usize> {
     let mut word = from / 64;
@@ -85,10 +82,11 @@ fn next_set(bits: &Mask, from: usize) -> Option<usize> {
     Some(word * 64 + set.trailing_zeros() as usize)
 }
 
-/// Find the row containing `code`, starting at the first possible row.
-/// The sorted boundaries must satisfy `offsets[from] <= code < offsets.last()`.
-/// Check the next boundary first, then double the search distance until a boundary
-/// is past the code. Binary search only that bracket; equal offsets skip empty rows.
+/// The row containing `code`, searching from row `from`.
+///
+/// Requires `offsets[from] <= code < offsets.last()`. Checks row `from` first, then
+/// doubles the step until a boundary passes `code`, and binary-searches that last
+/// step. Empty rows, with equal offsets, are skipped.
 #[inline]
 fn find_row<O: Offset>(offsets: &[O], from: usize, code: usize) -> usize {
     if offsets[from + 1].to_usize() > code {
@@ -113,7 +111,7 @@ mod tests {
     //!
     //! The same masks are resolved with u32 and u64 row offsets. Fixtures vary
     //! hit density and row length, including empty rows, long gaps, and rows that
-    //! span blocks. These tests accept all probe hits to isolate row resolution.
+    //! span blocks. These tests accept every hit to isolate row resolution.
 
     use super::{Mask, Resolver, find_row};
     use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};

@@ -1,36 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Substring query preparation, planning, scanning and verification.
+//! [`ContainsScan`]: substring search by scanning for the codes of a cut.
 //!
-//! [`ContainsScan`] compiles a **sound probe cover** from the pattern — dictionary
-//! token ids and id ranges chosen so that *any* row containing the pattern holds at
-//! least one probe token — then scans the flat code stream for the rows holding one
-//! ([`ContainsScan::scan`]). Every hit is then checked against the alignment graph
-//! in the compressed domain by the hit verifier.
+//! # How it works
 //!
-//! An empty pattern matches every row, including rows without codes. Its
-//! preparation needs no probes, and execution appends all rows without scanning.
+//! Rows are tokenized greedily: each token is the longest dictionary entry that
+//! prefixes the remaining bytes. An occurrence of the pattern may begin inside a
+//! token, but from its first token boundary on, greedy tokenization leaves little
+//! choice. Each later token either ends inside the pattern, and is then the longest
+//! token that prefixes the rest of the pattern, or finishes it, and then starts with
+//! whatever remains.
 //!
-//! # Soundness
-//! Every occurrence of a non-empty pattern in an encoded row falls into one of two cases,
-//! and the cover covers both:
+//! All possible encodings therefore fit in a small DAG, the *alignment graph*. Its
+//! nodes are the pattern offsets `0..=n`, and every occurrence in a row is a path
+//! from `0` to `n` whose edges are the occurrence's tokens:
 //!
-//! * **One token contains the whole pattern.** Its id is added unconditionally
-//!   (only reachable when `pattern.len() <= MAX_TOKEN_SIZE`), as the range of
-//!   tokens the pattern is a prefix of or as the set holding it further in.
-//! * **The occurrence crosses at least one token boundary.** Then it begins at
-//!   some feasible first-token alignment `k`, after which greedy parsing of
-//!   `pattern[k..]` is deterministic. Every such layout is one path through the
-//!   alignment DAG, and the cover is a cut of that DAG — so whichever layout the
-//!   occurrence takes, it runs into a probe.
+//! * an *alignment edge* `0 -> k` for a first token that begins before the
+//!   occurrence and ends with its first `k` bytes, or `0 -> n` if it contains the
+//!   whole occurrence;
+//! * a *greedy edge* for each token that begins and ends inside the pattern;
+//! * a *range edge* to `n` for a last token that starts with the rest of the pattern.
 //!
-//! # Responsibilities
-//! [`ContainsScan`] coordinates graph construction, cost-based cover selection and
-//! hit verifier compilation. `alignment` owns the graph and cut solver; `plan` prices
-//! and selects covers and their matchers using explicit facts and capabilities.
-//! `scan` produces hits, resolves rows and checks each hit with the exact
-//! `HitVerifier` from `verify`.
+//! Preparation picks a *cut* of this graph: a set of edges that every path crosses.
+//! The codes on its edges form the *filter*, represented as a [`ProbeCover`]: every
+//! row that contains the pattern contains one of them. Any cut is correct, and the
+//! planner looks for a cheap one: rare codes mean few hits to verify, and few
+//! distinct codes mean a faster matcher.
+//!
+//! The scan then processes the codes block by block:
+//!
+//! 1. a matcher marks every code in the filter, a *hit*;
+//! 2. each hit is mapped to its row and verified by walking the alignment graph
+//!    forward and backward through the neighboring codes.
+//!
+//! A row is emitted on its first verified hit, and its remaining hits are skipped.
+//!
+//! # Modules
+//!
+//! * `alignment`: the alignment graph, its minimum cut, and the resulting filter.
+//! * `plan`: the cost model that chooses the cut, its matcher and the mask packing.
+//! * `scan`: the block loop, the SIMD matchers and row resolution.
+//! * `verify`: the hit verifier.
 
 mod alignment;
 mod plan;
@@ -50,14 +61,12 @@ use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex, panic_malforme
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 use crate::search::substring::ContainsError;
 
-/// A prepared substring query, ready to scan any chunk encoded with its dictionary.
+/// A substring query prepared for one dictionary.
 ///
-/// Borrows the dictionary it was prepared with, and holds the probe cover, its
-/// matcher, the compiled hit verifier and the probe density of the stream used for
-/// planning. Each [`ContainsScan::scan`] call owns its execution state, so one
-/// preparation can scan many chunks and be shared between concurrent calls.
-/// Coverage statistics take the frequency index of the chunk they describe.
-/// An empty pattern matches all rows and needs no probes.
+/// Preparation chooses the filter and compiles the hit verifier once. Each
+/// [`scan`](Self::scan) keeps its state local, so one query can scan any number of
+/// chunks encoded with the same dictionary, concurrently if needed. An empty
+/// pattern matches every row.
 #[derive(Debug, Clone)]
 pub struct ContainsScan<'d> {
     dict: CompactDictionaryView<'d>,
@@ -69,37 +78,26 @@ pub struct ContainsScan<'d> {
 }
 
 impl<'d> ContainsScan<'d> {
-    /// Maximum pattern length, bounded by the `u16` needle offsets used during
-    /// preparation and verification.
+    /// Longest supported pattern, in bytes. Pattern offsets are stored as `u16`.
     pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
 
-    /// Prepare an exact substring scan for `pattern` using the dictionary and index.
-    /// Select the sampled probe cover with the lowest relative cost and compile
-    /// the hit verifier that checks its hits.
+    /// Prepares a scan for `pattern`.
     ///
-    /// This constructor prepares the checks; the caller decides whether executing
-    /// them is profitable, using the coverage statistics for the chunk at hand.
-    /// An empty pattern produces a scan that admits every row without compiling probes.
-    ///
-    /// # Precondition
-    /// `dict` is conformant: sorted, complete, and unique. These properties are
-    /// guaranteed for a dictionary trained by [`Parser::train`](crate::Parser::train)
-    /// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
-    /// `frequencies` must be associated with this dictionary's token IDs and the
-    /// code stream used for planning. Build or validate it at the input boundary
-    /// using `dict.num_tokens()` and that stream's codes or code count.
-    ///
-    /// Preparation only checks that the already validated index has
-    /// `dict.num_tokens() + 1` cumulative entries, so dictionary token IDs can
-    /// safely index it. This is a constant-time size check; it does not establish
-    /// dictionary identity or verify the frequencies against the stream.
-    /// Values are advisory weights: they affect the plan and profitability, but
-    /// never remove members from the resulting cover.
+    /// `frequencies` counts how often each token occurs in a representative code
+    /// stream. It only guides the choice of the filter: inaccurate counts can make scans
+    /// slower, never incorrect.
     ///
     /// # Errors
-    /// Returns [`ContainsError`] if the pattern exceeds [`Self::MAX_PATTERN_LEN`],
-    /// the index size does not match the dictionary, or greedy parsing encounters
-    /// a missing dictionary token.
+    /// Returns [`ContainsError::PatternTooLong`] if `pattern` is longer than
+    /// [`Self::MAX_PATTERN_LEN`], and [`ContainsError::InvalidData`] if `frequencies`
+    /// does not have one entry per dictionary token or `dict` cannot tokenize
+    /// `pattern`.
+    ///
+    /// # Precondition
+    /// `dict` is conformant (sorted, unique and complete), as guaranteed by
+    /// [`Parser::train`](crate::Parser::train) and
+    /// [`CompactDictionary::validate`](crate::CompactDictionary::validate), and
+    /// `frequencies` is indexed by its token IDs. Only the index length is checked.
     pub fn new<S: TokenFrequencyIndexStorage>(
         pattern: &[u8],
         dict: CompactDictionaryView<'d>,
@@ -139,33 +137,22 @@ impl<'d> ContainsScan<'d> {
         })
     }
 
-    /// Execute this scan and append the ascending rows containing the pattern.
+    /// Appends to `out` the index of every row that contains the pattern, in
+    /// ascending order.
     ///
-    /// Every hit on the cover is checked against the alignment graph in the
-    /// compressed domain. Emitted rows contain a complete occurrence of the pattern.
-    ///
-    /// This method only executes the prepared cover; the caller decides whether
-    /// scanning it is profitable. For a non-empty pattern, an empty cover appends
-    /// nothing. An empty pattern appends every row, including empty rows, without
-    /// scanning. Execution state is local to this call, so the same preparation
-    /// can be reused or shared between concurrent calls.
-    ///
-    /// Rows cover `codes[row_offsets[0]..row_offsets[R]]`. A view sliced from a
-    /// larger column keeps the codes before and after that range; they belong to
-    /// no row and are not scanned.
+    /// Row `i` is `codes[row_offsets[i]..row_offsets[i + 1]]`. Codes outside
+    /// `row_offsets[0]..row_offsets[last]` belong to no row and are never read, so a
+    /// view sliced from a larger column can pass its whole code buffer.
     ///
     /// # Panics
-    /// With [`InvalidColumn::BadRowOffsets`] if the first offset exceeds the last,
-    /// or the last exceeds `codes.len()`.
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the first offset exceeds the
+    /// last, or the last exceeds `codes.len()`.
     ///
     /// # Precondition
-    /// `row_offsets` are non-decreasing, and every code lies in the
-    /// token domain of the prepared cover. Rows must be greedily tokenized with
-    /// the conformant dictionary this scan was prepared with, as produced by
-    /// [`Column::compress`](crate::Column::compress).
-    /// Validating a dictionary or externally supplied column buffers alone does not
-    /// establish greedy tokenization. Each scan appends each matching row once in
-    /// ascending order, preserving all prior contents of `out`.
+    /// `row_offsets` is non-decreasing, and the rows were greedily tokenized with the
+    /// dictionary this scan was prepared with, as by
+    /// [`Column::compress`](crate::Column::compress). Validating the buffers does not
+    /// establish greedy tokenization.
     pub fn scan<O: Offset>(&self, codes: &[Token], row_offsets: &[O], out: &mut Vec<usize>) {
         if self.matches_all {
             out.extend(0..row_offsets.len().saturating_sub(1));
@@ -195,21 +182,17 @@ impl<'d> ContainsScan<'d> {
         );
     }
 
-    /// The normalized checks the SIMD prefilter can execute.
-    ///
-    /// For an empty pattern this cover is empty, but [`ContainsScan::scan`]
-    /// still returns every row.
+    /// The tokens this scan searches for. Empty for an empty pattern, which matches
+    /// every row without searching.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
     }
 
-    /// Number of code positions in the indexed stream whose token is covered by
-    /// the probes. Points and ranges are disjoint, so each occurrence counts once.
-    /// Zero for an empty pattern, which needs no probes.
+    /// Number of codes in the stream indexed by `frequencies` that hit the filter.
     ///
     /// # Panics
-    /// Panics if a probe token lies outside `frequencies`, which must use this
-    /// scan's dictionary token IDs.
+    /// Panics if a filter token is out of range for `frequencies`, which must be
+    /// indexed by this scan's dictionary.
     pub fn covered_frequency<S: TokenFrequencyIndexStorage>(
         &self,
         frequencies: &TokenFrequencyIndex<S>,
@@ -217,12 +200,11 @@ impl<'d> ContainsScan<'d> {
         self.probe_cover.frequency(frequencies.as_view())
     }
 
-    /// Fraction of code positions in the indexed stream whose token is covered by
-    /// the probes. Returns `0.0` when that stream is empty or the pattern is empty
-    /// and needs no probes.
+    /// [`covered_frequency`](Self::covered_frequency) as a fraction of all indexed
+    /// codes: the expected hit density. `0.0` for an empty stream.
     ///
     /// # Panics
-    /// Panics under the same condition as [`Self::covered_frequency`].
+    /// Panics under the same condition as [`covered_frequency`](Self::covered_frequency).
     pub fn covered_fraction<S: TokenFrequencyIndexStorage>(
         &self,
         frequencies: &TokenFrequencyIndex<S>,

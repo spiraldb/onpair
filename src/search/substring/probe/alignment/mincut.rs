@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Minimum-weight cuts of an alignment graph.
+//! Minimum-weight cut of an alignment graph, in linear time.
 //!
-//! Removing the source and sink leaves a forest: each internal node has
-//! at most one outgoing internal edge. Source and terminal edges become
-//! costs of placing a node on either side of the cut.
+//! A cut puts every node on the source side or the sink side and selects the edges
+//! that cross from the first to the second. Each internal node has at most one
+//! internal successor, so without the source and sink the nodes form a forest whose
+//! roots lead to the sink. That makes the minimum cut a dynamic program over trees.
+//! Alignment and range edges become costs for placing their internal endpoint on
+//! one side.
 //!
-//! A forward pass combines subtree costs. A backward pass assigns sides,
-//! preferring the sink side on ties. Edges leaving the source side form
-//! the cut, returned in their original order.
+//! A forward pass, from children to parents in offset order, accumulates subtree
+//! costs. A backward pass assigns sides from the roots down, preferring the sink
+//! side on ties. Unenumerated alignment edges, whose tokens cannot be in a filter,
+//! force their target onto the source side, so they are never cut.
 
 use super::graph::{AlignmentGraph, Edge};
 
-/// A cut solver reusable with different weights on the same alignment graph.
-/// Each solve takes linear time and reuses the topology and scratch buffers.
+/// A cut solver for one graph, reusable with different edge weights.
 pub(in crate::search::substring::probe) struct MinCut<'g> {
     edges: &'g [Edge],
     /// Internal nodes incident to edges, in increasing needle-offset order.
@@ -23,23 +26,22 @@ pub(in crate::search::substring::probe) struct MinCut<'g> {
     parent: Vec<u16>,
     /// Weight of the internal edge to the parent; zero for forest roots.
     parent_weight: Vec<i64>,
-    /// Cost of choosing the source side minus the cost of choosing the sink
-    /// side. Forced assignments are represented separately.
+    /// Cost of the source side minus cost of the sink side, for the subtree.
     delta: Vec<i64>,
-    /// An unenumerated source edge prevents placing this node on the sink side.
+    /// Whether an unenumerated alignment edge enters this node, forcing it onto the
+    /// source side.
     forced_source: Vec<bool>,
-    /// Node assignments reconstructed by the latest solve.
+    /// Side assignments from the latest solve.
     source_side: Vec<bool>,
-    /// Selected edge indices, in original edge order.
+    /// Cut edge indices from the latest solve, in edge order.
     cut: Vec<u32>,
 }
 
 impl<'g> MinCut<'g> {
-    /// Record the topology once and allocate reusable buffers.
+    /// Records the forest of `graph` and allocates the solve buffers.
     ///
-    /// Alignment construction guarantees forward edges, at most one internal
-    /// successor per node, and unenumerated edges only from the source to an
-    /// internal node. Nodes are needle offsets, with source 0 and sink last.
+    /// Relies on the alignment graph's shape: edges go forward, each internal node
+    /// has at most one internal successor, and unenumerated edges leave the source.
     pub(in crate::search::substring::probe) fn new(graph: &'g AlignmentGraph) -> Self {
         let node_count = graph.node_count();
         let sink = graph.sink();
@@ -81,20 +83,19 @@ impl<'g> MinCut<'g> {
         }
     }
 
-    /// Return the cheapest cut as ascending indices into the graph's edges.
-    /// Among equal-cost cuts, choose the inclusion-minimal source side.
+    /// Returns the cheapest cut as ascending indices into the graph's edges. Among
+    /// equal-cost cuts, it picks the one with the inclusion-minimal source side.
     ///
-    /// Weights must be nonnegative, with their sum fitting in `i64`.
-    /// The planner's existing bounds put that sum below 2^51.
-    /// Only cuttable edges are passed to `weight`.
+    /// `weight` is only called for cuttable edges. Weights must be nonnegative and
+    /// their sum must fit in `i64`; the planner keeps it below 2^51.
     pub(in crate::search::substring::probe) fn solve(
         &mut self,
         weight: impl Fn(&Edge) -> u64,
     ) -> &[u32] {
         let sink = self.parent.len() - 1;
 
-        // Source edges charge the sink side; terminal edges charge the source
-        // side. Internal edge weights are used when combining subtrees.
+        // Alignment edges charge the sink side; range edges charge the source
+        // side. Greedy edge weights are used when combining subtrees.
         // Direct source-to-sink costs accumulate at the sink and do not affect
         // assignments: those edges must be cut regardless.
         self.delta.fill(0);
@@ -273,7 +274,7 @@ mod tests {
         assert_eq!(cut_steps(&graph), vec![(1, 4), (3, 4)]);
     }
 
-    /// Cutting an internal continuation does not cover a parallel terminal path.
+    /// Cutting the greedy edge out of a node leaves its range edge to cut as well.
     /// Direct source-to-sink edges are mandatory; unused offsets are harmless.
     #[test]
     fn terminal_edges_are_charged_alongside_internal_edges() {

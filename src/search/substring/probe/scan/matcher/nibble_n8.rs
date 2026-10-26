@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Match point probes with four nibble tables per batch of up to eight IDs.
+//! Point membership with shuffle-table lookups, eight points per batch.
 //!
-//! Each token ID is a `u16`, split into four 4-bit nibbles. A point owns one
-//! bit in each table entry selected by its nibbles. Looking up the input code's
-//! four nibbles and ANDing their entries leaves a bit only if the same point
-//! matches all four positions. This is exact token membership.
-//!
-//! Batches are ORed together, then range matches are added. The planner limits
-//! batch counts to bound register use. `shared::words` handles block loading
-//! and mask packing, as it does for the other vector matchers.
+//! A token ID is a `u16`, so four 4-bit nibbles. Each batch has one 16-entry
+//! table per nibble position, and point `k` sets bit `k` in the entry selected by
+//! its nibble at each position. Looking up a code's four nibbles and ANDing the
+//! entries leaves bit `k` iff the code equals point `k`. Batches are ORed
+//! together, then range hits are added. Planning caps the batch count so the
+//! tables stay in registers.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;

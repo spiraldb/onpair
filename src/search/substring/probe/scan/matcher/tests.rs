@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Check matcher masks against scalar probe-cover membership.
-//!
-//! Each eligible kernel receives the same cover and code block. The oracle
-//! calls `ProbeCover::contains` per code, independently of vector packing.
-//! Cases exercise point counts, ranges, code-width boundaries, and block tails.
-//! The block-driver checks also ensure padding cannot create candidate rows.
+//! Tests every kernel eligible on this CPU against scalar cover membership
+//! (`ProbeCover::contains`), across point counts, ranges, code-width boundaries
+//! and block tails.
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::EqOr;

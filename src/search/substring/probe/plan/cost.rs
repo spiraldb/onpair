@@ -1,25 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Relative costs for cover and matcher selection.
+//! Cost model for covers and matchers, calibrated per instruction set.
 //!
-//! One profile per instruction set prices both matcher work and covered token
-//! occurrences. Matcher selection minimizes the matcher term; cover ranking
-//! combines that same term with candidate processing. Costs express relative
-//! work, not nanoseconds. Mask packing is chosen separately.
+//! Costs are relative work, not time. `matcher_cost` prices scanning one code with
+//! a given matcher; `candidate_cost` prices the row lookup and verification of the
+//! hits. Matcher selection uses the first; cover ranking uses both.
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherKind, PER_BATCH};
 
-/// Rank matchers for a fixed cover. Lower is better.
+/// Cost of scanning one code with `matcher`. Lower is better.
 ///
-/// With `p` points, `r` ranges, and `b = ceil(p / PER_BATCH)`:
+/// With `p` points, `r` ranges and `b = ceil(p / PER_BATCH)` nibble batches:
 /// - Table: `table`.
 /// - EqOr: `point * p + range * r`.
 /// - Nibble: `nibble_base + nibble_batch * b + range * r`.
 ///
-/// The weights are calibrated relative costs, not literal instruction counts.
-/// Eligibility and ties are handled by selection, independently of this formula.
+/// Eligibility is checked separately, by `select::is_eligible`.
 pub(super) fn matcher_cost(isa: Isa, matcher: MatcherKind, cover: &ProbeCover) -> f64 {
     let weights = match isa {
         Isa::Neon => NEON_COSTS,
@@ -45,7 +43,7 @@ pub(super) fn matcher_cost(isa: Isa, matcher: MatcherKind, cover: &ProbeCover) -
     }
 }
 
-/// Shared formula, calibrated separately for each instruction set.
+/// Weights of the cost model for one instruction set.
 struct CostWeights {
     /// Table lookup, independent of cover shape.
     table: f64,
@@ -57,12 +55,12 @@ struct CostWeights {
     nibble_base: f64,
     /// One batch of up to eight point probes in Nibble.
     nibble_batch: f64,
-    /// Row resolution and verification per covered occurrence, in the same scale.
+    /// Row lookup and verification of one hit.
     candidate: f64,
 }
 
-/// Fitted on four datasets and checked on eight others with fixed covers.
-/// The candidate weight was evaluated separately on those datasets.
+/// Fitted on four datasets and checked on eight others with fixed covers. The
+/// candidate weight was evaluated separately on the same datasets.
 const NEON_COSTS: CostWeights = CostWeights {
     table: 22.0,
     point: 2.0,
@@ -72,10 +70,10 @@ const NEON_COSTS: CostWeights = CostWeights {
     candidate: 4096.0,
 };
 
-/// Conservative x86 profiles checked on fixed covers from ClickBench URLs,
-/// Amazon titles, and DBpedia abstracts on an AMD EPYC 9R05.
-/// The provisional candidate weight rounds the three-dataset fit of 3668.7225.
-/// Baseline-relative validation against decompress-then-scan is still pending.
+/// Conservative profile checked on fixed covers from ClickBench URLs, Amazon titles
+/// and DBpedia abstracts, on an AMD EPYC 9R05. The candidate weight is provisional:
+/// it rounds the three-dataset fit of 3668.7225 and has not yet been validated
+/// against decompress-then-scan.
 const AVX2_COSTS: CostWeights = CostWeights {
     table: 36.0,
     point: 1.0,
@@ -85,9 +83,9 @@ const AVX2_COSTS: CostWeights = CostWeights {
     candidate: 3669.0,
 };
 
-/// AVX-512 profile from the same fixed-cover evaluation as AVX2.
-/// The provisional candidate weight rounds the three-dataset fit of 3170.2343.
-/// Baseline-relative validation against decompress-then-scan is still pending.
+/// From the same evaluation as the AVX2 profile. The candidate weight is
+/// provisional: it rounds the three-dataset fit of 3170.2343 and has not yet been
+/// validated against decompress-then-scan.
 const AVX512BW_COSTS: CostWeights = CostWeights {
     table: 31.0,
     point: 1.0,
@@ -97,13 +95,11 @@ const AVX512BW_COSTS: CostWeights = CostWeights {
     candidate: 3170.0,
 };
 
-/// Approximate row-resolution and verification cost.
-/// Frequency counts covered token occurrences, not matching rows or hit verifier calls.
+/// Cost of looking up and verifying `covered_frequency` hits.
 ///
-/// Each profile balances this term against its matcher costs. The weight is
-/// independent of the cut-generation lambda; traversal lengths and successful-row
-/// skipping are not modeled explicitly. Scalar scans only have the table matcher,
-/// whose cost is independent of the cover, so their ranking minimizes frequency.
+/// A flat cost per hit: walk lengths and the hits skipped after a row matches are
+/// not modeled. On scalar targets only the table matcher exists, and its cost does
+/// not depend on the cover, so ranking there simply minimizes frequency.
 pub(super) fn candidate_cost(isa: Isa, covered_frequency: u32) -> f64 {
     let weight = match isa {
         Isa::Neon => NEON_COSTS.candidate,

@@ -5,17 +5,17 @@ use std::fmt;
 
 use crate::core::validate::InvalidColumn;
 
-/// A substring query could not be prepared. No matching rows have been produced.
+/// Error returned when a substring query cannot be prepared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainsError {
-    /// The pattern exceeds the state width of the chosen implementation.
+    /// The pattern is longer than the chosen implementation supports.
     PatternTooLong {
         /// Actual pattern length in bytes.
         length: usize,
         /// Maximum supported length in bytes.
         max: usize,
     },
-    /// Preparation encountered invalid dictionary or frequency-index data.
+    /// The dictionary or frequency index is invalid.
     InvalidData(InvalidColumn),
 }
 

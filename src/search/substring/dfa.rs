@@ -1,47 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Search one encoded row using token transitions derived from byte-level KMP.
+//! Per-row search with a KMP automaton lifted from bytes to tokens.
 //!
-//! Preparation simulates each token's bytes and stores the resulting transitions
-//! in an immutable `ContainsDfa`. `row_contains` then advances one token at a
-//! time using local state, without reading the dictionary or decoding the row.
+//! The states are the lengths of the matched pattern prefix, as in byte-level KMP.
+//! Preparation feeds each token's bytes through the byte automaton to get the
+//! token's transition, so `row_contains` then takes one step per code, without
+//! reading the dictionary.
 //!
-//! The table stores a base transition per token, computed from state zero.
-//! Other states store only the token ranges whose transitions differ from that
-//! base. A lookup searches those ranges before falling back to the base entry.
-//!
-//! This path searches the entire row independently of the bulk scan's cover
-//! and hit verifier. KMP failure links preserve overlapping partial matches;
-//! they are folded into token transitions during preparation.
+//! For most tokens the transition does not depend on the state, so each token
+//! stores its transition from state 0, and every other state stores only the token
+//! ranges that differ.
 
 use crate::core::dictionary::DictionaryView;
 use crate::core::types::{Token, TokenRange};
 use crate::search::lookup::prefix_range;
 use crate::search::substring::ContainsError;
 
-/// Number of leading pattern bytes matched, including the accepting length.
-/// The `u8` representation limits patterns to 255 bytes.
+/// Length of the matched pattern prefix; the pattern length accepts. Being a `u8`,
+/// it limits patterns to 255 bytes.
 type State = u8;
 
-/// Immutable token-transition DFA for one pattern and dictionary.
-/// Execution state lives in `row_contains`, so the prepared tables can be
-/// reused across rows and shared between concurrent calls.
+/// A pattern compiled into a token-level automaton, to test rows one at a time
+/// with [`row_contains`].
+///
+/// It needs no frequency index and supports patterns of up to
+/// [`MAX_PATTERN_LEN`](Self::MAX_PATTERN_LEN) bytes. To find all matching rows of a
+/// column, see [`ContainsScan`](crate::search::ContainsScan). The automaton is
+/// immutable, so it can be shared between threads.
 #[derive(Debug, Clone)]
 pub struct ContainsDfa {
-    /// Accepting state equal to the pattern length; zero for an empty pattern.
+    /// The accepting state: the pattern length, zero for an empty pattern.
     accept: State,
-    /// `base[token]` = KMP state after running `token`'s bytes from state 0.
+    /// `base[token]` is the state reached by reading `token` from state 0.
     base: Vec<State>,
-    /// Per-state exceptions: for entry state `s`, the tokens in
-    /// `sparse[offsets[s]..offsets[s + 1]]` transition to their `target` instead
-    /// of `base[token]`. Ranges within a state are ascending and disjoint.
+    /// Exceptions to `base`: from state `s`, the tokens of each range in
+    /// `sparse[offsets[s]..offsets[s + 1]]` go to its `target` instead. The ranges
+    /// of a state are ascending and disjoint.
     sparse: Vec<SparseTransition>,
-    /// Offsets delimiting each non-accepting state's exception slice.
+    /// Bounds of each state's slice of `sparse`.
     offsets: Vec<u32>,
 }
 
-/// Token range that overrides the base transition for one entry state.
+/// A token range whose transition from one state differs from `base`.
 #[derive(Debug, Clone, Copy)]
 struct SparseTransition {
     range: TokenRange,
@@ -52,8 +53,8 @@ impl ContainsDfa {
     /// Maximum pattern length, bounded by the DFA's `u8` state IDs.
     pub const MAX_PATTERN_LEN: usize = State::MAX as usize;
 
-    /// Compile token transitions for `pattern` using a sorted dictionary.
-    /// An empty pattern prepares a DFA that accepts every row, including empty rows.
+    /// Compiles `pattern` for `dict`, which must be sorted. An empty pattern matches
+    /// every row, including empty ones.
     ///
     /// # Errors
     /// Returns [`ContainsError::PatternTooLong`] if the pattern exceeds
@@ -99,9 +100,7 @@ impl ContainsDfa {
         })
     }
 
-    /// Apply a token transition, checking this state's exceptions before the base.
-    /// Requires a valid dictionary token ID and `state < accept`; `row_contains`
-    /// stops at acceptance before another transition is needed.
+    /// The state after reading `token` from `state`, which must not be accepting.
     #[inline]
     fn next(&self, state: State, token: Token) -> State {
         if state > 0 {
@@ -121,13 +120,10 @@ impl ContainsDfa {
     }
 }
 
-/// Whether the encoded row contains the prepared pattern.
-/// State starts at zero for each call. Token transitions account for matches
-/// inside tokens and across token boundaries; the first acceptance ends the scan.
-/// An empty pattern matches every row.
+/// Whether the row encoded by `codes` contains the pattern compiled into `dfa`.
 ///
 /// # Precondition
-/// Every code is a valid token ID from the dictionary used to prepare `dfa`.
+/// Every code is a token ID of the dictionary `dfa` was compiled for.
 pub fn row_contains(codes: &[Token], dfa: &ContainsDfa) -> bool {
     let mut state: State = 0;
     if state == dfa.accept {
@@ -142,8 +138,8 @@ pub fn row_contains(codes: &[Token], dfa: &ContainsDfa) -> bool {
     false
 }
 
-/// Byte-level KMP failure table: `fail[i]` is the length of the longest proper
-/// prefix of `pattern[..=i]` that is also a suffix.
+/// The byte-level KMP failure table: `fail[i]` is the length of the longest proper
+/// prefix of `pattern[..=i]` that is also its suffix.
 fn kmp_failure(pattern: &[u8]) -> Vec<State> {
     let m = pattern.len();
     let mut fail = vec![0 as State; m];
@@ -163,7 +159,7 @@ fn kmp_failure(pattern: &[u8]) -> Vec<State> {
     fail
 }
 
-/// Temporary KMP simulation state used to build base and exceptional transitions.
+/// Construction state of a `ContainsDfa`.
 struct Build<'a, V> {
     dict: V,
     /// Pattern bytes.
@@ -180,7 +176,7 @@ struct Build<'a, V> {
 }
 
 impl<V: DictionaryView> Build<'_, V> {
-    /// Simulate byte-level KMP from state `s`, retaining acceptance once reached.
+    /// Runs the byte automaton over `data` from state `s`. Acceptance is final.
     fn step_bytes(&self, mut s: State, data: &[u8]) -> State {
         for &b in data {
             if s as usize == self.m {
@@ -196,7 +192,7 @@ impl<V: DictionaryView> Build<'_, V> {
         s
     }
 
-    /// Compute the state reached from zero after each complete dictionary token.
+    /// Fills `base`: the state each token leads to from state 0.
     fn base_pass(&mut self) {
         let p0 = self.p[0];
         for t in 0..self.base.len() {
@@ -213,8 +209,8 @@ impl<V: DictionaryView> Build<'_, V> {
         }
     }
 
-    /// Append `(range, target)`, extending the previous range if it is adjacent
-    /// and shares the target. Only merges within the current entry state.
+    /// Appends an exception for the current state, merging it into the previous
+    /// one when adjacent with the same target.
     fn emit(&mut self, range: TokenRange, target: State) {
         if self.sparse.len() > self.range_start
             && let Some(last) = self.sparse.last_mut()
@@ -227,9 +223,7 @@ impl<V: DictionaryView> Build<'_, V> {
         self.sparse.push(SparseTransition { range, target });
     }
 
-    /// Record exceptions to the base table for every nonzero entry state.
-    /// Only token prefixes that can advance that state or one of its failure
-    /// states need traversal.
+    /// Fills `sparse` with the exceptions of every nonzero, non-accepting state.
     fn sparse_pass(&mut self) {
         let mut relevant: Vec<u8> = Vec::new();
         for j in 1..self.m {
@@ -260,9 +254,9 @@ impl<V: DictionaryView> Build<'_, V> {
         self.offsets[self.m] = self.sparse.len() as u32;
     }
 
-    /// Visit tokens sharing a prefix and compare two evolving KMP states.
-    /// `kmp_j` starts from the current entry state; `kmp_0` starts from zero.
-    /// Equal states need no exception and stop traversal of that subtree.
+    /// Records the exceptions among the tokens `tr`, which share their first `depth`
+    /// bytes. Those bytes lead to `kmp_j` from the current state and to `kmp_0` from
+    /// state 0. Once the two agree, the whole subtree agrees and is skipped.
     fn traverse(&mut self, tr: TokenRange, depth: usize, kmp_j: State, kmp_0: State) {
         if kmp_j == kmp_0 || tr.is_empty() {
             return;

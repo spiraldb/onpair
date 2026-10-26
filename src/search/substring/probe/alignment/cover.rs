@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Token IDs selected as probes for substring scanning.
+//! The filter of a cut, as a `ProbeCover`: the tokens a scan searches for.
 //!
-//! Selected graph edges contribute single IDs, ranges, or explicit sets.
-//! Normalization combines them into sorted points and inclusive ranges,
-//! merging overlaps and adjacent IDs without changing the covered tokens.
+//! Cut edges contribute single tokens, ranges and lists. Normalization merges them
+//! into sorted, disjoint points and inclusive ranges, without changing the covered
+//! set.
 
 use super::graph::{Edge, EdgeKind};
 use crate::core::types::{Token, TokenRange};
 use crate::search::index::TokenFrequencyIndexView;
 
-/// Token IDs that the scanner searches for.
+/// The filter of a [`ContainsScan`](crate::search::ContainsScan): the tokens it
+/// searches for, taken from a cut of the pattern's alignment graph.
 ///
-/// The planner chooses a cover that intersects every source-to-sink path
-/// in the alignment graph. Every matching row must therefore contain a
-/// covered token, but a probe hit still needs verification.
+/// Every row that contains the pattern contains at least one covered token, so rows
+/// without one are skipped. Rows with a hit are only candidates: the scan verifies
+/// each hit.
 #[derive(Debug, Clone)]
 pub struct ProbeCover {
     /// Individual token IDs.
@@ -25,12 +26,13 @@ pub struct ProbeCover {
 }
 
 impl ProbeCover {
-    /// Token IDs tested for equality.
+    /// Individual covered token IDs, in ascending order.
     pub fn points(&self) -> &[Token] {
         &self.points
     }
 
-    /// Inclusive ranges of token IDs.
+    /// Inclusive ranges of covered token IDs, in ascending order and disjoint from
+    /// the points.
     pub fn ranges(&self) -> &[TokenRange] {
         &self.ranges
     }
@@ -40,7 +42,7 @@ impl ProbeCover {
         self.points.len()
     }
 
-    /// Number of range probes, regardless of how many token IDs each covers.
+    /// Number of range probes, however many token IDs each covers.
     pub fn n_ranges(&self) -> usize {
         self.ranges.len()
     }
@@ -51,8 +53,8 @@ impl ProbeCover {
         self.points.is_empty() && self.ranges.is_empty()
     }
 
-    /// Sum the indexed occurrences of covered token IDs.
-    /// Disjoint points and ranges ensure each occurrence is counted once.
+    /// Occurrences of covered tokens in the indexed stream. Points and ranges are
+    /// disjoint, so each occurrence counts once.
     pub(in crate::search::substring::probe) fn frequency(
         &self,
         frequencies: TokenFrequencyIndexView<'_>,
@@ -70,11 +72,9 @@ impl ProbeCover {
         points + ranges
     }
 
-    /// Normalize inclusive ranges into points and ranges.
-    ///
-    /// Input may be unsorted and contain duplicates. Overlapping and adjacent
-    /// ranges are merged; ranges containing one ID become points.
-    /// For example, `[10, 20]` and `[15, 30]` become `[10, 30]`.
+    /// Normalizes inclusive ranges, given in any order and possibly overlapping.
+    /// Overlapping and adjacent ranges merge, so `[10, 20]` and `[15, 30]` become
+    /// `[10, 30]`; single-ID ranges become points.
     pub(in crate::search::substring::probe) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
         runs.sort_unstable_by_key(|run| run.begin);
         let mut merged: Vec<TokenRange> = Vec::with_capacity(runs.len());
@@ -92,10 +92,8 @@ impl ProbeCover {
         Self { points, ranges }
     }
 
-    /// Build a normalized cover from selected graph edges.
-    ///
-    /// Requires a cut that intersects every source-to-sink path and contains
-    /// no unenumerated sets. The cut solver establishes these conditions.
+    /// Builds the cover of a cut. The cover is only sound if the cut crosses every
+    /// source-to-sink path, as the cut solver guarantees.
     pub(in crate::search::substring::probe) fn from_edge_cut<'a>(
         cut: impl ExactSizeIterator<Item = &'a Edge>,
     ) -> Self {
@@ -109,7 +107,7 @@ impl ProbeCover {
                 EdgeKind::Single(id) => runs.push(point(*id)),
                 EdgeKind::Range(range) => runs.push(*range),
                 EdgeKind::Set(ids) => runs.extend(ids.iter().map(|&id| point(id))),
-                // Unenumerated sets have no IDs to collect and cannot be cut.
+                // Never cut: there are no listed tokens to probe.
                 EdgeKind::UnenumeratedSet => {}
             }
         }

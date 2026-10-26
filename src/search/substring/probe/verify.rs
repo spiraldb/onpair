@@ -1,24 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Confirm a substring occurrence around a candidate token hit.
+//! Hit verification: does a full occurrence of the needle pass through this code?
 //!
-//! Preparation compiles the alignment graph into per-offset continuation
-//! checks and a token-to-edges lookup. A hit token can belong to several edges;
-//! verification tries each role, walking the graph forward over the remaining
-//! codes and backward over the preceding codes within the same row. Tokens with a source-to-sink
-//! role already prove a match and are accepted before looking up their roles.
-//! Other role lists are traversed lazily and stop as soon as a trial succeeds.
+//! A hit token can take several roles, i.e. be on several edges of the alignment
+//! graph. For each role `from -> to`, the verifier walks the row in both directions:
 //!
-//! Forward checks follow greedy steps until a terminal range finishes the
-//! needle. Backward checks use the preceding token's single edge when possible;
-//! tokens with several roles use their length to locate the only possible
-//! predecessor, then check its expected token. Initial overlaps compare the
-//! token suffix with a short needle prefix when no explicit edge is used.
-//! The row must use the same greedy tokenization represented by the graph.
+//! * forward from `to`, matching each next code against the node's greedy edge,
+//!   until a code on the node's range edge completes the needle;
+//! * backward from `from`, matching each previous code against the edge entering
+//!   the node, until it reaches the source or a token whose suffix starts the needle.
 //!
-//! Each trial follows a path without branching, but different roles and hits
-//! can revisit codes. This is an anchored verifier, not a streaming KMP scan.
+//! Greedy tokenization leaves each walk a single path, and walks stop at the row
+//! boundaries. The hit is confirmed as soon as one role succeeds in both directions.
+//! A token that contains the whole needle is accepted without walking.
+//!
+//! Highly repetitive needles are the slow case: a token such as a run of one byte
+//! can take a role at almost every offset, and each hit may try all of them.
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{Token, TokenRange};
@@ -27,19 +25,20 @@ use crate::search::substring::probe::alignment::graph::{AlignmentGraph, EdgeKind
 /// Needle offset before any bytes have matched.
 const SOURCE: u16 = 0;
 
-/// Continuation checks at one needle offset in the compiled graph.
+/// The edges leaving one needle offset.
 #[derive(Debug, Clone, Default)]
 struct Node {
-    /// Token and destination for the next interior step, if one exists.
+    /// The greedy edge: its token and target offset.
     greedy_step: Option<(Token, u16)>,
-    /// Tokens that finish the needle from this offset.
+    /// The range edge: the tokens that finish the needle from this offset.
     terminal_range: Option<TokenRange>,
-    /// Needle prefix for an unenumerated source edge ending here.
-    /// A preceding token can start the match if its suffix equals this prefix.
+    /// For an unenumerated alignment edge into this offset, the needle prefix that a
+    /// preceding token must end with.
     entry: Option<NeedlePrefix>,
 }
 
-/// A short needle prefix packed for a fixed-width token-suffix comparison.
+/// A needle prefix of at most 16 bytes, packed to compare with a token suffix in
+/// one 128-bit operation.
 #[derive(Debug, Clone, Copy)]
 struct NeedlePrefix {
     len: usize,
@@ -59,8 +58,7 @@ impl NeedlePrefix {
         }
     }
 
-    /// Compare this prefix with the last bytes of a valid dictionary token.
-    /// A short token fails before the padded 16-byte dictionary read.
+    /// Whether `token`, a valid token ID, ends with this prefix.
     #[inline]
     fn is_tail_of(&self, dict: CompactDictionaryView<'_>, token: Token) -> bool {
         let token_len = dict.token_len(token);
@@ -74,40 +72,41 @@ impl NeedlePrefix {
     }
 }
 
-/// Needle offsets immediately before and after a token step, stored as `u16`.
+/// The endpoints of a graph edge: one role of a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Edge {
     from: u16,
     to: u16,
 }
 
-/// Enumerated graph edges indexed by token ID.
-/// The dense array stores one edge, `NONE`, or `LISTED`. Tokens with several
-/// roles keep their edges in a list sorted by token ID. Real edges advance the
-/// needle offset, so equal-endpoint sentinels cannot collide with them.
+/// The roles of each token: the graph edges that list it.
+///
+/// A dense array holds, per token, its only role, `NONE`, or `LISTED`. The roles of
+/// a `LISTED` token are in a separate list sorted by token. Real edges have
+/// `from < to`, so the sentinels cannot be mistaken for them.
 #[derive(Debug, Clone, Default)]
 struct EdgesByToken {
-    /// Token ID represented by index zero of the dense array.
+    /// The token at index zero of the dense arrays.
     first_token: Token,
-    /// One edge or sentinel per ID between the first and last indexed token.
+    /// One role or sentinel per token from `first_token` to the last token with a role.
     edge_of_token: Vec<Edge>,
-    /// Tokens containing the whole needle; allocated only if at least one exists.
+    /// Whether each token contains the whole needle; empty if none does.
     complete: Vec<bool>,
-    /// Grouped by token ID, with complete matches before partial roles.
+    /// Roles of `LISTED` tokens, grouped by token, a complete match first.
     edges_of_tokens: Vec<(Token, Edge)>,
 }
 
-/// Dense-array sentinel for a token with no enumerated graph edge.
+/// Sentinel for a token with no role.
 const NONE: Edge = Edge { from: 0, to: 0 };
 
-/// Dense-array sentinel for a token whose edges are in the separate list.
+/// Sentinel for a token whose roles are in `edges_of_tokens`.
 const LISTED: Edge = Edge {
     from: u16::MAX,
     to: u16::MAX,
 };
 
 impl EdgesByToken {
-    /// Deduplicate roles, placing complete matches first within each token group.
+    /// Indexes `token_edges`, deduplicated. `sink` identifies complete matches.
     fn new(mut token_edges: Vec<(Token, Edge)>, sink: u16) -> Self {
         let complete = Edge {
             from: SOURCE,
@@ -148,14 +147,14 @@ impl EdgesByToken {
         edges
     }
 
-    /// A source-to-sink role proves a match without inspecting neighboring codes.
+    /// Whether `token` contains the whole needle, which needs no walk to confirm.
     #[inline]
     fn contains_whole_needle(&self, token: Token) -> bool {
         let at = usize::from(token.wrapping_sub(self.first_token));
         self.complete.get(at).copied().unwrap_or(false)
     }
 
-    /// Visit this token's roles lazily, starting with a complete match if present.
+    /// The roles of `token`, lazily, a complete match first.
     #[inline]
     fn of(&self, token: Token) -> impl Iterator<Item = Edge> + '_ {
         let at = usize::from(token.wrapping_sub(self.first_token));
@@ -176,23 +175,22 @@ impl EdgesByToken {
     }
 }
 
-/// Immutable verification tables compiled from an alignment graph.
-/// The empty default is used for empty patterns and is never executed.
+/// An alignment graph compiled for hit verification.
+/// The default, empty verifier stands in for empty patterns and is never called.
 #[derive(Debug, Clone, Default)]
 pub(in crate::search::substring::probe) struct HitVerifier {
-    /// Forward transitions and unenumerated starts, indexed by needle offset.
+    /// Outgoing edges, by needle offset.
     nodes: Vec<Node>,
-    /// Roles to try for a candidate token and predecessor edges for backward checks.
+    /// The roles of each token: the edges to try for a hit, and the edges to follow
+    /// when walking backward.
     edges: EdgesByToken,
-    /// Partial source overlaps, indexed by matched prefix length (at most 15).
-    /// Multi-role backward steps use these instead of searching their edge lists.
+    /// The needle prefix of each partial alignment edge, by length (at most 15).
+    /// Backward walks use it to check an overlap without searching a role list.
     overlaps: Vec<Option<NeedlePrefix>>,
 }
 
 impl HitVerifier {
-    /// Compile the graph for the same nonempty needle used to build it.
-    /// Enumerated ranges and sets are expanded into token-edge pairs;
-    /// unenumerated starts retain a prefix check.
+    /// Compiles `graph`, which must have been built for `needle`, nonempty.
     pub(in crate::search::substring::probe) fn from_graph(
         graph: &AlignmentGraph,
         needle: &[u8],
@@ -215,8 +213,9 @@ impl HitVerifier {
                     token_edges
                         .extend((range.begin..=range.last).map(|token| (token, compiled_edge)));
                 }
-                // Enumerated entries cover both partial and whole matches.
-                // Retain partial prefixes for multi-role backward steps too.
+                // An alignment edge: partial (an overlap), or complete for tokens
+                // that contain the needle. Keep the prefix of a partial one for
+                // backward walks.
                 EdgeKind::Set(ids) => {
                     if from == SOURCE && to != graph.sink() {
                         overlaps[to as usize] = Some(NeedlePrefix::new(&needle[..to as usize]));
@@ -224,8 +223,7 @@ impl HitVerifier {
                     token_edges.extend(ids.iter().map(|&token| (token, compiled_edge)));
                 }
                 EdgeKind::UnenumeratedSet => {
-                    // Unenumerated entry edges run from the source to an
-                    // alignment inside the first token, at most 15 bytes in.
+                    // Always a partial alignment edge, so `to` is at most 15.
                     nodes[to as usize].entry = Some(NeedlePrefix::new(&needle[..to as usize]));
                     overlaps[to as usize] = nodes[to as usize].entry;
                 }
@@ -239,15 +237,16 @@ impl HitVerifier {
         }
     }
 
-    /// Needle offset reached when the complete pattern has matched.
+    /// The offset after the whole needle.
     fn sink(&self) -> u16 {
         (self.nodes.len() - 1) as u16
     }
 
-    /// Whether a complete occurrence passes through this hit in this row.
-    /// Try each edge associated with the hit token. Callers supply valid row
-    /// bounds, a hit inside them, and codes greedily encoded with the prepared
-    /// dictionary. Both directions must succeed for the same edge.
+    /// Whether an occurrence of the needle within `codes[row_start..row_end]` covers
+    /// the code at `hit_code_index`.
+    ///
+    /// The row must lie within `codes` and contain the hit, and be greedily
+    /// tokenized with the dictionary the graph was built for.
     #[inline]
     pub(in crate::search::substring::probe) fn check(
         &self,
@@ -271,8 +270,8 @@ impl HitVerifier {
         false
     }
 
-    /// Follow greedy transitions through following row codes until a terminal match.
-    /// Failure or the row boundary ends the trial.
+    /// Walks forward from `node`, starting at `code_index`, until a range-edge token
+    /// finishes the needle. Fails on a mismatch or at `row_end`.
     fn forward(
         &self,
         mut node: u16,
@@ -297,8 +296,9 @@ impl HitVerifier {
         false
     }
 
-    /// Follow preceding row codes back to the source or a matching token suffix.
-    /// The search never reads before `row_start`.
+    /// Walks backward from `node` over the codes before `code_end`, until the source
+    /// or a token that ends with the needle prefix. Fails on a mismatch or at
+    /// `row_start`.
     fn backward(
         &self,
         mut node: u16,
@@ -307,10 +307,10 @@ impl HitVerifier {
         row_start: usize,
         dict: CompactDictionaryView<'_>,
     ) -> bool {
-        // For a given token and interior offset, there is at most one incoming
-        // edge: a greedy step starts at offset minus token length, while a
-        // source overlap requires a token longer than that offset. Terminal
-        // edges enter the sink, which this backward traversal never starts at.
+        // For a given token and internal offset, there is at most one incoming
+        // edge: a greedy edge starts at the offset minus the token length, while an
+        // alignment edge requires a token longer than the offset. Range edges
+        // enter the sink, where backward walks never start.
         while node != SOURCE {
             if code_end <= row_start {
                 return false;
@@ -337,7 +337,7 @@ impl HitVerifier {
             } else if edge != NONE && edge.to == node {
                 node = edge.from;
             } else {
-                // An unenumerated source edge may still match this token's suffix.
+                // An unenumerated alignment edge may still match this token's suffix.
                 return self.nodes[node as usize]
                     .entry
                     .as_ref()
@@ -498,7 +498,7 @@ pub(in crate::search::substring::probe) mod tests {
         );
     }
 
-    /// `aba` is both an interior step and an enumerated initial overlap.
+    /// `aba` is both a greedy edge and an enumerated alignment edge.
     /// In `ababaqabaz`, its final `a` starts the occurrence at needle offset 1.
     #[test]
     fn backward_checks_multi_role_initial_overlap() {
@@ -550,7 +550,7 @@ pub(in crate::search::substring::probe) mod tests {
         );
     }
 
-    /// `ab` is a point step out of the source and the terminal range out of
+    /// `ab` is the greedy edge out of the source and on the range edge out of
     /// node 2, so each hit tries both roles; only one of them confirms.
     #[test]
     fn a_token_on_two_edges() {

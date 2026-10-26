@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Scalar cover membership through a table indexed by token ID.
+//! Scalar membership through a lookup table with one byte per possible code.
 //!
-//! The table has one byte for each of the 65,536 possible `u16` codes. Points
-//! and ranges set their entries during setup; scanning reads one entry per
-//! code and packs the results into mask bits. This kernel accepts every cover
-//! shape and requires no vector instruction set.
+//! The portable fallback: it supports every cover and needs no vector instructions.
 
 use super::{Block, Mask, Matcher};
 use crate::search::substring::ProbeCover;
 
-/// Membership table prepared once and reused across scan blocks.
+/// The membership table of one cover.
 pub(in crate::search::substring::probe::scan) struct Table {
     /// 0xFF for covered IDs and zero otherwise; packing extracts the low bit.
     admits: Vec<u8>,

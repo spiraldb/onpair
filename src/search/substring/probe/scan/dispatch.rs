@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Connect a prepared matcher and packing policy to their concrete implementation.
+//! Instantiate the planned kernel, so the block loop runs on concrete types.
 //!
-//! Dispatch derives nibble batches from the cover and resolves them, together
-//! with the packing policy, once before scanning, so the block loop runs with
-//! concrete type and const parameters.
+//! The matcher kind, the packing policy and the number of nibble batches are
+//! resolved once per scan into type and const parameters.
 //!
-//! AArch64 uses NEON. On x86, this build contains AVX2 kernels unless `avx512bw`
-//! is enabled at compile time, in which case it contains the AVX-512 versions.
-//! Runtime detection enables the compiled family when supported; otherwise
-//! selection uses the scalar table. Other architectures use the table too.
+//! AArch64 always has NEON. An x86 build contains the AVX2 kernels, or the AVX-512
+//! ones if `avx512bw` is enabled at compile time, and falls back to the table when
+//! the CPU lacks them. Other targets only have the table.
 
 use super::matcher;
 use super::{Isa, MatcherKind, ScanInput, both_stages};
@@ -19,7 +17,8 @@ use super::{PER_BATCH, matcher::Matcher};
 
 use crate::core::offset::Offset;
 
-/// Select whether empty groups skip mask packing: `S` enables it, `P` disables it.
+/// Runs `S`, the variant that skips packing empty groups, or `P`, the one that
+/// always packs.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn with_skip<O: Offset, S: Matcher, P: Matcher>(
     skip_empty_packing: bool,
@@ -33,10 +32,9 @@ fn with_skip<O: Offset, S: Matcher, P: Matcher>(
     }
 }
 
-/// Execute the prepared matcher and append the rows the input's hit verifier accepts.
-/// `skip_empty_packing` applies to vector matchers. Preparation must supply a
-/// matcher eligible for the cover and the current CPU; this function does not
-/// repeat those checks.
+/// Scans `input` with the `kind` kernel and appends the verified rows to `out`.
+/// `kind` must be eligible for the cover on this CPU, as planning ensures; this is
+/// not checked again.
 pub(in crate::search::substring::probe) fn run<O: Offset>(
     kind: MatcherKind,
     skip_empty_packing: bool,
@@ -84,8 +82,7 @@ pub(in crate::search::substring::probe) fn run<O: Offset>(
     }
 }
 
-/// Return the compiled kernel family supported by this CPU, or the scalar fallback.
-/// AVX-512 requires compile-time enablement as well as runtime CPU support.
+/// The compiled kernel family if this CPU supports it, otherwise `Isa::Scalar`.
 pub(in crate::search::substring::probe) fn detect_isa() -> Isa {
     #[cfg(target_arch = "aarch64")]
     let isa = Isa::Neon;

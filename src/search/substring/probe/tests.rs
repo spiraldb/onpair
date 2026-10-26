@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Scan contracts, alignment regressions, and planning invariants.
-//! Matcher, resolver, hit verifier and min-cut algorithms have their own unit tests.
+//! End-to-end tests of substring search against byte-level containment, plus graph
+//! and planning invariants. Matchers, the resolver, the hit verifier and the cut
+//! solver have their own unit tests.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};

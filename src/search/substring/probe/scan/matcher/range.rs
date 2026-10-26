@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Vector membership checks for inclusive ranges of token IDs.
+//! Vector membership tests for inclusive ranges of token IDs.
 //!
-//! For a valid range `[begin, last]`, unsigned wrapping subtraction turns
-//! membership into `code.wrapping_sub(begin) <= last - begin`. Values below
-//! `begin` wrap above the permitted width and are rejected.
+//! A code is in `[begin, last]` iff `code.wrapping_sub(begin) <= last - begin`:
+//! codes below `begin` wrap around to large values, so one unsigned comparison
+//! suffices.
 //!
-//! EqOr uses `mask` for covers containing only ranges. Equality and nibble matchers
-//! reuse `check_ranges` to add range hits to their point results. All paths
-//! produce the same exact membership mask.
+//! `check_ranges` adds range hits to the point hits of `eq_or` and `nibble_n8`;
+//! `mask` handles covers with ranges only.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;

@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Execute a prepared cover and append exact matching rows.
+//! Scan execution: find the hits block by block and append the verified rows.
 //!
-//! The caller supplies the prepared matcher, its mask-packing policy and the scan
-//! input: the encoded region plus the prepared cover and hit verifier. The matcher turns
-//! blocks of token codes into bit masks; the resolver maps set bits to rows and
-//! verifies each candidate occurrence with the hit verifier. A row is appended on its
-//! first verified hit, then its later hits are skipped.
+//! The codes are processed in blocks of `BLOCK`. For each block, the matcher writes
+//! a bitmask with one bit per code, set if the code is in the filter. The resolver
+//! maps each set bit to its row and runs the hit verifier. A row is appended on its
+//! first verified hit, and its remaining hits are skipped.
 //!
-//! `dispatch` connects the matcher and packing policy to a concrete implementation.
-//! `matcher` owns token membership checks; `resolver` owns row lookup and duplicate
-//! suppression. This module defines the instruction sets and matchers; `plan`
-//! selects the matcher during preparation and the packing policy for each scan.
-//! Empty patterns and covers are handled by `ContainsScan::scan`, before this module.
+//! `matcher` holds the membership kernels, `resolver` the row lookup, and `dispatch`
+//! instantiates the kernel chosen by `plan`.
 
 mod dispatch;
 mod matcher;
@@ -29,27 +25,30 @@ use matcher::Matcher;
 pub(super) use matcher::PER_BATCH;
 use resolver::Resolver;
 
-/// Instruction-set family used for kernel selection and ranking weights.
-/// Production callers use the family returned by `detect_isa`;
-/// planning tests can supply any family without executing its kernels.
+/// The vector instruction set the kernels and cost weights are chosen for.
+/// Scans use `detect_isa`; planning tests may pass any value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // Some variants are only constructed on other build targets.
 pub(super) enum Isa {
+    /// No vector kernels: only the table matcher is available.
     Scalar,
     Neon,
     Avx2,
     Avx512Bw,
 }
 
-/// Algorithm used to test token membership in the probe cover.
+/// The kernel that tests codes for membership in the filter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MatcherKind {
+    /// Scalar lookup table; supports any cover and any target.
     Table,
+    /// One vector equality per point, plus range checks.
     EqOr,
+    /// Nibble shuffle tables, eight points per batch, plus range checks.
     NibbleN8,
 }
 
-/// Token codes processed in one matcher block.
+/// Number of codes per matcher block.
 pub(super) const BLOCK: usize = 4096;
 
 /// Everything one scan borrows: the encoded region and the prepared query.
@@ -86,9 +85,8 @@ type Block = [Token; BLOCK];
 /// One bit per code in a block; bit `i` describes code `i`.
 type Mask = [u64; BLOCK / 64];
 
-/// Match blocks, verify candidate hits, and append each matching row once.
-/// Matcher setup, mask storage, and resolver state are reused across blocks.
-/// Appended indices are ascending; existing output contents are preserved.
+/// Runs the matcher over every block and appends each verified row once, in
+/// ascending order.
 fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usize>) {
     let matcher = M::new(input.cover);
     let mut resolver = Resolver::new(input);
@@ -106,9 +104,9 @@ fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usi
     );
 }
 
-/// Visit the codes from `first` in full blocks, and copy the final partial block
-/// into zero padding. The callback receives the block, its absolute start, and its
-/// valid code count. It must discard mask bits beyond that count before resolving rows.
+/// Calls `step` on each block of codes from `first`, with the block's absolute start
+/// and its number of valid codes. The last partial block is zero-padded, so `step`
+/// must discard mask bits past the valid count.
 fn blocks(codes: &[Token], first: usize, step: &mut dyn FnMut(&Block, usize, usize)) {
     let (whole, rest) = codes[first..].as_chunks::<BLOCK>();
     let mut at = first;
@@ -123,7 +121,7 @@ fn blocks(codes: &[Token], first: usize, step: &mut dyn FnMut(&Block, usize, usi
     }
 }
 
-/// Clear mask bits at or beyond the valid code count, excluding padded tokens.
+/// Clears the mask bits of padding codes, at index `valid` and beyond.
 fn clear_from(bits: &mut Mask, valid: usize) {
     if valid < BLOCK {
         bits[valid / 64] &= (1u64 << (valid % 64)) - 1;

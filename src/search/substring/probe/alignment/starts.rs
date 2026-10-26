@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Matches beginning inside dictionary tokens.
+//! The tokens an occurrence can begin inside: the alignment edges of the graph.
 //!
-//! A token can overlap the needle's beginning or contain the whole needle.
-//! Matches beginning at a token boundary are handled by the alignment graph.
+//! Such a token either ends with a needle prefix of `k` bytes, an *overlap* giving
+//! the alignment edge `0 -> k`, or contains the whole needle. One pass over the
+//! dictionary's concatenated token bytes finds both.
+//!
+//! Overlap lists are capped, more tightly for one-byte overlaps, which are common.
+//! Past the cap only the overlap's existence is kept: the edge becomes unenumerated,
+//! and the verifier compares token suffixes instead.
 
 use memchr::memmem::Finder;
 
@@ -12,29 +17,28 @@ use super::graph::EdgeKind;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 
-/// Maximum number of token IDs retained for one overlap.
+/// Maximum number of tokens listed for one overlap.
 pub(in crate::search::substring::probe) const MAX_ENUMERATED_TOKENS: usize = 512;
 
-/// One-byte overlaps use a smaller limit because they are often common.
+/// Maximum number of tokens listed for a one-byte overlap.
 const MAX_SINGLE_BYTE_TOKENS: usize = 16;
 
-/// The overlap exists, but its token IDs are not retained as a complete set.
+/// Count marking an overlap whose tokens exceeded the cap.
 const UNENUMERATED: usize = MAX_ENUMERATED_TOKENS + 1;
 
-/// Possible starts of a match inside a dictionary token.
+/// The tokens an occurrence of one needle can begin inside.
 pub(super) struct MatchStarts {
-    /// For overlap length `k`, the set size or `UNENUMERATED`.
+    /// For each overlap length, the number of listed tokens or `UNENUMERATED`.
     counts: [usize; MAX_TOKEN_SIZE],
-    /// Token IDs grouped by overlap length.
+    /// Listed tokens, by overlap length.
     ids: [[Token; MAX_ENUMERATED_TOKENS]; MAX_TOKEN_SIZE],
-    /// Tokens containing the whole needle but not starting with it,
-    /// in token-ID order. Tokens starting with the needle are already
-    /// covered by the graph's source-to-sink range edge.
+    /// Tokens that contain the whole needle but do not start with it, in ID order.
+    /// Tokens starting with the needle are on the range edge from the source instead.
     pub(super) contained: Vec<Token>,
 }
 
 impl MatchStarts {
-    /// Collect match starts for a nonempty needle.
+    /// Finds the match starts of a nonempty needle.
     #[inline]
     pub(super) fn new(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Self {
         let mut starts = Self {
@@ -51,8 +55,7 @@ impl MatchStarts {
         starts
     }
 
-    /// Materialize the source-edge kind for an overlap of `length` bytes.
-    /// Returns `None` when no such token exists; oversized sets stay unenumerated.
+    /// The alignment edge for an overlap of `length` bytes, or `None` if no token has one.
     pub(super) fn overlap(&self, length: usize) -> Option<EdgeKind> {
         let &count = self.counts.get(length)?;
         if count == 0 {
@@ -64,7 +67,7 @@ impl MatchStarts {
         }
     }
 
-    /// Record a token, marking the set unenumerated if it exceeds its limit.
+    /// Lists a token, or marks the overlap unenumerated once it exceeds `limit`.
     fn record_overlap(&mut self, overlap_len: usize, token: Token, limit: usize) {
         let count = &mut self.counts[overlap_len];
         if *count < limit {
@@ -75,13 +78,13 @@ impl MatchStarts {
         }
     }
 
-    /// Whether the overlap must be verified without an explicit token set.
+    /// Whether the overlap exceeded its cap.
     fn is_unenumerated(&self, overlap_len: usize) -> bool {
         self.counts[overlap_len] == UNENUMERATED
     }
 
-    /// Find tokens ending with the needle's first byte.
-    /// A one-byte token begins at a token boundary, so it is excluded.
+    /// Lists tokens ending with the needle's first byte. One-byte tokens are skipped:
+    /// an occurrence starting with one begins at a token boundary.
     fn collect_single_byte_overlaps(&mut self, payload: &[u8], offsets: &[u32], byte: u8) {
         for (token_id, bounds) in offsets.windows(2).enumerate() {
             let start = bounds[0] as usize;
@@ -95,8 +98,8 @@ impl MatchStarts {
         }
     }
 
-    /// Find larger overlaps and whole matches in one payload sweep.
-    /// Search for two needle bytes, or one when the needle itself is one byte.
+    /// Finds longer overlaps and contained needles in one pass over the payload,
+    /// searching for the needle's first two bytes (or its only byte).
     fn scan_payload(&mut self, payload: &[u8], offsets: &[u32], needle: &[u8]) {
         let prefix_len = needle.len().min(2);
         let finder = Finder::new(&needle[..prefix_len]);
@@ -212,7 +215,7 @@ pub(in crate::search::substring::probe) mod tests {
         let mut tokens: Vec<_> = (0..=MAX_ENUMERATED_TOKENS)
             .map(|i| [vec![128 + (i / 256) as u8, i as u8], b"ababa".to_vec()].concat())
             .collect();
-        // A token starting with the needle is covered by the terminal range,
+        // A token starting with the needle is covered by the range edge,
         // even when it contains another occurrence later.
         tokens.push(b"ababa".to_vec());
         let dict = dictionary(tokens);

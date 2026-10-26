@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Token alignments for one needle and dictionary.
+//! The alignment graph: every way a needle can be encoded in a greedily tokenized row.
 //!
-//! Nodes are byte offsets into the needle, from source 0 to sink `needle.len()`.
-//! Each edge consumes one token; its kind describes which token IDs it accepts.
-//! An occurrence in a greedily tokenized row follows a source-to-sink path.
+//! Nodes are needle offsets, from the source `0` to the sink `n = needle.len()`. An
+//! edge `from -> to` is a token covering `needle[from..to]`. There are three kinds:
 //!
-//! The planner cuts every path to choose scan probes. The verifier compiles
-//! the same graph to check matches around a probe hit.
+//! * **Alignment edges** `0 -> k` (`Set`, `UnenumeratedSet`): tokens an occurrence
+//!   begins inside, which end with `needle[..k]`, or contain the whole needle if
+//!   `k = n`.
+//! * **Greedy edges** (`Single`): the longest token that prefixes `needle[from..]`
+//!   and ends before the sink. Greedy tokenization lets no other token end inside
+//!   the needle there, so each node has at most one.
+//! * **Range edges** `from -> n` (`Range`): the tokens that start with
+//!   `needle[from..]`, and so finish the needle. They are contiguous in the sorted
+//!   dictionary.
+//!
+//! Every occurrence in a row is a source-to-sink path. The planner cuts all paths
+//! to choose the filter, and the verifier walks the same graph to confirm a hit.
 
 use super::starts::MatchStarts;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -18,21 +27,22 @@ use crate::search::index::TokenFrequencyIndexView;
 use crate::search::lookup::narrow;
 use crate::search::substring::ContainsError;
 
-/// How the tokens accepted by an edge are represented.
+/// The tokens an edge accepts.
 #[derive(Clone, Debug)]
 pub(in crate::search::substring::probe) enum EdgeKind {
-    /// One token ID.
+    /// One token: a greedy edge.
     Single(Token),
-    /// A contiguous range of token IDs.
+    /// A contiguous range of tokens: a range edge.
     Range(TokenRange),
-    /// An explicit set of token IDs.
+    /// An explicit list of tokens: an alignment edge.
     Set(Box<[Token]>),
-    /// Tokens whose suffix matches `needle[..edge.to]`, without enumerating
-    /// their IDs. Only used for partial source edges; a cut cannot select them.
+    /// An alignment edge with too many tokens to list: those ending with
+    /// `needle[..edge.to]`. Its tokens cannot be in a filter, so a cut never
+    /// selects it.
     UnenumeratedSet,
 }
 
-/// A token step between two needle offsets.
+/// A token step from one needle offset to a later one.
 #[derive(Clone, Debug)]
 pub(in crate::search::substring::probe) struct Edge {
     /// Needle offset before this token.
@@ -40,12 +50,13 @@ pub(in crate::search::substring::probe) struct Edge {
     /// Needle offset reached after this token.
     pub(in crate::search::substring::probe) to: u16,
     kind: EdgeKind,
-    /// Indexed frequency of the accepted tokens; zero for unenumerated sets.
+    /// Occurrences of the accepted tokens in the indexed stream; zero for
+    /// unenumerated sets.
     frequency: u32,
 }
 
 impl Edge {
-    /// Whether the edge's tokens can be selected as scan probes.
+    /// Whether the edge's tokens are listed, and so can be in a filter.
     pub(in crate::search::substring::probe) fn cuttable(&self) -> bool {
         !matches!(self.kind, EdgeKind::UnenumeratedSet)
     }
@@ -55,12 +66,12 @@ impl Edge {
         &self.kind
     }
 
-    /// Indexed frequency of the accepted tokens.
+    /// Occurrences of the accepted tokens in the indexed stream.
     pub(in crate::search::substring::probe) fn frequency(&self) -> u32 {
         self.frequency
     }
 
-    /// Number of point probes before cover normalization.
+    /// Number of point probes this edge adds to a cover, before normalization.
     pub(in crate::search::substring::probe) fn point_count(&self) -> usize {
         match &self.kind {
             EdgeKind::Single(_) => 1,
@@ -69,32 +80,35 @@ impl Edge {
         }
     }
 
-    /// Number of range probes before cover normalization.
+    /// Number of range probes this edge adds to a cover, before normalization.
     pub(in crate::search::substring::probe) fn range_count(&self) -> usize {
         usize::from(matches!(self.kind, EdgeKind::Range(_)))
     }
 }
 
-/// Possible token alignments, stored as a flat edge list.
+/// The alignment graph of one needle, as a flat edge list.
 ///
-/// A needle of `n` bytes has `n + 1` logical nodes and at most
-/// `2n + MAX_TOKEN_SIZE` edges. Explicit token lists have separate storage.
-/// Edges advance to larger offsets. Each internal node has at most one internal
-/// successor, plus a possible terminal range to the sink. Removing the source
-/// and sink therefore leaves a forest, which the cut solver relies on.
+/// A needle of `n` bytes has `n + 1` nodes and at most `2n + MAX_TOKEN_SIZE` edges.
+/// Each internal node has at most one greedy edge, so removing the source
+/// and sink leaves a forest. The cut solver relies on this.
 pub(in crate::search::substring::probe) struct AlignmentGraph {
-    /// Parse steps in construction order, also used to order selected cut edges.
+    /// Edges in construction order, which is also the order of cut output.
     pub(in crate::search::substring::probe) edges: Vec<Edge>,
-    /// Offset after the whole needle has matched.
+    /// The offset after the whole needle.
     sink: u16,
 }
 
 impl AlignmentGraph {
-    /// Build the graph and attach indexed token frequencies.
+    /// Builds the graph of `needle` and weights each edge by `frequencies`.
     ///
-    /// Requires a nonempty needle whose offsets fit the edges' `u16` node IDs, a
-    /// conformant dictionary, and an index using that dictionary's token IDs.
-    /// Query preparation checks the needle length and index size.
+    /// The caller checks that the needle is nonempty and at most
+    /// `ContainsScan::MAX_PATTERN_LEN` bytes, that the dictionary is conformant,
+    /// and that `frequencies` is indexed by its token IDs.
+    ///
+    /// # Errors
+    /// Returns [`ContainsError::InvalidData`] with
+    /// [`InvalidColumn::IncompleteAlphabet`] if no token prefixes some suffix of the
+    /// needle.
     pub(in crate::search::substring::probe) fn new(
         dict: CompactDictionaryView<'_>,
         needle: &[u8],
@@ -112,7 +126,7 @@ impl AlignmentGraph {
         // Start with matches beginning at a token boundary.
         builder.build_path(0)?;
 
-        // Build each remaining path before its source edge to preserve the
+        // Build each remaining path before its alignment edge to preserve the
         // construction order used by cut output and verification.
         for length in 1..needle.len().min(MAX_TOKEN_SIZE) {
             let Some(kind) = starts.overlap(length) else {
@@ -134,18 +148,18 @@ impl AlignmentGraph {
         })
     }
 
-    /// Logical node count, including offsets no edge reaches.
+    /// Number of nodes, including offsets that no edge reaches.
     pub(in crate::search::substring::probe) fn node_count(&self) -> usize {
         usize::from(self.sink()) + 1
     }
 
-    /// Offset after the whole needle has matched. The source is always 0.
+    /// The offset after the whole needle. The source is always 0.
     pub(in crate::search::substring::probe) fn sink(&self) -> u16 {
         self.sink
     }
 }
 
-/// Temporary state for building each reached needle offset once.
+/// Graph construction state; each reachable offset is built once.
 struct GraphBuilder<'d, 'n, 'f> {
     dict: CompactDictionaryView<'d>,
     needle: &'n [u8],
@@ -156,8 +170,8 @@ struct GraphBuilder<'d, 'n, 'f> {
 }
 
 impl GraphBuilder<'_, '_, '_> {
-    /// Term frequency of the edge's tokens. An explicit set has distinct IDs,
-    /// so its sum cannot exceed the code stream's length.
+    /// Occurrences of the edge's tokens. A set lists distinct tokens, so the sum
+    /// cannot exceed the stream length.
     fn frequency_of(&self, kind: &EdgeKind) -> u32 {
         match kind {
             EdgeKind::Single(id) => self.frequencies.frequency(*id),
@@ -179,8 +193,8 @@ impl GraphBuilder<'_, '_, '_> {
         });
     }
 
-    /// Add the greedy path from `start`, reusing positions already built.
-    /// Iteration keeps call-stack usage independent of needle length.
+    /// Adds the greedy path from `start`, stopping at the first offset already built.
+    /// The loop is iterative, so stack use does not grow with the needle.
     fn build_path(&mut self, start: usize) -> Result<(), ContainsError> {
         let n = self.needle.len();
         let mut offset = start;
@@ -195,8 +209,8 @@ impl GraphBuilder<'_, '_, '_> {
         Ok(())
     }
 
-    /// Add outgoing edges and return the next greedy offset.
-    /// Fails if no dictionary token is a prefix of the remaining needle.
+    /// Adds the edges leaving `offset`, and returns the offset after the longest token
+    /// that prefixes the rest of the needle. Fails if there is no such token.
     fn build_position(&mut self, offset: usize) -> Result<usize, ContainsError> {
         let remaining = &self.needle[offset..];
         let num_tokens = self.dict.num_tokens();
@@ -355,7 +369,7 @@ pub(super) mod tests {
     #[test]
     fn greedy_and_terminal_edges() {
         let dict = dictionary(&[b"app", b"appapple", b"applepie"]);
-        check_position(dict.as_view(), b"apple", 0); // Both a terminal range and a greedy step.
+        check_position(dict.as_view(), b"apple", 0); // Both a range edge and a greedy edge.
         check_position(dict.as_view(), b"appappapple", 0); // Greedy step after narrowing runs out.
         check_position(dict.as_view(), b"app", 0); // Exact token: no duplicate greedy edge.
         check_position(dict.as_view(), b"xxxapple", 3); // Edges use absolute needle offsets.
@@ -375,7 +389,7 @@ pub(super) mod tests {
     fn missing_token_prefix_is_an_error() {
         check_position(dictionary(&[]).as_view(), b"apple", 0);
         let dict = dictionary(&[b"applepie"]);
-        check_position(dict.as_view(), b"apple", 0); // Terminal match but no greedy token.
+        check_position(dict.as_view(), b"apple", 0); // A range edge but no greedy edge.
         check_position(dict.as_view(), b"absent", 0); // Neither kind of match.
     }
 

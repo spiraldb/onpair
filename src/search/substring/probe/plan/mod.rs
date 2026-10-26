@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Choose probe covers and their matchers during preparation, and mask packing per scan.
+//! Planning: choose the cut and its filter, the matcher, and the mask packing per scan.
 //!
-//! Minimum cuts use additive edge weights: frequency plus a penalty for the
-//! number of comparisons. Each sampled cut is normalized and ranked by its
-//! lowest eligible scan cost plus a fixed penalty per covered occurrence.
-//! A single cost profile per instruction set serves both decisions. It combines
-//! matcher work per code with candidate processing per covered occurrence.
-//! Mask packing follows a separate density rule, chosen for each scan.
+//! Every cut of the alignment graph gives a correct filter, so planning only affects
+//! speed. A filter costs matcher work for every scanned code, which grows with its
+//! number of codes, plus verification work for every hit, which grows with their
+//! frequency. A minimum cut can only minimize an additive edge weight, so
+//! `select_cover` samples cuts for the weight `frequency + λ · comparisons` over a
+//! range of `λ`, and ranks the resulting filters with the full cost model in `cost`.
 //!
-//! `scan` defines the instruction sets and matchers. `select` chooses eligible
-//! matchers using the formulas in `cost`, and the packing policy from hit density.
-//! Neither performs CPU detection or scanning.
-//! Frequencies guide these choices but never remove tokens from a cover.
+//! The matcher is chosen once per query, in `select`. Mask packing is chosen per
+//! scan, from the expected hit density.
 
 mod cost;
 mod select;
@@ -27,13 +25,11 @@ use crate::search::index::TokenFrequencyIndexView;
 pub(super) use select::is_eligible;
 pub(super) use select::{cover_cost, select_matcher, skip_empty_packing};
 
-/// Select the sampled cover with the lowest relative cost.
-/// Return the cover and its indexed token occurrence count.
+/// Returns the cheapest sampled cover and its frequency in the indexed stream.
 ///
-/// First evaluate a large comparison penalty, then try lambda = 0, 1, 4, ...
-/// up to the indexed code count. Stop early when a cut matches the first one,
-/// and avoid repricing consecutive identical cuts. This samples alternatives;
-/// it does not enumerate every cut or guarantee the lowest possible cost.
+/// The first cut uses a `λ` above the code count, which minimizes comparisons.
+/// Then `λ = 0, 1, 4, 16, ...` up to the code count, stopping once a cut repeats
+/// the first. This samples the trade-off; it does not guarantee the cheapest cover.
 pub(super) fn select_cover(
     graph: &AlignmentGraph,
     frequencies: TokenFrequencyIndexView<'_>,
@@ -75,13 +71,14 @@ pub(super) fn select_cover(
     (best_cover, best_frequency)
 }
 
-/// Additive cut weight: indexed frequency plus a comparison-count penalty.
-/// This proxy generates cuts; complete covers are evaluated after normalization.
+/// Cut weight of an edge: its frequency plus `lambda` per comparison it adds.
+/// Only a proxy for generating cuts; covers are ranked by `cover_cost`.
 fn edge_weight(lambda: u64) -> impl Fn(&Edge) -> u64 {
-    // With n <= u16::MAX and F <= u32::MAX, there are at most 2n + 16 edges.
-    // Their comparison counts sum to at most 3n + 15*512 + 65536: one point
-    // and range per offset, up to 15 overlap sets, and one contained-token set.
-    // For lambda <= F + 1, total finite capacity is therefore below 2^51.
+    // Overflow bound for the cut solver. With n <= u16::MAX and F <= u32::MAX,
+    // there are at most 2n + 16 edges, and their comparisons sum to at most
+    // 3n + 15 * 512 + 65536: a point and a range per offset, up to 15 overlap
+    // lists, and one contained-token list. For lambda <= F + 1, the total weight
+    // stays below 2^51.
     move |edge| {
         let comparisons = edge.point_count() + 2 * edge.range_count();
         u64::from(edge.frequency()) + lambda * comparisons as u64

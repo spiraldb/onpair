@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Match point probes with vector equality comparisons.
+//! Point membership with one vector equality comparison per point.
 //!
-//! Each point is broadcast across lanes, compared with the input codes, and
-//! ORed into the hit lanes. Inclusive-range results are then ORed into the
-//! same mask. Work grows with the number of points and ranges in the cover.
-//!
-//! Dispatch specializes covers without points before scanning. The general
-//! kernel also supports empty point slices. `shared::words` loads blocks and packs
-//! the hit lanes, optionally skipping the pack for groups with no hits.
+//! Each point is broadcast to all lanes and compared with the codes, and the
+//! results are ORed together with the range hits. Work grows linearly with the
+//! number of points and ranges. Covers without points get a specialization that
+//! only checks ranges.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
