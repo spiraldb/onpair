@@ -11,6 +11,9 @@
 //! * [`ContainsDfa`] with [`row_contains`] (`dfa`) tests one row at a time with a
 //!   token-level KMP automaton. It needs no frequency index and works with any
 //!   dictionary view, but supports only patterns of up to 255 bytes.
+//!
+//! Both reject the empty pattern with [`ContainsError::EmptyPattern`]: every row
+//! contains it, so callers answer it without a search.
 
 mod dfa;
 mod error;

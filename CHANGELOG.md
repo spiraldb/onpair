@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Replace `search::contains` and `ContainsTable` with
   `row_contains` and `ContainsDfa`. `ContainsDfa::new` returns
   `ContainsError::PatternTooLong` for patterns longer than
-  `ContainsDfa::MAX_PATTERN_LEN` (255 bytes) instead of panicking.
+  `ContainsDfa::MAX_PATTERN_LEN` (255 bytes) instead of panicking, and
+  `ContainsError::EmptyPattern` for an empty pattern, which
+  `ColumnView::rows_containing` still matches against every row.
 - **Breaking:** `ColumnView::rows_containing` returns
   `Result<Vec<usize>, ContainsError>`.
 - **Breaking:** Add `InvalidColumn::FrequencyIndex` for invalid token frequency

@@ -187,12 +187,16 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     }
 
     /// Ascending indices of the rows containing `pattern` as a substring,
-    /// prepared once as a [`ContainsDfa`] and matched per row.
+    /// prepared once as a [`ContainsDfa`] and matched per row. An empty pattern
+    /// matches every row without an automaton.
     ///
     /// # Errors
     /// Returns [`ContainsError::PatternTooLong`] if `pattern` exceeds
     /// [`ContainsDfa::MAX_PATTERN_LEN`].
     pub fn rows_containing(&self, pattern: &[u8]) -> Result<Vec<usize>, ContainsError> {
+        if pattern.is_empty() {
+            return Ok(self.select(|_| true));
+        }
         let dfa = ContainsDfa::new(pattern, self.dict)?;
         Ok(self.select(|codes| row_contains(codes, &dfa)))
     }
@@ -218,6 +222,9 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// index size, not dictionary identity or agreement with the stream.
     /// Inexact weights affect planning, not query correctness.
     ///
+    /// An empty pattern matches every row. It is answered without a scan, so it
+    /// does not use `frequencies`.
+    ///
     /// # Errors
     /// Propagates preparation errors from [`ContainsScan::new`].
     pub fn rows_containing_with_scan<S: TokenFrequencyIndexStorage>(
@@ -225,6 +232,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         pattern: &[u8],
         frequencies: &TokenFrequencyIndex<S>,
     ) -> Result<Vec<usize>, ContainsError> {
+        if pattern.is_empty() {
+            // Visiting each row validates the row layer, as the scan would.
+            return Ok(self.select(|_| true));
+        }
         let scan = ContainsScan::new(pattern, self.dict, frequencies)?;
         let mut rows = Vec::new();
         scan.scan(self.codes, self.row_offsets, &mut rows);

@@ -65,8 +65,9 @@ use crate::search::substring::ContainsError;
 ///
 /// Preparation chooses the filter and compiles the hit verifier once. Each
 /// [`scan`](Self::scan) keeps its state local, so one query can scan any number of
-/// chunks encoded with the same dictionary, concurrently if needed. An empty
-/// pattern matches every row.
+/// chunks encoded with the same dictionary, concurrently if needed. The pattern
+/// must not be empty: every row contains the empty pattern, so callers answer it
+/// without a scan.
 #[derive(Debug, Clone)]
 pub struct ContainsScan<'d> {
     dict: CompactDictionaryView<'d>,
@@ -74,7 +75,6 @@ pub struct ContainsScan<'d> {
     matcher: MatcherKind,
     verifier: HitVerifier,
     probe_density: f64,
-    matches_all: bool,
 }
 
 impl<'d> ContainsScan<'d> {
@@ -88,7 +88,8 @@ impl<'d> ContainsScan<'d> {
     /// slower, never incorrect.
     ///
     /// # Errors
-    /// Returns [`ContainsError::PatternTooLong`] if `pattern` is longer than
+    /// Returns [`ContainsError::EmptyPattern`] if `pattern` is empty,
+    /// [`ContainsError::PatternTooLong`] if it is longer than
     /// [`Self::MAX_PATTERN_LEN`], and [`ContainsError::InvalidData`] if `frequencies`
     /// does not have one entry per dictionary token or `dict` cannot tokenize
     /// `pattern`.
@@ -103,6 +104,9 @@ impl<'d> ContainsScan<'d> {
         dict: CompactDictionaryView<'d>,
         frequencies: &TokenFrequencyIndex<S>,
     ) -> Result<Self, ContainsError> {
+        if pattern.is_empty() {
+            return Err(ContainsError::EmptyPattern);
+        }
         if pattern.len() > Self::MAX_PATTERN_LEN {
             return Err(ContainsError::PatternTooLong {
                 length: pattern.len(),
@@ -114,26 +118,18 @@ impl<'d> ContainsScan<'d> {
                 InvalidFrequencyIndex::BadLength.into(),
             ));
         }
-        if pattern.is_empty() {
-            return Ok(Self {
-                dict,
-                probe_cover: ProbeCover::from_runs(Vec::new()),
-                matcher: MatcherKind::Table,
-                verifier: HitVerifier::default(),
-                probe_density: 0.0,
-                matches_all: true,
-            });
-        }
         let isa = scan::detect_isa();
         let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
         let (cover, covered_frequency) = plan::select_cover(&graph, frequencies.as_view(), isa);
+        // Following greedy edges from the source always reaches the sink, so every
+        // cut, and with it the filter, is nonempty.
+        debug_assert!(!cover.is_empty(), "empty filter for {pattern:?}");
         Ok(Self {
             dict,
             matcher: plan::select_matcher(isa, &cover),
             probe_cover: cover,
             verifier: HitVerifier::from_graph(&graph, pattern),
             probe_density: fraction(covered_frequency, frequencies.total_frequency()),
-            matches_all: false,
         })
     }
 
@@ -161,11 +157,8 @@ impl<'d> ContainsScan<'d> {
         if first > last || last > codes.len() {
             panic_malformed(InvalidColumn::BadRowOffsets);
         }
-        if self.matches_all {
-            out.extend(0..row_offsets.len() - 1);
-            return;
-        }
-        if first == last || self.probe_cover.is_empty() {
+        // Without codes, no row can contain the pattern.
+        if first == last {
             return;
         }
         scan::run(
@@ -182,8 +175,7 @@ impl<'d> ContainsScan<'d> {
         );
     }
 
-    /// The tokens this scan searches for. Empty for an empty pattern, which matches
-    /// every row without searching.
+    /// The tokens this scan searches for; never empty.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
     }

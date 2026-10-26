@@ -30,7 +30,7 @@ type State = u8;
 /// immutable, so it can be shared between threads.
 #[derive(Debug, Clone)]
 pub struct ContainsDfa {
-    /// The accepting state: the pattern length, zero for an empty pattern.
+    /// The accepting state: the pattern length.
     accept: State,
     /// `base[token]` is the state reached by reading `token` from state 0.
     base: Vec<State>,
@@ -53,13 +53,15 @@ impl ContainsDfa {
     /// Maximum pattern length, bounded by the DFA's `u8` state IDs.
     pub const MAX_PATTERN_LEN: usize = State::MAX as usize;
 
-    /// Compiles `pattern` for `dict`, which must be sorted. An empty pattern matches
-    /// every row, including empty ones.
+    /// Compiles `pattern` for `dict`, which must be sorted.
     ///
     /// # Errors
-    /// Returns [`ContainsError::PatternTooLong`] if the pattern exceeds
-    /// [`Self::MAX_PATTERN_LEN`].
+    /// Returns [`ContainsError::EmptyPattern`] if `pattern` is empty, and
+    /// [`ContainsError::PatternTooLong`] if it exceeds [`Self::MAX_PATTERN_LEN`].
     pub fn new<V: DictionaryView>(pattern: &[u8], dict: V) -> Result<Self, ContainsError> {
+        if pattern.is_empty() {
+            return Err(ContainsError::EmptyPattern);
+        }
         if pattern.len() > Self::MAX_PATTERN_LEN {
             return Err(ContainsError::PatternTooLong {
                 length: pattern.len(),
@@ -68,17 +70,6 @@ impl ContainsDfa {
         }
         let m = pattern.len();
         let num_tokens = dict.num_tokens();
-
-        // Empty pattern: accept state 0, every token a no-op transition.
-        if m == 0 {
-            return Ok(Self {
-                accept: 0,
-                base: vec![0; num_tokens],
-                sparse: Vec::new(),
-                offsets: vec![0, 0],
-            });
-        }
-
         let mut build = Build {
             dict,
             p: pattern,
@@ -126,9 +117,6 @@ impl ContainsDfa {
 /// Every code is a token ID of the dictionary `dfa` was compiled for.
 pub fn row_contains(codes: &[Token], dfa: &ContainsDfa) -> bool {
     let mut state: State = 0;
-    if state == dfa.accept {
-        return true; // empty pattern is a substring of everything
-    }
     for &code in codes {
         state = dfa.next(state, code);
         if state == dfa.accept {
@@ -347,7 +335,7 @@ mod tests {
         compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap()
     }
 
-    /// Independent byte-window oracle, including empty-pattern matches.
+    /// Independent byte-window oracle.
     fn byte_contains(hay: &[u8], needle: &[u8]) -> bool {
         needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
     }
@@ -384,9 +372,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_pattern_matches_all_rows() {
-        let rows: &[&[u8]] = &[b"a", b"", b"abc"];
-        check(rows, &[b""]);
+    fn empty_pattern_is_rejected() {
+        let column = compress_rows(&[b"a", b"", b"abc"]);
+        assert_eq!(
+            ContainsDfa::new(b"", column.view().dict).unwrap_err(),
+            ContainsError::EmptyPattern
+        );
     }
 
     #[test]
@@ -445,7 +436,7 @@ mod tests {
         use crate::test_corpus::binary_strings;
         let corpus = binary_strings(40, 24, 11);
         let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
-        let patterns: &[&[u8]] = &[b"", b"\x00", b"\xff", b"\x00\x01", &[7u8], &[200u8, 201]];
+        let patterns: &[&[u8]] = &[b"\x00", b"\xff", b"\x00\x01", &[7u8], &[200u8, 201]];
         check(&rows, patterns);
     }
 }

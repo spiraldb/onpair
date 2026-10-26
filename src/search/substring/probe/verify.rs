@@ -176,8 +176,7 @@ impl EdgesByToken {
 }
 
 /// An alignment graph compiled for hit verification.
-/// The default, empty verifier stands in for empty patterns and is never called.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(in crate::search::substring::probe) struct HitVerifier {
     /// Outgoing edges, by needle offset.
     nodes: Vec<Node>,

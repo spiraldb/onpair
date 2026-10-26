@@ -122,35 +122,15 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
             .enumerate()
             .filter_map(|(row, bytes)| byte_contains(bytes, pattern).then_some(row))
             .collect();
-        if !pattern.is_empty() {
+        if pattern.is_empty() {
+            assert_eq!(
+                ContainsScan::new(pattern, view.dict, &frequencies).unwrap_err(),
+                ContainsError::EmptyPattern
+            );
+        } else {
             check_starts(view.dict, pattern);
             check_graph(view, &frequencies, pattern);
-        }
-        let scan = ContainsScan::new(pattern, view.dict, &frequencies).unwrap();
-        let covered = view
-            .codes
-            .iter()
-            .filter(|&&code| scan.probe_cover().contains(code))
-            .count();
-        assert_eq!(
-            scan.covered_frequency(&frequencies) as usize,
-            covered,
-            "{pattern:?}"
-        );
-        let fraction = if view.codes.is_empty() {
-            0.0
-        } else {
-            covered as f64 / view.codes.len() as f64
-        };
-        assert_eq!(scan.covered_fraction(&frequencies), fraction, "{pattern:?}");
-        // Packing uses the planning stream's density, which this index describes.
-        assert_eq!(scan.probe_density, fraction, "{pattern:?}");
-        let mut actual = vec![usize::MAX];
-        let mut appended = actual.clone();
-        for _ in 0..2 {
-            scan.scan(view.codes, view.row_offsets, &mut actual);
-            appended.extend_from_slice(&expected);
-            assert_eq!(actual, appended, "scan: {pattern:?}");
+            check_scan(view, &frequencies, pattern, &expected);
         }
         assert_eq!(
             view.rows_containing_with_scan(pattern, &frequencies)
@@ -165,6 +145,42 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
                 "DFA: {pattern:?}"
             );
         }
+    }
+}
+
+/// Checks a prepared scan's coverage statistics, and its rows over two runs to
+/// check reuse and appending.
+fn check_scan(
+    view: ColumnView<'_, u32>,
+    frequencies: &TokenFrequencyIndex,
+    pattern: &[u8],
+    expected: &[usize],
+) {
+    let scan = ContainsScan::new(pattern, view.dict, frequencies).unwrap();
+    let covered = view
+        .codes
+        .iter()
+        .filter(|&&code| scan.probe_cover().contains(code))
+        .count();
+    assert_eq!(
+        scan.covered_frequency(frequencies) as usize,
+        covered,
+        "{pattern:?}"
+    );
+    let fraction = if view.codes.is_empty() {
+        0.0
+    } else {
+        covered as f64 / view.codes.len() as f64
+    };
+    assert_eq!(scan.covered_fraction(frequencies), fraction, "{pattern:?}");
+    // Packing uses the planning stream's density, which this index describes.
+    assert_eq!(scan.probe_density, fraction, "{pattern:?}");
+    let mut actual = vec![usize::MAX];
+    let mut appended = actual.clone();
+    for _ in 0..2 {
+        scan.scan(view.codes, view.row_offsets, &mut actual);
+        appended.extend_from_slice(expected);
+        assert_eq!(actual, appended, "scan: {pattern:?}");
     }
 }
 
@@ -218,27 +234,25 @@ fn longest_pattern_reaches_the_largest_offset() {
     );
 }
 
-/// Malformed row offsets panic with `BadRowOffsets`, whatever the pattern.
+/// Malformed row offsets panic with `BadRowOffsets`.
 #[test]
 fn scan_rejects_malformed_row_offsets() {
     let column = compress_rows(&[b"alpha", b"beta"]);
     let view = column.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
     let past_end = view.codes.len() as u32 + 1;
-    for pattern in [b"".as_slice(), b"alpha"] {
-        let scan = ContainsScan::new(pattern, view.dict, &frequencies).unwrap();
-        // The first offset after the last, and the last past the code stream.
-        for offsets in [[2u32, 1], [0, past_end]] {
-            let panic = catch_unwind(AssertUnwindSafe(|| {
-                scan.scan(view.codes, &offsets, &mut Vec::new());
-            }))
-            .expect_err("malformed offsets must panic");
-            let message = panic.downcast_ref::<String>().unwrap();
-            assert!(
-                message.contains("row offsets must be non-decreasing"),
-                "{pattern:?}, {offsets:?}: {message}"
-            );
-        }
+    let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
+    // The first offset after the last, and the last past the code stream.
+    for offsets in [[2u32, 1], [0, past_end]] {
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            scan.scan(view.codes, &offsets, &mut Vec::new());
+        }))
+        .expect_err("malformed offsets must panic");
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(
+            message.contains("row offsets must be non-decreasing"),
+            "{offsets:?}: {message}"
+        );
     }
 }
 
@@ -248,14 +262,12 @@ fn mismatched_frequency_domain_is_a_preparation_error() {
     let view = column.view();
     for size in [view.dict.num_tokens() - 1, view.dict.num_tokens() + 1] {
         let frequencies = build_token_frequency_index::<Token>(&[], size).unwrap();
-        for pattern in [b"".as_slice(), b"a"] {
-            assert_eq!(
-                view.rows_containing_with_scan(pattern, &frequencies),
-                Err(ContainsError::InvalidData(
-                    InvalidFrequencyIndex::BadLength.into()
-                ))
-            );
-        }
+        assert_eq!(
+            view.rows_containing_with_scan(b"a", &frequencies),
+            Err(ContainsError::InvalidData(
+                InvalidFrequencyIndex::BadLength.into()
+            ))
+        );
     }
 }
 
@@ -272,24 +284,21 @@ fn missing_alphabet_does_not_produce_a_partial_cover() {
     );
 }
 
+/// `ContainsScan` rejects the empty pattern, and the column answers it without a
+/// scan: every row matches, including rows without codes.
 #[test]
-fn empty_pattern_and_empty_cover_have_distinct_results() {
+fn empty_pattern_is_answered_without_a_scan() {
     let cases: &[&[&[u8]]] = &[&[b"", b"alpha", b"", b"beta", b""], &[b"", b""], &[]];
     for &rows in cases {
         let column = compress_rows(rows);
         let view = column.view();
-        let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
         check(view, rows, &[b"", b"absent"]);
-        let scan = ContainsScan::new(b"", view.dict, &frequencies).unwrap();
-        assert!(scan.probe_cover().is_empty());
-        // An empty cover without the empty-pattern flag must leave output alone.
-        let no_matches = ContainsScan {
-            matches_all: false,
-            ..scan
-        };
-        let mut output = vec![usize::MAX];
-        no_matches.scan(view.codes, view.row_offsets, &mut output);
-        assert_eq!(output, [usize::MAX]);
+        // The frequency index is not consulted, so even a mismatched one works.
+        let unrelated = build_token_frequency_index::<Token>(&[], 1).unwrap();
+        assert_eq!(
+            view.rows_containing_with_scan(b"", &unrelated).unwrap(),
+            (0..rows.len()).collect::<Vec<_>>()
+        );
     }
 }
 
@@ -299,7 +308,7 @@ fn prepared_scan_handles_empty_and_partial_inputs() {
     let column = compress_rows(rows);
     let view = column.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    for pattern in [b"".as_slice(), b"alpha", b"absent"] {
+    for pattern in [b"alpha".as_slice(), b"absent"] {
         let scan = ContainsScan::new(pattern, view.dict, &frequencies).unwrap();
         for start in 0..=rows.len() {
             for end in start..=rows.len() {
