@@ -154,16 +154,16 @@ impl<'d> ContainsScan<'d> {
     /// [`Column::compress`](crate::Column::compress). Validating the buffers does not
     /// establish greedy tokenization.
     pub fn scan<O: Offset>(&self, codes: &[Token], row_offsets: &[O], out: &mut Vec<usize>) {
-        if self.matches_all {
-            out.extend(0..row_offsets.len().saturating_sub(1));
-            return;
-        }
         let (Some(first), Some(last)) = (row_offsets.first(), row_offsets.last()) else {
             return;
         };
         let (first, last) = (first.to_usize(), last.to_usize());
         if first > last || last > codes.len() {
             panic_malformed(InvalidColumn::BadRowOffsets);
+        }
+        if self.matches_all {
+            out.extend(0..row_offsets.len() - 1);
+            return;
         }
         if first == last || self.probe_cover.is_empty() {
             return;
