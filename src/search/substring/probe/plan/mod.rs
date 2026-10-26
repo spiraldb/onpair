@@ -19,13 +19,14 @@ mod select;
 use super::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge};
 use super::alignment::mincut::MinCut;
-use super::scan::Isa;
+use super::scan::{Isa, MatcherKind};
 use crate::search::index::TokenFrequencyIndexView;
 #[cfg(test)]
 pub(super) use select::is_eligible;
 pub(super) use select::{cover_cost, select_matcher, skip_empty_packing};
 
-/// Returns the cheapest sampled cover and its frequency in the indexed stream.
+/// Returns the cheapest sampled cover, the matcher chosen for it, and its
+/// frequency in the indexed stream.
 ///
 /// The first cut uses a `λ` above the code count, which minimizes comparisons.
 /// Then `λ = 0, 1, 4, 16, ...` up to the code count, stopping once a cut repeats
@@ -34,21 +35,23 @@ pub(super) fn select_cover(
     graph: &AlignmentGraph,
     frequencies: TokenFrequencyIndexView<'_>,
     isa: Isa,
-) -> (ProbeCover, u32) {
+) -> (ProbeCover, MatcherKind, u32) {
     let code_count = frequencies.total_frequency();
     let mut solver = MinCut::new(graph);
     let evaluate_cut = |cut: &[u32]| {
         let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| &graph.edges[at as usize]));
+        let matcher = select_matcher(isa, &cover);
         let frequency = cover.frequency(frequencies);
-        let cost = cover_cost(isa, &cover, frequency, code_count);
-        (cover, frequency, cost)
+        let cost = cover_cost(isa, &cover, matcher, frequency, code_count);
+        (cover, matcher, frequency, cost)
     };
 
     // Evaluate the comparison-heavy end before sampling lower penalties.
     let high_penalty_cut = solver
         .solve(edge_weight(u64::from(code_count) + 1))
         .to_vec();
-    let (mut best_cover, mut best_frequency, mut best_cost) = evaluate_cut(&high_penalty_cut);
+    let (mut best_cover, mut best_matcher, mut best_frequency, mut best_cost) =
+        evaluate_cut(&high_penalty_cut);
 
     let mut previous_cut: Vec<u32> = Vec::new();
     let mut lambda = 0u64;
@@ -59,16 +62,17 @@ pub(super) fn select_cover(
         }
         if cut != previous_cut {
             previous_cut = cut.to_vec();
-            let (cover, frequency, cost) = evaluate_cut(&previous_cut);
+            let (cover, matcher, frequency, cost) = evaluate_cut(&previous_cut);
             if cost < best_cost {
                 best_cover = cover;
+                best_matcher = matcher;
                 best_frequency = frequency;
                 best_cost = cost;
             }
         }
         lambda = (lambda * 4).max(1);
     }
-    (best_cover, best_frequency)
+    (best_cover, best_matcher, best_frequency)
 }
 
 /// Cut weight of an edge: its frequency plus `lambda` per comparison it adds.

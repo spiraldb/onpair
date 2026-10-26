@@ -120,13 +120,14 @@ impl<'d> ContainsScan<'d> {
         }
         let isa = scan::detect_isa();
         let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
-        let (cover, covered_frequency) = plan::select_cover(&graph, frequencies.as_view(), isa);
+        let (cover, matcher, covered_frequency) =
+            plan::select_cover(&graph, frequencies.as_view(), isa);
         // Following greedy edges from the source always reaches the sink, so every
         // cut, and with it the filter, is nonempty.
         debug_assert!(!cover.is_empty(), "empty filter for {pattern:?}");
         Ok(Self {
             dict,
-            matcher: plan::select_matcher(isa, &cover),
+            matcher,
             probe_cover: cover,
             verifier: HitVerifier::from_graph(&graph, pattern),
             probe_density: fraction(covered_frequency, frequencies.total_frequency()),

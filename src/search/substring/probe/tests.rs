@@ -15,7 +15,7 @@ use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
-use super::plan::{cover_cost, select_cover};
+use super::plan::{cover_cost, select_cover, select_matcher};
 use super::scan::detect_isa;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
@@ -528,10 +528,17 @@ fn sweep_cost_does_not_exceed_the_frequency_cut() {
                 .iter()
                 .map(|&at| &graph.edges[at as usize]),
         );
-        let baseline_cost = cover_cost(isa, &baseline, baseline.frequency(freq), code_count);
-        let (cover, covered) = select_cover(&graph, freq, isa);
+        let baseline_cost = cover_cost(
+            isa,
+            &baseline,
+            select_matcher(isa, &baseline),
+            baseline.frequency(freq),
+            code_count,
+        );
+        let (cover, matcher, covered) = select_cover(&graph, freq, isa);
+        assert_eq!(matcher, select_matcher(isa, &cover));
         assert_eq!(covered, cover.frequency(freq));
-        let cost = cover_cost(isa, &cover, covered, code_count);
+        let cost = cover_cost(isa, &cover, matcher, covered, code_count);
         assert!(
             cost <= baseline_cost,
             "{pattern:?}: sweep {cost} against {baseline_cost}"

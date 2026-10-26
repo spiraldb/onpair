@@ -71,22 +71,22 @@ pub(in crate::search::substring::probe) fn skip_empty_packing(
     probe_density < SKIP_PACKING_DENSITY_THRESHOLD || probe_density * (code_count as f64) < 1.0
 }
 
-/// Estimated cost of scanning the indexed stream with `cover`. Lower is better.
+/// Estimated cost of scanning the indexed stream for `cover` with `matcher`. Lower
+/// is better.
 ///
 /// `cost = N * matcher_cost + candidate_cost(F)`, where `N = code_count` is the
-/// number of indexed codes, `F = covered_frequency` the number of them in the cover,
-/// and `matcher_cost` that of the cheapest eligible matcher. Zero for an empty cover
-/// or stream.
+/// number of indexed codes and `F = covered_frequency` the number of them in the
+/// cover. Zero for an empty cover or stream.
 pub(in crate::search::substring::probe) fn cover_cost(
     isa: Isa,
     cover: &ProbeCover,
+    matcher: MatcherKind,
     covered_frequency: u32,
     code_count: u32,
 ) -> f64 {
     if cover.is_empty() || code_count == 0 {
         return 0.0;
     }
-    let matcher = select_matcher(isa, cover);
     let scanning = f64::from(code_count) * matcher_cost(isa, matcher, cover);
     let candidate_processing = candidate_cost(isa, covered_frequency);
     scanning + candidate_processing
