@@ -163,7 +163,7 @@ fn check_scan(
         .filter(|&&code| scan.probe_cover().contains(code))
         .count();
     assert_eq!(
-        scan.covered_frequency(frequencies) as usize,
+        scan.covered_frequency(frequencies).unwrap() as usize,
         covered,
         "{pattern:?}"
     );
@@ -172,7 +172,11 @@ fn check_scan(
     } else {
         covered as f64 / view.codes.len() as f64
     };
-    assert_eq!(scan.covered_fraction(frequencies), fraction, "{pattern:?}");
+    assert_eq!(
+        scan.covered_fraction(frequencies).unwrap(),
+        fraction,
+        "{pattern:?}"
+    );
     // Packing uses the planning stream's density, which this index describes.
     assert_eq!(scan.probe_density, fraction, "{pattern:?}");
     let mut actual = vec![usize::MAX];
@@ -256,18 +260,23 @@ fn scan_rejects_malformed_row_offsets() {
     }
 }
 
+/// A frequency index without one entry per dictionary token is rejected when
+/// preparing a scan and when measuring its coverage.
 #[test]
-fn mismatched_frequency_domain_is_a_preparation_error() {
+fn mismatched_frequency_index_is_an_error() {
     let column = compress_rows(&[b"abc"]);
     let view = column.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let scan = ContainsScan::new(b"a", view.dict, &frequencies).unwrap();
+    let bad_length = ContainsError::InvalidData(InvalidFrequencyIndex::BadLength.into());
     for size in [view.dict.num_tokens() - 1, view.dict.num_tokens() + 1] {
-        let frequencies = build_token_frequency_index::<Token>(&[], size).unwrap();
+        let mismatched = build_token_frequency_index::<Token>(&[], size).unwrap();
         assert_eq!(
-            view.rows_containing_with_scan(b"a", &frequencies),
-            Err(ContainsError::InvalidData(
-                InvalidFrequencyIndex::BadLength.into()
-            ))
+            view.rows_containing_with_scan(b"a", &mismatched),
+            Err(bad_length)
         );
+        assert_eq!(scan.covered_frequency(&mismatched), Err(bad_length));
+        assert_eq!(scan.covered_fraction(&mismatched), Err(bad_length));
     }
 }
 
@@ -472,8 +481,8 @@ fn borrowed_frequencies_preserve_the_plan_and_results() {
         owned_scan.probe_cover().ranges()
     );
     assert_eq!(
-        borrowed_scan.covered_frequency(&borrowed),
-        owned_scan.covered_frequency(&owned)
+        borrowed_scan.covered_frequency(&borrowed).unwrap(),
+        owned_scan.covered_frequency(&owned).unwrap()
     );
     assert_eq!(borrowed_scan.probe_density, owned_scan.probe_density);
     assert_eq!(
@@ -498,7 +507,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
     .unwrap();
     let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
     assert!(!scan.probe_cover().is_empty());
-    assert_eq!(scan.covered_frequency(&frequencies), 0);
+    assert_eq!(scan.covered_frequency(&frequencies), Ok(0));
     let mut rows = Vec::new();
     scan.scan(view.codes, view.row_offsets, &mut rows);
     assert_eq!(rows, [0, 2]);

@@ -113,11 +113,7 @@ impl<'d> ContainsScan<'d> {
                 max: Self::MAX_PATTERN_LEN,
             });
         }
-        if frequencies.num_tokens() != dict.num_tokens() {
-            return Err(ContainsError::InvalidData(
-                InvalidFrequencyIndex::BadLength.into(),
-            ));
-        }
+        check_frequencies(dict, frequencies)?;
         let isa = scan::detect_isa();
         let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
         let (cover, matcher, covered_frequency) =
@@ -183,29 +179,42 @@ impl<'d> ContainsScan<'d> {
 
     /// Number of codes in the stream indexed by `frequencies` that hit the filter.
     ///
-    /// # Panics
-    /// Panics if a filter token is out of range for `frequencies`, which must be
-    /// indexed by this scan's dictionary.
+    /// # Errors
+    /// Returns [`ContainsError::InvalidData`] if `frequencies` does not have one entry
+    /// per token of this scan's dictionary.
     pub fn covered_frequency<S: TokenFrequencyIndexStorage>(
         &self,
         frequencies: &TokenFrequencyIndex<S>,
-    ) -> u32 {
-        self.probe_cover.frequency(frequencies.as_view())
+    ) -> Result<u32, ContainsError> {
+        check_frequencies(self.dict, frequencies)?;
+        Ok(self.probe_cover.frequency(frequencies.as_view()))
     }
 
     /// [`covered_frequency`](Self::covered_frequency) as a fraction of all indexed
     /// codes: the expected hit density. `0.0` for an empty stream.
     ///
-    /// # Panics
-    /// Panics under the same condition as [`covered_frequency`](Self::covered_frequency).
+    /// # Errors
+    /// Same as [`covered_frequency`](Self::covered_frequency).
     pub fn covered_fraction<S: TokenFrequencyIndexStorage>(
         &self,
         frequencies: &TokenFrequencyIndex<S>,
-    ) -> f64 {
-        fraction(
-            self.covered_frequency(frequencies),
-            frequencies.total_frequency(),
-        )
+    ) -> Result<f64, ContainsError> {
+        let covered = self.covered_frequency(frequencies)?;
+        Ok(fraction(covered, frequencies.total_frequency()))
+    }
+}
+
+/// Rejects a frequency index without exactly one entry per dictionary token.
+fn check_frequencies<S: TokenFrequencyIndexStorage>(
+    dict: CompactDictionaryView<'_>,
+    frequencies: &TokenFrequencyIndex<S>,
+) -> Result<(), ContainsError> {
+    if frequencies.num_tokens() == dict.num_tokens() {
+        Ok(())
+    } else {
+        Err(ContainsError::InvalidData(
+            InvalidFrequencyIndex::BadLength.into(),
+        ))
     }
 }
 
