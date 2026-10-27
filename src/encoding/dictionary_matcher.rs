@@ -32,7 +32,7 @@ const PREFIX_SLOTS: usize = 1 << 16;
 /// of `w[0]` sorts at or before `q`, so `q` always exists and shares the first
 /// byte of `w`.
 ///
-/// Keys are stored in blocks of [`BLOCK_KEYS`], one cache line each, and the
+/// Keys are stored in 128-byte blocks of [`BLOCK_KEYS`], and the
 /// first key of every block is copied into a small sample array that stays in
 /// cache. A direct table on the first two bytes gives the range of tokens to
 /// search for `q`. A binary search over the samples of that range finds the
@@ -58,10 +58,10 @@ pub(crate) struct DictionaryMatcher {
     singles: [Token; 256],
 }
 
-/// Keys per block: one 128-byte cache line.
+/// Keys per 128-byte block.
 const BLOCK_KEYS: usize = 8;
 
-/// One cache line of keys.
+/// One aligned block of key columns.
 #[derive(Copy, Clone, Debug)]
 #[repr(align(128))]
 struct KeyBlock {
@@ -306,7 +306,8 @@ impl DictionaryMatcher {
 
         // Keys are sorted, the block starts with a key `<=` the input key, and
         // the next block starts with a larger one. So `q` is the last key of
-        // the block that is `<=` the input key. The steps read one cache line.
+        // the block that is `<=` the input key. Only MAX padding blocks can
+        // follow it with equal keys; they carry the same prefix chain.
         let mut slot = [0usize; K];
         if SIMD {
             #[cfg(target_arch = "x86_64")]
@@ -493,7 +494,7 @@ mod tests {
         if std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("popcnt")
         {
-            // SAFETY: AVX-512F and POPCNT was detected above.
+            // SAFETY: AVX-512F and POPCNT were detected above.
             let simd = unsafe { matcher.find_all_avx512(bytes, at, win) };
             assert_eq!(simd, scalar);
         }
@@ -589,6 +590,33 @@ mod tests {
                 assert_eq!(rank, BLOCK_KEYS - 1);
             }
         }
+    }
+
+    #[test]
+    fn sample_rank_handles_full_dictionary_and_large_prefix_range() {
+        let extra: Vec<Vec<u8>> = (0..65_280u16)
+            .map(|i| vec![b'a', b'b', (i >> 8) as u8, i as u8])
+            .collect();
+        let extra: Vec<&[u8]> = extra.iter().map(Vec::as_slice).collect();
+        let dict = make_test_dictionary(&extra);
+        assert_eq!(dict.num_tokens(), 1 << 16);
+        let matcher = DictionaryMatcher::from_dictionary(dict.as_view());
+        assert_eq!(std::mem::size_of::<KeyBlock>(), 128);
+        assert_eq!(std::mem::align_of::<KeyBlock>(), 128);
+
+        for suffix in [
+            0, 1, 7, 8, 9, 63, 64, 65, 255, 256, 32_767, 65_279, 65_535u16,
+        ] {
+            let data = [b'a', b'b', (suffix >> 8) as u8, suffix as u8];
+            check_paths(&dict, &matcher, &data, &[0, 0, 1, 2, 3], &[4, 2, 3, 2, 1]);
+        }
+        check_paths(
+            &dict,
+            &matcher,
+            &[0xFF; MAX_TOKEN_SIZE],
+            &[0],
+            &[MAX_TOKEN_SIZE],
+        );
     }
 
     // ── Construction ─────────────────────────────────────────────────────────
