@@ -37,6 +37,7 @@ use onpair::Column;
 use onpair::Config;
 use onpair::DECODE_PADDING;
 use onpair::MaxDictBits;
+use onpair::Parser;
 use onpair::Threshold;
 use onpair::compress;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -244,6 +245,24 @@ fn train_and_compress(bencher: Bencher, bits: u8) {
                 cfg,
             )
             .unwrap()
+        });
+}
+
+#[divan::bench(args = BITS_CONFIGS)]
+fn parse(bencher: Bencher, bits: u8) {
+    let c = corpus();
+    let cfg = Config {
+        max_dict_bits: MaxDictBits::new(bits).unwrap(),
+        threshold: Threshold::new(0.5).unwrap(),
+        seed: Some(42),
+    };
+    let parser = Parser::train(&c.bytes, &c.offsets, cfg).unwrap();
+    bencher
+        .counter(divan::counter::BytesCount::new(c.total_bytes))
+        .bench(|| {
+            parser
+                .parse(divan::black_box(&c.bytes), divan::black_box(&c.offsets))
+                .unwrap()
         });
 }
 
