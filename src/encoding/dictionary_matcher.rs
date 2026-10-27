@@ -38,7 +38,16 @@ const PREFIX_SLOTS: usize = 1 << 16;
 #[derive(Debug, Clone)]
 pub(crate) struct DictionaryMatcher {
     /// Token keys in dictionary order, then `u128::MAX` up to a whole block.
-    blocks: Vec<KeyBlock>,
+    keys: Vec<u128>,
+    /// Dictionary indices delimiting every two-byte prefix, including 65536.
+    #[allow(dead_code)]
+    starts: Vec<u32>,
+    /// Bytes 2..6 as big-endian u32s, followed by fifteen readable pads.
+    #[allow(dead_code)]
+    mid: Vec<u32>,
+    /// First token with the same first six padded bytes as this token.
+    #[allow(dead_code)]
+    tie_starts: Vec<u32>,
     /// First key of each block.
     samples: Vec<u128>,
     /// Per 2-byte prefix `p`: the block of the last token before the tokens
@@ -53,11 +62,6 @@ pub(crate) struct DictionaryMatcher {
 
 /// Keys per block: one 128-byte cache line.
 const BLOCK_KEYS: usize = 8;
-
-/// One cache line of keys.
-#[derive(Copy, Clone, Debug)]
-#[repr(align(128))]
-struct KeyBlock([u128; BLOCK_KEYS]);
 
 /// The prefix tokens of one token `t` by length bound, in one 32-byte record,
 /// so that the match needs one load after the search.
@@ -155,14 +159,27 @@ impl DictionaryMatcher {
         chain.retain(|&id| dict.token(id).iter().all(|&b| b == 0xFF));
         chains.resize(keys.len(), PrefixChain::new(dict, &chain));
 
-        let blocks: Vec<KeyBlock> = keys
+        let samples = keys
             .chunks_exact(BLOCK_KEYS)
-            .map(|chunk| KeyBlock(chunk.try_into().unwrap()))
+            .map(|chunk| chunk[0])
             .collect();
-        let samples = blocks.iter().map(|block| block.0[0]).collect();
+        let mut mid: Vec<u32> = keys[..n].iter().map(|&key| (key >> 80) as u32).collect();
+        mid.resize(n + 15, u32::MAX);
+        let mut tie_starts = Vec::with_capacity(n);
+        let mut first = 0;
+        for i in 0..n {
+            if i == 0 || keys[i] >> 80 != keys[i - 1] >> 80 {
+                first = i;
+            }
+            tie_starts.push(first as u32);
+        }
+        let starts = starts.into_iter().map(|i| i as u32).collect();
 
         Self {
-            blocks,
+            keys,
+            starts,
+            mid,
+            tie_starts,
             samples,
             first_blocks,
             chains,
@@ -232,7 +249,7 @@ impl DictionaryMatcher {
         let mut half = BLOCK_KEYS / 2;
         while half > 0 {
             for j in 0..K {
-                let block = &self.blocks[base[j]].0;
+                let block = &self.keys[base[j] * BLOCK_KEYS..][..BLOCK_KEYS];
                 slot[j] = advance_if_le(block[slot[j] + half], key[j], slot[j], half);
             }
             half /= 2;
@@ -241,7 +258,7 @@ impl DictionaryMatcher {
         let mut q = [0usize; K];
         let len: [usize; K] = std::array::from_fn(|j| {
             q[j] = base[j] * BLOCK_KEYS + slot[j];
-            let found = self.blocks[base[j]].0[slot[j]];
+            let found = self.keys[q[j]];
 
             let common = ((found ^ key[j]).leading_zeros() / 8) as usize;
             let max_len = common.min(win[j]);
