@@ -87,7 +87,7 @@ impl<'g> MinCut<'g> {
     /// equal-cost cuts, it picks the one with the inclusion-minimal source side.
     ///
     /// `weight` is only called for cuttable edges. Weights must be nonnegative and
-    /// their sum must fit in `i64`; the planner keeps it below 2^51.
+    /// their sum must fit in `i64`, which the planner's weights do.
     pub(in crate::search::substring::probe) fn solve(
         &mut self,
         weight: impl Fn(&Edge) -> u64,

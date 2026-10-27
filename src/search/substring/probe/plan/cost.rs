@@ -95,6 +95,37 @@ const AVX512BW_COSTS: CostWeights = CostWeights {
     candidate: 3170.0,
 };
 
+/// The cost model's slopes: what one more point or range adds to scanning a code,
+/// and what one hit costs. They make additive cut weights.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Slopes {
+    /// One point in EqOr.
+    pub(super) eq_or_point: f64,
+    /// One point in Nibble: its batch's cost, spread over the batch's points.
+    pub(super) nibble_point: f64,
+    /// One range in any vector matcher.
+    pub(super) range: f64,
+    /// Row lookup and verification of one hit.
+    pub(super) candidate: f64,
+}
+
+/// The slopes of `isa`'s cost model, or `None` on scalar targets, where the
+/// table's cost does not depend on the cover.
+pub(super) fn slopes(isa: Isa) -> Option<Slopes> {
+    let weights = match isa {
+        Isa::Neon => NEON_COSTS,
+        Isa::Avx2 => AVX2_COSTS,
+        Isa::Avx512Bw => AVX512BW_COSTS,
+        Isa::Scalar => return None,
+    };
+    Some(Slopes {
+        eq_or_point: weights.point,
+        nibble_point: weights.nibble_batch / PER_BATCH as f64,
+        range: weights.range,
+        candidate: weights.candidate,
+    })
+}
+
 /// Cost of looking up and verifying `covered_frequency` hits.
 ///
 /// A flat cost per hit: walk lengths and the hits skipped after a row matches are

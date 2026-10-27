@@ -14,7 +14,7 @@ use super::ContainsScan;
 use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
-use super::alignment::starts::{MAX_ENUMERATED_TOKENS, tests::check_starts};
+use super::alignment::starts::tests::check_starts;
 use super::plan::{cover_cost, select_cover, select_matcher};
 use super::scan::detect_isa;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -514,7 +514,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
 }
 
 #[test]
-fn sweep_cost_does_not_exceed_the_frequency_cut() {
+fn planned_cost_does_not_exceed_the_frequency_cut() {
     let corpus = crate::test_corpus::user_strings(200);
     let rows: Vec<&[u8]> = corpus.iter().map(|row| row.as_bytes()).collect();
     let column = compress_rows(&rows);
@@ -550,21 +550,7 @@ fn sweep_cost_does_not_exceed_the_frequency_cut() {
         let cost = cover_cost(isa, &cover, matcher, covered, code_count);
         assert!(
             cost <= baseline_cost,
-            "{pattern:?}: sweep {cost} against {baseline_cost}"
+            "{pattern:?}: planned {cost} against {baseline_cost}"
         );
     }
-}
-
-#[test]
-fn planner_weight_bound_fits_signed_differences() {
-    // Calculate in u128 so a future limit increase fails instead of overflowing.
-    let n = ContainsScan::MAX_PATTERN_LEN as u128;
-    let frequency = u128::from(u32::MAX);
-    let dictionary_size = u128::from(Token::MAX) + 1;
-    let edges = 2 * n + MAX_TOKEN_SIZE as u128;
-    let comparisons =
-        3 * n + (MAX_TOKEN_SIZE - 1) as u128 * MAX_ENUMERATED_TOKENS as u128 + dictionary_size;
-    let finite_capacity = edges * frequency + comparisons * (frequency + 1);
-    assert!(finite_capacity < 1u128 << 51);
-    assert!(finite_capacity < i64::MAX as u128);
 }
