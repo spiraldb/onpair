@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Frozen longest-prefix matcher for encoding. [`DictionaryMatcher`] is built
-//! from the final, sorted dictionary and matches several inputs at once without
-//! data-dependent branches.
+//! from the final, sorted dictionary and interleaves several independent inputs.
 
 use std::hint::select_unpredictable;
 
@@ -14,8 +13,7 @@ use crate::core::types::{MAX_TOKEN_SIZE, Token};
 const PREFIX_SLOTS: usize = 1 << 16;
 
 /// Frozen longest-prefix matcher over a sorted, complete dictionary. Token ids
-/// are dictionary indices. It matches several inputs at once without
-/// data-dependent branches, so independent inputs overlap in the CPU.
+/// are dictionary indices. Independent inputs overlap their searches in the CPU.
 ///
 /// Each token is held as a 16-byte big-endian key, zero-padded past its length.
 /// Lexicographic token order is then also key order. For input `w`, let `q` be
@@ -27,14 +25,13 @@ const PREFIX_SLOTS: usize = 1 << 16;
 /// of `w[0]` sorts at or before `q`, so `q` always exists and shares the first
 /// byte of `w`.
 ///
-/// Keys are stored in blocks of [`BLOCK_KEYS`], one cache line each, and the
-/// first key of every block is copied into a small sample array that stays in
-/// cache. A direct table on the first two bytes gives the range of tokens to
-/// search for `q`. A binary search over the samples of that range finds the
-/// block of `q`, and three more steps inside that block find `q`. So a search
-/// reads one block that may miss the cache.
-/// All inputs of one call search with the same number of steps, so the loop has
-/// no branch that depends on the data; see [`advance_if_le`].
+/// The scalar path searches samples and eight-key groups with branch-free
+/// binary-search steps; see [`advance_if_le`]. The SIMD path uses the first two
+/// bytes to select a token range, then ranks bytes 2..6 in a dense u32 column.
+/// Range-local sample levels use sixteen separators for seventeen children;
+/// leaves hold sixteen tokens. Every rank masks entries beyond the range.
+/// Equal six-byte prefixes need full-key correction when the selected candidate
+/// exceeds the input. The full keys and prefix chains remain separate columns.
 #[derive(Debug, Clone)]
 pub(crate) struct DictionaryMatcher {
     /// Token keys in dictionary order, then `u128::MAX` up to a whole block.
@@ -61,7 +58,7 @@ pub(crate) struct DictionaryMatcher {
     singles: [Token; 256],
 }
 
-/// Keys per block: one 128-byte cache line.
+/// Keys per scalar search group (128 bytes).
 const BLOCK_KEYS: usize = 8;
 const SAMPLE_STRIDES: [usize; 3] = [16, 272, 4624];
 
@@ -285,7 +282,7 @@ impl DictionaryMatcher {
 
         // Keys are sorted, the block starts with a key `<=` the input key, and
         // the next block starts with a larger one. So `q` is the last key of
-        // the block that is `<=` the input key. The steps read one cache line.
+        // the block that is `<=` the input key.
         let mut slot = [0usize; K];
         let mut half = BLOCK_KEYS / 2;
         while half > 0 {

@@ -7,8 +7,8 @@
 //! previous one ends, so a single row cannot go faster than one match latency
 //! at a time. Rows are independent, though. The parser splits each batch of
 //! rows into [`LANES`] lanes of about equal size and advances all lanes in one
-//! loop with [`DictionaryMatcher::find_all`]. That step has no data-dependent
-//! branches, so the CPU overlaps the memory accesses of the lanes. Each lane
+//! loop with the selected matcher. Independent lanes overlap their memory
+//! accesses; SIMD matching can branch to correct equal-prefix candidates. Each lane
 //! writes its codes to its own buffer; the buffers are joined in row order
 //! after the batch.
 
@@ -32,9 +32,9 @@ const LANES: usize = 6;
 /// cache.
 const BATCH_BYTES: usize = 256 << 10;
 
-/// Three lanes minimized the geometric-mean cost on the FineWeb and real-URL
-/// tuning inputs; scalar parsing keeps the original architecture-specific width.
-const SIMD_LANES: usize = 3;
+/// Four lanes held up better than the three-lane tuning winner on the broader
+/// validation set. Scalar parsing keeps the original architecture-specific width.
+const SIMD_LANES: usize = 4;
 const MAX_LANES: usize = if SIMD_LANES > LANES {
     SIMD_LANES
 } else {
