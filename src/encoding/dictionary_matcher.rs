@@ -307,8 +307,19 @@ impl DictionaryMatcher {
         q: &[usize; K],
         win: &[usize; K],
     ) -> [(Token, usize); K] {
+        self.finish_with(key, q, win, |j| self.keys[q[j]])
+    }
+
+    #[inline(always)]
+    fn finish_with<const K: usize, F: Fn(usize) -> u128>(
+        &self,
+        key: &[u128; K],
+        q: &[usize; K],
+        win: &[usize; K],
+        found: F,
+    ) -> [(Token, usize); K] {
         let len: [usize; K] = std::array::from_fn(|j| {
-            let found = self.keys[q[j]];
+            let found = found(j);
 
             let common = ((found ^ key[j]).leading_zeros() / 8) as usize;
             let max_len = common.min(win[j]);
@@ -432,7 +443,12 @@ impl DictionaryMatcher {
             let count = unsafe { rank16::<MODE>(self.mid.as_ptr().add(load_at), w[j], valid) };
             // Prefix zero contains the key zero, so its count cannot be zero.
             q[j] = start[j] + offset + count - 1;
-            if count > 0 && self.mid[q[j]] == w[j] && self.tie_starts[q[j]] != u32::MAX {
+        }
+        let mut found: [u128; K] = std::array::from_fn(|j| self.keys[q[j]]);
+        for j in 0..K {
+            // A candidate whose full key is already <= the window is exact.
+            // A larger one necessarily belongs to an equal-six-byte run.
+            if found[j] > key[j] {
                 let mut base = (self.tie_starts[q[j]] as usize).saturating_sub(1);
                 let mut size = q[j] + 1 - base;
                 let steps = usize::BITS - size.saturating_sub(1).leading_zeros();
@@ -442,9 +458,10 @@ impl DictionaryMatcher {
                     size -= half;
                 }
                 q[j] = base;
+                found[j] = self.keys[q[j]];
             }
         }
-        self.finish(&key, &q, win)
+        self.finish_with(&key, &q, win, |j| found[j])
     }
     /// A fixed stride lets the compiler replace integer division with constants.
     #[inline(always)]
