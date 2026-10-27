@@ -36,16 +36,18 @@ const PREFIX_SLOTS: usize = 1 << 16;
 /// first key of every block is copied into a small sample array that stays in
 /// cache. A direct table on the first two bytes gives the range of tokens to
 /// search for `q`. A binary search over the samples of that range finds the
-/// block of `q`, and three more steps inside that block find `q`. So a search
-/// reads one block that may miss the cache.
+/// block of `q`. AVX-512F finishes the sample search and searches that block
+/// with eight-wide rank counts; the scalar path uses binary search throughout.
+/// A search reads one block that may miss the cache.
 /// All inputs of one call search with the same number of steps, so the loop has
 /// no branch that depends on the data; see [`advance_if_le`].
 #[derive(Debug, Clone)]
 pub(crate) struct DictionaryMatcher {
     /// Token keys in dictionary order, then `u128::MAX` up to a whole block.
     blocks: Vec<KeyBlock>,
-    /// First key of each block.
-    samples: Vec<u128>,
+    /// First key of each block, in columns, including seven trailing pad blocks.
+    samples_hi: Vec<u64>,
+    samples_lo: Vec<u64>,
     /// Per 2-byte prefix `p`: the block of the last token before the tokens
     /// whose keys start with `p` (block 0 if there is none). The block of the
     /// last token with prefix `p` is then `first_blocks[p + 1]`.
@@ -170,6 +172,13 @@ impl DictionaryMatcher {
         chain.retain(|&id| dict.token(id).iter().all(|&b| b == 0xFF));
         chains.resize(keys.len(), PrefixChain::new(dict, &chain));
 
+        // An eight-wide sample load can include seven entries after the last
+        // candidate. For key == u128::MAX those entries compare <= too: there
+        // is no larger sentinel. Back them with real pad blocks and the same
+        // 0xFF prefix chain, so any rank still selects a valid predecessor.
+        keys.resize(keys.len() + (BLOCK_KEYS - 1) * BLOCK_KEYS, u128::MAX);
+        chains.resize(keys.len(), PrefixChain::new(dict, &chain));
+
         let blocks: Vec<KeyBlock> = keys
             .chunks_exact(BLOCK_KEYS)
             .map(|chunk| KeyBlock {
@@ -177,11 +186,13 @@ impl DictionaryMatcher {
                 lo: std::array::from_fn(|i| chunk[i] as u64),
             })
             .collect();
-        let samples = blocks.iter().map(|block| block.key(0)).collect();
+        let samples_hi = blocks.iter().map(|block| block.hi[0]).collect();
+        let samples_lo = blocks.iter().map(|block| block.lo[0]).collect();
 
         Self {
             blocks,
-            samples,
+            samples_hi,
+            samples_lo,
             first_blocks,
             chains,
             singles,
@@ -259,13 +270,37 @@ impl DictionaryMatcher {
         // The searches advance one step at a time across all inputs, so their
         // loads sit next to each other and overlap.
         let largest = size.iter().copied().max().unwrap_or(0);
-        let steps = usize::BITS - largest.saturating_sub(1).leading_zeros();
+        let mut steps = usize::BITS - largest.saturating_sub(1).leading_zeros();
+        if SIMD {
+            steps = steps.saturating_sub(3);
+        }
         for _ in 0..steps {
             for j in 0..K {
                 let half = size[j] / 2;
                 let mid = base[j] + half;
-                base[j] = advance_if_le(self.samples[mid], key[j], base[j], half);
+                let sample =
+                    (u128::from(self.samples_hi[mid]) << 64) | u128::from(self.samples_lo[mid]);
+                base[j] = advance_if_le(sample, key[j], base[j], half);
                 size[j] -= half;
+            }
+        }
+
+        if SIMD {
+            #[cfg(target_arch = "x86_64")]
+            for j in 0..K {
+                // Outside the remaining range, samples are greater than the
+                // key: either an earlier comparison excluded them, or their
+                // two-byte prefix is larger. MAX pads are valid blocks too.
+                // SAFETY: base is a candidate block, seven trailing samples
+                // make eight elements readable, its first key is <= key[j],
+                // and the caller guarantees AVX-512F and POPCNT.
+                base[j] += unsafe {
+                    rank8(
+                        self.samples_hi.as_ptr().add(base[j]),
+                        self.samples_lo.as_ptr().add(base[j]),
+                        key[j],
+                    )
+                };
             }
         }
 
@@ -523,6 +558,36 @@ mod tests {
             let win = std::array::from_fn(|i| (data.len() - i).min(MAX_TOKEN_SIZE));
             check_paths(&dict, &matcher, &data, &at, &win);
             check_paths(&dict, &matcher, b"a\0\0", &[0, 0, 0], &[1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn sample_padding_preserves_short_ff_chain() {
+        for extra_len in 0..BLOCK_KEYS {
+            let mut extra = vec![vec![0xFF; 2], vec![0xFF, 0xFF, 0xFF, b'a']];
+            extra.extend((0..extra_len).map(|i| vec![b'a', i as u8]));
+            let extra: Vec<&[u8]> = extra.iter().map(Vec::as_slice).collect();
+            let dict = make_test_dictionary(&extra);
+            let matcher = DictionaryMatcher::from_dictionary(dict.as_view());
+            let data = [0xFF; MAX_TOKEN_SIZE];
+            check_paths(&dict, &matcher, &data, &[0, 0, 0], &[1, 2, MAX_TOKEN_SIZE]);
+
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("popcnt")
+            {
+                let last = matcher.blocks.len() - BLOCK_KEYS;
+                // SAFETY: seven samples follow `last`, AVX-512F and POPCNT were detected,
+                // and every key is <= u128::MAX.
+                let rank = unsafe {
+                    rank8(
+                        matcher.samples_hi.as_ptr().add(last),
+                        matcher.samples_lo.as_ptr().add(last),
+                        u128::MAX,
+                    )
+                };
+                assert_eq!(rank, BLOCK_KEYS - 1);
+            }
         }
     }
 
