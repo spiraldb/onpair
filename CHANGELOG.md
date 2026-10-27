@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `ContainsScan`, a substring search over the compressed codes. A
   frequency-aware min-cut cover chooses the probe tokens, SIMD matchers find
-  them (NEON, AVX2, or AVX-512BW when compiled with it; scalar on other
+  them (NEON; AVX-512BW or AVX2 on x86_64, chosen at runtime; scalar on other
   targets), and every hit is verified exactly in the compressed domain.
   `ColumnView::rows_containing_with_scan` runs it over a column view, including
   a view sliced from a larger column.

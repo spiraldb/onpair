@@ -5,16 +5,15 @@
 //! (`ProbeCover::contains`), across point counts, ranges, code-width boundaries
 //! and block tails.
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::EqOr;
 use super::{Block, Mask, Matcher, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::{NibbleN8, PER_BATCH};
+use super::{Kernels, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
+use crate::search::substring::probe::plan::is_eligible;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use crate::search::substring::probe::scan::Isa;
-use crate::search::substring::probe::scan::{BLOCK, MatcherKind};
+use crate::search::substring::probe::scan::dispatch::supports;
+use crate::search::substring::probe::scan::{BLOCK, Isa, MatcherKind};
 
 /// Run one matcher and verify that a false return guarantees an empty mask.
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
@@ -39,15 +38,15 @@ fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
     bits
 }
 
-/// Compare an eligible matcher with the independent mask oracle.
-fn agrees<M: Matcher>(kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
-    if !is_eligible(detect_isa(), kind, cover) {
+/// Compare a matcher eligible on `isa` with the independent mask oracle.
+fn agrees<M: Matcher>(isa: Isa, kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
+    if !is_eligible(isa, kind, cover) {
         return;
     }
     assert_eq!(
         mask::<M>(cover, codes),
         expected(cover, codes),
-        "{name} differs from the cover it was built from"
+        "{isa:?} {name} differs from the cover it was built from"
     );
 }
 
@@ -60,34 +59,50 @@ fn block() -> Block {
     codes
 }
 
-/// Check all kernels and packing variants eligible on this CPU.
+/// Check all kernels and packing variants on every instruction set this CPU
+/// supports.
 fn every_matcher(cover: &ProbeCover, codes: &Block) {
-    agrees::<Table>(MatcherKind::Table, "table", cover, codes);
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    agrees::<Table>(Isa::Scalar, MatcherKind::Table, "table", cover, codes);
+    #[cfg(target_arch = "aarch64")]
+    vector_matchers::<super::Neon>(cover, codes);
+    #[cfg(target_arch = "x86_64")]
     {
-        agrees::<EqOr<false>>(MatcherKind::EqOr, "eq_or", cover, codes);
-        agrees::<EqOr<true>>(MatcherKind::EqOr, "eq_or_skip_empty", cover, codes);
-        if cover.n_points() == 0 {
-            agrees::<EqOr<false, false>>(MatcherKind::EqOr, "eq_or_ranges", cover, codes);
-            agrees::<EqOr<true, false>>(MatcherKind::EqOr, "eq_or_ranges_skip_empty", cover, codes);
+        vector_matchers::<super::Avx2>(cover, codes);
+        vector_matchers::<super::Avx512>(cover, codes);
+    }
+}
+
+/// Check the vector kernels and packing variants of `K`, if this CPU supports its
+/// instruction set.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
+    let isa = K::ISA;
+    if !supports(isa) {
+        return;
+    }
+    let eq_or = MatcherKind::EqOr;
+    agrees::<K::EqOr<false, true>>(isa, eq_or, "eq_or", cover, codes);
+    agrees::<K::EqOr<true, true>>(isa, eq_or, "eq_or_skip_empty", cover, codes);
+    if cover.n_points() == 0 {
+        agrees::<K::EqOr<false, false>>(isa, eq_or, "eq_or_ranges", cover, codes);
+        agrees::<K::EqOr<true, false>>(isa, eq_or, "eq_or_ranges_skip_empty", cover, codes);
+    }
+    // Use the same point-to-batch mapping as production dispatch.
+    let n8k = MatcherKind::NibbleN8;
+    match cover.points().len().div_ceil(PER_BATCH) {
+        1 => {
+            agrees::<K::NibbleN8<1, false>>(isa, n8k, "nibble_n8", cover, codes);
+            agrees::<K::NibbleN8<1, true>>(isa, n8k, "nibble_n8_skip_empty", cover, codes);
         }
-        // Use the same point-to-batch mapping as production dispatch.
-        let n8k = MatcherKind::NibbleN8;
-        match cover.points().len().div_ceil(PER_BATCH) {
-            1 => {
-                agrees::<NibbleN8<1, false>>(n8k, "nibble_n8", cover, codes);
-                agrees::<NibbleN8<1, true>>(n8k, "nibble_n8_skip_empty", cover, codes);
-            }
-            2 => {
-                agrees::<NibbleN8<2, false>>(n8k, "nibble_n16", cover, codes);
-                agrees::<NibbleN8<2, true>>(n8k, "nibble_n16_skip_empty", cover, codes);
-            }
-            3 => {
-                agrees::<NibbleN8<3, false>>(n8k, "nibble_n24", cover, codes);
-                agrees::<NibbleN8<3, true>>(n8k, "nibble_n24_skip_empty", cover, codes);
-            }
-            _ => {}
+        2 => {
+            agrees::<K::NibbleN8<2, false>>(isa, n8k, "nibble_n16", cover, codes);
+            agrees::<K::NibbleN8<2, true>>(isa, n8k, "nibble_n16_skip_empty", cover, codes);
         }
+        3 => {
+            agrees::<K::NibbleN8<3, false>>(isa, n8k, "nibble_n24", cover, codes);
+            agrees::<K::NibbleN8<3, true>>(isa, n8k, "nibble_n24_skip_empty", cover, codes);
+        }
+        _ => {}
     }
 }
 
@@ -123,10 +138,24 @@ fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) 
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn eq_or_without_points_checks_ranges() {
-    if detect_isa() == Isa::Scalar {
+    let codes = block();
+    #[cfg(target_arch = "aarch64")]
+    eq_or_checks_ranges_alone::<super::Neon>(&codes);
+    #[cfg(target_arch = "x86_64")]
+    {
+        eq_or_checks_ranges_alone::<super::Avx2>(&codes);
+        eq_or_checks_ranges_alone::<super::Avx512>(&codes);
+    }
+}
+
+/// Every EqOr variant of `K`, given a cover without points, marks exactly the
+/// ranges, in both packing modes, if this CPU supports its instruction set.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn eq_or_checks_ranges_alone<K: Kernels>(codes: &Block) {
+    let isa = K::ISA;
+    if !supports(isa) {
         return;
     }
-    let codes = block();
     for ranges in [
         vec![],
         vec![
@@ -141,16 +170,20 @@ fn eq_or_without_points_checks_ranges() {
         ],
     ] {
         let cover = ProbeCover::new(vec![], ranges);
-        let want = expected(&cover, &codes);
+        let want = expected(&cover, codes);
         let mut bits = [u64::MAX; BLOCK / 64];
-        EqOr::<false>::new(&cover).check(&codes, &mut bits);
-        assert_eq!(bits, want);
+        K::EqOr::<false, true>::new(&cover).check(codes, &mut bits);
+        assert_eq!(bits, want, "{isa:?}");
         bits.fill(u64::MAX);
-        let any_hit = EqOr::<true>::new(&cover).check(&codes, &mut bits);
-        assert_eq!(bits, want);
-        assert!(any_hit || bits.iter().all(|&word| word == 0));
-        assert_eq!(mask::<EqOr<false, false>>(&cover, &codes), want);
-        assert_eq!(mask::<EqOr<true, false>>(&cover, &codes), want);
+        let any_hit = K::EqOr::<true, true>::new(&cover).check(codes, &mut bits);
+        assert_eq!(bits, want, "{isa:?}");
+        assert!(any_hit || bits.iter().all(|&word| word == 0), "{isa:?}");
+        assert_eq!(
+            mask::<K::EqOr<false, false>>(&cover, codes),
+            want,
+            "{isa:?}"
+        );
+        assert_eq!(mask::<K::EqOr<true, false>>(&cover, codes), want, "{isa:?}");
     }
 }
 
@@ -364,6 +397,3 @@ fn the_table_masks_one_code() {
         "extra hits"
     );
 }
-
-use crate::search::substring::probe::plan::is_eligible;
-use crate::search::substring::probe::scan::detect_isa;

@@ -26,30 +26,31 @@
 //!   128 codes at a time, and packs the hits into mask words; when skipping is
 //!   enabled, groups without hits are zeroed without packing.
 //!
-//! The `isa` alias selects the file compiled for this target.
+//! AArch64 builds contain the `neon` kernels, which every AArch64 CPU runs. x86_64
+//! builds contain both the `avx2` and the `avx512` kernels, each compiled for its
+//! own instruction set whatever the build's target features, and `dispatch` runs
+//! the best one the CPU supports. Each file names its matchers in a `Kernels` impl
+//! (`Neon`, `Avx2`, `Avx512`), so dispatch and the tests are written once for all.
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
+#[cfg(target_arch = "x86_64")]
 mod avx2;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[cfg(target_arch = "x86_64")]
 mod avx512;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 mod table;
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-use avx2 as isa;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-use avx512 as isa;
-#[cfg(target_arch = "aarch64")]
-use neon as isa;
 
 use super::{Block, Mask};
 use crate::search::substring::ProbeCover;
 
 /// Number of points in one batch of nibble tables.
 pub(in crate::search::substring::probe) const PER_BATCH: usize = 8;
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(in crate::search::substring::probe::scan) use isa::{EqOr, NibbleN8};
+#[cfg(target_arch = "x86_64")]
+pub(in crate::search::substring::probe::scan) use avx2::Avx2;
+#[cfg(target_arch = "x86_64")]
+pub(in crate::search::substring::probe::scan) use avx512::Avx512;
+#[cfg(target_arch = "aarch64")]
+pub(in crate::search::substring::probe::scan) use neon::Neon;
 pub(in crate::search::substring::probe::scan) use table::Table;
 
 /// A cover membership test, prepared once and run on every block.
@@ -63,6 +64,17 @@ pub(in crate::search::substring::probe::scan) trait Matcher:
     /// Overwrites `bits` with the block's mask. Returns `false` only if the mask is
     /// empty, so the caller can skip row lookup; `true` does not imply a hit.
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool;
+}
+
+/// The vector matchers of one instruction set.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(in crate::search::substring::probe::scan) trait Kernels {
+    /// The instruction set the matchers run on.
+    const ISA: super::Isa;
+    /// One vector comparison per point, plus range checks.
+    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool, const HAS_POINTS: bool>: Matcher;
+    /// Nibble shuffle tables, eight points per batch, plus range checks.
+    type NibbleN8<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>: Matcher;
 }
 
 #[cfg(test)]

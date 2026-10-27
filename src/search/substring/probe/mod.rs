@@ -51,7 +51,7 @@ mod verify;
 pub use alignment::cover::ProbeCover;
 
 use alignment::graph::AlignmentGraph;
-use scan::{MatcherKind, ScanInput};
+use scan::{Isa, MatcherKind, ScanInput};
 use verify::HitVerifier;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -72,6 +72,7 @@ use crate::search::substring::ContainsError;
 pub struct ContainsScan<'d> {
     dict: CompactDictionaryView<'d>,
     probe_cover: ProbeCover,
+    isa: Isa,
     matcher: MatcherKind,
     verifier: HitVerifier,
     probe_density: f64,
@@ -123,6 +124,7 @@ impl<'d> ContainsScan<'d> {
         debug_assert!(!cover.is_empty(), "empty filter for {pattern:?}");
         Ok(Self {
             dict,
+            isa,
             matcher,
             probe_cover: cover,
             verifier: HitVerifier::from_graph(&graph, pattern),
@@ -159,6 +161,7 @@ impl<'d> ContainsScan<'d> {
             return;
         }
         scan::run(
+            self.isa,
             self.matcher,
             plan::skip_empty_packing(self.probe_density, last - first),
             ScanInput::new(

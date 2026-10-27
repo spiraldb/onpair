@@ -131,6 +131,7 @@ fn clear_from(bits: &mut Mask, valid: usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::dispatch::supports;
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
     use crate::core::types::TokenRange;
@@ -146,8 +147,9 @@ mod tests {
         CompactDictionary::from_raw(bytes, offsets)
     }
 
-    /// Runs every kernel eligible on this CPU, in both packing modes, with a verifier
-    /// that accepts every hit, and checks that each appends exactly `expected`.
+    /// Runs every kernel eligible on every instruction set this CPU supports, in both
+    /// packing modes, with a verifier that accepts every hit, and checks that each
+    /// appends exactly `expected`.
     fn check_every_kernel<O: Offset>(
         cover: &ProbeCover,
         codes: &[Token],
@@ -156,18 +158,22 @@ mod tests {
     ) {
         let dict = byte_dictionary();
         let verifier = accepting_verifier();
-        for kind in [MatcherKind::Table, MatcherKind::EqOr, MatcherKind::NibbleN8] {
-            if !is_eligible(detect_isa(), kind, cover) {
-                continue;
-            }
-            for skip_empty_packing in [false, true] {
-                let input = ScanInput::new(codes, row_offsets, dict.as_view(), cover, &verifier);
-                let mut out = Vec::new();
-                run(kind, skip_empty_packing, input, &mut out);
-                assert_eq!(
-                    out, expected,
-                    "{kind:?}, skip_empty_packing={skip_empty_packing}"
-                );
+        let isas = [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw];
+        for isa in isas.into_iter().filter(|&isa| supports(isa)) {
+            for kind in [MatcherKind::Table, MatcherKind::EqOr, MatcherKind::NibbleN8] {
+                if !is_eligible(isa, kind, cover) {
+                    continue;
+                }
+                for skip_empty_packing in [false, true] {
+                    let input =
+                        ScanInput::new(codes, row_offsets, dict.as_view(), cover, &verifier);
+                    let mut out = Vec::new();
+                    run(isa, kind, skip_empty_packing, input, &mut out);
+                    assert_eq!(
+                        out, expected,
+                        "{isa:?}, {kind:?}, skip_empty_packing={skip_empty_packing}"
+                    );
+                }
             }
         }
     }

@@ -3,17 +3,17 @@
 
 //! Instantiate the planned kernel, so the block loop runs on concrete types.
 //!
-//! The matcher kind, the packing policy and the number of nibble batches are
-//! resolved once per scan into type and const parameters.
+//! The instruction set, the matcher kind, the packing policy and the number of
+//! nibble batches are resolved once per scan into type and const parameters.
 //!
-//! AArch64 always has NEON. An x86 build contains the AVX2 kernels, or the AVX-512
-//! ones if `avx512bw` is enabled at compile time, and falls back to the table when
-//! the CPU lacks them. Other targets only have the table.
+//! AArch64 always has NEON. An x86_64 build contains both the AVX2 and the AVX-512
+//! kernels and picks the best one the CPU supports at runtime, falling back to the
+//! table without either. Other targets only have the table.
 
 use super::matcher;
 use super::{Isa, MatcherKind, ScanInput, both_stages};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::{PER_BATCH, matcher::Matcher};
+use super::{PER_BATCH, matcher::Kernels, matcher::Matcher};
 
 use crate::core::offset::Offset;
 
@@ -32,47 +32,68 @@ fn with_skip<O: Offset, S: Matcher, P: Matcher>(
     }
 }
 
-/// Scans `input` with the `kind` kernel and appends the verified rows to `out`.
-/// `kind` must be eligible for the cover on this CPU, as planning ensures; this is
-/// not checked again.
+/// Scans `input` with the `kind` kernel of `isa` and appends the verified rows to
+/// `out`. `isa` must be supported by this CPU and `kind` eligible for the cover on
+/// it, as planning ensures; neither is checked again.
 pub(in crate::search::substring::probe) fn run<O: Offset>(
+    isa: Isa,
     kind: MatcherKind,
     skip_empty_packing: bool,
     input: ScanInput<'_, O>,
     out: &mut Vec<usize>,
 ) {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        let _ = (kind, skip_empty_packing);
-        both_stages::<matcher::Table, O>(input, out);
+    let _ = (kind, skip_empty_packing);
+    match isa {
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => run_with::<matcher::Neon, O>(kind, skip_empty_packing, input, out),
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => run_with::<matcher::Avx2, O>(kind, skip_empty_packing, input, out),
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx512Bw => run_with::<matcher::Avx512, O>(kind, skip_empty_packing, input, out),
+        _ => both_stages::<matcher::Table, O>(input, out),
     }
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+}
+
+/// Scans `input` with the `kind` kernel among `K`'s, one instruction set's matchers.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn run_with<K: Kernels, O: Offset>(
+    kind: MatcherKind,
+    skip_empty_packing: bool,
+    input: ScanInput<'_, O>,
+    out: &mut Vec<usize>,
+) {
+    debug_assert!(
+        supports(K::ISA),
+        "{:?} kernels on a CPU without them",
+        K::ISA
+    );
     match kind {
         MatcherKind::Table => both_stages::<matcher::Table, O>(input, out),
         MatcherKind::EqOr if input.cover.n_points() == 0 => {
-            with_skip::<O, matcher::EqOr<true, false>, matcher::EqOr<false, false>>(
+            with_skip::<O, K::EqOr<true, false>, K::EqOr<false, false>>(
                 skip_empty_packing,
                 input,
                 out,
             )
         }
-        MatcherKind::EqOr => with_skip::<O, matcher::EqOr<true>, matcher::EqOr<false>>(
+        MatcherKind::EqOr => with_skip::<O, K::EqOr<true, true>, K::EqOr<false, true>>(
             skip_empty_packing,
             input,
             out,
         ),
         MatcherKind::NibbleN8 => match input.cover.n_points().div_ceil(PER_BATCH) {
-            1 => with_skip::<O, matcher::NibbleN8<1, true>, matcher::NibbleN8<1, false>>(
+            1 => with_skip::<O, K::NibbleN8<1, true>, K::NibbleN8<1, false>>(
                 skip_empty_packing,
                 input,
                 out,
             ),
-            2 => with_skip::<O, matcher::NibbleN8<2, true>, matcher::NibbleN8<2, false>>(
+            2 => with_skip::<O, K::NibbleN8<2, true>, K::NibbleN8<2, false>>(
                 skip_empty_packing,
                 input,
                 out,
             ),
-            3 => with_skip::<O, matcher::NibbleN8<3, true>, matcher::NibbleN8<3, false>>(
+            3 => with_skip::<O, K::NibbleN8<3, true>, K::NibbleN8<3, false>>(
                 skip_empty_packing,
                 input,
                 out,
@@ -82,24 +103,27 @@ pub(in crate::search::substring::probe) fn run<O: Offset>(
     }
 }
 
-/// The compiled kernel family if this CPU supports it, otherwise `Isa::Scalar`.
+/// Whether this build has kernels for `isa` and this CPU can run them.
+pub(in crate::search::substring::probe) fn supports(isa: Isa) -> bool {
+    match isa {
+        Isa::Scalar => true,
+        #[cfg(target_arch = "aarch64")]
+        Isa::Neon => true,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 => std::is_x86_feature_detected!("avx2"),
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx512Bw => {
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+        }
+        _ => false,
+    }
+}
+
+/// The fastest instruction set this CPU supports: AVX-512 before AVX2 on x86_64,
+/// NEON on AArch64, and `Isa::Scalar` without any of them.
 pub(in crate::search::substring::probe) fn detect_isa() -> Isa {
-    #[cfg(target_arch = "aarch64")]
-    let isa = Isa::Neon;
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-    let isa = if std::is_x86_feature_detected!("avx2") {
-        Isa::Avx2
-    } else {
-        Isa::Scalar
-    };
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-    let isa = if std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx2")
-    {
-        Isa::Avx512Bw
-    } else {
-        Isa::Scalar
-    };
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let isa = Isa::Scalar;
-    isa
+    [Isa::Avx512Bw, Isa::Avx2, Isa::Neon]
+        .into_iter()
+        .find(|&isa| supports(isa))
+        .unwrap_or(Isa::Scalar)
 }

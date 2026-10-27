@@ -9,9 +9,10 @@
 
 use std::arch::x86_64::*;
 
-use super::{Block, Mask, Matcher, PER_BATCH};
+use super::{Block, Kernels, Mask, Matcher, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
+use crate::search::substring::probe::scan::Isa;
 
 /// Membership results for 64 codes: one 0xFF/0x00 byte per code.
 type Hits = [__m256i; 2];
@@ -360,4 +361,15 @@ fn nibble_mask<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
             unsafe { check_ranges(probe(batches, codes), ranges, codes) }
         },
     )
+}
+
+/// The AVX2 matchers.
+pub(in crate::search::substring::probe::scan) struct Avx2;
+
+impl Kernels for Avx2 {
+    const ISA: Isa = Isa::Avx2;
+    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool, const HAS_POINTS: bool> =
+        EqOr<SKIP_MOVEMASK_IF_NO_MATCH, HAS_POINTS>;
+    type NibbleN8<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> =
+        NibbleN8<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>;
 }

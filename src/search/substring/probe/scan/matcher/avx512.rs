@@ -9,9 +9,10 @@
 
 use std::arch::x86_64::*;
 
-use super::{Block, Mask, Matcher, PER_BATCH};
+use super::{Block, Kernels, Mask, Matcher, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
+use crate::search::substring::probe::scan::Isa;
 
 /// Membership results for 64 codes: one mask bit per code.
 type Hits = u64;
@@ -42,7 +43,7 @@ unsafe fn load(at: *const Token) -> Vectors {
 /// `false` guarantees an empty mask; without skipping, the return is always
 /// `true` even if every packed bit is zero.
 #[inline]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn words<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     codes: &Block,
     bits: &mut Mask,
@@ -90,7 +91,7 @@ unsafe fn movemask(bits: &mut [u64], a: Hits, b: Hits) {
 }
 
 fn hold(range: TokenRange) -> Held {
-    // SAFETY: avx512bw, enabled by the build and checked by `detect_isa`.
+    // SAFETY: avx512f and avx512bw, checked by `detect_isa` before planning.
     unsafe {
         (
             _mm512_set1_epi16(range.begin as i16),
@@ -109,7 +110,7 @@ unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
 /// OR range membership into existing hit lanes.
 /// The caller must have enabled the compiled vector instruction set.
 #[inline]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
     for &held in held {
         // SAFETY: the caller provides the instruction set required by these helpers.
@@ -120,7 +121,7 @@ unsafe fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
 
 /// Fill a block mask from prepared ranges; an empty slice clears the mask.
 /// The target-feature boundary keeps range comparisons inside the vector loop.
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn ranges_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     held: &[Held],
     codes: &Block,
@@ -139,7 +140,7 @@ fn ranges_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
 }
 
 fn broadcast(code: Token) -> Broadcast {
-    // SAFETY: avx512bw, enabled by the build and checked by `detect_isa`.
+    // SAFETY: avx512f and avx512bw, checked by `detect_isa` before planning.
     unsafe { _mm512_set1_epi16(code as i16) }
 }
 
@@ -200,7 +201,7 @@ impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool, const HAS_POINTS: bool> Matcher
 
 /// Fill the block mask with point and range matches.
 /// The target-feature boundary lets the comparison closure inline with its caller.
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn eq_or_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     tokens: &[Broadcast],
     ranges: &[Held],
@@ -234,7 +235,7 @@ fn batch(tokens: &[Token]) -> Batch {
 }
 
 fn table(row: [u8; 16]) -> Table {
-    // SAFETY: the row is the load's 16 bytes.
+    // SAFETY: avx512f, checked by `detect_isa`; the row is the load's 16 bytes.
     unsafe { _mm512_broadcast_i32x4(_mm_loadu_si128(row.as_ptr().cast())) }
 }
 
@@ -333,7 +334,7 @@ impl<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher
 
 /// Fill a block mask with nibble-table and range matches.
 /// The target-feature boundary keeps the probe closure inside the vector loop.
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn nibble_mask<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     batches: &[Batch; BATCHES],
     ranges: &[Held],
@@ -349,4 +350,15 @@ fn nibble_mask<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
             unsafe { check_ranges(probe(batches, codes), ranges, codes) }
         },
     )
+}
+
+/// The AVX-512BW matchers.
+pub(in crate::search::substring::probe::scan) struct Avx512;
+
+impl Kernels for Avx512 {
+    const ISA: Isa = Isa::Avx512Bw;
+    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool, const HAS_POINTS: bool> =
+        EqOr<SKIP_MOVEMASK_IF_NO_MATCH, HAS_POINTS>;
+    type NibbleN8<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> =
+        NibbleN8<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>;
 }
