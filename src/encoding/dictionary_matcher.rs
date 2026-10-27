@@ -57,7 +57,17 @@ const BLOCK_KEYS: usize = 8;
 /// One cache line of keys.
 #[derive(Copy, Clone, Debug)]
 #[repr(align(128))]
-struct KeyBlock([u128; BLOCK_KEYS]);
+struct KeyBlock {
+    hi: [u64; BLOCK_KEYS],
+    lo: [u64; BLOCK_KEYS],
+}
+
+impl KeyBlock {
+    #[inline(always)]
+    fn key(&self, slot: usize) -> u128 {
+        (u128::from(self.hi[slot]) << 64) | u128::from(self.lo[slot])
+    }
+}
 
 /// The prefix tokens of one token `t` by length bound, in one 32-byte record,
 /// so that the match needs one load after the search.
@@ -157,9 +167,12 @@ impl DictionaryMatcher {
 
         let blocks: Vec<KeyBlock> = keys
             .chunks_exact(BLOCK_KEYS)
-            .map(|chunk| KeyBlock(chunk.try_into().unwrap()))
+            .map(|chunk| KeyBlock {
+                hi: std::array::from_fn(|i| (chunk[i] >> 64) as u64),
+                lo: std::array::from_fn(|i| chunk[i] as u64),
+            })
             .collect();
-        let samples = blocks.iter().map(|block| block.0[0]).collect();
+        let samples = blocks.iter().map(|block| block.key(0)).collect();
 
         Self {
             blocks,
@@ -232,8 +245,8 @@ impl DictionaryMatcher {
         let mut half = BLOCK_KEYS / 2;
         while half > 0 {
             for j in 0..K {
-                let block = &self.blocks[base[j]].0;
-                slot[j] = advance_if_le(block[slot[j] + half], key[j], slot[j], half);
+                let block = &self.blocks[base[j]];
+                slot[j] = advance_if_le(block.key(slot[j] + half), key[j], slot[j], half);
             }
             half /= 2;
         }
@@ -241,7 +254,7 @@ impl DictionaryMatcher {
         let mut q = [0usize; K];
         let len: [usize; K] = std::array::from_fn(|j| {
             q[j] = base[j] * BLOCK_KEYS + slot[j];
-            let found = self.blocks[base[j]].0[slot[j]];
+            let found = self.blocks[base[j]].key(slot[j]);
 
             let common = ((found ^ key[j]).leading_zeros() / 8) as usize;
             let max_len = common.min(win[j]);
