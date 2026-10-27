@@ -40,13 +40,10 @@ pub(crate) struct DictionaryMatcher {
     /// Token keys in dictionary order, then `u128::MAX` up to a whole block.
     keys: Vec<u128>,
     /// Dictionary indices delimiting every two-byte prefix, including 65536.
-    #[allow(dead_code)]
     starts: Vec<u32>,
     /// Bytes 2..6 as big-endian u32s, followed by fifteen readable pads.
-    #[allow(dead_code)]
     mid: Vec<u32>,
-    /// First token with the same first six padded bytes as this token.
-    #[allow(dead_code)]
+    /// First token in the equal-six-byte run, or MAX when no token exceeds six bytes.
     tie_starts: Vec<u32>,
     /// First key of each block.
     samples: Vec<u128>,
@@ -165,13 +162,17 @@ impl DictionaryMatcher {
             .collect();
         let mut mid: Vec<u32> = keys[..n].iter().map(|&key| (key >> 80) as u32).collect();
         mid.resize(n + 15, u32::MAX);
-        let mut tie_starts = Vec::with_capacity(n);
+        let mut tie_starts = vec![u32::MAX; n];
         let mut first = 0;
-        for i in 0..n {
-            if i == 0 || keys[i] >> 80 != keys[i - 1] >> 80 {
-                first = i;
+        while first < n {
+            let mut end = first + 1;
+            while end < n && keys[end] >> 80 == keys[first] >> 80 {
+                end += 1;
             }
-            tie_starts.push(first as u32);
+            if (first..end).any(|i| dict.token_len(i as Token) > 6) {
+                tie_starts[first..end].fill(first as u32);
+            }
+            first = end;
         }
         let starts = starts.into_iter().map(|i| i as u32).collect();
 
@@ -255,9 +256,18 @@ impl DictionaryMatcher {
             half /= 2;
         }
 
-        let mut q = [0usize; K];
+        let q = std::array::from_fn(|j| base[j] * BLOCK_KEYS + slot[j]);
+        self.finish(&key, &q, win)
+    }
+
+    #[inline(always)]
+    fn finish<const K: usize>(
+        &self,
+        key: &[u128; K],
+        q: &[usize; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
         let len: [usize; K] = std::array::from_fn(|j| {
-            q[j] = base[j] * BLOCK_KEYS + slot[j];
             let found = self.keys[q[j]];
 
             let common = ((found ^ key[j]).leading_zeros() / 8) as usize;
@@ -278,6 +288,191 @@ impl DictionaryMatcher {
             (select_unpredictable(len[j] == 1, single, longer), len[j])
         })
     }
+    /// Scalar middle-key variant, also used to validate the SIMD variants.
+    #[inline(always)]
+    pub(crate) fn find_all_middle<const K: usize>(
+        &self,
+        bytes: &[u8],
+        at: &[usize; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        // SAFETY: mode one requires no target features.
+        unsafe { self.find_all_rank::<K, 1>(bytes, at, win) }
+    }
+
+    /// The caller must detect AVX-512F and POPCNT.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,popcnt")]
+    #[inline]
+    pub(crate) unsafe fn find_all_avx512<const K: usize>(
+        &self,
+        bytes: &[u8],
+        at: &[usize; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        // SAFETY: this function enables both required features.
+        unsafe { self.find_all_rank::<K, 3>(bytes, at, win) }
+    }
+
+    /// The caller must detect AVX2 and POPCNT.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,popcnt")]
+    #[inline]
+    pub(crate) unsafe fn find_all_avx2<const K: usize>(
+        &self,
+        bytes: &[u8],
+        at: &[usize; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        // SAFETY: this function enables both required features.
+        unsafe { self.find_all_rank::<K, 2>(bytes, at, win) }
+    }
+
+    /// The caller must detect NEON. Kept available for ARM measurement.
+    #[cfg(all(test, target_arch = "aarch64"))]
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn find_all_neon<const K: usize>(
+        &self,
+        bytes: &[u8],
+        at: &[usize; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        // SAFETY: this function enables NEON.
+        unsafe { self.find_all_rank::<K, 4>(bytes, at, win) }
+    }
+
+    /// Modes two and three require their respective SIMD ISA and POPCNT.
+    #[inline(always)]
+    unsafe fn find_all_rank<const K: usize, const MODE: u8>(
+        &self,
+        bytes: &[u8],
+        at: &[usize; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        let key: [u128; K] = std::array::from_fn(|j| window_key(bytes, at[j]));
+        let start: [usize; K] =
+            std::array::from_fn(|j| self.starts[(key[j] >> 112) as usize] as usize);
+        let n: [usize; K] =
+            std::array::from_fn(|j| self.starts[(key[j] >> 112) as usize + 1] as usize - start[j]);
+        let w: [u32; K] = std::array::from_fn(|j| (key[j] >> 80) as u32);
+        let last = self.starts[PREFIX_SLOTS] as usize - 1;
+        let mut block = [0usize; K];
+        let mut size: [usize; K] = std::array::from_fn(|j| n[j].div_ceil(16));
+        let largest = size.iter().copied().max().unwrap_or(0);
+        let steps = usize::BITS - largest.saturating_sub(1).leading_zeros();
+        for _ in 0..steps {
+            for j in 0..K {
+                let half = size[j] / 2;
+                let mid = block[j] + half;
+                let sample = self.mid[(start[j] + mid * 16).min(last)];
+                block[j] = select_unpredictable(sample <= w[j], mid, block[j]);
+                size[j] -= half;
+            }
+        }
+        let mut q = [0usize; K];
+        for j in 0..K {
+            let offset = block[j] * 16;
+            let valid = ((1u32 << n[j].saturating_sub(offset).min(16)) - 1) as u16;
+            // Empty ranges can start at the end of the array. Clamp their
+            // zero-masked load so fifteen trailing pads are sufficient.
+            let load_at = (start[j] + offset).min(last);
+            // SAFETY: load_at is at most the last token, followed by fifteen
+            // readable pads; the caller guarantees the selected ISA.
+            let count = unsafe { rank16::<MODE>(self.mid.as_ptr().add(load_at), w[j], valid) };
+            // Prefix zero contains the key zero, so its count cannot be zero.
+            q[j] = start[j] + offset + count - 1;
+            if count > 0 && self.mid[q[j]] == w[j] && self.tie_starts[q[j]] != u32::MAX {
+                let mut base = (self.tie_starts[q[j]] as usize).saturating_sub(1);
+                let mut size = q[j] + 1 - base;
+                let steps = usize::BITS - size.saturating_sub(1).leading_zeros();
+                for _ in 0..steps {
+                    let half = size / 2;
+                    base = advance_if_le(self.keys[base + half], key[j], base, half);
+                    size -= half;
+                }
+                q[j] = base;
+            }
+        }
+        self.finish(&key, &q, win)
+    }
+}
+
+/// Both the pointer and the ISA are guaranteed by the matcher specialization.
+#[inline(always)]
+unsafe fn rank16<const MODE: u8>(ptr: *const u32, w: u32, valid: u16) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if MODE == 3 {
+        // SAFETY: inherited pointer and AVX-512F/POPCNT preconditions.
+        return unsafe { rank16_avx512(ptr, w, valid) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if MODE == 2 {
+        // SAFETY: inherited pointer and AVX2/POPCNT preconditions.
+        return unsafe { rank16_avx2(ptr, w, valid) };
+    }
+    #[cfg(all(test, target_arch = "aarch64"))]
+    if MODE == 4 {
+        // SAFETY: inherited pointer and NEON preconditions.
+        return unsafe { rank16_neon(ptr, w, valid) };
+    }
+    let mut count = 0;
+    for i in 0..16 {
+        // SAFETY: the caller provides sixteen readable u32 entries.
+        count += usize::from(unsafe { *ptr.add(i) } <= w && valid & (1 << i) != 0);
+    }
+    count
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,popcnt")]
+#[inline]
+unsafe fn rank16_avx512(ptr: *const u32, w: u32, valid: u16) -> usize {
+    // SAFETY: the caller provides sixteen readable u32 entries.
+    let keys = unsafe { std::arch::x86_64::_mm512_loadu_si512(ptr.cast()) };
+    let w = std::arch::x86_64::_mm512_set1_epi32(w as i32);
+    std::arch::x86_64::_mm512_mask_cmple_epu32_mask(valid, keys, w).count_ones() as usize
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+#[inline]
+unsafe fn rank16_avx2(ptr: *const u32, w: u32, valid: u16) -> usize {
+    let bias = std::arch::x86_64::_mm256_set1_epi32(i32::MIN);
+    let w = std::arch::x86_64::_mm256_set1_epi32((w ^ 0x8000_0000) as i32);
+    // SAFETY: the caller provides sixteen readable u32 entries.
+    let (a, b) = unsafe {
+        (
+            std::arch::x86_64::_mm256_loadu_si256(ptr.cast()),
+            std::arch::x86_64::_mm256_loadu_si256(ptr.add(8).cast()),
+        )
+    };
+    let a = std::arch::x86_64::_mm256_xor_si256(a, bias);
+    let b = std::arch::x86_64::_mm256_xor_si256(b, bias);
+    let a = std::arch::x86_64::_mm256_cmpgt_epi32(a, w);
+    let b = std::arch::x86_64::_mm256_cmpgt_epi32(b, w);
+    let gt = std::arch::x86_64::_mm256_movemask_ps(std::arch::x86_64::_mm256_castsi256_ps(a))
+        as u16
+        | ((std::arch::x86_64::_mm256_movemask_ps(std::arch::x86_64::_mm256_castsi256_ps(b))
+            as u16)
+            << 8);
+    ((!gt) & valid).count_ones() as usize
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+unsafe fn rank16_neon(ptr: *const u32, w: u32, valid: u16) -> usize {
+    let mut count = 0;
+    let w = std::arch::aarch64::vdupq_n_u32(w);
+    for group in 0..4 {
+        // SAFETY: the caller provides sixteen readable entries.
+        let keys = unsafe { std::arch::aarch64::vld1q_u32(ptr.add(group * 4)) };
+        let mask: [u32; 4] = std::array::from_fn(|i| u32::from((valid >> (group * 4 + i)) & 1));
+        // SAFETY: mask has four readable entries.
+        let mask = unsafe { std::arch::aarch64::vld1q_u32(mask.as_ptr()) };
+        let le = std::arch::aarch64::vshrq_n_u32::<31>(std::arch::aarch64::vcleq_u32(keys, w));
+        count += std::arch::aarch64::vaddvq_u32(std::arch::aarch64::vandq_u32(le, mask)) as usize;
+    }
+    count
 }
 
 /// `at + step` if `a <= b`, else `at`, without a branch: one step of a binary
@@ -569,3 +764,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dictionary_matcher_tests.rs"]
+mod rank_tests;
