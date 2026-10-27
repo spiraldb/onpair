@@ -290,7 +290,7 @@ fn gather_sample<'a>(
 pub(crate) fn train<R: Rows + ?Sized>(rows: &R, cfg: &TrainingConfig) -> TrainResult {
     let total_bytes = rows.total_bytes();
     let seed = cfg.seed.unwrap_or_else(|| {
-        use rand::Rng;
+        use rand::RngExt;
         rand::rng().random()
     });
     let (order, selected_start) = make_training_order(rows, cfg.threshold, total_bytes, seed);

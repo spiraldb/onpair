@@ -8,7 +8,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::ContainsScan;
 use super::alignment::cover::ProbeCover;
