@@ -35,7 +35,9 @@ use divan::Bencher;
 use onpair::Column;
 use onpair::Config;
 use onpair::DECODE_PADDING;
+use onpair::DEFAULT_CONFIG;
 use onpair::MaxDictBits;
+use onpair::Parser;
 use onpair::Threshold;
 use onpair::compress;
 use tpchgen::generators::CustomerGenerator;
@@ -198,14 +200,19 @@ where
     (bytes, offsets)
 }
 
-fn build_column(col: &'static str, bits: u8) -> Column<u64> {
-    let c = corpus_for(col);
-    let cfg = Config {
+/// The default configuration with a `bits`-bit dictionary and a 0.2
+/// threshold.
+fn bench_config(bits: u8) -> Config {
+    Config {
         max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.2).unwrap(),
-        seed: Some(42),
-    };
-    compress(&c.bytes, &c.offsets, cfg).unwrap()
+        ..DEFAULT_CONFIG
+    }
+}
+
+fn build_column(col: &'static str, bits: u8) -> Column<u64> {
+    let c = corpus_for(col);
+    compress(&c.bytes, &c.offsets, bench_config(bits)).unwrap()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,21 +223,24 @@ fn build_column(col: &'static str, bits: u8) -> Column<u64> {
 fn train_and_compress(bencher: Bencher, param: (&'static str, u8)) {
     let (col, bits) = param;
     let c = corpus_for(col);
-    let cfg = Config {
-        max_dict_bits: MaxDictBits::new(bits).unwrap(),
-        threshold: Threshold::new(0.2).unwrap(),
-        seed: Some(42),
-    };
+    let cfg = bench_config(bits);
+
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
-        .bench(|| {
-            compress(
-                divan::black_box(&c.bytes),
-                divan::black_box(&c.offsets),
-                cfg,
-            )
-            .unwrap()
-        });
+        .with_inputs(|| (c.bytes.as_slice(), c.offsets.as_slice()))
+        .bench_refs(|(bytes, offsets)| compress(bytes, offsets, cfg).unwrap());
+}
+
+#[divan::bench(args = PARAMS)]
+fn parse(bencher: Bencher, param: (&'static str, u8)) {
+    let (col, bits) = param;
+    let c = corpus_for(col);
+    let parser = Parser::train(&c.bytes, &c.offsets, bench_config(bits)).unwrap();
+
+    bencher
+        .counter(divan::counter::BytesCount::new(c.total_bytes))
+        .with_inputs(|| (c.bytes.as_slice(), c.offsets.as_slice()))
+        .bench_refs(|(bytes, offsets)| parser.parse(bytes, offsets).unwrap());
 }
 
 #[divan::bench(args = PARAMS)]
