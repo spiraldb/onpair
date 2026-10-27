@@ -31,7 +31,11 @@ jobs:
 
   bench-codspeed:
     name: Benchmark with Codspeed
-    runs-on: ubuntu-latest
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=c7i.8xlarge
+      - image=ubuntu24-full-x64
+      - tag=bench-codspeed
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
@@ -42,6 +46,7 @@ jobs:
 
       - name: Build benchmarks
         env:
+          # Simulation runs under Valgrind, which cannot decode AVX-512.
           RUSTFLAGS: "-C target-feature=+avx2"
         run: |
           cargo codspeed build --profile bench -m simulation
@@ -54,7 +59,11 @@ jobs:
 
   bench-codspeed-walltime:
     name: Benchmark with Codspeed (Walltime)
-    runs-on: ubuntu-latest
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=c7i.8xlarge
+      - image=ubuntu24-full-x64
+      - tag=bench-codspeed-walltime
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
@@ -65,10 +74,7 @@ jobs:
 
       - name: Build benchmarks
         env:
-          # TODO: use avx512 (+avx512f,+avx512bw,+avx512vl,+avx512dq) once the
-          # walltime runner is guaranteed to expose it (e.g. codspeed-macro);
-          # ubuntu-latest does not reliably support AVX-512 and would SIGILL.
-          RUSTFLAGS: "-C target-feature=+avx2"
+          RUSTFLAGS: "-C target-cpu=native -C force-frame-pointers=yes"
         run: |
           cargo codspeed build --profile bench -m walltime
 
