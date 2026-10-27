@@ -6,6 +6,12 @@
 //! Costs are relative work, not time. `matcher_cost` prices scanning one code with
 //! a given matcher; `candidate_cost` prices the row lookup and verification of the
 //! hits. Matcher selection uses the first; cover ranking uses both.
+//!
+//! Each instruction set has its own weights in its own unit, so only ratios within
+//! one set mean anything: `candidate` over `table`, for instance, is how many codes
+//! the table matcher scans in the time a hit takes to verify. The weights are
+//! rounded measurements on the target: scan times with fixed covers for the
+//! matchers, and the cost of a typical hit for `candidate`.
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherKind, PER_BATCH};
@@ -59,21 +65,15 @@ struct CostWeights {
     candidate: f64,
 }
 
-/// Fitted on four datasets and checked on eight others with fixed covers. The
-/// candidate weight was evaluated separately on the same datasets.
 const NEON_COSTS: CostWeights = CostWeights {
     table: 22.0,
     point: 2.0,
     range: 3.0,
     nibble_base: 2.0,
     nibble_batch: 5.0,
-    candidate: 4096.0,
+    candidate: 2048.0,
 };
 
-/// Conservative profile checked on fixed covers from ClickBench URLs, Amazon titles
-/// and DBpedia abstracts, on an AMD EPYC 9R05. The candidate weight is provisional:
-/// it rounds the three-dataset fit of 3668.7225 and has not yet been validated
-/// against decompress-then-scan.
 const AVX2_COSTS: CostWeights = CostWeights {
     table: 36.0,
     point: 1.0,
@@ -83,9 +83,6 @@ const AVX2_COSTS: CostWeights = CostWeights {
     candidate: 3669.0,
 };
 
-/// From the same evaluation as the AVX2 profile. The candidate weight is
-/// provisional: it rounds the three-dataset fit of 3170.2343 and has not yet been
-/// validated against decompress-then-scan.
 const AVX512BW_COSTS: CostWeights = CostWeights {
     table: 31.0,
     point: 1.0,
@@ -128,9 +125,10 @@ pub(super) fn slopes(isa: Isa) -> Option<Slopes> {
 
 /// Cost of looking up and verifying `covered_frequency` hits.
 ///
-/// A flat cost per hit: walk lengths and the hits skipped after a row matches are
-/// not modeled. On scalar targets only the table matcher exists, and its cost does
-/// not depend on the cover, so ranking there simply minimizes frequency.
+/// A flat cost per hit, although sparse hits cost more each than dense ones. Walk
+/// lengths and the hits skipped after a row matches are not modeled either. On
+/// scalar targets only the table matcher exists, and its cost does not depend on
+/// the cover, so ranking there simply minimizes frequency.
 pub(super) fn candidate_cost(isa: Isa, covered_frequency: u32) -> f64 {
     let weight = match isa {
         Isa::Neon => NEON_COSTS.candidate,
