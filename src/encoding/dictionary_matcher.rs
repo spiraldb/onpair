@@ -45,6 +45,10 @@ pub(crate) struct DictionaryMatcher {
     mid: Vec<u32>,
     /// First token in the equal-six-byte run, or MAX when no token exceeds six bytes.
     tie_starts: Vec<u32>,
+    /// Per prefix: sample offset shifted left two bits, then the level count.
+    sample_info: Vec<u32>,
+    /// Range-local sample levels, highest first; each node has 16 separators.
+    level_samples: Vec<u32>,
     /// First key of each block.
     samples: Vec<u128>,
     /// Per 2-byte prefix `p`: the block of the last token before the tokens
@@ -59,6 +63,7 @@ pub(crate) struct DictionaryMatcher {
 
 /// Keys per block: one 128-byte cache line.
 const BLOCK_KEYS: usize = 8;
+const SAMPLE_STRIDES: [usize; 3] = [16, 272, 4624];
 
 /// The prefix tokens of one token `t` by length bound, in one 32-byte record,
 /// so that the match needs one load after the search.
@@ -174,13 +179,48 @@ impl DictionaryMatcher {
             }
             first = end;
         }
-        let starts = starts.into_iter().map(|i| i as u32).collect();
+        let starts: Vec<u32> = starts.into_iter().map(|i| i as u32).collect();
+        // Sixteen separators select seventeen children. Final leaves hold
+        // sixteen tokens, giving capacities 16, 272, 4624, and 78608.
+        let mut sample_info = vec![0u32; PREFIX_SLOTS];
+        let mut level_samples = vec![u32::MAX; 16];
+        for p in 0..PREFIX_SLOTS {
+            let start = starts[p] as usize;
+            let n = starts[p + 1] as usize - start;
+            let mut capacity = 16;
+            let mut levels = 0;
+            while capacity < n {
+                capacity *= 17;
+                levels += 1;
+            }
+            if levels == 0 {
+                continue;
+            }
+            sample_info[p] = ((level_samples.len() as u32) << 2) | levels as u32;
+            for level in (0..levels).rev() {
+                let stride = SAMPLE_STRIDES[level];
+                let capacity = stride * 17;
+                for node in 0..n.div_ceil(capacity) {
+                    for separator in 1..=16 {
+                        let index = node * capacity + separator * stride;
+                        level_samples.push(if index < n {
+                            mid[start + index]
+                        } else {
+                            u32::MAX
+                        });
+                    }
+                }
+            }
+        }
+        level_samples.resize(level_samples.len() + 15, u32::MAX);
 
         Self {
             keys,
             starts,
             mid,
             tie_starts,
+            sample_info,
+            level_samples,
             samples,
             first_blocks,
             chains,
@@ -356,22 +396,33 @@ impl DictionaryMatcher {
             std::array::from_fn(|j| self.starts[(key[j] >> 112) as usize + 1] as usize - start[j]);
         let w: [u32; K] = std::array::from_fn(|j| (key[j] >> 80) as u32);
         let last = self.starts[PREFIX_SLOTS] as usize - 1;
-        let mut block = [0usize; K];
-        let mut size: [usize; K] = std::array::from_fn(|j| n[j].div_ceil(16));
-        let largest = size.iter().copied().max().unwrap_or(0);
-        let steps = usize::BITS - largest.saturating_sub(1).leading_zeros();
-        for _ in 0..steps {
+        let info: [u32; K] = std::array::from_fn(|j| self.sample_info[(key[j] >> 112) as usize]);
+        let depth: [usize; K] = std::array::from_fn(|j| (info[j] & 3) as usize);
+        let mut sample_base: [usize; K] = std::array::from_fn(|j| (info[j] >> 2) as usize);
+        let mut offset = [0usize; K];
+        let largest = depth.iter().copied().max().unwrap_or(0);
+        for level in (0..largest).rev() {
+            let stride = SAMPLE_STRIDES[level];
+            let capacity = stride * 17;
             for j in 0..K {
-                let half = size[j] / 2;
-                let mid = block[j] + half;
-                let sample = self.mid[(start[j] + mid * 16).min(last)];
-                block[j] = select_unpredictable(sample <= w[j], mid, block[j]);
-                size[j] -= half;
+                let active = usize::from(depth[j] > level);
+                let node = offset[j] / capacity;
+                let load_at = select_unpredictable(active != 0, sample_base[j] + node * 16, 0);
+                let valid =
+                    ((1u32 << (n[j].saturating_sub(offset[j] + 1) / stride).min(16)) - 1) as u16;
+                let valid = valid & 0u16.wrapping_sub(active as u16);
+                // SAFETY: a complete sample node has sixteen readable entries;
+                // inactive lanes use the zero-masked sentinel node at offset zero.
+                let count = unsafe {
+                    rank16::<MODE>(self.level_samples.as_ptr().add(load_at), w[j], valid)
+                };
+                offset[j] += count * stride;
+                sample_base[j] += n[j].div_ceil(capacity) * 16 * active;
             }
         }
         let mut q = [0usize; K];
         for j in 0..K {
-            let offset = block[j] * 16;
+            let offset = offset[j];
             let valid = ((1u32 << n[j].saturating_sub(offset).min(16)) - 1) as u16;
             // Empty ranges can start at the end of the array. Clamp their
             // zero-masked load so fifteen trailing pads are sufficient.
