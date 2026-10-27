@@ -102,6 +102,10 @@ fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
             agrees::<K::NibbleN8<3, false>>(isa, n8k, "nibble_n24", cover, codes);
             agrees::<K::NibbleN8<3, true>>(isa, n8k, "nibble_n24_skip_empty", cover, codes);
         }
+        4 => {
+            agrees::<K::NibbleN8<4, false>>(isa, n8k, "nibble_n32", cover, codes);
+            agrees::<K::NibbleN8<4, true>>(isa, n8k, "nibble_n32_skip_empty", cover, codes);
+        }
         _ => {}
     }
 }
@@ -190,7 +194,7 @@ fn eq_or_checks_ranges_alone<K: Kernels>(codes: &Block) {
 #[test]
 fn agree_on_needles_the_block_holds() {
     let codes = block();
-    for count in [1, 2, 3, 8, 9, 12, 16, 17, 24, 64] {
+    for count in [1, 2, 3, 8, 9, 12, 16, 17, 24, 25, 32, 64] {
         let needles: Vec<Token> = (0..count).map(|k| codes[k * 37]).collect();
         let cover = ProbeCover::new(needles.to_vec(), vec![]);
         assert_eq!(

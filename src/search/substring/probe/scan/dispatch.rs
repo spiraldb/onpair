@@ -98,6 +98,11 @@ fn run_with<K: Kernels, O: Offset>(
                 input,
                 out,
             ),
+            4 => with_skip::<O, K::NibbleN8<4, true>, K::NibbleN8<4, false>>(
+                skip_empty_packing,
+                input,
+                out,
+            ),
             _ => both_stages::<matcher::Table, O>(input, out),
         },
     }

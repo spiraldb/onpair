@@ -13,7 +13,7 @@ use super::cost::{candidate_cost, matcher_cost};
 const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 2.5e-4;
 
 /// Whether `matcher` can run `cover` on `isa`, an instruction set this CPU supports.
-/// Nibble batches are capped at two on AVX2 and three elsewhere, to fit in registers.
+/// Nibble batches are capped at four on AVX2 and three elsewhere.
 pub(in crate::search::substring::probe) fn is_eligible(
     isa: Isa,
     matcher: MatcherKind,
@@ -28,7 +28,7 @@ pub(in crate::search::substring::probe) fn is_eligible(
                 && cover.n_points() > 0
                 && cover.n_points().div_ceil(PER_BATCH)
                     <= match isa {
-                        Isa::Avx2 => 2,
+                        Isa::Avx2 => 4,
                         _ => 3,
                     }
         }
@@ -115,10 +115,10 @@ mod tests {
         for (isa, limit) in [
             (Isa::Scalar, 0),
             (Isa::Neon, 24),
-            (Isa::Avx2, 16),
+            (Isa::Avx2, 32),
             (Isa::Avx512Bw, 24),
         ] {
-            for points in 0..=32 {
+            for points in 0..=40 {
                 assert_eq!(
                     is_eligible(isa, MatcherKind::NibbleN8, &cover(points, 0)),
                     points > 0 && points <= limit
