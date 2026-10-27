@@ -398,27 +398,27 @@ impl DictionaryMatcher {
         let last = self.starts[PREFIX_SLOTS] as usize - 1;
         let info: [u32; K] = std::array::from_fn(|j| self.sample_info[(key[j] >> 112) as usize]);
         let depth: [usize; K] = std::array::from_fn(|j| (info[j] & 3) as usize);
-        let mut sample_base: [usize; K] = std::array::from_fn(|j| (info[j] >> 2) as usize);
+        let roots: [usize; K] = std::array::from_fn(|j| (info[j] >> 2) as usize);
         let mut offset = [0usize; K];
+        let mut node = [0usize; K];
         let largest = depth.iter().copied().max().unwrap_or(0);
-        for level in (0..largest).rev() {
-            let stride = SAMPLE_STRIDES[level];
-            let capacity = stride * 17;
-            for j in 0..K {
-                let active = usize::from(depth[j] > level);
-                let node = offset[j] / capacity;
-                let load_at = select_unpredictable(active != 0, sample_base[j] + node * 16, 0);
-                let valid =
-                    ((1u32 << (n[j].saturating_sub(offset[j] + 1) / stride).min(16)) - 1) as u16;
-                let valid = valid & 0u16.wrapping_sub(active as u16);
-                // SAFETY: a complete sample node has sixteen readable entries;
-                // inactive lanes use the zero-masked sentinel node at offset zero.
-                let count = unsafe {
-                    rank16::<MODE>(self.level_samples.as_ptr().add(load_at), w[j], valid)
-                };
-                offset[j] += count * stride;
-                sample_base[j] += n[j].div_ceil(capacity) * 16 * active;
-            }
+        if largest > 2 {
+            // SAFETY: target features and complete sample nodes are provided.
+            unsafe {
+                self.descend::<K, MODE, 4624, 2>(&n, &w, &depth, &roots, &mut offset, &mut node)
+            };
+        }
+        if largest > 1 {
+            // SAFETY: target features and complete sample nodes are provided.
+            unsafe {
+                self.descend::<K, MODE, 272, 1>(&n, &w, &depth, &roots, &mut offset, &mut node)
+            };
+        }
+        if largest > 0 {
+            // SAFETY: target features and complete sample nodes are provided.
+            unsafe {
+                self.descend::<K, MODE, 16, 0>(&n, &w, &depth, &roots, &mut offset, &mut node)
+            };
         }
         let mut q = [0usize; K];
         for j in 0..K {
@@ -445,6 +445,39 @@ impl DictionaryMatcher {
             }
         }
         self.finish(&key, &q, win)
+    }
+    /// A fixed stride lets the compiler replace integer division with constants.
+    #[inline(always)]
+    unsafe fn descend<const K: usize, const MODE: u8, const STRIDE: usize, const LEVEL: usize>(
+        &self,
+        n: &[usize; K],
+        w: &[u32; K],
+        depth: &[usize; K],
+        roots: &[usize; K],
+        offset: &mut [usize; K],
+        node: &mut [usize; K],
+    ) {
+        for j in 0..K {
+            let active = usize::from(depth[j] > LEVEL);
+            let preceding = if LEVEL == 0 {
+                16 * usize::from(depth[j] > 1)
+                    + 16 * n[j].div_ceil(4624) * usize::from(depth[j] > 2)
+            } else if LEVEL == 1 {
+                16 * usize::from(depth[j] > 2)
+            } else {
+                0
+            };
+            let load_at = select_unpredictable(active != 0, roots[j] + preceding + node[j] * 16, 0);
+            let valid =
+                ((1u32 << (n[j].saturating_sub(offset[j] + 1) / STRIDE).min(16)) - 1) as u16;
+            let valid = valid & 0u16.wrapping_sub(active as u16);
+            // SAFETY: active nodes contain sixteen entries; inactive lanes
+            // use the zero-masked sentinel. The caller guarantees the ISA.
+            let count =
+                unsafe { rank16::<MODE>(self.level_samples.as_ptr().add(load_at), w[j], valid) };
+            offset[j] += count * STRIDE;
+            node[j] = (node[j] * 17 + count) * active;
+        }
     }
 }
 
