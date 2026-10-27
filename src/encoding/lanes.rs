@@ -271,11 +271,15 @@ impl OffsetLike for usize {
 
 #[cfg(test)]
 mod tests {
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
     use super::*;
-    use crate::core::dictionary::Dictionary;
+    use crate::core::dictionary::{Dictionary, DictionaryView};
     use crate::search::tokenize;
     use crate::test_corpus::{
-        binary_strings, make_raw, mixed_length_strings, random_ascii_strings, user_strings,
+        PROPERTY_ALPHABET, binary_strings, complete_dictionary, make_raw, mixed_length_strings,
+        random_ascii_strings, trainer_matcher, user_strings,
     };
     use crate::{DEFAULT_CONFIG, Parser};
 
@@ -338,6 +342,76 @@ mod tests {
             );
             assert_eq!(codes, expected_codes, "rows, batch {batch}");
             assert_eq!(row_offsets, expected_offsets, "rows, batch {batch}");
+        }
+    }
+
+    #[hegel::test(test_cases = 300)]
+    fn lanes_agree_with_trainer_matcher(tc: TestCase) {
+        let bytes = || gs::vecs(gs::sampled_from(&PROPERTY_ALPHABET[..]));
+        let extra: Vec<Vec<u8>> =
+            tc.draw(gs::vecs(bytes().min_size(2).max_size(MAX_TOKEN_SIZE)).max_size(300));
+        let mut rows: Vec<Vec<u8>> = tc.draw(gs::vecs(bytes().max_size(40)).max_size(40));
+        let batch = tc.draw(gs::integers::<usize>().min_value(1).max_value(128));
+
+        // Runs of one byte reach the pad key: 16 bytes of `0xFF`.
+        for row in &mut rows {
+            if let Some(&first) = row.first()
+                && tc.draw(gs::booleans())
+            {
+                row.fill(first);
+            }
+        }
+
+        let extra: Vec<&[u8]> = extra.iter().map(Vec::as_slice).collect();
+        let dict = complete_dictionary(&extra);
+        let view = dict.as_view();
+        let matcher = DictionaryMatcher::from_dictionary(view);
+        let (trainer, trainer_tokens) = trainer_matcher(view);
+
+        // Greedy parse row by row with the trainer's matcher, as token bytes.
+        let mut expected: Vec<&[u8]> = Vec::new();
+        let mut expected_offsets = vec![0u64];
+        for row in &rows {
+            let mut pos = 0;
+            while pos < row.len() {
+                let (token, len) = trainer.find_longest_match(&row[pos..]);
+                expected.push(&trainer_tokens[usize::from(token)]);
+                pos += len;
+            }
+            expected_offsets.push(expected.len() as u64);
+        }
+
+        let raw = make_raw(&rows);
+        let slices: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+        let mut buffers = LaneBuffers::default();
+        for arrow in [true, false] {
+            let mut codes = Vec::new();
+            let mut row_offsets = vec![0u64];
+            if arrow {
+                parse_arrow_batched(
+                    &matcher,
+                    &raw.data,
+                    &raw.offsets,
+                    batch,
+                    &mut buffers,
+                    &mut codes,
+                    &mut row_offsets,
+                );
+            } else {
+                parse_rows_batched(
+                    &matcher,
+                    slices.as_slice(),
+                    batch,
+                    &mut buffers,
+                    &mut codes,
+                    &mut row_offsets,
+                );
+            }
+
+            let tokens: Vec<&[u8]> = codes.iter().map(|&c| view.token(c)).collect();
+            assert_eq!(tokens, expected, "arrow {arrow}");
+            assert_eq!(row_offsets, expected_offsets, "arrow {arrow}");
+            assert_eq!(tokens.concat(), raw.data, "arrow {arrow}");
         }
     }
 

@@ -343,24 +343,14 @@ fn window_key(bytes: &[u8], at: usize) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary};
-
-    /// Sorted, complete dictionary: every single byte plus `extra`.
-    fn make_test_dictionary(extra: &[&[u8]]) -> CompactDictionary {
-        let mut tokens: Vec<Vec<u8>> = (0u16..=255).map(|i| vec![i as u8]).collect();
-        tokens.extend(extra.iter().map(|t| t.to_vec()));
-        tokens.sort();
-        tokens.dedup();
-
-        let mut bytes = Vec::new();
-        let mut offsets = vec![0u32];
-        for t in &tokens {
-            bytes.extend_from_slice(t);
-            offsets.push(bytes.len() as u32);
-        }
-        CompactDictionary::from_raw(bytes, offsets)
-    }
+    use crate::test_corpus::{
+        PROPERTY_ALPHABET, complete_dictionary as make_test_dictionary, trainer_matcher,
+    };
 
     fn id_of(dict: &CompactDictionary, token: &[u8]) -> Token {
         let view = dict.as_view();
@@ -485,6 +475,46 @@ mod tests {
                 "{window:?}"
             );
         }
+    }
+
+    #[hegel::test(test_cases = 500)]
+    fn dictionary_matcher_agrees_with_trainer_matcher(tc: TestCase) {
+        let bytes = || gs::vecs(gs::sampled_from(&PROPERTY_ALPHABET[..]));
+        let extra: Vec<Vec<u8>> =
+            tc.draw(gs::vecs(bytes().min_size(2).max_size(MAX_TOKEN_SIZE)).max_size(300));
+        // Runs of one byte reach the pad key: 16 bytes of `0xFF`.
+        let data: Vec<u8> = if tc.draw(gs::booleans()) {
+            let byte = tc.draw(gs::sampled_from(&PROPERTY_ALPHABET[..]));
+            let len = tc.draw(
+                gs::integers::<usize>()
+                    .min_value(1)
+                    .max_value(MAX_TOKEN_SIZE + 4),
+            );
+            vec![byte; len]
+        } else {
+            tc.draw(bytes().min_size(1).max_size(MAX_TOKEN_SIZE + 4))
+        };
+        let win = tc.draw(
+            gs::integers::<usize>()
+                .min_value(1)
+                .max_value(data.len().min(MAX_TOKEN_SIZE)),
+        );
+
+        let extra: Vec<&[u8]> = extra.iter().map(Vec::as_slice).collect();
+        let d = make_test_dictionary(&extra);
+        let view = d.as_view();
+        let m = DictionaryMatcher::from_dictionary(view);
+        let (trainer, trainer_tokens) = trainer_matcher(view);
+
+        // The window is the first `win` bytes; the bytes after it are in
+        // `data` too, so the key holds them.
+        let window = &data[..win];
+        let (token, len) = m.find_all(&data, &[0], &[win])[0];
+        assert_eq!((token, len), brute_force_match(&d, window));
+
+        let (expected, expected_len) = trainer.find_longest_match(window);
+        assert_eq!(len, expected_len);
+        assert_eq!(view.token(token), trainer_tokens[usize::from(expected)]);
     }
 
     #[test]
