@@ -32,14 +32,23 @@ const LANES: usize = 6;
 /// cache.
 const BATCH_BYTES: usize = 256 << 10;
 
+/// Three lanes minimized the geometric-mean cost on the FineWeb and real-URL
+/// tuning inputs; scalar parsing keeps the original architecture-specific width.
+const SIMD_LANES: usize = 3;
+const MAX_LANES: usize = if SIMD_LANES > LANES {
+    SIMD_LANES
+} else {
+    LANES
+};
+
 /// Reusable per-lane buffers.
 #[derive(Default)]
 pub(crate) struct LaneBuffers {
     /// Codes of each lane in the current batch.
-    codes: [Vec<Token>; LANES],
+    codes: [Vec<Token>; MAX_LANES],
     /// Per lane: code count at the end of each row, then one spare slot for
     /// the writes after the last row.
-    row_ends: [Vec<usize>; LANES],
+    row_ends: [Vec<usize>; MAX_LANES],
     /// Copy of the rows of one batch, for inputs that are not contiguous.
     bytes: Vec<u8>,
     /// Row offsets into `bytes`.
@@ -247,7 +256,7 @@ fn parse_batch<I: OffsetLike, O: Offset, const MODE: u8>(
         // SAFETY: the parse entry point detected AVX2 and POPCNT.
         return unsafe { parse_batch_avx2(matcher, bytes, offsets, buffers, codes, row_offsets) };
     }
-    parse_batch_with::<I, O, 0>(matcher, bytes, offsets, buffers, codes, row_offsets);
+    parse_batch_with::<I, O, 0, LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -260,7 +269,7 @@ unsafe fn parse_batch_avx512<I: OffsetLike, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
-    parse_batch_with::<I, O, 3>(matcher, bytes, offsets, buffers, codes, row_offsets);
+    parse_batch_with::<I, O, 3, SIMD_LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -273,11 +282,11 @@ unsafe fn parse_batch_avx2<I: OffsetLike, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
-    parse_batch_with::<I, O, 2>(matcher, bytes, offsets, buffers, codes, row_offsets);
+    parse_batch_with::<I, O, 2, SIMD_LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
 }
 
 #[inline(always)]
-fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8>(
+fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
     matcher: &DictionaryMatcher,
     bytes: &[u8],
     offsets: &[I],
@@ -290,22 +299,22 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8>(
     let total = offsets[n].to_usize() - first;
 
     // Lane `j` parses rows `bounds[j]..bounds[j + 1]`, split by byte count.
-    let mut bounds = [0usize; LANES + 1];
-    for (j, bound) in bounds.iter_mut().enumerate().skip(1) {
-        let target = first + total * j / LANES;
+    let mut bounds = [0usize; MAX_LANES + 1];
+    for (j, bound) in bounds.iter_mut().enumerate().take(K + 1).skip(1) {
+        let target = first + total * j / K;
         *bound = offsets.partition_point(|o| o.to_usize() < target).min(n);
     }
-    bounds[LANES] = n;
+    bounds[K] = n;
 
     // Per lane: position, end of the current row, current row, end row, and
     // number of codes written.
-    let mut at = [0usize; LANES];
-    let mut row_end = [0usize; LANES];
-    let mut row = [0usize; LANES];
-    let mut last_row = [0usize; LANES];
-    let mut count = [0usize; LANES];
+    let mut at = [0usize; K];
+    let mut row_end = [0usize; K];
+    let mut row = [0usize; K];
+    let mut last_row = [0usize; K];
+    let mut count = [0usize; K];
 
-    for j in 0..LANES {
+    for j in 0..K {
         let (r0, r1) = (bounds[j], bounds[j + 1]);
         let start = offsets[r0].to_usize();
         at[j] = start;
@@ -330,7 +339,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8>(
 
     loop {
         // An inactive lane still runs one search; its result is discarded.
-        let win: [usize; LANES] =
+        let win: [usize; K] =
             std::array::from_fn(|j| (row_end[j] - at[j]).clamp(1, MAX_TOKEN_SIZE));
         #[cfg(target_arch = "x86_64")]
         let found = if MODE == 3 {
@@ -352,7 +361,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8>(
         };
 
         let mut busy = false;
-        for j in 0..LANES {
+        for j in 0..K {
             let running = row[j] < last_row[j];
             busy |= running;
 
@@ -384,7 +393,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8>(
         }
     }
 
-    for j in 0..LANES {
+    for j in 0..K {
         let base = codes.len();
         codes.extend_from_slice(&buffers.codes[j][..count[j]]);
 
