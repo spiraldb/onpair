@@ -92,7 +92,7 @@ const AVX512BW_COSTS: CostWeights = CostWeights {
     range: 0.066,
     nibble_base: 0.033,
     nibble_batch: 0.033,
-    max_nibble_batches: 3,
+    max_nibble_batches: 4,
     candidate: 105.0,
 };
 

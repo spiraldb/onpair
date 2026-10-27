@@ -109,7 +109,7 @@ mod tests {
             (Isa::Scalar, 0),
             (Isa::Neon, 24),
             (Isa::Avx2, 32),
-            (Isa::Avx512Bw, 24),
+            (Isa::Avx512Bw, 32),
         ] {
             for points in 0..=40 {
                 assert_eq!(
