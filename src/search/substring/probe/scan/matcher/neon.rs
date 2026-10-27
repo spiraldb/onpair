@@ -30,6 +30,7 @@ type Table = uint8x16_t;
 
 /// Load 64 codes without requiring aligned pointers.
 /// The caller must provide 64 readable tokens and the required CPU features.
+#[inline]
 #[target_feature(enable = "neon")]
 unsafe fn load(at: *const Token) -> Vectors {
     std::array::from_fn(|i| unsafe { vld1q_u16(at.add(8 * i)) })
@@ -121,6 +122,7 @@ fn hold(range: TokenRange) -> Held {
     }
 }
 
+#[inline]
 #[target_feature(enable = "neon")]
 unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
     let mut hit = codes;
@@ -154,9 +156,12 @@ fn ranges_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
         bits.fill(0);
         return false;
     };
-    words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| unsafe {
-        check_ranges(inside(first, codes), rest, codes)
-    })
+    words::<SKIP_MOVEMASK_IF_NO_MATCH>(
+        codes,
+        bits,
+        #[inline(always)]
+        |codes| unsafe { check_ranges(inside(first, codes), rest, codes) },
+    )
 }
 
 fn broadcast(code: Token) -> Broadcast {
@@ -346,8 +351,13 @@ fn nibble_mask<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
-    words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| {
-        // SAFETY: the instruction set, inherited from this function.
-        unsafe { check_ranges(probe(batches, codes), ranges, codes) }
-    })
+    words::<SKIP_MOVEMASK_IF_NO_MATCH>(
+        codes,
+        bits,
+        #[inline(always)]
+        |codes| {
+            // SAFETY: the instruction set, inherited from this function.
+            unsafe { check_ranges(probe(batches, codes), ranges, codes) }
+        },
+    )
 }
