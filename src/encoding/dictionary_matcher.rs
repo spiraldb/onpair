@@ -268,18 +268,59 @@ impl DictionaryMatcher {
 #[inline(always)]
 fn advance_if_le(a: u128, b: u128, at: usize, step: usize) -> usize {
     // On x86-64 and on generic aarch64 (Graviton), LLVM turns a select on this
-    // comparison into a branch, even through `select_unpredictable`. The borrow
-    // bit of `b - a`, computed with plain arithmetic, stays branch-free.
-    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+    // comparison into a branch, even through `select_unpredictable`, and the
+    // same arithmetic without a select costs about ten instructions. The
+    // assembly is the compare that the select would be: a 128-bit subtraction
+    // whose borrow picks the result.
+    #[cfg(target_arch = "x86_64")]
     {
-        let diff = b.wrapping_sub(a);
-        let borrow = ((!b & a) | (!(b ^ a) & diff)) >> 127;
-        at + step * (1 - borrow as usize)
+        let mut next = at + step;
+        // SAFETY: only register arithmetic and flags.
+        unsafe {
+            std::arch::asm!(
+                "cmp {b_lo}, {a_lo}",
+                "sbb {b_hi}, {a_hi}",
+                "cmovb {next}, {at}",
+                b_lo = in(reg) b as u64,
+                a_lo = in(reg) a as u64,
+                b_hi = inout(reg) (b >> 64) as u64 => _,
+                a_hi = in(reg) (a >> 64) as u64,
+                at = in(reg) at,
+                next = inout(reg) next,
+                options(pure, nomem, nostack),
+            );
+        }
+        next
     }
 
-    // On Apple Silicon the select becomes a conditional select, which costs
-    // fewer instructions than the arithmetic.
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    {
+        let mut next = at + step;
+        // SAFETY: only register arithmetic and flags.
+        unsafe {
+            std::arch::asm!(
+                "cmp {b_lo}, {a_lo}",
+                "sbcs xzr, {b_hi}, {a_hi}",
+                "csel {next}, {next}, {at}, hs",
+                b_lo = in(reg) b as u64,
+                a_lo = in(reg) a as u64,
+                b_hi = in(reg) (b >> 64) as u64,
+                a_hi = in(reg) (a >> 64) as u64,
+                at = in(reg) at,
+                next = inout(reg) next,
+                options(pure, nomem, nostack),
+            );
+        }
+        next
+    }
+
+    // On Apple Silicon the select becomes a conditional select already.
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    {
+        select_unpredictable(a <= b, at + step, at)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         select_unpredictable(a <= b, at + step, at)
     }
