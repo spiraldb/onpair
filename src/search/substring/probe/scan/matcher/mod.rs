@@ -17,7 +17,7 @@
 //!   position, and point `k` sets bit `k` in the entry selected by its nibble at
 //!   each position. Looking up a code's four nibbles and ANDing the entries leaves
 //!   bit `k` iff the code equals point `k`. Batches are ORed together, then range
-//!   hits are added. Planning caps the batch count so the tables stay in registers.
+//!   hits are added. Planning caps the batch count per instruction set.
 //! - `check_ranges` adds the cover's ranges to either kernel's point hits, and
 //!   `ranges_mask` handles covers with ranges only. A code is in `[begin, last]` iff
 //!   `code.wrapping_sub(begin) <= last - begin`: codes below `begin` wrap around to

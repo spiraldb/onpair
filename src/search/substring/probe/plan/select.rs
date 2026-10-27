@@ -5,7 +5,7 @@
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherKind, PER_BATCH};
-use super::cost::{candidate_cost, matcher_cost};
+use super::cost::{candidate_cost, matcher_cost, max_nibble_batches};
 
 /// Hit density below which vector matchers skip packing empty groups (0.025%).
 /// Empirical, and shared by NEON, AVX2 and AVX-512. Clustered hits can make
@@ -13,24 +13,17 @@ use super::cost::{candidate_cost, matcher_cost};
 const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 2.5e-4;
 
 /// Whether `matcher` can run `cover` on `isa`, an instruction set this CPU supports.
-/// Nibble batches are capped at four on AVX2 and three elsewhere.
+/// Nibble batches are capped per instruction set, by the cost model.
 pub(in crate::search::substring::probe) fn is_eligible(
     isa: Isa,
     matcher: MatcherKind,
     cover: &ProbeCover,
 ) -> bool {
-    let vector = isa != Isa::Scalar;
     match matcher {
         MatcherKind::Table => true,
-        MatcherKind::EqOr => vector && !cover.is_empty(),
+        MatcherKind::EqOr => isa != Isa::Scalar && !cover.is_empty(),
         MatcherKind::NibbleN8 => {
-            vector
-                && cover.n_points() > 0
-                && cover.n_points().div_ceil(PER_BATCH)
-                    <= match isa {
-                        Isa::Avx2 => 4,
-                        _ => 3,
-                    }
+            cover.n_points() > 0 && cover.n_points().div_ceil(PER_BATCH) <= max_nibble_batches(isa)
         }
     }
 }
@@ -111,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn target_admission_respects_nibble_register_budgets() {
+    fn nibble_admission_respects_batch_caps() {
         for (isa, limit) in [
             (Isa::Scalar, 0),
             (Isa::Neon, 24),

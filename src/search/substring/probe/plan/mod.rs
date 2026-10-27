@@ -82,22 +82,28 @@ struct CutWeights {
 
 impl CutWeights {
     /// The cuts tried after the frequency cut, over `code_count` scanned codes:
-    /// - the fewest probes, ties broken by frequency: a probe outweighs any one
-    ///   edge's hits. Merging can make this filter cheaper than the priced ones;
+    /// - the fewest probes, ties broken by frequency: a point outweighs any one
+    ///   edge's hits, and a range weighs as many points as it costs in EqOr.
+    ///   Merging can make this filter cheaper than the priced ones;
     /// - EqOr's cost per point and per range;
     /// - Nibble's, with each batch's cost spread over its eight points. This only
     ///   approximates Nibble's steps per batch and its limit on batches.
     fn priced(slopes: Slopes, code_count: u32) -> [Self; 3] {
         let codes = f64::from(code_count);
-        let cut = |hit, scale: f64, point: f64| Self {
-            hit,
-            point: scale * point,
-            range: scale * slopes.range,
+        let probe = codes + 1.0;
+        let cut = |point: f64| Self {
+            hit: slopes.candidate,
+            point: codes * point,
+            range: codes * slopes.range,
         };
         [
-            cut(1.0, codes + 1.0, slopes.eq_or_point),
-            cut(slopes.candidate, codes, slopes.eq_or_point),
-            cut(slopes.candidate, codes, slopes.nibble_point),
+            Self {
+                hit: 1.0,
+                point: probe,
+                range: probe * slopes.range / slopes.eq_or_point,
+            },
+            cut(slopes.eq_or_point),
+            cut(slopes.nibble_point),
         ]
     }
 
