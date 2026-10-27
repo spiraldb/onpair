@@ -45,7 +45,7 @@ pub(crate) struct DictionaryMatcher {
     /// whose keys start with `p` (block 0 if there is none). The block of the
     /// last token with prefix `p` is then `first_blocks[p + 1]`.
     first_blocks: Vec<u16>,
-    /// Prefix tokens of each token, in dictionary order.
+    /// Prefix tokens of each token, in dictionary order, then of each pad.
     chains: Vec<PrefixChain>,
     /// Token of each single byte: the first prefix token of every chain.
     singles: [Token; 256],
@@ -59,16 +59,30 @@ const BLOCK_KEYS: usize = 8;
 #[repr(align(128))]
 struct KeyBlock([u128; BLOCK_KEYS]);
 
-/// The tokens that are prefixes of one token `t`, including `t`, in one
-/// 32-byte record, so that the match needs one load after the search.
+/// The prefix tokens of one token `t` by length bound, in one 32-byte record,
+/// so that the match needs one load after the search.
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(align(32))]
 struct PrefixChain {
     /// Bit `k` is set when the first `k + 1` bytes of `t` are a token.
     lens: u16,
-    /// The prefix tokens after the single-byte one, shortest first: one per
-    /// set bit of `lens` above bit 0.
+    /// Entry `k` is the longest token that is a prefix of `t` and not longer
+    /// than `k + 2` bytes. A bound of one byte gives the single-byte token.
     ids: [Token; MAX_TOKEN_SIZE - 1],
+}
+
+impl PrefixChain {
+    /// Record of `chain`: prefix tokens of one token, shortest first, starting
+    /// with a single byte.
+    fn new(dict: CompactDictionaryView<'_>, chain: &[Token]) -> Self {
+        let mut record = Self::default();
+        for &prefix in chain {
+            let len = dict.token_len(prefix);
+            record.lens |= 1 << (len - 1);
+            record.ids[len.max(2) - 2..].fill(prefix);
+        }
+        record
+    }
 }
 
 impl DictionaryMatcher {
@@ -113,12 +127,7 @@ impl DictionaryMatcher {
                 singles[token[0] as usize] = id;
             }
 
-            let mut record = PrefixChain::default();
-            for &prefix in &chain {
-                record.lens |= 1 << (dict.token_len(prefix) - 1);
-            }
-            record.ids[..chain.len() - 1].copy_from_slice(&chain[1..]);
-            chains.push(record);
+            chains.push(PrefixChain::new(dict, &chain));
         }
 
         // `starts[p]` is the first token whose 2-byte prefix is `p` or larger.
@@ -139,6 +148,13 @@ impl DictionaryMatcher {
         // At least one `u128::MAX` pads the last block, so a search past the
         // last token stops there.
         keys.resize((n / BLOCK_KEYS + 1) * BLOCK_KEYS, u128::MAX);
+
+        // A window of 16 `0xFF` bytes has the key `u128::MAX` too, so the
+        // search can stop on a pad. Its prefix tokens are the runs of `0xFF`.
+        // The last token starts with `0xFF`, so the stack holds all of them.
+        chain.retain(|&id| dict.token(id).iter().all(|&b| b == 0xFF));
+        chains.resize(keys.len(), PrefixChain::new(dict, &chain));
+
         let blocks: Vec<KeyBlock> = keys
             .chunks_exact(BLOCK_KEYS)
             .map(|chunk| KeyBlock(chunk.try_into().unwrap()))
@@ -176,7 +192,10 @@ impl DictionaryMatcher {
         at: &[usize; K],
         win: &[usize; K],
     ) -> [(Token, usize); K] {
-        let key: [u128; K] = std::array::from_fn(|j| window_key(bytes, at[j], win[j]));
+        // The key holds all 16 bytes at `at`, also past the window. Every token
+        // that is a prefix of the window is a prefix of the whole key, so it is
+        // also a prefix of `q`; the length bound below drops the longer ones.
+        let key: [u128; K] = std::array::from_fn(|j| window_key(bytes, at[j]));
 
         // Candidate blocks: from the block of the last token before the
         // input's 2-byte prefix to the block of the last token with that
@@ -219,23 +238,27 @@ impl DictionaryMatcher {
             half /= 2;
         }
 
-        std::array::from_fn(|j| {
-            let q = base[j] * BLOCK_KEYS + slot[j];
+        let mut q = [0usize; K];
+        let len: [usize; K] = std::array::from_fn(|j| {
+            q[j] = base[j] * BLOCK_KEYS + slot[j];
             let found = self.blocks[base[j]].0[slot[j]];
 
             let common = ((found ^ key[j]).leading_zeros() / 8) as usize;
             let max_len = common.min(win[j]);
 
             // `max_len >= 1` and bit 0 is always set, so `fits` is never zero.
-            let chain = &self.chains[q];
-            let fits = u32::from(chain.lens) & ((1u32 << max_len) - 1);
-            let len = (u32::BITS - fits.leading_zeros()) as usize;
-            let rank = fits.count_ones() as usize - 1;
+            let fits = u32::from(self.chains[q[j]].lens) & ((1u32 << max_len) - 1);
+            (u32::BITS - fits.leading_zeros()) as usize
+        });
 
-            // Rank 0 is the single-byte token of the first input byte.
-            let longer = chain.ids[rank.saturating_sub(1)];
+        // The prefix token of length `len`; a length of one byte is the
+        // single-byte token of the first input byte. The token loads come after
+        // all lengths: the next positions then do not wait behind them, which
+        // is measurably faster on Intel and costs little elsewhere.
+        std::array::from_fn(|j| {
+            let longer = self.chains[q[j]].ids[len[j].max(2) - 2];
             let single = self.singles[(key[j] >> 120) as usize];
-            (select_unpredictable(rank == 0, single, longer), len)
+            (select_unpredictable(len[j] == 1, single, longer), len[j])
         })
     }
 }
@@ -245,28 +268,69 @@ impl DictionaryMatcher {
 #[inline(always)]
 fn advance_if_le(a: u128, b: u128, at: usize, step: usize) -> usize {
     // On x86-64 and on generic aarch64 (Graviton), LLVM turns a select on this
-    // comparison into a branch, even through `select_unpredictable`. The borrow
-    // bit of `b - a`, computed with plain arithmetic, stays branch-free.
-    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+    // comparison into a branch, even through `select_unpredictable`, and the
+    // same arithmetic without a select costs about ten instructions. The
+    // assembly is the compare that the select would be: a 128-bit subtraction
+    // whose borrow picks the result.
+    #[cfg(target_arch = "x86_64")]
     {
-        let diff = b.wrapping_sub(a);
-        let borrow = ((!b & a) | (!(b ^ a) & diff)) >> 127;
-        at + step * (1 - borrow as usize)
+        let mut next = at + step;
+        // SAFETY: only register arithmetic and flags.
+        unsafe {
+            std::arch::asm!(
+                "cmp {b_lo}, {a_lo}",
+                "sbb {b_hi}, {a_hi}",
+                "cmovb {next}, {at}",
+                b_lo = in(reg) b as u64,
+                a_lo = in(reg) a as u64,
+                b_hi = inout(reg) (b >> 64) as u64 => _,
+                a_hi = in(reg) (a >> 64) as u64,
+                at = in(reg) at,
+                next = inout(reg) next,
+                options(pure, nomem, nostack),
+            );
+        }
+        next
     }
 
-    // On Apple Silicon the select becomes a conditional select, which costs
-    // fewer instructions than the arithmetic.
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    {
+        let mut next = at + step;
+        // SAFETY: only register arithmetic and flags.
+        unsafe {
+            std::arch::asm!(
+                "cmp {b_lo}, {a_lo}",
+                "sbcs xzr, {b_hi}, {a_hi}",
+                "csel {next}, {next}, {at}, hs",
+                b_lo = in(reg) b as u64,
+                a_lo = in(reg) a as u64,
+                b_hi = in(reg) (b >> 64) as u64,
+                a_hi = in(reg) (a >> 64) as u64,
+                at = in(reg) at,
+                next = inout(reg) next,
+                options(pure, nomem, nostack),
+            );
+        }
+        next
+    }
+
+    // On Apple Silicon the select becomes a conditional select already.
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    {
+        select_unpredictable(a <= b, at + step, at)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         select_unpredictable(a <= b, at + step, at)
     }
 }
 
-/// Big-endian key of the `win` bytes at `bytes[at..]`, zero past `win` and
-/// past the end of `bytes`.
+/// Big-endian key of the 16 bytes at `bytes[at..]`, zero past the end of
+/// `bytes`.
 #[inline(always)]
-fn window_key(bytes: &[u8], at: usize, win: usize) -> u128 {
-    let raw = if at + MAX_TOKEN_SIZE <= bytes.len() {
+fn window_key(bytes: &[u8], at: usize) -> u128 {
+    if at + MAX_TOKEN_SIZE <= bytes.len() {
         u128::from_be_bytes(bytes[at..at + MAX_TOKEN_SIZE].try_into().unwrap())
     } else {
         let mut buf = [0u8; MAX_TOKEN_SIZE];
@@ -274,8 +338,7 @@ fn window_key(bytes: &[u8], at: usize, win: usize) -> u128 {
         let n = tail.len().min(MAX_TOKEN_SIZE);
         buf[..n].copy_from_slice(&tail[..n]);
         u128::from_be_bytes(buf)
-    };
-    raw & (u128::MAX << (8 * (MAX_TOKEN_SIZE - win)))
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +439,52 @@ mod tests {
         assert_eq!(m.find_longest_match(b"ab\0\0"), (id_of(&d, b"ab\0"), 3));
         assert_eq!(m.find_longest_match(b"ab\0\0x"), (id_of(&d, b"ab\0\0x"), 5));
         assert_eq!(m.find_longest_match(b"a\0"), (id_of(&d, b"a"), 1));
+    }
+
+    #[test]
+    fn dictionary_matcher_all_ff_window() {
+        // A window of 16 `0xFF` bytes has the same key as the pads after the
+        // last token. The token counts leave the last block part empty.
+        for extra in [
+            &[b"ab".as_slice()][..],
+            &[b"ab", b"\xFF\xFF", b"\xFF\xFF\xFFa"],
+        ] {
+            let d = make_test_dictionary(extra);
+            assert_ne!(d.num_tokens() % BLOCK_KEYS, 0);
+            let m = DictionaryMatcher::from_dictionary(d.as_view());
+            for len in 1..=MAX_TOKEN_SIZE + 4 {
+                let data = vec![0xFF; len];
+                assert_eq!(
+                    m.find_longest_match(&data),
+                    brute_force_match(&d, &data),
+                    "{len} bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_matcher_ignores_bytes_past_window() {
+        // The key holds the bytes after a short window too. They extend
+        // tokens that are longer than the window, and that must not change
+        // the match.
+        let d = make_test_dictionary(&[b"ab", b"abc", b"abcd", b"b\xFF", b"\xFF\xFF"]);
+        let m = DictionaryMatcher::from_dictionary(d.as_view());
+        for (data, win) in [
+            (&b"abcd"[..], 1),
+            (b"abcd", 2),
+            (b"abcd", 3),
+            (b"abcdx", 4),
+            (b"b\xFF\xFF", 1),
+            (b"\xFF\xFF\xFF", 1),
+        ] {
+            let window = &data[..win];
+            assert_eq!(
+                m.find_all(data, &[0], &[win])[0],
+                brute_force_match(&d, window),
+                "{window:?}"
+            );
+        }
     }
 
     #[test]

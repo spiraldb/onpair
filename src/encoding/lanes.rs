@@ -37,8 +37,8 @@ const BATCH_BYTES: usize = 256 << 10;
 pub(crate) struct LaneBuffers {
     /// Codes of each lane in the current batch.
     codes: [Vec<Token>; LANES],
-    /// Per lane: code count at the end of each row, then one slot for the
-    /// writes of rounds that end no row.
+    /// Per lane: code count at the end of each row, then one spare slot for
+    /// the writes after the last row.
     row_ends: [Vec<usize>; LANES],
     /// Copy of the rows of one batch, for inputs that are not contiguous.
     bytes: Vec<u8>,
@@ -214,12 +214,14 @@ fn parse_batch<I: OffsetLike, O: Offset>(
             count[j] += active as usize;
             at[j] += select_unpredictable(active, len, 0);
 
+            // The slot of the current row holds its code count so far, so it
+            // is final when the row ends. A lane past its last row writes the
+            // spare slot.
+            buffers.row_ends[j][row[j] - bounds[j]] = count[j];
+
             // A row ends when its bytes are used up. The next row starts where
             // this one ends.
             let done = at[j] == row_end[j] && running;
-            let slot =
-                select_unpredictable(done, row[j] - bounds[j], buffers.row_ends[j].len() - 1);
-            buffers.row_ends[j][slot] = count[j];
             row[j] += done as usize;
 
             // After its last row a lane keeps `row_end == at`, so it stays
