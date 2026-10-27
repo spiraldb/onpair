@@ -6,6 +6,12 @@
 //! 64 codes fill eight 128-bit vectors of `u16` lanes. Comparisons yield
 //! 0xFFFF/0x0000 lanes, which `narrow` reduces to one byte per code; `movemask`
 //! packs 128 such bytes into two mask words with lane bits and pairwise adds.
+//!
+//! The helpers the scan loop calls are `#[inline]`: the loop is generic, so it is
+//! compiled in the crate that runs the scan, and without LTO that crate cannot
+//! inline a non-generic function from this one unless it is marked so. The
+//! closures passed to `words` are `#[inline(always)]`, since `words` calls each
+//! twice per 128 codes and the compiler would otherwise keep it out of line.
 
 use std::arch::aarch64::*;
 

@@ -6,6 +6,12 @@
 //! 64 codes fill two 512-bit vectors of `u16` lanes. Comparisons land in mask
 //! registers, so the hits of 64 codes are already one `u64` mask word: there is
 //! nothing to narrow or pack.
+//!
+//! The helpers the scan loop calls are `#[inline]`: the loop is generic, so it is
+//! compiled in the crate that runs the scan, and without LTO that crate cannot
+//! inline a non-generic function from this one unless it is marked so. The
+//! closures passed to `words` are `#[inline(always)]`, since `words` calls each
+//! twice per 128 codes and the compiler would otherwise keep it out of line.
 
 use std::arch::x86_64::*;
 
