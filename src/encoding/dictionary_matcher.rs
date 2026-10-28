@@ -62,7 +62,7 @@ pub(crate) struct DictionaryMatcher {
     /// Per 2-byte prefix `p`: the block of the last token before the tokens
     /// whose keys start with `p` (block 0 if there is none). The block of the
     /// last token with prefix `p` is then `first_blocks[p + 1]`.
-    first_blocks: Vec<u16>,
+    first_blocks: Box<[u16; PREFIX_SLOTS + 1]>,
     /// Prefix metadata of each token, in dictionary order, then of each pad.
     chains: Vec<PrefixChain>,
     /// Proper prefix paths, shared by tokens with the same parent.
@@ -265,7 +265,7 @@ impl DictionaryMatcher {
             blocks,
             samples_hi,
             samples_lo,
-            first_blocks,
+            first_blocks: first_blocks.into_boxed_slice().try_into().unwrap(),
             chains,
             prefix_ids: prefix_pool.ids,
             single_byte_only: n == 256,
