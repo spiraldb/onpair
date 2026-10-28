@@ -92,7 +92,7 @@ struct EdgesByToken {
     edge_of_token: Vec<Edge>,
     /// Whether each token contains the whole needle; empty if none does.
     complete: Vec<bool>,
-    /// Roles of `LISTED` tokens, grouped by token, a complete match first.
+    /// Roles of `LISTED` tokens, sorted by token.
     edges_of_tokens: Vec<(Token, Edge)>,
 }
 
@@ -106,44 +106,49 @@ const LISTED: Edge = Edge {
 };
 
 impl EdgesByToken {
-    /// Indexes `token_edges`, deduplicated. `sink` identifies complete matches.
-    fn new(mut token_edges: Vec<(Token, Edge)>, sink: u16) -> Self {
+    /// Indexes `token_edges`, which may repeat a pair. `sink` identifies complete
+    /// matches. Pairs go straight into the dense arrays, so only the roles of
+    /// `LISTED` tokens are sorted.
+    fn new(token_edges: Vec<(Token, Edge)>, sink: u16) -> Self {
         let complete = Edge {
             from: SOURCE,
             to: sink,
         };
-        token_edges.sort_unstable();
-        token_edges.dedup();
-        let (Some(&(first_token, _)), Some(&(last_token, _))) =
-            (token_edges.first(), token_edges.last())
+        let Some((first_token, last_token)) = token_edges
+            .iter()
+            .map(|&(token, _)| (token, token))
+            .reduce(|(lo, hi), (token, _)| (lo.min(token), hi.max(token)))
         else {
             return Self::default();
         };
+        let span = usize::from(last_token - first_token) + 1;
         let mut edges = Self {
             first_token,
-            edge_of_token: vec![NONE; usize::from(last_token - first_token) + 1],
+            edge_of_token: vec![NONE; span],
             complete: Vec::new(),
             edges_of_tokens: Vec::new(),
         };
-        for same_token in token_edges.chunk_by_mut(|a, b| a.0 == b.0) {
-            let (token, edge) = same_token[0];
-            edges.edge_of_token[usize::from(token - first_token)] = if same_token.len() == 1 {
-                edge
-            } else {
-                // A complete occurrence needs no walking; try it first.
-                if let Some(at) = same_token.iter().position(|&(_, edge)| edge == complete) {
-                    same_token.swap(0, at);
-                }
-                edges.edges_of_tokens.extend_from_slice(same_token);
-                LISTED
-            };
-            if same_token[0].1 == complete {
+        for (token, edge) in token_edges {
+            let at = usize::from(token - first_token);
+            if edge == complete {
                 if edges.complete.is_empty() {
-                    edges.complete.resize(edges.edge_of_token.len(), false);
+                    edges.complete.resize(span, false);
                 }
-                edges.complete[usize::from(token - first_token)] = true;
+                edges.complete[at] = true;
+            }
+            let slot = &mut edges.edge_of_token[at];
+            match *slot {
+                NONE => *slot = edge,
+                LISTED => edges.edges_of_tokens.push((token, edge)),
+                held if held == edge => {}
+                held => {
+                    edges.edges_of_tokens.extend([(token, held), (token, edge)]);
+                    *slot = LISTED;
+                }
             }
         }
+        edges.edges_of_tokens.sort_unstable();
+        edges.edges_of_tokens.dedup();
         edges
     }
 
@@ -154,7 +159,7 @@ impl EdgesByToken {
         self.complete.get(at).copied().unwrap_or(false)
     }
 
-    /// The roles of `token`, lazily, a complete match first.
+    /// The roles of `token`, lazily.
     #[inline]
     fn of(&self, token: Token) -> impl Iterator<Item = Edge> + '_ {
         let at = usize::from(token.wrapping_sub(self.first_token));
