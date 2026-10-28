@@ -25,8 +25,9 @@ const PREFIX_SLOTS: usize = 1 << 16;
 /// the last token with `key(q) <= key(w)`. Every token that is a prefix of `w`
 /// sorts between that token and `w`, so it is also a prefix of `q`. Thus the
 /// longest match is `q` or the longest prefix of `q` that is not longer than
-/// the common prefix of `q` and `w`. Each token stores its prefix lengths and a shared path of proper prefix
-/// tokens, so the last step is a mask, a rank, and a path lookup. The single-byte token
+/// the common prefix of `q` and `w`. Each token stores its prefix lengths and a
+/// shared path of proper prefix tokens, so the last step is a mask, a rank, and
+/// a path lookup. The single-byte token
 /// of `w[0]` sorts at or before `q`, so `q` always exists and shares the first
 /// byte of `w`.
 ///
