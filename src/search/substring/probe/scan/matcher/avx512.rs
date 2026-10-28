@@ -37,11 +37,11 @@ type Broadcast = __m512i;
 type Table = __m512i;
 
 /// Load 64 codes without requiring aligned pointers.
-/// The caller must provide 64 readable tokens and the required CPU features.
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn load(at: *const Token) -> Vectors {
-    std::array::from_fn(|i| unsafe { _mm512_loadu_si512(at.add(32 * i).cast()) })
+fn load(codes: &[Token; 64]) -> Vectors {
+    // SAFETY: load `i` reads 32 of the 64 codes, starting at code 32 * i.
+    std::array::from_fn(|i| unsafe { _mm512_loadu_si512(codes.as_ptr().add(32 * i).cast()) })
 }
 
 /// Fill all mask words by comparing 128 codes per iteration.
@@ -56,17 +56,16 @@ fn words<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     hits: impl Fn(Vectors) -> Hits,
 ) -> bool {
     let mut written = false;
-    for (pair, bits) in bits.chunks_exact_mut(2).enumerate() {
-        let at = codes[pair * 128..].as_ptr();
-        // SAFETY: a block holds 128 codes for every pair of mask words.
-        let (a, b) = unsafe { (hits(load(at)), hits(load(at.add(64)))) };
+    // Two 64-code groups per pair of mask words.
+    let groups = codes.as_chunks::<64>().0.as_chunks::<2>().0;
+    for ([lo, hi], bits) in groups.iter().zip(bits.as_chunks_mut::<2>().0) {
+        let (a, b) = (hits(load(lo)), hits(load(hi)));
         if SKIP_MOVEMASK_IF_NO_MATCH && !any(a, b) {
-            bits.fill(0);
+            *bits = [0; 2];
             continue;
         }
         written = true;
-        // SAFETY: the chunk is the two words the store writes.
-        unsafe { movemask(bits, a, b) };
+        movemask(bits, a, b);
     }
     written
 }
@@ -89,11 +88,10 @@ fn join(lo: u32, hi: u32) -> Hits {
     u64::from(lo) | u64::from(hi) << 32
 }
 
-/// Store two already-packed AVX-512 masks in the caller's two-word slice.
+/// Store two already-packed AVX-512 masks as the two mask words.
 #[inline]
-unsafe fn movemask(bits: &mut [u64], a: Hits, b: Hits) {
-    bits[0] = a;
-    bits[1] = b;
+fn movemask(bits: &mut [u64; 2], a: Hits, b: Hits) {
+    *bits = [a, b];
 }
 
 fn hold(range: TokenRange) -> Held {

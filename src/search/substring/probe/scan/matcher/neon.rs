@@ -36,11 +36,11 @@ type Broadcast = uint16x8_t;
 type Table = uint8x16_t;
 
 /// Load 64 codes without requiring aligned pointers.
-/// The caller must provide 64 readable tokens and the required CPU features.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn load(at: *const Token) -> Vectors {
-    std::array::from_fn(|i| unsafe { vld1q_u16(at.add(8 * i)) })
+fn load(codes: &[Token; 64]) -> Vectors {
+    // SAFETY: load `i` reads eight of the 64 codes, starting at code eight * i.
+    std::array::from_fn(|i| unsafe { vld1q_u16(codes.as_ptr().add(8 * i)) })
 }
 
 /// Fill all mask words by comparing 128 codes per iteration.
@@ -55,17 +55,16 @@ fn words<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     hits: impl Fn(Vectors) -> Hits,
 ) -> bool {
     let mut written = false;
-    for (pair, bits) in bits.chunks_exact_mut(2).enumerate() {
-        let at = codes[pair * 128..].as_ptr();
-        // SAFETY: a block holds 128 codes for every pair of mask words.
-        let (a, b) = unsafe { (hits(load(at)), hits(load(at.add(64)))) };
+    // Two 64-code groups per pair of mask words.
+    let groups = codes.as_chunks::<64>().0.as_chunks::<2>().0;
+    for ([lo, hi], bits) in groups.iter().zip(bits.as_chunks_mut::<2>().0) {
+        let (a, b) = (hits(load(lo)), hits(load(hi)));
         if SKIP_MOVEMASK_IF_NO_MATCH && !any(a, b) {
-            bits.fill(0);
+            *bits = [0; 2];
             continue;
         }
         written = true;
-        // SAFETY: the chunk is the two words the store writes.
-        unsafe { movemask(bits, a, b) };
+        movemask(bits, a, b);
     }
     written
 }
@@ -102,10 +101,9 @@ fn narrow(hit: [uint16x8_t; 8]) -> Hits {
 }
 
 /// Pack 128 hit bytes into two words using lane bits and pairwise adds.
-/// The caller supplies space for both words and enables NEON.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn movemask(bits: &mut [u64], a: Hits, b: Hits) {
+fn movemask(bits: &mut [u64; 2], a: Hits, b: Hits) {
     const LANE_BIT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
     // SAFETY: LANE_BIT is 16 bytes.
     let lane_bit = unsafe { vld1q_u8(LANE_BIT.as_ptr()) };
@@ -115,7 +113,7 @@ unsafe fn movemask(bits: &mut [u64], a: Hits, b: Hits) {
         vpaddq_u8(lo, hi)
     };
     let lanes = vpaddq_u8(half(a), half(b));
-    // SAFETY: the caller's chunk is the two words this writes.
+    // SAFETY: `bits` is the two words, 16 bytes, that the store writes.
     unsafe { vst1q_u64(bits.as_mut_ptr(), vreinterpretq_u64_u8(lanes)) };
 }
 
