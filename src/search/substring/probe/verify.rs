@@ -90,7 +90,9 @@ struct EdgesByToken {
     first_token: Token,
     /// One role or sentinel per token from `first_token` to the last token with a role.
     edge_of_token: Vec<Edge>,
-    /// Whether each token contains the whole needle; empty if none does.
+    /// Whether each token contains the whole needle; empty if none does. Only
+    /// `LISTED` tokens consult it: a single role from the source to the sink already
+    /// passes both walks.
     complete: Vec<bool>,
     /// Roles of `LISTED` tokens, sorted by token.
     edges_of_tokens: Vec<(Token, Edge)>,
@@ -159,24 +161,20 @@ impl EdgesByToken {
         self.complete.get(at).copied().unwrap_or(false)
     }
 
-    /// The roles of `token`, lazily.
+    /// The only role of `token`, `NONE`, or `LISTED`.
     #[inline]
-    fn of(&self, token: Token) -> impl Iterator<Item = Edge> + '_ {
+    fn entry(&self, token: Token) -> Edge {
         let at = usize::from(token.wrapping_sub(self.first_token));
-        let (single, listed) = match self.edge_of_token.get(at).copied().unwrap_or(NONE) {
-            NONE => (None, &self.edges_of_tokens[..0]),
-            LISTED => {
-                let first = self.edges_of_tokens.partition_point(|&(t, _)| t < token);
-                (None, &self.edges_of_tokens[first..])
-            }
-            edge => (Some(edge), &self.edges_of_tokens[..0]),
-        };
-        single.into_iter().chain(
-            listed
-                .iter()
-                .take_while(move |&&(t, _)| t == token)
-                .map(|&(_, edge)| edge),
-        )
+        self.edge_of_token.get(at).copied().unwrap_or(NONE)
+    }
+
+    /// The roles of a `LISTED` token, lazily.
+    fn listed(&self, token: Token) -> impl Iterator<Item = Edge> + '_ {
+        let first = self.edges_of_tokens.partition_point(|&(t, _)| t < token);
+        self.edges_of_tokens[first..]
+            .iter()
+            .take_while(move |&&(t, _)| t == token)
+            .map(|&(_, edge)| edge)
     }
 }
 
@@ -261,17 +259,15 @@ impl HitVerifier {
         hit_code_index: usize,
     ) -> bool {
         let hit = codes[hit_code_index];
-        if self.edges.contains_whole_needle(hit) {
-            return true;
-        }
-        for Edge { from, to } in self.edges.of(hit) {
-            if (to == self.sink() || self.forward(to, hit_code_index + 1, codes, row_end))
+        let passes = |Edge { from, to }| {
+            (to == self.sink() || self.forward(to, hit_code_index + 1, codes, row_end))
                 && (from == SOURCE || self.backward(from, hit_code_index, codes, row_start, dict))
-            {
-                return true;
-            }
+        };
+        match self.edges.entry(hit) {
+            NONE => false,
+            LISTED => self.edges.contains_whole_needle(hit) || self.edges.listed(hit).any(passes),
+            edge => passes(edge),
         }
-        false
     }
 
     /// Walks forward from `node`, starting at `code_index`, until a range-edge token
@@ -320,8 +316,7 @@ impl HitVerifier {
                 return false;
             }
             let code = codes[code_end - 1];
-            let at = usize::from(code.wrapping_sub(self.edges.first_token));
-            let edge = self.edges.edge_of_token.get(at).copied().unwrap_or(NONE);
+            let edge = self.edges.entry(code);
             if edge == LISTED {
                 let length = dict.token_len(code) as u16;
                 if length > node {
@@ -361,15 +356,19 @@ pub(in crate::search::substring::probe) mod tests {
     use crate::search::substring::probe::alignment::graph::AlignmentGraph;
     use crate::search::tokenize;
 
-    /// A hit verifier that accepts every hit: each token counts as containing the whole
+    /// A hit verifier that accepts every hit: each token's only role spans the whole
     /// needle, so scan tests can exercise matching and row lookup on their own.
     pub(in crate::search::substring::probe) fn accepting_verifier() -> HitVerifier {
+        let whole = Edge {
+            from: SOURCE,
+            to: 1,
+        };
         HitVerifier {
-            nodes: vec![Node::default()],
+            nodes: vec![Node::default(); 2],
             edges: EdgesByToken {
                 first_token: 0,
-                edge_of_token: vec![NONE; 1 << 16],
-                complete: vec![true; 1 << 16],
+                edge_of_token: vec![whole; 1 << 16],
+                complete: Vec::new(),
                 edges_of_tokens: Vec::new(),
             },
             overlaps: Vec::new(),
