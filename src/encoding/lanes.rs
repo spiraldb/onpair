@@ -34,7 +34,7 @@ const BATCH_BYTES: usize = 256 << 10;
 
 /// The tree overlaps four rows; flat sample searches have their own lane width.
 const SIMD_LANES: usize = 4;
-const LEGACY_LANES: usize = 4;
+const LEGACY_LANES: usize = 6;
 const MAX_LANES: usize = if LEGACY_LANES > LANES {
     LEGACY_LANES
 } else {
