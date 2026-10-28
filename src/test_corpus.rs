@@ -9,6 +9,49 @@
 use rand::RngExt;
 use rand::SeedableRng;
 
+use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, DictionaryView};
+use crate::core::types::Token;
+use crate::encoding::lpm::LongestPrefixMatcher;
+
+/// Bytes for property tests. Few distinct bytes make shared prefixes and
+/// nested tokens common; `0` and `0xFF` are the zero padding of keys and the
+/// pad key.
+pub(crate) const PROPERTY_ALPHABET: [u8; 5] = [b'a', b'b', b'c', 0, 0xFF];
+
+/// Sorted, complete dictionary: every single byte plus `extra`.
+pub(crate) fn complete_dictionary(extra: &[&[u8]]) -> CompactDictionary {
+    let mut tokens: Vec<Vec<u8>> = (0u16..=255).map(|i| vec![i as u8]).collect();
+    tokens.extend(extra.iter().map(|t| t.to_vec()));
+    tokens.sort();
+    tokens.dedup();
+
+    let mut bytes = Vec::new();
+    let mut offsets = vec![0u32];
+    for t in &tokens {
+        bytes.extend_from_slice(t);
+        offsets.push(bytes.len() as u32);
+    }
+    CompactDictionary::from_raw(bytes, offsets)
+}
+
+/// The matcher the trainer uses, holding the tokens of `dict`, and the bytes
+/// of each of its token ids. Its ids differ from the dictionary ids.
+pub(crate) fn trainer_matcher(
+    dict: CompactDictionaryView<'_>,
+) -> (LongestPrefixMatcher, Vec<Vec<u8>>) {
+    let mut matcher = LongestPrefixMatcher::new();
+    let mut tokens: Vec<Vec<u8>> = (0u16..=255).map(|b| vec![b as u8]).collect();
+    for id in 0..dict.num_tokens() {
+        let token = dict.token(id as Token);
+        if token.len() > 1 {
+            let new_id = matcher.insert(token);
+            debug_assert_eq!(usize::from(new_id), tokens.len());
+            tokens.push(token.to_vec());
+        }
+    }
+    (matcher, tokens)
+}
+
 /// Arrow-style flat representation of a list of byte strings.
 pub(crate) struct Raw {
     pub data: Vec<u8>,
