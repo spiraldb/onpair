@@ -27,8 +27,8 @@ const PREFIX_SLOTS: usize = 1 << 16;
 /// the last token with `key(q) <= key(w)`. Every token that is a prefix of `w`
 /// sorts between that token and `w`, so it is also a prefix of `q`. Thus the
 /// longest match is `q` or the longest prefix of `q` that is not longer than
-/// the common prefix of `q` and `w`. Each token stores its prefix tokens in one
-/// record, so that last step is a mask and one load. The single-byte token
+/// the common prefix of `q` and `w`. Each token stores its prefix lengths and a shared path of proper prefix
+/// tokens, so the last step is a mask, a rank, and a path lookup. The single-byte token
 /// of `w[0]` sorts at or before `q`, so `q` always exists and shares the first
 /// byte of `w`.
 ///
@@ -54,8 +54,8 @@ pub(crate) struct DictionaryMatcher {
     first_blocks: Vec<u16>,
     /// Prefix tokens of each token, in dictionary order, then of each pad.
     chains: Vec<PrefixChain>,
-    /// Token of each single byte: the first prefix token of every chain.
-    singles: [Token; 256],
+    /// Proper prefix paths, shared by tokens with the same parent.
+    prefix_ids: Vec<Token>,
 }
 
 /// Keys per 128-byte block.
@@ -76,29 +76,47 @@ impl KeyBlock {
     }
 }
 
-/// The prefix tokens of one token `t` by length bound, in one 32-byte record,
-/// so that the match needs one load after the search.
+/// A token's prefix lengths and its shared path of proper prefix tokens.
+/// Siblings share the path indexed by `base`; `id` holds the token itself.
 #[derive(Copy, Clone, Debug, Default)]
-#[repr(align(32))]
+#[repr(C)]
 struct PrefixChain {
-    /// Bit `k` is set when the first `k + 1` bytes of `t` are a token.
+    base: u32,
     lens: u16,
-    /// Entry `k` is the longest token that is a prefix of `t` and not longer
-    /// than `k + 2` bytes. A bound of one byte gives the single-byte token.
-    ids: [Token; MAX_TOKEN_SIZE - 1],
+    id: Token,
 }
-
+struct PrefixPool {
+    bases: Vec<u32>,
+    ids: Vec<Token>,
+}
 impl PrefixChain {
-    /// Record of `chain`: prefix tokens of one token, shortest first, starting
-    /// with a single byte.
-    fn new(dict: CompactDictionaryView<'_>, chain: &[Token]) -> Self {
-        let mut record = Self::default();
-        for &prefix in chain {
-            let len = dict.token_len(prefix);
-            record.lens |= 1 << (len - 1);
-            record.ids[len.max(2) - 2..].fill(prefix);
+    fn new(dict: CompactDictionaryView<'_>, chain: &[Token], pool: &mut PrefixPool) -> Self {
+        let parent = chain[chain.len().saturating_sub(2)];
+        let base = &mut pool.bases[parent as usize];
+        if *base == u32::MAX {
+            // A dictionary has at most 2^16 tokens, each with at most 16
+            // ancestors, so the path offset fits in u32.
+            *base = pool.ids.len() as u32;
+            let count = chain.len().saturating_sub(1).max(1);
+            pool.ids.extend_from_slice(&chain[..count]);
+            // The full-fit rank reads this spare entry before selecting `id`.
+            // Singles also share their one-entry path with their children.
+            pool.ids.push(0);
         }
-        record
+        let lens = chain
+            .iter()
+            .fold(0u16, |mask, &id| mask | (1 << (dict.token_len(id) - 1)));
+        Self {
+            base: *base,
+            lens,
+            id: *chain.last().unwrap(),
+        }
+    }
+    #[inline(always)]
+    fn code(&self, pool: &[Token], fits: u32) -> Token {
+        let rank = fits.count_ones() as usize - 1;
+        let proper = pool[self.base as usize + rank];
+        select_unpredictable(fits == self.lens as u32, self.id, proper)
     }
 }
 
@@ -109,9 +127,12 @@ impl DictionaryMatcher {
     /// single-byte token.
     pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
         let n = dict.num_tokens();
+        let mut prefix_pool = PrefixPool {
+            bases: vec![u32::MAX; n],
+            ids: Vec::new(),
+        };
         let mut keys = Vec::with_capacity(n + 1);
         let mut chains = Vec::with_capacity(n);
-        let mut singles = [0 as Token; 256];
 
         // Prefix tokens of the current token, shortest first. A token that is a
         // prefix of a later token stays on the stack while every token between
@@ -140,11 +161,7 @@ impl DictionaryMatcher {
             chain.push(id);
             debug_assert_eq!(dict.token_len(chain[0]), 1, "dictionary is incomplete");
 
-            if token.len() == 1 {
-                singles[token[0] as usize] = id;
-            }
-
-            chains.push(PrefixChain::new(dict, &chain));
+            chains.push(PrefixChain::new(dict, &chain, &mut prefix_pool));
         }
 
         // `starts[p]` is the first token whose 2-byte prefix is `p` or larger.
@@ -170,14 +187,14 @@ impl DictionaryMatcher {
         // search can stop on a pad. Its prefix tokens are the runs of `0xFF`.
         // The last token starts with `0xFF`, so the stack holds all of them.
         chain.retain(|&id| dict.token(id).iter().all(|&b| b == 0xFF));
-        chains.resize(keys.len(), PrefixChain::new(dict, &chain));
+        chains.resize(keys.len(), PrefixChain::new(dict, &chain, &mut prefix_pool));
 
         // An eight-wide sample load can include seven entries after the last
         // candidate. For key == u128::MAX those entries compare <= too: there
         // is no larger sentinel. Back them with real pad blocks and the same
         // 0xFF prefix chain, so any rank still selects a valid predecessor.
         keys.resize(keys.len() + (BLOCK_KEYS - 1) * BLOCK_KEYS, u128::MAX);
-        chains.resize(keys.len(), PrefixChain::new(dict, &chain));
+        chains.resize(keys.len(), PrefixChain::new(dict, &chain, &mut prefix_pool));
 
         let blocks: Vec<KeyBlock> = keys
             .chunks_exact(BLOCK_KEYS)
@@ -195,7 +212,7 @@ impl DictionaryMatcher {
             samples_lo,
             first_blocks,
             chains,
-            singles,
+            prefix_ids: prefix_pool.ids,
         }
     }
 
@@ -329,6 +346,7 @@ impl DictionaryMatcher {
         }
 
         let mut q = [0usize; K];
+        let mut fits_out = [0u32; K];
         let len: [usize; K] = std::array::from_fn(|j| {
             q[j] = base[j] * BLOCK_KEYS + slot[j];
             let found = self.blocks[base[j]].key(slot[j]);
@@ -338,6 +356,7 @@ impl DictionaryMatcher {
 
             // `max_len >= 1` and bit 0 is always set, so `fits` is never zero.
             let fits = u32::from(self.chains[q[j]].lens) & ((1u32 << max_len) - 1);
+            fits_out[j] = fits;
             (u32::BITS - fits.leading_zeros()) as usize
         });
 
@@ -346,9 +365,10 @@ impl DictionaryMatcher {
         // all lengths: the next positions then do not wait behind them, which
         // is measurably faster on Intel and costs little elsewhere.
         std::array::from_fn(|j| {
-            let longer = self.chains[q[j]].ids[len[j].max(2) - 2];
-            let single = self.singles[(key[j] >> 120) as usize];
-            (select_unpredictable(len[j] == 1, single, longer), len[j])
+            (
+                self.chains[q[j]].code(&self.prefix_ids, fits_out[j]),
+                len[j],
+            )
         })
     }
 }
@@ -801,3 +821,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dictionary_matcher_rank_tests.rs"]
+mod rank_tests;
