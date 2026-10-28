@@ -32,11 +32,19 @@ const LANES: usize = 6;
 /// cache.
 const BATCH_BYTES: usize = 256 << 10;
 
-/// The tree overlaps four rows; flat sample searches have their own lane width.
-const SIMD_LANES: usize = 4;
-const LEGACY_LANES: usize = 6;
-const MAX_LANES: usize = if LEGACY_LANES > LANES {
-    LEGACY_LANES
+/// Four lanes suit the tree's completion branches; six overlap the flat rank
+/// search best on the measured prose and URL tuning inputs.
+const TREE_LANES: usize = 4;
+const RANK_LANES: usize = 6;
+const SCALAR: u8 = 0;
+#[cfg(target_arch = "x86_64")]
+const TREE: u8 = 1;
+#[cfg(target_arch = "x86_64")]
+const RANK: u8 = 2;
+const MAX_LANES: usize = if TREE_LANES > RANK_LANES && TREE_LANES > LANES {
+    TREE_LANES
+} else if RANK_LANES > LANES {
+    RANK_LANES
 } else {
     LANES
 };
@@ -108,7 +116,7 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
         let first = offsets[0].to_usize();
         let last = offsets[offsets.len() - 1].to_usize();
         if last - first >= BATCH_BYTES && matcher.prefers_tree(&bytes[first..last]) {
-            return parse_arrow_batched_with::<I, O, 3>(
+            return parse_arrow_batched_with::<I, O, TREE>(
                 matcher,
                 bytes,
                 offsets,
@@ -118,7 +126,7 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
                 row_offsets,
             );
         }
-        return parse_arrow_batched_with::<I, O, 6>(
+        return parse_arrow_batched_with::<I, O, RANK>(
             matcher,
             bytes,
             offsets,
@@ -129,7 +137,7 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
         );
     }
 
-    parse_arrow_batched_with::<I, O, 0>(
+    parse_arrow_batched_with::<I, O, SCALAR>(
         matcher,
         bytes,
         offsets,
@@ -199,7 +207,7 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("popcnt")
     {
-        return parse_rows_batched_with::<R, O, 6>(
+        return parse_rows_batched_with::<R, O, RANK>(
             matcher,
             rows,
             batch_bytes,
@@ -209,7 +217,14 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
         );
     }
 
-    parse_rows_batched_with::<R, O, 0>(matcher, rows, batch_bytes, buffers, codes, row_offsets);
+    parse_rows_batched_with::<R, O, SCALAR>(
+        matcher,
+        rows,
+        batch_bytes,
+        buffers,
+        codes,
+        row_offsets,
+    );
 }
 
 fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
@@ -256,15 +271,16 @@ fn parse_batch<I: OffsetLike, O: Offset, const MODE: u8>(
     row_offsets: &mut Vec<O>,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if MODE == 6 {
+    if MODE == RANK {
+        // SAFETY: the parse entry point detected AVX-512F and POPCNT.
         return unsafe { parse_batch_rank(matcher, bytes, offsets, buffers, codes, row_offsets) };
     }
     #[cfg(target_arch = "x86_64")]
-    if MODE == 3 {
+    if MODE == TREE {
         // SAFETY: the parse entry point detected AVX-512F and POPCNT before choosing SIMD.
         return unsafe { parse_batch_avx512(matcher, bytes, offsets, buffers, codes, row_offsets) };
     }
-    parse_batch_with::<I, O, 0, LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
+    parse_batch_with::<I, O, SCALAR, LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -277,7 +293,14 @@ unsafe fn parse_batch_avx512<I: OffsetLike, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
-    parse_batch_with::<I, O, 3, SIMD_LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
+    parse_batch_with::<I, O, TREE, TREE_LANES>(
+        matcher,
+        bytes,
+        offsets,
+        buffers,
+        codes,
+        row_offsets,
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -290,7 +313,14 @@ unsafe fn parse_batch_rank<I: OffsetLike, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
-    parse_batch_with::<I, O, 6, LEGACY_LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
+    parse_batch_with::<I, O, RANK, RANK_LANES>(
+        matcher,
+        bytes,
+        offsets,
+        buffers,
+        codes,
+        row_offsets,
+    );
 }
 
 #[inline(always)]
@@ -350,10 +380,10 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
         let win: [usize; K] =
             std::array::from_fn(|j| (row_end[j] - at[j]).clamp(1, MAX_TOKEN_SIZE));
         #[cfg(target_arch = "x86_64")]
-        let found = if MODE == 6 {
+        let found = if MODE == RANK {
             // SAFETY: the batch wrapper enables AVX-512F and POPCNT.
             unsafe { matcher.find_all_rank(bytes, &at, &win) }
-        } else if MODE == 3 {
+        } else if MODE == TREE {
             // SAFETY: the batch wrapper enables AVX-512F and POPCNT.
             unsafe { matcher.find_all_avx512(bytes, &at, &win) }
         } else {

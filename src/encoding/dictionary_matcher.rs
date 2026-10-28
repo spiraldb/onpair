@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Frozen longest-prefix matcher for encoding. [`DictionaryMatcher`] is built
-//! from the final, sorted dictionary and matches several inputs at once without
-//! data-dependent branches.
+//! from the final, sorted dictionary and overlaps several independent searches.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
@@ -19,8 +18,7 @@ use crate::core::types::{MAX_TOKEN_SIZE, Token};
 const PREFIX_SLOTS: usize = 1 << 16;
 
 /// Frozen longest-prefix matcher over a sorted, complete dictionary. Token ids
-/// are dictionary indices. It matches several inputs at once without
-/// data-dependent branches, so independent inputs overlap in the CPU.
+/// are dictionary indices. Independent inputs overlap their searches in the CPU.
 ///
 /// Each token is held as a 16-byte big-endian key, zero-padded past its length.
 /// Lexicographic token order is then also key order. For input `w`, let `q` be
@@ -39,8 +37,12 @@ const PREFIX_SLOTS: usize = 1 << 16;
 /// block of `q`. AVX-512F finishes the sample search and searches that block
 /// with eight-wide rank counts; the scalar path uses binary search throughout.
 /// A search reads one block that may miss the cache.
-/// All inputs of one call search with the same number of steps, so the loop has
-/// no branch that depends on the data; see [`advance_if_le`].
+/// An alternative eight-way tree over the same block separators avoids the
+/// remaining binary steps in large ranges. The two-byte table acts as a trie
+/// root; equal block ranges share a tree. Tree descent may finish lanes at
+/// different depths, so the parser selects it only when sampled heights agree.
+/// The scalar path retains the original branch-free binary comparisons; see
+/// [`advance_if_le`].
 #[derive(Debug, Clone)]
 pub(crate) struct DictionaryMatcher {
     /// Token keys in dictionary order, then `u128::MAX` up to a whole block.
@@ -60,7 +62,7 @@ pub(crate) struct DictionaryMatcher {
     /// whose keys start with `p` (block 0 if there is none). The block of the
     /// last token with prefix `p` is then `first_blocks[p + 1]`.
     first_blocks: Vec<u16>,
-    /// Prefix tokens of each token, in dictionary order, then of each pad.
+    /// Prefix metadata of each token, in dictionary order, then of each pad.
     chains: Vec<PrefixChain>,
     /// Proper prefix paths, shared by tokens with the same parent.
     prefix_ids: Vec<Token>,
@@ -217,6 +219,8 @@ impl DictionaryMatcher {
 
         #[cfg(target_arch = "x86_64")]
         let (roots, tree, tree_meta) = {
+            // The first separator of every candidate range is <= its query. Each
+            // node partitions contiguous blocks into up to eight contiguous groups.
             let mut roots = Vec::with_capacity(PREFIX_SLOTS);
             let mut tree = Vec::new();
             let mut tree_meta = Vec::new();
@@ -474,6 +478,9 @@ impl DictionaryMatcher {
                     let idx = refs[j] as usize;
                     let node = &self.tree[idx];
                     let meta = self.tree_meta[idx];
+                    // SAFETY: a node has eight readable entries in each column;
+                    // bit zero is valid and its key is <= this query. The caller
+                    // guarantees AVX-512F and POPCNT.
                     let slot = unsafe {
                         rank8_masked(
                             node.hi.as_ptr(),
@@ -493,6 +500,8 @@ impl DictionaryMatcher {
         let base: [usize; K] = std::array::from_fn(|j| (refs[j] & 0x7fff_ffff) as usize);
         let slot: [usize; K] = std::array::from_fn(|j| {
             let b = &self.blocks[base[j]];
+            // SAFETY: a leaf has eight readable entries and starts <= this
+            // query; the caller guarantees AVX-512F and POPCNT.
             unsafe { rank8(b.hi.as_ptr(), b.lo.as_ptr(), key[j]) }
         });
         let q: [usize; K] = std::array::from_fn(|j| base[j] * 8 + slot[j]);
@@ -649,6 +658,8 @@ fn build_node(
             );
         }
     }
+    // Low 32 bits index contiguous children, bits 32..39 mark separators,
+    // and bit 40 distinguishes leaf blocks from internal nodes.
     meta[id] = child_base as u64
         | ((((1u32 << children) - 1) as u64) << 32)
         | (u64::from(stride == 1) << 40);
@@ -657,6 +668,7 @@ fn build_node(
 #[target_feature(enable = "avx512f,popcnt")]
 #[inline]
 unsafe fn rank8_masked(hi: *const u64, lo: *const u64, key: u128, valid: u8) -> usize {
+    // SAFETY: the caller guarantees eight readable entries in each column.
     let (hi, lo) = unsafe { (_mm512_loadu_si512(hi.cast()), _mm512_loadu_si512(lo.cast())) };
     let kh = _mm512_set1_epi64((key >> 64) as i64);
     let kl = _mm512_set1_epi64(key as i64);
