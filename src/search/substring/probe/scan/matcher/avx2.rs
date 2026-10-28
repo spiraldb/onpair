@@ -245,6 +245,7 @@ fn table(row: [u8; 16]) -> Table {
 
 /// Pack low and high bytes separately and restore their original code order.
 /// Convert surviving point bits to 0xFF lanes for the later movemask.
+#[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
     let byte = _mm256_set1_epi16(0x00ff);

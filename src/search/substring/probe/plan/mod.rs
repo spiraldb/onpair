@@ -23,6 +23,7 @@ use super::alignment::mincut::MinCut;
 use super::scan::{Isa, MatcherKind};
 use crate::search::index::TokenFrequencyIndexView;
 use cost::Slopes;
+pub(super) use cost::max_nibble_batches;
 #[cfg(test)]
 pub(super) use select::is_eligible;
 pub(super) use select::{cover_cost, select_matcher, skip_empty_packing};

@@ -97,7 +97,7 @@ const AVX512BW_COSTS: CostWeights = CostWeights {
 };
 
 /// The weights of `isa`, or `None` on scalar targets, where only the table runs.
-fn weights(isa: Isa) -> Option<&'static CostWeights> {
+const fn weights(isa: Isa) -> Option<&'static CostWeights> {
     match isa {
         Isa::Neon => Some(&NEON_COSTS),
         Isa::Avx2 => Some(&AVX2_COSTS),
@@ -106,9 +106,13 @@ fn weights(isa: Isa) -> Option<&'static CostWeights> {
     }
 }
 
-/// The most batches planning gives Nibble on `isa`; none on scalar targets.
-pub(super) fn max_nibble_batches(isa: Isa) -> usize {
-    weights(isa).map_or(0, |weights| weights.max_nibble_batches)
+/// The most batches planning gives Nibble on `isa`, and so the most dispatch
+/// compiles a Nibble kernel for; none on scalar targets.
+pub(in crate::search::substring::probe) const fn max_nibble_batches(isa: Isa) -> usize {
+    match weights(isa) {
+        Some(weights) => weights.max_nibble_batches,
+        None => 0,
+    }
 }
 
 /// The cost model's slopes: what one more point or range adds to scanning a code,

@@ -14,6 +14,8 @@ use super::matcher;
 use super::{Isa, MatcherKind, ScanInput, both_stages};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::{PER_BATCH, matcher::Kernels, matcher::Matcher};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use crate::search::substring::probe::plan::max_nibble_batches;
 
 use crate::core::offset::Offset;
 
@@ -73,30 +75,45 @@ fn run_with<K: Kernels, O: Offset>(
         MatcherKind::EqOr => {
             with_skip::<O, K::EqOr<true>, K::EqOr<false>>(skip_empty_packing, input, out)
         }
+        // An arm is compiled only if planning can give Nibble that many batches on
+        // this instruction set.
         MatcherKind::NibbleN8 => match input.cover.n_points().div_ceil(PER_BATCH) {
-            1 => with_skip::<O, K::NibbleN8<1, true>, K::NibbleN8<1, false>>(
-                skip_empty_packing,
-                input,
-                out,
-            ),
-            2 => with_skip::<O, K::NibbleN8<2, true>, K::NibbleN8<2, false>>(
-                skip_empty_packing,
-                input,
-                out,
-            ),
-            3 => with_skip::<O, K::NibbleN8<3, true>, K::NibbleN8<3, false>>(
-                skip_empty_packing,
-                input,
-                out,
-            ),
-            4 => with_skip::<O, K::NibbleN8<4, true>, K::NibbleN8<4, false>>(
-                skip_empty_packing,
-                input,
-                out,
-            ),
-            _ => both_stages::<matcher::Table, O>(input, out),
+            1 => nibble::<K, O, 1>(skip_empty_packing, input, out),
+            2 if const { max_nibble_batches(K::ISA) >= 2 } => {
+                nibble::<K, O, 2>(skip_empty_packing, input, out)
+            }
+            3 if const { max_nibble_batches(K::ISA) >= 3 } => {
+                nibble::<K, O, 3>(skip_empty_packing, input, out)
+            }
+            4 if const { max_nibble_batches(K::ISA) >= 4 } => {
+                nibble::<K, O, 4>(skip_empty_packing, input, out)
+            }
+            batches => unreachable!("Nibble planned with {batches} batches, above the cap"),
         },
     }
+}
+
+// Every batch count planning can give Nibble has an arm in `run_with`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const _: () = assert!(
+    max_nibble_batches(Isa::Neon) <= 4
+        && max_nibble_batches(Isa::Avx2) <= 4
+        && max_nibble_batches(Isa::Avx512Bw) <= 4,
+    "a Nibble batch cap exceeds the batch counts `run_with` compiles"
+);
+
+/// Scans `input` with `K`'s Nibble matcher for `BATCHES` batches.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn nibble<K: Kernels, O: Offset, const BATCHES: usize>(
+    skip_empty_packing: bool,
+    input: ScanInput<'_, O>,
+    out: &mut Vec<usize>,
+) {
+    with_skip::<O, K::NibbleN8<BATCHES, true>, K::NibbleN8<BATCHES, false>>(
+        skip_empty_packing,
+        input,
+        out,
+    )
 }
 
 /// Whether this build has kernels for `isa` and this CPU can run them.

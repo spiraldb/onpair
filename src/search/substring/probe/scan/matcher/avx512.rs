@@ -229,6 +229,7 @@ fn table(row: [u8; 16]) -> Table {
 
 /// Pack low and high bytes separately and restore their original code order.
 /// AVX-512 tests surviving point bits directly into the output mask.
+#[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
     let byte = _mm512_set1_epi16(0x00ff);

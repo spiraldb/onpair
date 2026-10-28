@@ -251,6 +251,7 @@ fn table(row: [u8; 16]) -> Table {
     unsafe { vld1q_u8(row.as_ptr()) }
 }
 
+#[inline]
 #[target_feature(enable = "neon")]
 unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
     let nibble = vdupq_n_u8(0x0f);
