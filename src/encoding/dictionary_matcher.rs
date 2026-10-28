@@ -56,6 +56,7 @@ pub(crate) struct DictionaryMatcher {
     chains: Vec<PrefixChain>,
     /// Proper prefix paths, shared by tokens with the same parent.
     prefix_ids: Vec<Token>,
+    single_byte_only: bool,
 }
 
 /// Keys per 128-byte block.
@@ -213,7 +214,13 @@ impl DictionaryMatcher {
             first_blocks,
             chains,
             prefix_ids: prefix_pool.ids,
+            single_byte_only: n == 256,
         }
+    }
+
+    /// A complete dictionary with exactly 256 tokens assigns each byte its value.
+    pub(crate) fn is_single_byte_only(&self) -> bool {
+        self.single_byte_only
     }
 
     /// Longest token whose bytes are a prefix of `data`, with that prefix's

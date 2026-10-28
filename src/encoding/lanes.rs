@@ -60,6 +60,18 @@ pub(crate) fn parse_arrow<I: Offset, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
+    if matcher.is_single_byte_only() {
+        let first = offsets[0].to_usize();
+        let last = offsets[offsets.len() - 1].to_usize();
+        let base = codes.len();
+        codes.extend(bytes[first..last].iter().copied().map(Token::from));
+        row_offsets.extend(
+            offsets[1..]
+                .iter()
+                .map(|o| O::from_usize(base + o.to_usize() - first)),
+        );
+        return;
+    }
     parse_arrow_batched(
         matcher,
         bytes,
@@ -142,6 +154,13 @@ pub(crate) fn parse_rows<R: Rows + ?Sized, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
+    if matcher.is_single_byte_only() {
+        for i in 0..rows.num_rows() {
+            codes.extend(rows.row(i).iter().copied().map(Token::from));
+            row_offsets.push(O::from_usize(codes.len()));
+        }
+        return;
+    }
     parse_rows_batched(matcher, rows, BATCH_BYTES, buffers, codes, row_offsets);
 }
 
@@ -533,6 +552,41 @@ mod tests {
             &train,
             &[b"".as_slice(), b"a", b"", b"", b"hello world", b"x", b""],
         );
+    }
+
+    #[test]
+    fn single_byte_dictionary_appends_with_empty_rows_and_nonzero_offset() {
+        let dict = complete_dictionary(&[]);
+        let matcher = DictionaryMatcher::from_dictionary(dict.as_view());
+        let bytes = [99, b'a', 0, 255, 88];
+        let offsets = [1u32, 1, 4, 4];
+        let rows: [&[u8]; 3] = [&[], &bytes[1..4], &[]];
+        for arrow in [false, true] {
+            let mut codes = vec![42];
+            let mut ends = vec![0u64, 1];
+            let mut buffers = LaneBuffers::default();
+            if arrow {
+                parse_arrow(
+                    &matcher,
+                    &bytes,
+                    &offsets,
+                    &mut buffers,
+                    &mut codes,
+                    &mut ends,
+                );
+            } else {
+                parse_rows(
+                    &matcher,
+                    rows.as_slice(),
+                    &mut buffers,
+                    &mut codes,
+                    &mut ends,
+                );
+            }
+            assert_eq!(codes, [42, 97, 0, 255]);
+            assert_eq!(ends, [0, 1, 1, 4, 4]);
+            assert!(buffers.bytes.is_empty());
+        }
     }
 
     #[test]
