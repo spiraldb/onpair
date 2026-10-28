@@ -15,9 +15,10 @@ use crate::search::substring::probe::plan::is_eligible;
 use crate::search::substring::probe::scan::dispatch::supports;
 use crate::search::substring::probe::scan::{BLOCK, Isa, MatcherKind};
 
-/// Run one matcher and verify that a false return guarantees an empty mask.
+/// Runs one matcher on a mask full of stale bits, as a scan reuses its mask
+/// across blocks, and checks that a false return means an empty mask.
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
-    let mut bits = [0u64; BLOCK / 64];
+    let mut bits = [u64::MAX; BLOCK / 64];
     // A matcher may return true for an empty mask when it always packs.
     let any_hit = M::new(cover).check(codes, &mut bits);
     assert!(
