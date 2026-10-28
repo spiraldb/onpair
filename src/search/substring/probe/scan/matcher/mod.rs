@@ -10,8 +10,7 @@
 //!
 //! - `EqOr` broadcasts each point to all lanes, compares it with the codes, and ORs
 //!   the results together with the range hits. Work grows linearly with the number
-//!   of points and ranges. Covers without points get a specialization that only
-//!   checks ranges.
+//!   of points and ranges; a cover without points checks only its ranges.
 //! - `NibbleN8` tests up to eight points at once with shuffle tables. A token ID is
 //!   a `u16`, so four 4-bit nibbles. Each batch has one 16-entry table per nibble
 //!   position, and point `k` sets bit `k` in the entry selected by its nibble at
@@ -72,7 +71,7 @@ pub(in crate::search::substring::probe::scan) trait Kernels {
     /// The instruction set the matchers run on.
     const ISA: super::Isa;
     /// One vector comparison per point, plus range checks.
-    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool, const HAS_POINTS: bool>: Matcher;
+    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool>: Matcher;
     /// Nibble shuffle tables, eight points per batch, plus range checks.
     type NibbleN8<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>: Matcher;
 }

@@ -82,12 +82,8 @@ fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
         return;
     }
     let eq_or = MatcherKind::EqOr;
-    agrees::<K::EqOr<false, true>>(isa, eq_or, "eq_or", cover, codes);
-    agrees::<K::EqOr<true, true>>(isa, eq_or, "eq_or_skip_empty", cover, codes);
-    if cover.n_points() == 0 {
-        agrees::<K::EqOr<false, false>>(isa, eq_or, "eq_or_ranges", cover, codes);
-        agrees::<K::EqOr<true, false>>(isa, eq_or, "eq_or_ranges_skip_empty", cover, codes);
-    }
+    agrees::<K::EqOr<false>>(isa, eq_or, "eq_or", cover, codes);
+    agrees::<K::EqOr<true>>(isa, eq_or, "eq_or_skip_empty", cover, codes);
     // Use the same point-to-batch mapping as production dispatch.
     let n8k = MatcherKind::NibbleN8;
     match cover.points().len().div_ceil(PER_BATCH) {
@@ -153,8 +149,8 @@ fn eq_or_without_points_checks_ranges() {
     }
 }
 
-/// Every EqOr variant of `K`, given a cover without points, marks exactly the
-/// ranges, in both packing modes, if this CPU supports its instruction set.
+/// `K`'s EqOr, given a cover without points, marks exactly the ranges, in both
+/// packing modes, if this CPU supports its instruction set.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn eq_or_checks_ranges_alone<K: Kernels>(codes: &Block) {
     let isa = K::ISA;
@@ -176,19 +172,8 @@ fn eq_or_checks_ranges_alone<K: Kernels>(codes: &Block) {
     ] {
         let cover = ProbeCover::new(vec![], ranges);
         let want = expected(&cover, codes);
-        let mut bits = [u64::MAX; BLOCK / 64];
-        K::EqOr::<false, true>::new(&cover).check(codes, &mut bits);
-        assert_eq!(bits, want, "{isa:?}");
-        bits.fill(u64::MAX);
-        let any_hit = K::EqOr::<true, true>::new(&cover).check(codes, &mut bits);
-        assert_eq!(bits, want, "{isa:?}");
-        assert!(any_hit || bits.iter().all(|&word| word == 0), "{isa:?}");
-        assert_eq!(
-            mask::<K::EqOr<false, false>>(&cover, codes),
-            want,
-            "{isa:?}"
-        );
-        assert_eq!(mask::<K::EqOr<true, false>>(&cover, codes), want, "{isa:?}");
+        assert_eq!(mask::<K::EqOr<false>>(&cover, codes), want, "{isa:?}");
+        assert_eq!(mask::<K::EqOr<true>>(&cover, codes), want, "{isa:?}");
     }
 }
 

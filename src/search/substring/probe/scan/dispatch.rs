@@ -70,18 +70,9 @@ fn run_with<K: Kernels, O: Offset>(
     );
     match kind {
         MatcherKind::Table => both_stages::<matcher::Table, O>(input, out),
-        MatcherKind::EqOr if input.cover.n_points() == 0 => {
-            with_skip::<O, K::EqOr<true, false>, K::EqOr<false, false>>(
-                skip_empty_packing,
-                input,
-                out,
-            )
+        MatcherKind::EqOr => {
+            with_skip::<O, K::EqOr<true>, K::EqOr<false>>(skip_empty_packing, input, out)
         }
-        MatcherKind::EqOr => with_skip::<O, K::EqOr<true, true>, K::EqOr<false, true>>(
-            skip_empty_packing,
-            input,
-            out,
-        ),
         MatcherKind::NibbleN8 => match input.cover.n_points().div_ceil(PER_BATCH) {
             1 => with_skip::<O, K::NibbleN8<1, true>, K::NibbleN8<1, false>>(
                 skip_empty_packing,

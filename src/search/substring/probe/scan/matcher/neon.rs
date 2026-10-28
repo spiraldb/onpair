@@ -190,40 +190,24 @@ unsafe fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> H
 }
 
 /// Broadcast point probes and prepared ranges reused across scan blocks.
-pub(in crate::search::substring::probe::scan) struct EqOr<
-    const SKIP_MOVEMASK_IF_NO_MATCH: bool,
-    const HAS_POINTS: bool = true,
-> {
-    /// One broadcast vector per point in the cover.
+pub(in crate::search::substring::probe::scan) struct EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool> {
+    /// One broadcast vector per point in the cover; none for a cover of ranges only.
     tokens: Vec<Broadcast>,
     /// Range starts and widths, already broadcast for vector comparisons.
     ranges: Vec<Held>,
 }
 
-impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool, const HAS_POINTS: bool> Matcher
-    for EqOr<SKIP_MOVEMASK_IF_NO_MATCH, HAS_POINTS>
-{
+impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for EqOr<SKIP_MOVEMASK_IF_NO_MATCH> {
     fn new(cover: &ProbeCover) -> Self {
-        debug_assert!(HAS_POINTS || cover.points().is_empty());
         Self {
-            tokens: if HAS_POINTS {
-                cover.points().iter().copied().map(broadcast).collect()
-            } else {
-                Vec::new()
-            },
+            tokens: cover.points().iter().copied().map(broadcast).collect(),
             ranges: cover.ranges().iter().copied().map(hold).collect(),
         }
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
         // SAFETY: planning selects this kernel only after CPU feature detection.
-        unsafe {
-            if HAS_POINTS {
-                eq_or_mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.tokens, &self.ranges, codes, bits)
-            } else {
-                ranges_mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.ranges, codes, bits)
-            }
-        }
+        unsafe { eq_or_mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.tokens, &self.ranges, codes, bits) }
     }
 }
 
@@ -372,8 +356,7 @@ pub(in crate::search::substring::probe::scan) struct Neon;
 
 impl Kernels for Neon {
     const ISA: Isa = Isa::Neon;
-    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool, const HAS_POINTS: bool> =
-        EqOr<SKIP_MOVEMASK_IF_NO_MATCH, HAS_POINTS>;
+    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool> = EqOr<SKIP_MOVEMASK_IF_NO_MATCH>;
     type NibbleN8<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> =
         NibbleN8<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>;
 }
