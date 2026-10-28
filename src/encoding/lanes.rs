@@ -7,8 +7,8 @@
 //! previous one ends, so a single row cannot go faster than one match latency
 //! at a time. Rows are independent, though. The parser splits each batch of
 //! rows into [`LANES`] lanes of about equal size and advances all lanes in one
-//! loop with [`DictionaryMatcher::find_all`]. That step has no data-dependent
-//! branches, so the CPU overlaps the memory accesses of the lanes. Each lane
+//! loop with the selected matcher. Independent lanes overlap their memory
+//! accesses. The predecessor search remains exact in every variant. Each lane
 //! writes its codes to its own buffer; the buffers are joined in row order
 //! after the batch.
 
@@ -32,14 +32,23 @@ const LANES: usize = 6;
 /// cache.
 const BATCH_BYTES: usize = 256 << 10;
 
+/// The tree overlaps four rows; flat sample searches have their own lane width.
+const SIMD_LANES: usize = 4;
+const LEGACY_LANES: usize = 4;
+const MAX_LANES: usize = if LEGACY_LANES > LANES {
+    LEGACY_LANES
+} else {
+    LANES
+};
+
 /// Reusable per-lane buffers.
 #[derive(Default)]
 pub(crate) struct LaneBuffers {
     /// Codes of each lane in the current batch.
-    codes: [Vec<Token>; LANES],
+    codes: [Vec<Token>; MAX_LANES],
     /// Per lane: code count at the end of each row, then one spare slot for
     /// the writes after the last row.
-    row_ends: [Vec<usize>; LANES],
+    row_ends: [Vec<usize>; MAX_LANES],
     /// Copy of the rows of one batch, for inputs that are not contiguous.
     bytes: Vec<u8>,
     /// Row offsets into `bytes`.
@@ -96,7 +105,20 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("popcnt")
     {
-        return parse_arrow_batched_with::<I, O, true>(
+        let first = offsets[0].to_usize();
+        let last = offsets[offsets.len() - 1].to_usize();
+        if last - first >= BATCH_BYTES && matcher.prefers_tree(&bytes[first..last]) {
+            return parse_arrow_batched_with::<I, O, 3>(
+                matcher,
+                bytes,
+                offsets,
+                batch_bytes,
+                buffers,
+                codes,
+                row_offsets,
+            );
+        }
+        return parse_arrow_batched_with::<I, O, 6>(
             matcher,
             bytes,
             offsets,
@@ -106,7 +128,8 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
             row_offsets,
         );
     }
-    parse_arrow_batched_with::<I, O, false>(
+
+    parse_arrow_batched_with::<I, O, 0>(
         matcher,
         bytes,
         offsets,
@@ -117,7 +140,7 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
     );
 }
 
-fn parse_arrow_batched_with<I: Offset, O: Offset, const SIMD: bool>(
+fn parse_arrow_batched_with<I: Offset, O: Offset, const MODE: u8>(
     matcher: &DictionaryMatcher,
     bytes: &[u8],
     offsets: &[I],
@@ -133,7 +156,7 @@ fn parse_arrow_batched_with<I: Offset, O: Offset, const SIMD: bool>(
         let limit = offsets[start].to_usize() + batch_bytes;
         let fit = offsets[start + 1..=n].partition_point(|o| o.to_usize() <= limit);
         let end = start + fit.max(1);
-        parse_batch::<I, O, SIMD>(
+        parse_batch::<I, O, MODE>(
             matcher,
             bytes,
             &offsets[start..=end],
@@ -176,7 +199,7 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
     if std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("popcnt")
     {
-        return parse_rows_batched_with::<R, O, true>(
+        return parse_rows_batched_with::<R, O, 6>(
             matcher,
             rows,
             batch_bytes,
@@ -185,10 +208,11 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
             row_offsets,
         );
     }
-    parse_rows_batched_with::<R, O, false>(matcher, rows, batch_bytes, buffers, codes, row_offsets);
+
+    parse_rows_batched_with::<R, O, 0>(matcher, rows, batch_bytes, buffers, codes, row_offsets);
 }
 
-fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const SIMD: bool>(
+fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
     matcher: &DictionaryMatcher,
     rows: &R,
     batch_bytes: usize,
@@ -215,7 +239,7 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const SIMD: bool>(
 
         // Padding keeps every window load on the fast path.
         bytes.resize(bytes.len() + MAX_TOKEN_SIZE, 0);
-        parse_batch::<usize, O, SIMD>(matcher, &bytes, &offsets, buffers, codes, row_offsets);
+        parse_batch::<usize, O, MODE>(matcher, &bytes, &offsets, buffers, codes, row_offsets);
     }
 
     buffers.bytes = bytes;
@@ -223,7 +247,7 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const SIMD: bool>(
 }
 
 /// Encode one batch of contiguous rows with all lanes.
-fn parse_batch<I: OffsetLike, O: Offset, const SIMD: bool>(
+fn parse_batch<I: OffsetLike, O: Offset, const MODE: u8>(
     matcher: &DictionaryMatcher,
     bytes: &[u8],
     offsets: &[I],
@@ -232,11 +256,15 @@ fn parse_batch<I: OffsetLike, O: Offset, const SIMD: bool>(
     row_offsets: &mut Vec<O>,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if SIMD {
+    if MODE == 6 {
+        return unsafe { parse_batch_rank(matcher, bytes, offsets, buffers, codes, row_offsets) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if MODE == 3 {
         // SAFETY: the parse entry point detected AVX-512F and POPCNT before choosing SIMD.
         return unsafe { parse_batch_avx512(matcher, bytes, offsets, buffers, codes, row_offsets) };
     }
-    parse_batch_with::<I, O, false>(matcher, bytes, offsets, buffers, codes, row_offsets);
+    parse_batch_with::<I, O, 0, LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -249,11 +277,24 @@ unsafe fn parse_batch_avx512<I: OffsetLike, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
-    parse_batch_with::<I, O, true>(matcher, bytes, offsets, buffers, codes, row_offsets);
+    parse_batch_with::<I, O, 3, SIMD_LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,popcnt")]
+unsafe fn parse_batch_rank<I: OffsetLike, O: Offset>(
+    matcher: &DictionaryMatcher,
+    bytes: &[u8],
+    offsets: &[I],
+    buffers: &mut LaneBuffers,
+    codes: &mut Vec<Token>,
+    row_offsets: &mut Vec<O>,
+) {
+    parse_batch_with::<I, O, 6, LEGACY_LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
 }
 
 #[inline(always)]
-fn parse_batch_with<I: OffsetLike, O: Offset, const SIMD: bool>(
+fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
     matcher: &DictionaryMatcher,
     bytes: &[u8],
     offsets: &[I],
@@ -266,22 +307,22 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const SIMD: bool>(
     let total = offsets[n].to_usize() - first;
 
     // Lane `j` parses rows `bounds[j]..bounds[j + 1]`, split by byte count.
-    let mut bounds = [0usize; LANES + 1];
-    for (j, bound) in bounds.iter_mut().enumerate().skip(1) {
-        let target = first + total * j / LANES;
+    let mut bounds = [0usize; MAX_LANES + 1];
+    for (j, bound) in bounds.iter_mut().enumerate().take(K + 1).skip(1) {
+        let target = first + total * j / K;
         *bound = offsets.partition_point(|o| o.to_usize() < target).min(n);
     }
-    bounds[LANES] = n;
+    bounds[K] = n;
 
     // Per lane: position, end of the current row, current row, end row, and
     // number of codes written.
-    let mut at = [0usize; LANES];
-    let mut row_end = [0usize; LANES];
-    let mut row = [0usize; LANES];
-    let mut last_row = [0usize; LANES];
-    let mut count = [0usize; LANES];
+    let mut at = [0usize; K];
+    let mut row_end = [0usize; K];
+    let mut row = [0usize; K];
+    let mut last_row = [0usize; K];
+    let mut count = [0usize; K];
 
-    for j in 0..LANES {
+    for j in 0..K {
         let (r0, r1) = (bounds[j], bounds[j + 1]);
         let start = offsets[r0].to_usize();
         at[j] = start;
@@ -306,11 +347,14 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const SIMD: bool>(
 
     loop {
         // An inactive lane still runs one search; its result is discarded.
-        let win: [usize; LANES] =
+        let win: [usize; K] =
             std::array::from_fn(|j| (row_end[j] - at[j]).clamp(1, MAX_TOKEN_SIZE));
         #[cfg(target_arch = "x86_64")]
-        let found = if SIMD {
-            // SAFETY: called from parse_batch_avx512 with AVX-512F and POPCNT enabled.
+        let found = if MODE == 6 {
+            // SAFETY: the batch wrapper enables AVX-512F and POPCNT.
+            unsafe { matcher.find_all_rank(bytes, &at, &win) }
+        } else if MODE == 3 {
+            // SAFETY: the batch wrapper enables AVX-512F and POPCNT.
             unsafe { matcher.find_all_avx512(bytes, &at, &win) }
         } else {
             matcher.find_all(bytes, &at, &win)
@@ -319,7 +363,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const SIMD: bool>(
         let found = matcher.find_all(bytes, &at, &win);
 
         let mut busy = false;
-        for j in 0..LANES {
+        for j in 0..K {
             let running = row[j] < last_row[j];
             busy |= running;
 
@@ -351,7 +395,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const SIMD: bool>(
         }
     }
 
-    for j in 0..LANES {
+    for j in 0..K {
         let base = codes.len();
         codes.extend_from_slice(&buffers.codes[j][..count[j]]);
 
@@ -383,7 +427,6 @@ impl OffsetLike for usize {
         self
     }
 }
-
 #[cfg(test)]
 mod tests {
     use hegel::TestCase;

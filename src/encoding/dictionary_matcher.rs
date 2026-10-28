@@ -45,6 +45,14 @@ const PREFIX_SLOTS: usize = 1 << 16;
 pub(crate) struct DictionaryMatcher {
     /// Token keys in dictionary order, then `u128::MAX` up to a whole block.
     blocks: Vec<KeyBlock>,
+    /// Roots of eight-way predecessor trees, shared by equal block ranges.
+    #[cfg(target_arch = "x86_64")]
+    roots: Vec<u32>,
+    #[cfg(target_arch = "x86_64")]
+    tree: Vec<KeyBlock>,
+    /// Child base, valid separator mask, and whether children are leaf blocks.
+    #[cfg(target_arch = "x86_64")]
+    tree_meta: Vec<u64>,
     /// First key of each block, in columns, including seven trailing pad blocks.
     samples_hi: Vec<u64>,
     samples_lo: Vec<u64>,
@@ -175,7 +183,7 @@ impl DictionaryMatcher {
         }
 
         // At most 2^16 tokens, so at most 2^13 blocks: a block fits a `u16`.
-        let first_blocks = starts
+        let first_blocks: Vec<u16> = starts
             .iter()
             .map(|&start| ((start.max(1) - 1) / BLOCK_KEYS) as u16)
             .collect();
@@ -207,7 +215,48 @@ impl DictionaryMatcher {
         let samples_hi = blocks.iter().map(|block| block.hi[0]).collect();
         let samples_lo = blocks.iter().map(|block| block.lo[0]).collect();
 
+        #[cfg(target_arch = "x86_64")]
+        let (roots, tree, tree_meta) = {
+            let mut roots = Vec::with_capacity(PREFIX_SLOTS);
+            let mut tree = Vec::new();
+            let mut tree_meta = Vec::new();
+            let mut cache = std::collections::HashMap::new();
+            for p in 0..PREFIX_SLOTS {
+                let first = first_blocks[p] as usize;
+                let last = first_blocks[p + 1] as usize;
+                let link = if first == last {
+                    0x8000_0000 | first as u32
+                } else {
+                    *cache.entry((first, last)).or_insert_with(|| {
+                        let id = tree.len();
+                        tree.push(KeyBlock {
+                            hi: [u64::MAX; 8],
+                            lo: [u64::MAX; 8],
+                        });
+                        tree_meta.push(0);
+                        build_node(
+                            id,
+                            first,
+                            last - first + 1,
+                            &blocks,
+                            &mut tree,
+                            &mut tree_meta,
+                        );
+                        id as u32
+                    })
+                };
+                roots.push(link);
+            }
+            (roots, tree, tree_meta)
+        };
+
         Self {
+            #[cfg(target_arch = "x86_64")]
+            roots,
+            #[cfg(target_arch = "x86_64")]
+            tree,
+            #[cfg(target_arch = "x86_64")]
+            tree_meta,
             blocks,
             samples_hi,
             samples_lo,
@@ -216,6 +265,22 @@ impl DictionaryMatcher {
             prefix_ids: prefix_pool.ids,
             single_byte_only: n == 256,
         }
+    }
+
+    /// Estimate whether tree searches will have a predictable common height.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn prefers_tree(&self, bytes: &[u8]) -> bool {
+        // A mixed tree height makes per-lane completion branches unpredictable.
+        // Require one height in at least seven eighths of the sampled windows.
+        let mut depths = [0usize; 6];
+        for j in 0..64 {
+            let at = bytes.len().saturating_sub(1) * j / 64;
+            let prefix = (window_key(bytes, at) >> 112) as usize;
+            let n = self.first_blocks[prefix + 1] as usize + 1 - self.first_blocks[prefix] as usize;
+            let depth = (usize::BITS - n.saturating_sub(1).leading_zeros()).div_ceil(3) as usize;
+            depths[depth] += 1;
+        }
+        depths.into_iter().max().unwrap_or(0) >= 56
     }
 
     /// A complete dictionary with exactly 256 tokens assigns each byte its value.
@@ -246,7 +311,7 @@ impl DictionaryMatcher {
         win: &[usize; K],
     ) -> [(Token, usize); K] {
         // SAFETY: the scalar specialization requires no target features.
-        unsafe { self.find_all_with::<K, false>(bytes, at, win) }
+        unsafe { self.find_all_with::<K, false, false>(bytes, at, win) }
     }
 
     /// AVX-512 specialization; the caller must detect AVX-512F and POPCNT first.
@@ -259,13 +324,24 @@ impl DictionaryMatcher {
         at: &[usize; K],
         win: &[usize; K],
     ) -> [(Token, usize); K] {
-        // SAFETY: this function enables AVX-512F and POPCNT.
-        unsafe { self.find_all_with::<K, true>(bytes, at, win) }
+        // SAFETY: the caller guarantees AVX-512F and POPCNT.
+        unsafe { self.find_all_with::<K, true, true>(bytes, at, win) }
     }
 
+    /// Flat sample-rank specialization; the caller must detect AVX-512F and POPCNT.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(crate) unsafe fn find_all_rank<const K: usize>(
+        &self,
+        b: &[u8],
+        a: &[usize; K],
+        w: &[usize; K],
+    ) -> [(Token, usize); K] {
+        unsafe { self.find_all_with::<K, true, false>(b, a, w) }
+    }
     /// The SIMD specialization requires AVX-512F and POPCNT on x86-64.
     #[inline(always)]
-    unsafe fn find_all_with<const K: usize, const SIMD: bool>(
+    unsafe fn find_all_with<const K: usize, const SIMD: bool, const TREE: bool>(
         &self,
         bytes: &[u8],
         at: &[usize; K],
@@ -275,6 +351,11 @@ impl DictionaryMatcher {
         // that is a prefix of the window is a prefix of the whole key, so it is
         // also a prefix of `q`; the length bound below drops the longer ones.
         let key: [u128; K] = std::array::from_fn(|j| window_key(bytes, at[j]));
+        #[cfg(target_arch = "x86_64")]
+        if SIMD && TREE {
+            // SAFETY: the SIMD caller guarantees AVX-512F and POPCNT.
+            return unsafe { self.find_tree(&key, win) };
+        }
 
         // Candidate blocks: from the block of the last token before the
         // input's 2-byte prefix to the block of the last token with that
@@ -378,6 +459,58 @@ impl DictionaryMatcher {
             )
         })
     }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn find_tree<const K: usize>(
+        &self,
+        key: &[u128; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        let mut refs: [u32; K] = std::array::from_fn(|j| self.roots[(key[j] >> 112) as usize]);
+        loop {
+            let mut busy = false;
+            for j in 0..K {
+                if refs[j] & 0x8000_0000 == 0 {
+                    let idx = refs[j] as usize;
+                    let node = &self.tree[idx];
+                    let meta = self.tree_meta[idx];
+                    let slot = unsafe {
+                        rank8_masked(
+                            node.hi.as_ptr(),
+                            node.lo.as_ptr(),
+                            key[j],
+                            (meta >> 32) as u8,
+                        )
+                    };
+                    refs[j] = (meta as u32 + slot as u32) | (((meta >> 40) as u32 & 1) << 31);
+                    busy |= refs[j] & 0x8000_0000 == 0;
+                }
+            }
+            if !busy {
+                break;
+            }
+        }
+        let base: [usize; K] = std::array::from_fn(|j| (refs[j] & 0x7fff_ffff) as usize);
+        let slot: [usize; K] = std::array::from_fn(|j| {
+            let b = &self.blocks[base[j]];
+            unsafe { rank8(b.hi.as_ptr(), b.lo.as_ptr(), key[j]) }
+        });
+        let q: [usize; K] = std::array::from_fn(|j| base[j] * 8 + slot[j]);
+        let mut fits_out = [0u32; K];
+        let len: [usize; K] = std::array::from_fn(|j| {
+            let found = self.blocks[base[j]].key(slot[j]);
+            let common = ((found ^ key[j]).leading_zeros() / 8) as usize;
+            let fits = self.chains[q[j]].lens as u32 & ((1u32 << common.min(win[j])) - 1);
+            fits_out[j] = fits;
+            (u32::BITS - fits.leading_zeros()) as usize
+        });
+        std::array::from_fn(|j| {
+            (
+                self.chains[q[j]].code(&self.prefix_ids, fits_out[j]),
+                len[j],
+            )
+        })
+    }
 }
 
 /// Last of eight sorted keys <= `key`. Both pointers must address eight u64s,
@@ -471,6 +604,65 @@ fn window_key(bytes: &[u8], at: usize) -> u128 {
         buf[..n].copy_from_slice(&tail[..n]);
         u128::from_be_bytes(buf)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_node(
+    id: usize,
+    first: usize,
+    count: usize,
+    blocks: &[KeyBlock],
+    tree: &mut Vec<KeyBlock>,
+    meta: &mut Vec<u64>,
+) {
+    let mut stride = 1;
+    while stride * 8 < count {
+        stride *= 8;
+    }
+    let children = count.div_ceil(stride);
+    let child_base = if stride == 1 {
+        first
+    } else {
+        let base = tree.len();
+        tree.resize(
+            base + children,
+            KeyBlock {
+                hi: [u64::MAX; 8],
+                lo: [u64::MAX; 8],
+            },
+        );
+        meta.resize(base + children, 0);
+        base
+    };
+    for j in 0..children {
+        let b = first + j * stride;
+        tree[id].hi[j] = blocks[b].hi[0];
+        tree[id].lo[j] = blocks[b].lo[0];
+        if stride > 1 {
+            build_node(
+                child_base + j,
+                b,
+                stride.min(count - j * stride),
+                blocks,
+                tree,
+                meta,
+            );
+        }
+    }
+    meta[id] = child_base as u64
+        | ((((1u32 << children) - 1) as u64) << 32)
+        | (u64::from(stride == 1) << 40);
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,popcnt")]
+#[inline]
+unsafe fn rank8_masked(hi: *const u64, lo: *const u64, key: u128, valid: u8) -> usize {
+    let (hi, lo) = unsafe { (_mm512_loadu_si512(hi.cast()), _mm512_loadu_si512(lo.cast())) };
+    let kh = _mm512_set1_epi64((key >> 64) as i64);
+    let kl = _mm512_set1_epi64(key as i64);
+    let le = _mm512_cmplt_epu64_mask(hi, kh)
+        | (_mm512_cmpeq_epu64_mask(hi, kh) & _mm512_cmple_epu64_mask(lo, kl));
+    (le & valid).count_ones() as usize - 1
 }
 
 #[cfg(test)]

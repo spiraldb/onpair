@@ -30,6 +30,7 @@ fn check<const K: usize>(
         {
             // SAFETY: the required target features were detected.
             assert_eq!(unsafe { matcher.find_all_avx512(bytes, at, win) }, scalar);
+            assert_eq!(unsafe { matcher.find_all_rank(bytes, at, win) }, scalar);
         }
     }
 }
