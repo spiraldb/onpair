@@ -21,3 +21,10 @@ mod probe;
 pub use dfa::{ContainsDfa, row_contains};
 pub use error::ContainsError;
 pub use probe::{ContainsScan, ProbeCover};
+
+// Both document that one prepared query can be shared between threads.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<ContainsDfa>();
+    send_sync::<ContainsScan<'static>>();
+};

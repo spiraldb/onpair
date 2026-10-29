@@ -50,6 +50,8 @@ mod verify;
 
 pub use alignment::cover::ProbeCover;
 
+use std::fmt;
+
 use alignment::graph::AlignmentGraph;
 use scan::{Isa, MatcherKind, ScanInput};
 use verify::HitVerifier;
@@ -67,14 +69,14 @@ use crate::search::substring::ContainsError;
 /// [`scan`](Self::scan) keeps its state local, so one query can scan any number of
 /// chunks encoded with the same dictionary, concurrently if needed. The empty
 /// pattern matches every row, without a scan.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContainsScan<'d> {
     dict: CompactDictionaryView<'d>,
     query: Query,
 }
 
 /// What a scan does for its pattern.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Query {
     /// The empty pattern, which every row contains.
     Everything,
@@ -229,6 +231,29 @@ impl<'d> ContainsScan<'d> {
         Ok(self
             .probe_cover()
             .map_or(0, |cover| cover.frequency(frequencies)))
+    }
+}
+
+/// Shows the plan: the filter, the instruction set, the matcher and the hit
+/// density it was planned for. The dictionary and the verifier's tables are left
+/// out.
+impl fmt::Debug for ContainsScan<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("ContainsScan");
+        debug.field("probe_cover", &self.probe_cover());
+        if let Query::Scan {
+            isa,
+            matcher,
+            probe_density,
+            ..
+        } = &self.query
+        {
+            debug
+                .field("isa", isa)
+                .field("matcher", matcher)
+                .field("probe_density", probe_density);
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
