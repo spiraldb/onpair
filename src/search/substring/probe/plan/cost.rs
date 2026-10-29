@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Cost model for covers and matchers, calibrated per instruction set.
+//! Cost model for covers and matchers, with weights per instruction set.
 //!
 //! Costs are in table scans: one is the time the table matcher takes to test one
 //! code, so the table costs 1 on every instruction set. Per code, a filter costs
@@ -13,12 +13,10 @@
 //! The weights set where one choice overtakes another. With NEON's, for filters
 //! without ranges, EqOr beats the table up to 10 points, Nibble beats EqOr from 4
 //! points and the table up to 24, and a filter covering 1% of the codes spends
-//! about one table scan per code on its hits. The NEON weights are rounded
-//! measurements. The x86 ones steer planning rather than measure it: on AVX2, EqOr
-//! with one to four points costs about a quarter of a table scan whatever the
-//! count, bound by reading the codes, but weights that said so led planning to
-//! filters with more points, which ran slower. Their point weight acts as a
-//! preference for fewer points.
+//! about one table scan per code on its hits. On x86 the point weight is a
+//! preference rather than a time: on AVX2, EqOr with up to four points is bound by
+//! loading the codes, so its cost barely depends on the point count, and the
+//! weight steers planning toward filters with fewer points.
 
 use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherKind, PER_BATCH};

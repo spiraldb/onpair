@@ -7,9 +7,9 @@ use super::super::ProbeCover;
 use super::super::scan::{Isa, MatcherKind, PER_BATCH};
 use super::cost::{candidate_cost, matcher_cost, max_nibble_batches};
 
-/// Hit density below which vector matchers skip packing empty groups (0.025%).
-/// Empirical, and shared by NEON, AVX2 and AVX-512. Clustered hits can make
-/// skipping pay off above it too.
+/// Hit density below which vector matchers test each 128 codes for a hit before
+/// packing them: 0.025%, about one expected hit per 4096-code block. Clustered
+/// hits can make skipping pay off above it too.
 const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 2.5e-4;
 
 /// Whether `matcher` can run `cover` on `isa`, an instruction set this CPU supports.
