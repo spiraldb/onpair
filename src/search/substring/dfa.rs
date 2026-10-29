@@ -28,6 +28,26 @@ type State = u8;
 /// [`MAX_PATTERN_LEN`](Self::MAX_PATTERN_LEN) bytes. To find all matching rows of a
 /// column, see [`ContainsScan`](crate::search::ContainsScan). The automaton is
 /// immutable, so it can be shared between threads.
+///
+/// # Examples
+///
+/// ```
+/// use onpair::search::{ContainsDfa, row_contains};
+/// use onpair::{Column, DEFAULT_CONFIG};
+///
+/// let bytes = b"catdogbirdcatfish";
+/// let offsets = [0u32, 3, 6, 10, 13, 17];
+/// let column = Column::compress(bytes, &offsets, DEFAULT_CONFIG)?;
+/// let view = column.view();
+///
+/// // Compile once per pattern, then test rows one at a time.
+/// let dfa = ContainsDfa::new(b"at", view.dict)?;
+/// let rows: Vec<usize> = (0..view.num_rows())
+///     .filter(|&row| row_contains(view.row_codes(row), &dfa))
+///     .collect();
+/// assert_eq!(rows, [0, 3]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct ContainsDfa {
     /// The accepting state: the pattern length.

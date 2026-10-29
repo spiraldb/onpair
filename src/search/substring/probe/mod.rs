@@ -69,6 +69,32 @@ use crate::search::substring::ContainsError;
 /// [`scan`](Self::scan) keeps its state local, so one query can scan any number of
 /// chunks encoded with the same dictionary, concurrently if needed. The empty
 /// pattern matches every row, without a scan.
+///
+/// # Examples
+///
+/// ```
+/// use onpair::search::ContainsScan;
+/// use onpair::search::index::TokenFrequencyIndex;
+/// use onpair::{Column, DEFAULT_CONFIG, DictionaryView};
+///
+/// let bytes = b"catdogbirdcatfish";
+/// let offsets = [0u32, 3, 6, 10, 13, 17];
+/// let column = Column::compress(bytes, &offsets, DEFAULT_CONFIG)?;
+/// let view = column.view();
+/// let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens())?;
+///
+/// // Prepare once per pattern, then scan any slice of rows.
+/// let scan = ContainsScan::new(b"cat", view.dict, frequencies.as_view())?;
+/// let mut rows = Vec::new();
+/// scan.scan(view.codes, view.row_offsets, &mut rows);
+/// assert_eq!(rows, [0, 3]);
+///
+/// // Row indices count from the first offset passed in.
+/// rows.clear();
+/// scan.scan(view.codes, &view.row_offsets[2..], &mut rows);
+/// assert_eq!(rows, [1]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone)]
 pub struct ContainsScan<'d> {
     dict: CompactDictionaryView<'d>,
