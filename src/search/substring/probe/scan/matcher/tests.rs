@@ -17,11 +17,11 @@ use crate::search::substring::probe::scan::{BLOCK, Isa, MatcherKind};
 
 /// Runs one matcher on a mask full of stale bits, as a scan reuses its mask
 /// across blocks, and checks that a false return means an empty mask.
-fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
+fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block, skip_empty: bool) -> Mask {
     let mut bits = [u64::MAX; BLOCK / 64];
     // A matcher may return true for an empty mask when it always packs.
     // SAFETY: callers check `supports` before testing a vector matcher.
-    let any_hit = unsafe { M::new(cover) }.check(codes, &mut bits);
+    let any_hit = unsafe { M::new(cover) }.check(codes, &mut bits, skip_empty);
     assert!(
         any_hit || bits.iter().all(|&set| set == 0),
         "a set bit under a cleared empty-block flag"
@@ -40,16 +40,19 @@ fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
     bits
 }
 
-/// Compare a matcher eligible on `isa` with the independent mask oracle.
+/// Compare a matcher eligible on `isa` with the independent mask oracle, in both
+/// packing modes.
 fn agrees<M: Matcher>(isa: Isa, kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
     if !is_eligible(isa, kind, cover) {
         return;
     }
-    assert_eq!(
-        mask::<M>(cover, codes),
-        expected(cover, codes),
-        "{isa:?} {name} differs from the cover it was built from"
-    );
+    for skip_empty in [false, true] {
+        assert_eq!(
+            mask::<M>(cover, codes, skip_empty),
+            expected(cover, codes),
+            "{isa:?} {name} (skip_empty={skip_empty}) differs from the cover it was built from"
+        );
+    }
 }
 
 /// Create distinct codes so a selected point has exactly one hit per block.
@@ -82,28 +85,14 @@ fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
     if !supports(isa) {
         return;
     }
-    let eq_or = MatcherKind::EqOr;
-    agrees::<K::EqOr<false>>(isa, eq_or, "eq_or", cover, codes);
-    agrees::<K::EqOr<true>>(isa, eq_or, "eq_or_skip_empty", cover, codes);
+    agrees::<K::EqOr>(isa, MatcherKind::EqOr, "eq_or", cover, codes);
     // Use the same point-to-batch mapping as production dispatch.
     let n8k = MatcherKind::NibbleN8;
     match cover.points().len().div_ceil(PER_BATCH) {
-        1 => {
-            agrees::<K::NibbleN8<1, false>>(isa, n8k, "nibble_n8", cover, codes);
-            agrees::<K::NibbleN8<1, true>>(isa, n8k, "nibble_n8_skip_empty", cover, codes);
-        }
-        2 => {
-            agrees::<K::NibbleN8<2, false>>(isa, n8k, "nibble_n16", cover, codes);
-            agrees::<K::NibbleN8<2, true>>(isa, n8k, "nibble_n16_skip_empty", cover, codes);
-        }
-        3 => {
-            agrees::<K::NibbleN8<3, false>>(isa, n8k, "nibble_n24", cover, codes);
-            agrees::<K::NibbleN8<3, true>>(isa, n8k, "nibble_n24_skip_empty", cover, codes);
-        }
-        4 => {
-            agrees::<K::NibbleN8<4, false>>(isa, n8k, "nibble_n32", cover, codes);
-            agrees::<K::NibbleN8<4, true>>(isa, n8k, "nibble_n32_skip_empty", cover, codes);
-        }
+        1 => agrees::<K::NibbleN8<1>>(isa, n8k, "nibble_n8", cover, codes),
+        2 => agrees::<K::NibbleN8<2>>(isa, n8k, "nibble_n16", cover, codes),
+        3 => agrees::<K::NibbleN8<3>>(isa, n8k, "nibble_n24", cover, codes),
+        4 => agrees::<K::NibbleN8<4>>(isa, n8k, "nibble_n32", cover, codes),
         _ => {}
     }
 }
@@ -173,8 +162,9 @@ fn eq_or_checks_ranges_alone<K: Kernels>(codes: &Block) {
     ] {
         let cover = ProbeCover::new(vec![], ranges);
         let want = expected(&cover, codes);
-        assert_eq!(mask::<K::EqOr<false>>(&cover, codes), want, "{isa:?}");
-        assert_eq!(mask::<K::EqOr<true>>(&cover, codes), want, "{isa:?}");
+        for skip_empty in [false, true] {
+            assert_eq!(mask::<K::EqOr>(&cover, codes, skip_empty), want, "{isa:?}");
+        }
     }
 }
 
@@ -372,7 +362,8 @@ fn table_rejects_the_codes_around_its_own() {
         &codes,
     );
     every_matcher(&ProbeCover::new(vec![1000 as Token, 3000], vec![]), &codes);
-    let bits = mask::<Table>(&ProbeCover::new(vec![1000 as Token, 3000], vec![]), &codes);
+    let cover = ProbeCover::new(vec![1000 as Token, 3000], vec![]);
+    let bits = mask::<Table>(&cover, &codes, false);
     assert_eq!(bits[0] & 0x3f, 0b000110);
 }
 
@@ -380,7 +371,11 @@ fn table_rejects_the_codes_around_its_own() {
 #[test]
 fn the_table_masks_one_code() {
     let codes = block();
-    let bits = mask::<Table>(&ProbeCover::new(codes[100..101].to_vec(), vec![]), &codes);
+    let bits = mask::<Table>(
+        &ProbeCover::new(codes[100..101].to_vec(), vec![]),
+        &codes,
+        false,
+    );
     assert_eq!(bits[100 / 64] >> (100 % 64) & 1, 1, "missed the code");
     assert_eq!(
         bits.iter().map(|word| word.count_ones()).sum::<u32>(),

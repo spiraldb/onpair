@@ -28,7 +28,8 @@ impl Matcher for Table {
         Self { admits }
     }
 
-    fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
+    /// Always packs: a lookup per code leaves nothing to skip.
+    fn check(&self, codes: &Block, bits: &mut Mask, _skip_empty: bool) -> bool {
         let mut any = 0;
         for (word, codes) in bits.iter_mut().zip(codes.chunks_exact(64)) {
             // Eight independent shift-OR chains per word.

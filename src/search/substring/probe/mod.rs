@@ -51,9 +51,10 @@ mod verify;
 pub use alignment::cover::ProbeCover;
 
 use std::fmt;
+use std::sync::Arc;
 
 use alignment::graph::AlignmentGraph;
-use scan::{Isa, MatcherKind, ScanInput};
+use scan::{Isa, Matcher, MatcherKind, ScanInput};
 use verify::HitVerifier;
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
@@ -65,7 +66,8 @@ use crate::search::substring::ContainsError;
 
 /// A substring query prepared for one dictionary.
 ///
-/// Preparation chooses the filter and compiles the hit verifier once. Each
+/// Preparation chooses the filter, builds its matcher and compiles the hit verifier
+/// once. Each
 /// [`scan`](Self::scan) keeps its state local, so one query can scan any number of
 /// chunks encoded with the same dictionary, concurrently if needed. The empty
 /// pattern matches every row, without a scan.
@@ -103,6 +105,10 @@ pub struct ContainsScan<'d> {
 
 /// What a scan does for its pattern.
 #[derive(Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a prepared query holds one `Query`, so `Everything`'s unused bytes cost nothing"
+)]
 enum Query {
     /// The empty pattern, which every row contains.
     Everything,
@@ -110,7 +116,9 @@ enum Query {
     Scan {
         probe_cover: ProbeCover,
         isa: Isa,
-        matcher: MatcherKind,
+        kind: MatcherKind,
+        /// The `kind` matcher of `isa`, built for `probe_cover`.
+        matcher: Arc<dyn Matcher>,
         verifier: HitVerifier,
         probe_density: f64,
     },
@@ -166,9 +174,10 @@ impl<'d> ContainsScan<'d> {
         Ok(Self {
             dict,
             query: Query::Scan {
+                matcher: scan::prepare(isa, plan.matcher, &plan.cover),
                 probe_cover: plan.cover,
                 isa,
-                matcher: plan.matcher,
+                kind: plan.matcher,
                 verifier: HitVerifier::from_graph(&graph, pattern),
                 probe_density: fraction(plan.hits, frequencies.total_frequency()),
             },
@@ -202,11 +211,10 @@ impl<'d> ContainsScan<'d> {
             panic_malformed(InvalidColumn::BadRowOffsets);
         }
         let Query::Scan {
-            probe_cover,
-            isa,
             matcher,
             verifier,
             probe_density,
+            ..
         } = &self.query
         else {
             // Every row contains the empty pattern, even a row without codes.
@@ -218,16 +226,9 @@ impl<'d> ContainsScan<'d> {
             return;
         }
         scan::run(
-            *isa,
-            *matcher,
+            &**matcher,
             plan::skip_empty_packing(*probe_density, last - first),
-            ScanInput::new(
-                &codes[..last],
-                row_offsets,
-                self.dict,
-                probe_cover,
-                verifier,
-            ),
+            ScanInput::new(&codes[..last], row_offsets, self.dict, verifier),
             out,
         );
     }
@@ -269,14 +270,14 @@ impl fmt::Debug for ContainsScan<'_> {
         debug.field("probe_cover", &self.probe_cover());
         if let Query::Scan {
             isa,
-            matcher,
+            kind,
             probe_density,
             ..
         } = &self.query
         {
             debug
                 .field("isa", isa)
-                .field("matcher", matcher)
+                .field("matcher", kind)
                 .field("probe_density", probe_density);
         }
         debug.finish_non_exhaustive()

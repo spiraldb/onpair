@@ -7,10 +7,7 @@
 //! registers, so the hits of 64 codes are already one `u64` mask word: there is
 //! nothing to narrow or pack.
 //!
-//! The helpers the scan loop calls are `#[inline]`: the loop is generic, so it is
-//! compiled in the crate that runs the scan, and without LTO that crate cannot
-//! inline a non-generic function from this one unless it is marked so. The
-//! closures passed to `words` are `#[inline(always)]`, since `words` calls each
+//! The closures passed to `words` are `#[inline(always)]`, since `words` calls each
 //! twice per 128 codes and the compiler would otherwise keep it out of line.
 
 use std::arch::x86_64::*;
@@ -164,14 +161,14 @@ fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
 }
 
 /// Broadcast point probes and prepared ranges reused across scan blocks.
-pub(in crate::search::substring::probe::scan) struct EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool> {
+pub(in crate::search::substring::probe::scan) struct EqOr {
     /// One broadcast vector per point in the cover; none for a cover of ranges only.
     tokens: Vec<Broadcast>,
     /// Range starts and widths, already broadcast for vector comparisons.
     ranges: Vec<Held>,
 }
 
-impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for EqOr<SKIP_MOVEMASK_IF_NO_MATCH> {
+impl Matcher for EqOr {
     unsafe fn new(cover: &ProbeCover) -> Self {
         // SAFETY: the caller guarantees AVX-512, which `broadcast` and `hold` need.
         unsafe {
@@ -186,9 +183,16 @@ impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for EqOr<SKIP_MOVEMASK_IF_NO
         }
     }
 
-    fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
+    fn check(&self, codes: &Block, bits: &mut Mask, skip_empty: bool) -> bool {
+        let (tokens, ranges) = (&self.tokens, &self.ranges);
         // SAFETY: `self` was built by `new`, whose caller guaranteed AVX-512.
-        unsafe { eq_or_mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.tokens, &self.ranges, codes, bits) }
+        unsafe {
+            if skip_empty {
+                eq_or_mask::<true>(tokens, ranges, codes, bits)
+            } else {
+                eq_or_mask::<false>(tokens, ranges, codes, bits)
+            }
+        }
     }
 }
 
@@ -290,19 +294,14 @@ fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hi
 /// Prepared point batches and ranges for repeated block checks.
 /// `BATCHES` must be positive and large enough to hold every point in the cover;
 /// planning and dispatch choose the supported specialization.
-pub(in crate::search::substring::probe::scan) struct NibbleN8<
-    const BATCHES: usize,
-    const SKIP_MOVEMASK_IF_NO_MATCH: bool,
-> {
+pub(in crate::search::substring::probe::scan) struct NibbleN8<const BATCHES: usize> {
     /// Up to eight point probes per batch; unused entries contribute no bits.
     batches: [Batch; BATCHES],
     /// Prepared inclusive ranges, added after point matching.
     ranges: Vec<Held>,
 }
 
-impl<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher
-    for NibbleN8<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>
-{
+impl<const BATCHES: usize> Matcher for NibbleN8<BATCHES> {
     unsafe fn new(cover: &ProbeCover) -> Self {
         let codes = cover.points();
         // SAFETY: the caller guarantees AVX-512, which `batch` and `hold` need.
@@ -318,15 +317,15 @@ impl<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher
         }
     }
 
-    fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
+    fn check(&self, codes: &Block, bits: &mut Mask, skip_empty: bool) -> bool {
+        let (batches, ranges) = (&self.batches, &self.ranges);
         // SAFETY: `self` was built by `new`, whose caller guaranteed AVX-512.
         unsafe {
-            nibble_mask::<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>(
-                &self.batches,
-                &self.ranges,
-                codes,
-                bits,
-            )
+            if skip_empty {
+                nibble_mask::<BATCHES, true>(batches, ranges, codes, bits)
+            } else {
+                nibble_mask::<BATCHES, false>(batches, ranges, codes, bits)
+            }
         }
     }
 }
@@ -353,7 +352,6 @@ pub(in crate::search::substring::probe::scan) struct Avx512;
 
 impl Kernels for Avx512 {
     const ISA: Isa = Isa::Avx512Bw;
-    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool> = EqOr<SKIP_MOVEMASK_IF_NO_MATCH>;
-    type NibbleN8<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> =
-        NibbleN8<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>;
+    type EqOr = EqOr;
+    type NibbleN8<const BATCHES: usize> = NibbleN8<BATCHES>;
 }

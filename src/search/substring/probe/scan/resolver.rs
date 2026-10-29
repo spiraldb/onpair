@@ -138,7 +138,6 @@ mod tests {
     use crate::core::dictionary::Dictionary;
     use crate::core::offset::Offset;
     use crate::core::types::Token;
-    use crate::search::substring::ProbeCover;
     use crate::search::substring::probe::scan::tests::byte_dictionary;
     use crate::search::substring::probe::scan::{BLOCK, ScanInput};
     use crate::search::substring::probe::verify::tests::accepting_verifier;
@@ -151,10 +150,9 @@ mod tests {
     /// The hit verifier accepts every hit, so rows depend only on lookup and deduplication.
     fn resolve<O: Offset>(mask: &[u64], row_offsets: &[O]) -> Vec<usize> {
         let codes = [0 as Token; CODES];
-        let cover = ProbeCover::new(Vec::new(), Vec::new());
         let verifier = accepting_verifier();
         let dict = byte_dictionary();
-        let input = ScanInput::new(&codes, row_offsets, dict.as_view(), &cover, &verifier);
+        let input = ScanInput::new(&codes, row_offsets, dict.as_view(), &verifier);
         let mut out = Vec::new();
         let mut resolver = Resolver::new(input);
         for (block, bits) in mask.chunks_exact(BLOCK / 64).enumerate() {

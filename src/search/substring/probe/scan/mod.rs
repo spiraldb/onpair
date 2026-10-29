@@ -9,7 +9,7 @@
 //! first verified hit, and its remaining hits are skipped.
 //!
 //! `matcher` holds the membership kernels, `resolver` the row lookup, and `dispatch`
-//! instantiates the kernel chosen by `plan`.
+//! builds the kernel chosen by `plan`, once per query.
 
 mod dispatch;
 mod matcher;
@@ -20,9 +20,8 @@ use super::verify::HitVerifier;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-pub(super) use dispatch::{detect_isa, run};
-use matcher::Matcher;
-pub(super) use matcher::PER_BATCH;
+pub(super) use dispatch::{detect_isa, prepare};
+pub(super) use matcher::{Matcher, PER_BATCH};
 use resolver::Resolver;
 
 /// The vector instruction set the kernels and cost weights are chosen for.
@@ -51,30 +50,28 @@ pub(super) enum MatcherKind {
 /// Number of codes per matcher block.
 pub(super) const BLOCK: usize = 4096;
 
-/// Everything one scan borrows: the encoded region and the prepared query.
+/// Everything one scan borrows for row resolution: the encoded region and the
+/// prepared hit verifier.
 #[derive(Clone, Copy)]
 pub(super) struct ScanInput<'a, O> {
     codes: &'a [Token],
     row_offsets: &'a [O],
     dict: CompactDictionaryView<'a>,
-    cover: &'a ProbeCover,
     verifier: &'a HitVerifier,
 }
 
 impl<'a, O> ScanInput<'a, O> {
-    /// Borrow the encoded region and the cover and hit verifier prepared for it.
+    /// Borrow the encoded region and the hit verifier prepared for it.
     pub(super) const fn new(
         codes: &'a [Token],
         row_offsets: &'a [O],
         dict: CompactDictionaryView<'a>,
-        cover: &'a ProbeCover,
         verifier: &'a HitVerifier,
     ) -> Self {
         Self {
             codes,
             row_offsets,
             dict,
-            cover,
             verifier,
         }
     }
@@ -85,22 +82,22 @@ type Block = [Token; BLOCK];
 /// One bit per code in a block; bit `i` describes code `i`.
 type Mask = [u64; BLOCK / 64];
 
-/// Runs the matcher over every block and appends each verified row once, in
-/// ascending order.
-///
-/// # Safety
-/// The CPU supports `M`'s instruction set.
-unsafe fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usize>) {
-    // SAFETY: the caller's guarantee.
-    let matcher = unsafe { M::new(input.cover) };
+/// Runs `matcher` over every block and appends each verified row once, in
+/// ascending order. `skip_empty` is passed to every `check`.
+pub(super) fn run<O: Offset>(
+    matcher: &dyn Matcher,
+    skip_empty: bool,
+    input: ScanInput<'_, O>,
+    out: &mut Vec<usize>,
+) {
     let mut resolver = Resolver::new(input);
     let mut bits = [0u64; BLOCK / 64];
     blocks(
         input.codes,
         input.row_offsets[0].to_usize(),
-        &mut |block, at, valid| {
+        |block, at, valid| {
             // A false result guarantees no hits; true may still mean an empty mask.
-            if matcher.check(block, &mut bits) {
+            if matcher.check(block, &mut bits, skip_empty) {
                 clear_from(&mut bits, valid);
                 resolver.rows(&bits, at, out);
             }
@@ -111,7 +108,7 @@ unsafe fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut 
 /// Calls `step` on each block of codes from `first`, with the block's absolute start
 /// and its number of valid codes. The last partial block is zero-padded, so `step`
 /// must discard mask bits past the valid count.
-fn blocks(codes: &[Token], first: usize, step: &mut dyn FnMut(&Block, usize, usize)) {
+fn blocks(codes: &[Token], first: usize, mut step: impl FnMut(&Block, usize, usize)) {
     let (whole, rest) = codes[first..].as_chunks::<BLOCK>();
     let mut at = first;
     for block in whole {
@@ -168,15 +165,12 @@ mod tests {
                 if !is_eligible(isa, kind, cover) {
                     continue;
                 }
-                for skip_empty_packing in [false, true] {
-                    let input =
-                        ScanInput::new(codes, row_offsets, dict.as_view(), cover, &verifier);
+                let matcher = prepare(isa, kind, cover);
+                for skip_empty in [false, true] {
+                    let input = ScanInput::new(codes, row_offsets, dict.as_view(), &verifier);
                     let mut out = Vec::new();
-                    run(isa, kind, skip_empty_packing, input, &mut out);
-                    assert_eq!(
-                        out, expected,
-                        "{isa:?}, {kind:?}, skip_empty_packing={skip_empty_packing}"
-                    );
+                    run(&*matcher, skip_empty, input, &mut out);
+                    assert_eq!(out, expected, "{isa:?}, {kind:?}, skip_empty={skip_empty}");
                 }
             }
         }
@@ -230,7 +224,7 @@ mod tests {
             let codes: Vec<Token> = (1..=len).map(|code| code as Token).collect();
             for first in [0, len / 2] {
                 let mut seen = Vec::new();
-                blocks(&codes, first, &mut |block, at, valid| {
+                blocks(&codes, first, |block, at, valid| {
                     assert!(block[valid..].iter().all(|&code| code == 0), "{len} codes");
                     seen.extend(
                         (at..)

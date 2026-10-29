@@ -27,10 +27,10 @@
 //!
 //! AArch64 builds contain the `neon` kernels. x86_64 builds contain both the
 //! `avx2` and the `avx512` kernels, each compiled for its own instruction set
-//! whatever the build's target features. `dispatch` runs the best kernels the CPU
-//! supports, and checks that support before building them. Each file names its
-//! matchers in a `Kernels` impl (`Neon`, `Avx2`, `Avx512`), so dispatch and the
-//! tests are written once for all.
+//! whatever the build's target features. `dispatch` builds the best kernels the
+//! CPU supports, once per query, and checks that support first. Each file names its
+//! matchers in a `Kernels` impl (`Neon`, `Avx2`, `Avx512`), so dispatch is written
+//! once for all.
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
@@ -53,22 +53,26 @@ pub(in crate::search::substring::probe::scan) use avx512::Avx512;
 pub(in crate::search::substring::probe::scan) use neon::Neon;
 pub(in crate::search::substring::probe::scan) use table::Table;
 
-/// A cover membership test, prepared once and run on every block.
+/// A cover membership test, prepared once per query and run on every block.
 ///
 /// A vector matcher runs the instructions of its instruction set. Building one is
 /// the unsafe step: once built, it may be checked anywhere.
-pub(in crate::search::substring::probe::scan) trait Matcher:
-    Sized
+pub(in crate::search::substring::probe) trait Matcher:
+    Send + Sync
 {
     /// Prepares `cover`, which must be eligible for this matcher.
     ///
     /// # Safety
     /// The CPU supports the matcher's instruction set. The table needs none.
-    unsafe fn new(cover: &ProbeCover) -> Self;
+    unsafe fn new(cover: &ProbeCover) -> Self
+    where
+        Self: Sized;
 
-    /// Overwrites `bits` with the block's mask. Returns `false` only if the mask is
-    /// empty, so the caller can skip row lookup; `true` does not imply a hit.
-    fn check(&self, codes: &Block, bits: &mut Mask) -> bool;
+    /// Overwrites `bits` with the block's mask. With `skip_empty`, a vector matcher
+    /// tests each 128 codes for a hit and zeroes their mask words without packing
+    /// if there is none. Returns `false` only if the mask is empty, so the caller
+    /// can skip row lookup; `true` does not imply a hit.
+    fn check(&self, codes: &Block, bits: &mut Mask, skip_empty: bool) -> bool;
 }
 
 /// The vector matchers of one instruction set.
@@ -77,9 +81,9 @@ pub(in crate::search::substring::probe::scan) trait Kernels {
     /// The instruction set the matchers run on.
     const ISA: super::Isa;
     /// One vector comparison per point, plus range checks.
-    type EqOr<const SKIP_MOVEMASK_IF_NO_MATCH: bool>: Matcher;
+    type EqOr: Matcher + 'static;
     /// Nibble shuffle tables, eight points per batch, plus range checks.
-    type NibbleN8<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>: Matcher;
+    type NibbleN8<const BATCHES: usize>: Matcher + 'static;
 }
 
 #[cfg(test)]

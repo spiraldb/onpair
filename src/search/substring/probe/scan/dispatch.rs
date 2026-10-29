@@ -1,79 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Instantiate the planned kernel, so the block loop runs on concrete types.
+//! Build the planned matcher, once per query.
 //!
-//! The instruction set, the matcher kind, the packing policy and the number of
-//! nibble batches are resolved once per scan into type and const parameters.
+//! The instruction set, the matcher kind and the number of Nibble batches are
+//! resolved into a concrete matcher behind `dyn Matcher`, which every scan of the
+//! query then calls once per block. Whether to skip packing empty groups is decided
+//! per scan, and passed to the matcher.
 //!
 //! AArch64 always has NEON. An x86_64 build contains both the AVX2 and the AVX-512
 //! kernels and picks the best one the CPU supports at runtime, falling back to the
 //! table without either. Other targets only have the table.
 
-use super::matcher;
-use super::{Isa, MatcherKind, ScanInput, both_stages};
+use std::sync::Arc;
+
+use super::matcher::{self, Matcher};
+use super::{Isa, MatcherKind, ProbeCover};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::{PER_BATCH, matcher::Kernels, matcher::Matcher};
+use super::{PER_BATCH, matcher::Kernels};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::search::substring::probe::plan::max_nibble_batches;
 
-use crate::core::offset::Offset;
-
-/// Runs `S`, the variant that skips packing empty groups, or `P`, the one that
-/// always packs.
-///
-/// # Safety
-/// The CPU supports the instruction set of `S` and `P`.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-unsafe fn with_skip<O: Offset, S: Matcher, P: Matcher>(
-    skip_empty_packing: bool,
-    input: ScanInput<'_, O>,
-    out: &mut Vec<usize>,
-) {
-    // SAFETY: the caller's guarantee.
-    unsafe {
-        if skip_empty_packing {
-            both_stages::<S, O>(input, out)
-        } else {
-            both_stages::<P, O>(input, out)
-        }
-    }
-}
-
-/// Scans `input` with the `kind` kernel of `isa` and appends the verified rows to
-/// `out`. `kind` must be eligible for the cover on `isa`, as planning ensures.
+/// Builds the `kind` matcher of `isa` for `cover`. `kind` must be eligible for the
+/// cover on `isa`, as planning ensures.
 ///
 /// # Panics
 /// If this CPU does not support `isa`.
-pub(in crate::search::substring::probe) fn run<O: Offset>(
+pub(in crate::search::substring::probe) fn prepare(
     isa: Isa,
     kind: MatcherKind,
-    skip_empty_packing: bool,
-    input: ScanInput<'_, O>,
-    out: &mut Vec<usize>,
-) {
+    cover: &ProbeCover,
+) -> Arc<dyn Matcher> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = (kind, skip_empty_packing);
+    let _ = kind;
     match isa {
         #[cfg(target_arch = "aarch64")]
-        Isa::Neon => run_with::<matcher::Neon, O>(kind, skip_empty_packing, input, out),
+        Isa::Neon => prepare_with::<matcher::Neon>(kind, cover),
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 => run_with::<matcher::Avx2, O>(kind, skip_empty_packing, input, out),
+        Isa::Avx2 => prepare_with::<matcher::Avx2>(kind, cover),
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx512Bw => run_with::<matcher::Avx512, O>(kind, skip_empty_packing, input, out),
+        Isa::Avx512Bw => prepare_with::<matcher::Avx512>(kind, cover),
         // SAFETY: the table runs on any CPU.
-        _ => unsafe { both_stages::<matcher::Table, O>(input, out) },
+        _ => Arc::new(unsafe { matcher::Table::new(cover) }),
     }
 }
 
-/// Scans `input` with the `kind` kernel among `K`'s, one instruction set's matchers.
+/// Builds the `kind` matcher among `K`'s, one instruction set's matchers.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn run_with<K: Kernels, O: Offset>(
-    kind: MatcherKind,
-    skip_empty_packing: bool,
-    input: ScanInput<'_, O>,
-    out: &mut Vec<usize>,
-) {
+fn prepare_with<K: Kernels>(kind: MatcherKind, cover: &ProbeCover) -> Arc<dyn Matcher> {
     // Every matcher built below relies on this check.
     assert!(
         supports(K::ISA),
@@ -83,22 +57,20 @@ fn run_with<K: Kernels, O: Offset>(
     // below except the table, which needs none.
     unsafe {
         match kind {
-            MatcherKind::Table => both_stages::<matcher::Table, O>(input, out),
-            MatcherKind::EqOr => {
-                with_skip::<O, K::EqOr<true>, K::EqOr<false>>(skip_empty_packing, input, out)
-            }
+            MatcherKind::Table => Arc::new(matcher::Table::new(cover)),
+            MatcherKind::EqOr => Arc::new(K::EqOr::new(cover)),
             // An arm is compiled only if planning can give Nibble that many batches on
             // this instruction set.
-            MatcherKind::NibbleN8 => match input.cover.points().len().div_ceil(PER_BATCH) {
-                1 => nibble::<K, O, 1>(skip_empty_packing, input, out),
+            MatcherKind::NibbleN8 => match cover.points().len().div_ceil(PER_BATCH) {
+                1 => Arc::new(K::NibbleN8::<1>::new(cover)),
                 2 if const { max_nibble_batches(K::ISA) >= 2 } => {
-                    nibble::<K, O, 2>(skip_empty_packing, input, out)
+                    Arc::new(K::NibbleN8::<2>::new(cover))
                 }
                 3 if const { max_nibble_batches(K::ISA) >= 3 } => {
-                    nibble::<K, O, 3>(skip_empty_packing, input, out)
+                    Arc::new(K::NibbleN8::<3>::new(cover))
                 }
                 4 if const { max_nibble_batches(K::ISA) >= 4 } => {
-                    nibble::<K, O, 4>(skip_empty_packing, input, out)
+                    Arc::new(K::NibbleN8::<4>::new(cover))
                 }
                 batches => unreachable!("Nibble planned with {batches} batches, above the cap"),
             },
@@ -106,34 +78,14 @@ fn run_with<K: Kernels, O: Offset>(
     }
 }
 
-// Every batch count planning can give Nibble has an arm in `run_with`.
+// Every batch count planning can give Nibble has an arm in `prepare_with`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const _: () = assert!(
     max_nibble_batches(Isa::Neon) <= 4
         && max_nibble_batches(Isa::Avx2) <= 4
         && max_nibble_batches(Isa::Avx512Bw) <= 4,
-    "a Nibble batch cap exceeds the batch counts `run_with` compiles"
+    "a Nibble batch cap exceeds the batch counts `prepare_with` compiles"
 );
-
-/// Scans `input` with `K`'s Nibble matcher for `BATCHES` batches.
-///
-/// # Safety
-/// The CPU supports `K::ISA`.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-unsafe fn nibble<K: Kernels, O: Offset, const BATCHES: usize>(
-    skip_empty_packing: bool,
-    input: ScanInput<'_, O>,
-    out: &mut Vec<usize>,
-) {
-    // SAFETY: the caller's guarantee.
-    unsafe {
-        with_skip::<O, K::NibbleN8<BATCHES, true>, K::NibbleN8<BATCHES, false>>(
-            skip_empty_packing,
-            input,
-            out,
-        )
-    }
-}
 
 /// Whether this build has kernels for `isa` and this CPU can run them.
 pub(in crate::search::substring::probe) fn supports(isa: Isa) -> bool {
