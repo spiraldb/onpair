@@ -100,6 +100,7 @@ impl<'d> ContainsScan<'d> {
     /// [`Parser::train`](crate::Parser::train) and
     /// [`CompactDictionary::validate`](crate::CompactDictionary::validate), and
     /// `frequencies` is indexed by its token IDs. Only the index length is checked.
+    /// Otherwise the rows its scans return are unspecified.
     pub fn new<S: TokenFrequencyIndexStorage>(
         pattern: &[u8],
         dict: CompactDictionaryView<'d>,
@@ -147,7 +148,9 @@ impl<'d> ContainsScan<'d> {
     /// `row_offsets` is non-decreasing, and the rows were greedily tokenized with the
     /// dictionary this scan was prepared with, as by
     /// [`Column::compress`](crate::Column::compress). Validating the buffers does not
-    /// establish greedy tokenization.
+    /// establish greedy tokenization. Otherwise the rows returned are unspecified,
+    /// and decreasing offsets may panic with [`InvalidColumn::BadRowOffsets`]. A code
+    /// outside the dictionary never matches.
     pub fn scan<O: Offset>(&self, codes: &[Token], row_offsets: &[O], out: &mut Vec<usize>) {
         let (Some(first), Some(last)) = (row_offsets.first(), row_offsets.last()) else {
             return;

@@ -58,15 +58,19 @@ impl NeedlePrefix {
         }
     }
 
-    /// Whether `token`, a valid token ID, ends with this prefix.
+    /// Whether `token` ends with this prefix. A code outside the dictionary does
+    /// not: walks read row codes, which may be malformed.
     #[inline]
     fn is_tail_of(&self, dict: CompactDictionaryView<'_>, token: Token) -> bool {
+        if usize::from(token) >= dict.num_tokens() {
+            return false;
+        }
         let token_len = dict.token_len(token);
         if token_len < self.len {
             return false;
         }
-        // SAFETY: token_len checked the token ID. The dictionary guarantees
-        // MAX_TOKEN_SIZE readable bytes at every valid token's pointer.
+        // SAFETY: `token` is a valid token ID, checked above. The dictionary
+        // guarantees MAX_TOKEN_SIZE readable bytes at every valid token's pointer.
         let window = unsafe { dict.token_ptr(token).cast::<u128>().read_unaligned() };
         (u128::from_le(window) >> (8 * (token_len - self.len))) & self.mask == self.bytes
     }
@@ -423,12 +427,11 @@ pub(in crate::search::substring::probe) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "index out of bounds")]
     fn needle_prefix_rejects_invalid_token_id() {
         let bytes = [b'a'; 16];
         let offsets = [0, 1];
         let dict = CompactDictionaryView::validate_safety(&bytes, &offsets).unwrap();
-        NeedlePrefix::new(b"a").is_tail_of(dict, 1);
+        assert!(!NeedlePrefix::new(b"a").is_tail_of(dict, 1));
     }
 
     /// Build a complete dictionary and greedily encode the fixture rows.

@@ -23,7 +23,7 @@ use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex};
 use crate::search::index::{
     TokenFrequencyIndex, TokenFrequencyIndexStorage, build_token_frequency_index,
 };
-use crate::search::substring::{ContainsDfa, ContainsError};
+use crate::search::substring::{ContainsDfa, ContainsError, row_contains};
 use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
 
 struct BorrowedFrequencies<'a>(&'a [u32]);
@@ -238,18 +238,27 @@ fn longest_pattern_reaches_the_largest_offset() {
     );
 }
 
-/// Malformed row offsets panic with `BadRowOffsets`.
+/// Malformed row offsets panic with `BadRowOffsets`: the outer ones always, inner
+/// ones once the scan reads their row.
 #[test]
 fn scan_rejects_malformed_row_offsets() {
     let column = compress_rows(&[b"alpha", b"beta"]);
     let view = column.view();
     let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let past_end = view.codes.len() as u32 + 1;
+    let len = view.codes.len() as u32;
     let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
-    // The first offset after the last, and the last past the code stream.
-    for offsets in [[2u32, 1], [0, past_end]] {
+    let cases: [&[u32]; 4] = [
+        // The first offset after the last, and the last past the code stream.
+        &[2, 1],
+        &[0, len + 1],
+        // An inner offset past the last: the end of the first row, read when the
+        // scan starts, and of a row holding a hit.
+        &[0, len, len - 1],
+        &[0, 0, len, len - 1],
+    ];
+    for offsets in cases {
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            scan.scan(view.codes, &offsets, &mut Vec::new());
+            scan.scan(view.codes, offsets, &mut Vec::new());
         }))
         .expect_err("malformed offsets must panic");
         let message = panic.downcast_ref::<String>().unwrap();
@@ -257,6 +266,30 @@ fn scan_rejects_malformed_row_offsets() {
             message.contains("row offsets must be non-decreasing"),
             "{offsets:?}: {message}"
         );
+    }
+}
+
+/// Both engines treat a code outside the dictionary as matching nothing, so an
+/// occurrence cannot span it.
+#[test]
+fn codes_outside_the_dictionary_never_match() {
+    let column = compress_rows(&[b"alpha"]);
+    let view = column.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
+    let dfa = ContainsDfa::new(b"alpha", view.dict).unwrap();
+    let alpha = view.codes;
+    for outside in [view.dict.num_tokens() as Token, Token::MAX] {
+        for (codes, contains) in [
+            (vec![outside], false),
+            ([&[outside], alpha, &[outside]].concat(), true),
+            ([&alpha[..2], &[outside], &alpha[2..]].concat(), false),
+        ] {
+            let mut rows = Vec::new();
+            scan.scan(&codes, &[0, codes.len() as u32], &mut rows);
+            assert_eq!(rows == [0], contains, "scan: {codes:?}");
+            assert_eq!(row_contains(&codes, &dfa), contains, "DFA: {codes:?}");
+        }
     }
 }
 

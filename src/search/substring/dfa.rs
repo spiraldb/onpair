@@ -53,11 +53,16 @@ impl ContainsDfa {
     /// Maximum pattern length, bounded by the DFA's `u8` state IDs.
     pub const MAX_PATTERN_LEN: usize = State::MAX as usize;
 
-    /// Compiles `pattern` for `dict`, which must be sorted.
+    /// Compiles `pattern` for `dict`.
     ///
     /// # Errors
     /// Returns [`ContainsError::EmptyPattern`] if `pattern` is empty, and
     /// [`ContainsError::PatternTooLong`] if it exceeds [`Self::MAX_PATTERN_LEN`].
+    ///
+    /// # Precondition
+    /// `dict` is sorted, as guaranteed by [`Parser::train`](crate::Parser::train) and
+    /// [`CompactDictionary::validate`](crate::CompactDictionary::validate). Otherwise
+    /// the automaton's answers are unspecified, and compiling it may panic.
     pub fn new<V: DictionaryView>(pattern: &[u8], dict: V) -> Result<Self, ContainsError> {
         if pattern.is_empty() {
             return Err(ContainsError::EmptyPattern);
@@ -92,6 +97,7 @@ impl ContainsDfa {
     }
 
     /// The state after reading `token` from `state`, which must not be accepting.
+    /// A code outside the dictionary leaves no pattern prefix matched.
     #[inline]
     fn next(&self, state: State, token: Token) -> State {
         if state > 0 {
@@ -107,14 +113,15 @@ impl ContainsDfa {
                 }
             }
         }
-        self.base[token as usize]
+        self.base.get(usize::from(token)).copied().unwrap_or(0)
     }
 }
 
 /// Whether the row encoded by `codes` contains the pattern compiled into `dfa`.
 ///
 /// # Precondition
-/// Every code is a token ID of the dictionary `dfa` was compiled for.
+/// `codes` were encoded with the dictionary `dfa` was compiled for. A code outside
+/// that dictionary never matches.
 pub fn row_contains(codes: &[Token], dfa: &ContainsDfa) -> bool {
     let mut state: State = 0;
     for &code in codes {

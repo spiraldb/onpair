@@ -211,8 +211,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// before choosing a search operation.
     ///
     /// Rows must be greedily tokenized with this view's conformant dictionary,
-    /// as produced by the encoder. Buffer validation alone does not establish
-    /// greedy tokenization for externally supplied codes.
+    /// as produced by the encoder; on such rows it returns the same rows as
+    /// [`rows_containing`](Self::rows_containing). Buffer validation alone does
+    /// not establish greedy tokenization for externally supplied codes, and on
+    /// other rows the result is unspecified.
     ///
     /// `frequencies` must be associated with this view's dictionary and code
     /// stream. Build an exact index with
@@ -233,7 +235,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         frequencies: &TokenFrequencyIndex<S>,
     ) -> Result<Vec<usize>, ContainsError> {
         if pattern.is_empty() {
-            // Visiting each row validates the row layer, as the scan would.
+            // Visiting each row validates the row layer.
             return Ok(self.select(|_| true));
         }
         let scan = ContainsScan::new(pattern, self.dict, frequencies)?;

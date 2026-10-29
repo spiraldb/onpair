@@ -7,9 +7,15 @@
 //! blocks. A hit in a later row is located by galloping forward from the next row
 //! and binary-searching the last step, in time logarithmic in the rows skipped.
 //! Once a row is appended, its remaining hits are skipped, even in later blocks.
+//!
+//! The verifier walks from a hit to the ends of its row, and after a match the
+//! scan resumes at the row's end, so the row must hold the hit and end within the
+//! codes. The lookup finds a row holding the hit even if the offsets decrease, so
+//! the resolver only checks the row's end whenever it enters a row.
 
 use super::{Mask, ScanInput};
 use crate::core::offset::Offset;
+use crate::core::validate::{InvalidColumn, panic_malformed};
 
 /// Row lookup and verification state, kept across blocks.
 pub(super) struct Resolver<'a, O> {
@@ -26,10 +32,15 @@ pub(super) struct Resolver<'a, O> {
 impl<'a, O: Offset> Resolver<'a, O> {
     /// Starts at the first row of `input`.
     pub(super) fn new(input: ScanInput<'a, O>) -> Self {
+        let row_end = input.row_offsets.get(1).map_or(0, |x| x.to_usize());
+        // Hits before `row_end` stay in row 0 without a lookup, so check it now.
+        if row_end > input.codes.len() {
+            panic_malformed(InvalidColumn::BadRowOffsets);
+        }
         Self {
             input,
             row: 0,
-            row_end: input.row_offsets.get(1).map_or(0, |x| x.to_usize()),
+            row_end,
             resolved_code: 0,
         }
     }
@@ -51,6 +62,9 @@ impl<'a, O: Offset> Resolver<'a, O> {
             if code >= self.row_end {
                 self.row = find_row(row_offsets, self.row + 1, code);
                 self.row_end = row_offsets[self.row + 1].to_usize();
+                if self.row_end > codes.len() {
+                    panic_malformed(InvalidColumn::BadRowOffsets);
+                }
             }
             let row_start = row_offsets[self.row].to_usize();
             if verifier.check(dict, codes, row_start, self.row_end, code) {
@@ -79,8 +93,12 @@ fn next_set(bits: &Mask, from: usize) -> Option<usize> {
 /// The row containing `code`, searching from row `from`.
 ///
 /// Requires `offsets[from] <= code < offsets.last()`. Checks row `from` first, then
-/// doubles the step until a boundary passes `code`, and binary-searches that last
-/// step. Empty rows, with equal offsets, are skipped.
+/// doubles the step until a boundary passes `code`, and bisects that last step.
+/// Empty rows, with equal offsets, are skipped.
+///
+/// The search keeps a boundary at or before `code` and a later one past it, so the
+/// row found satisfies `offsets[row] <= code < offsets[row + 1]` even if the
+/// offsets decrease.
 #[inline]
 fn find_row<O: Offset>(offsets: &[O], from: usize, code: usize) -> usize {
     if offsets[from + 1].to_usize() > code {
@@ -89,14 +107,23 @@ fn find_row<O: Offset>(offsets: &[O], from: usize, code: usize) -> usize {
     let last = offsets.len() - 1;
     let mut lo = from + 1;
     let mut step = 1;
-    loop {
+    let mut hi = loop {
         let hi = (lo + step).min(last);
         if offsets[hi].to_usize() > code {
-            return lo + offsets[lo + 1..hi].partition_point(|&x| x.to_usize() <= code);
+            break hi;
         }
         lo = hi;
         step *= 2;
+    };
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if offsets[mid].to_usize() <= code {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
+    lo
 }
 
 #[cfg(test)]
@@ -329,6 +356,30 @@ mod tests {
                         assert_eq!(find_row(&offsets, from, code as usize), expected);
                     }
                 }
+            }
+        }
+    }
+
+    /// On decreasing offsets the row found is unspecified, but still holds the code,
+    /// so the verifier stays within the codes.
+    #[test]
+    fn lookup_holds_the_code_on_decreasing_offsets() {
+        let mut state = 0x2545_F491u32;
+        let mut offsets: Vec<u32> = (0..64)
+            .map(|_| {
+                state = state.wrapping_mul(0x0019_660D).wrapping_add(0x3C6E_F35F);
+                state % 100
+            })
+            .collect();
+        offsets.push(100);
+        for from in 0..offsets.len() - 1 {
+            for code in offsets[from] as usize..100 {
+                let row = find_row(&offsets, from, code);
+                let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+                assert!(
+                    start <= code && code < end,
+                    "row {row} [{start}, {end}) misses {code}, searching from {from}"
+                );
             }
         }
     }
