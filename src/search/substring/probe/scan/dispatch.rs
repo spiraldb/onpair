@@ -89,7 +89,7 @@ fn run_with<K: Kernels, O: Offset>(
             }
             // An arm is compiled only if planning can give Nibble that many batches on
             // this instruction set.
-            MatcherKind::NibbleN8 => match input.cover.n_points().div_ceil(PER_BATCH) {
+            MatcherKind::NibbleN8 => match input.cover.points().len().div_ceil(PER_BATCH) {
                 1 => nibble::<K, O, 1>(skip_empty_packing, input, out),
                 2 if const { max_nibble_batches(K::ISA) >= 2 } => {
                     nibble::<K, O, 2>(skip_empty_packing, input, out)

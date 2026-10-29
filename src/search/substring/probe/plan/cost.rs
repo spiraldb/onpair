@@ -37,9 +37,9 @@ pub(super) fn matcher_cost(isa: Isa, matcher: MatcherKind, cover: &ProbeCover) -
             f64::INFINITY
         };
     };
-    let points = cover.n_points() as f64;
-    let ranges = cover.n_ranges() as f64;
-    let batches = cover.n_points().div_ceil(PER_BATCH) as f64;
+    let points = cover.points().len() as f64;
+    let ranges = cover.ranges().len() as f64;
+    let batches = cover.points().len().div_ceil(PER_BATCH) as f64;
     match matcher {
         MatcherKind::Table => 1.0,
         MatcherKind::EqOr => weights.point * points + weights.range * ranges,

@@ -213,13 +213,15 @@ impl<'d> ContainsScan<'d> {
         }
     }
 
-    /// Number of codes in the stream indexed by `frequencies` that hit the filter;
-    /// zero for the empty pattern.
+    /// How many codes of the stream counted by `frequencies` this scan would check
+    /// as hits: the occurrences of the filter's tokens, zero for the empty pattern.
+    /// Divided by [`total_frequency`](TokenFrequencyIndexView::total_frequency), it
+    /// is the expected hit density.
     ///
     /// # Errors
     /// Returns [`ContainsError::FrequencyIndexMismatch`] if `frequencies` counts a
     /// different number of tokens than this scan's dictionary has.
-    pub fn covered_frequency(
+    pub fn expected_hits(
         &self,
         frequencies: TokenFrequencyIndexView<'_>,
     ) -> Result<u32, ContainsError> {
@@ -227,19 +229,6 @@ impl<'d> ContainsScan<'d> {
         Ok(self
             .probe_cover()
             .map_or(0, |cover| cover.frequency(frequencies)))
-    }
-
-    /// [`covered_frequency`](Self::covered_frequency) as a fraction of all indexed
-    /// codes: the expected hit density. `0.0` for an empty stream.
-    ///
-    /// # Errors
-    /// Same as [`covered_frequency`](Self::covered_frequency).
-    pub fn covered_fraction(
-        &self,
-        frequencies: TokenFrequencyIndexView<'_>,
-    ) -> Result<f64, ContainsError> {
-        let covered = self.covered_frequency(frequencies)?;
-        Ok(fraction(covered, frequencies.total_frequency()))
     }
 }
 

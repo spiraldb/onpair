@@ -148,23 +148,18 @@ fn check_scan(
         .filter(|&&code| scan.probe_cover().is_some_and(|cover| cover.contains(code)))
         .count();
     assert_eq!(
-        scan.covered_frequency(frequencies).unwrap() as usize,
+        scan.expected_hits(frequencies).unwrap() as usize,
         covered,
-        "{pattern:?}"
-    );
-    let fraction = if view.codes.is_empty() {
-        0.0
-    } else {
-        covered as f64 / view.codes.len() as f64
-    };
-    assert_eq!(
-        scan.covered_fraction(frequencies).unwrap(),
-        fraction,
         "{pattern:?}"
     );
     // Packing uses the planning stream's density, which this index describes.
     if let Query::Scan { probe_density, .. } = scan.query {
-        assert_eq!(probe_density, fraction, "{pattern:?}");
+        let density = if view.codes.is_empty() {
+            0.0
+        } else {
+            covered as f64 / view.codes.len() as f64
+        };
+        assert_eq!(probe_density, density, "{pattern:?}");
     }
     let mut actual = vec![usize::MAX];
     let mut appended = actual.clone();
@@ -289,7 +284,7 @@ fn codes_outside_the_dictionary_never_match() {
 }
 
 /// A frequency index without one entry per dictionary token is rejected when
-/// preparing a scan and when measuring its coverage.
+/// preparing a scan and when counting its expected hits.
 #[test]
 fn mismatched_frequency_index_is_an_error() {
     let column = compress_rows(&[b"abc"]);
@@ -305,8 +300,7 @@ fn mismatched_frequency_index_is_an_error() {
             dict_tokens,
         };
         assert_eq!(view.rows_containing_with_scan(b"a", mismatched), Err(error));
-        assert_eq!(scan.covered_frequency(mismatched), Err(error));
-        assert_eq!(scan.covered_fraction(mismatched), Err(error));
+        assert_eq!(scan.expected_hits(mismatched), Err(error));
     }
 }
 
@@ -505,7 +499,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
     let frequencies = TokenFrequencyIndexView::new(&cumulative).unwrap();
     let scan = ContainsScan::new(b"alpha", view.dict, frequencies).unwrap();
     assert!(scan.probe_cover().is_some_and(|cover| !cover.is_empty()));
-    assert_eq!(scan.covered_frequency(frequencies), Ok(0));
+    assert_eq!(scan.expected_hits(frequencies), Ok(0));
     let mut rows = Vec::new();
     scan.scan(view.codes, view.row_offsets, &mut rows);
     assert_eq!(rows, [0, 2]);

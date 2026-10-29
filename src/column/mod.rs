@@ -204,8 +204,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// [`ContainsScan::scan`] scans the code stream for the rows holding a
     /// probe and verifies each hit against the alignment graph, so the rows
     /// come back exact. This method always runs the bulk scan. Callers can
-    /// prepare a reusable [`ContainsScan`] to inspect its cover and coverage
-    /// before choosing a search operation.
+    /// prepare a reusable [`ContainsScan`] to inspect its
+    /// [`probe_cover`](ContainsScan::probe_cover) and
+    /// [`expected_hits`](ContainsScan::expected_hits) before choosing a search
+    /// operation.
     ///
     /// Rows must be greedily tokenized with this view's conformant dictionary,
     /// as produced by the encoder; on such rows it returns the same rows as

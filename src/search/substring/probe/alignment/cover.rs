@@ -17,7 +17,7 @@ use crate::search::index::TokenFrequencyIndexView;
 /// Every row that contains the pattern contains at least one covered token, so rows
 /// without one are skipped. Rows with a hit are only candidates: the scan verifies
 /// each hit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeCover {
     /// Individual token IDs.
     points: Vec<Token>,
@@ -37,19 +37,14 @@ impl ProbeCover {
         &self.ranges
     }
 
-    /// Number of individual point probes.
-    pub fn n_points(&self) -> usize {
-        self.points.len()
-    }
-
-    /// Number of range probes, however many token IDs each covers.
-    pub fn n_ranges(&self) -> usize {
-        self.ranges.len()
+    /// Whether `token` is covered, as a point or in a range.
+    pub fn contains(&self, token: Token) -> bool {
+        self.points.contains(&token) || self.ranges.iter().any(|range| range.contains(token))
     }
 
     /// Whether the cover contains no token IDs.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(in crate::search::substring::probe) fn is_empty(&self) -> bool {
         self.points.is_empty() && self.ranges.is_empty()
     }
 
@@ -121,11 +116,5 @@ impl ProbeCover {
         ranges: Vec<TokenRange>,
     ) -> Self {
         Self { points, ranges }
-    }
-
-    /// Check membership of one token ID for test oracles.
-    #[cfg(test)]
-    pub fn contains(&self, code: Token) -> bool {
-        self.points.contains(&code) || self.ranges.iter().any(|range| range.contains(code))
     }
 }

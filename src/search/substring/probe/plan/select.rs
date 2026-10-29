@@ -23,7 +23,8 @@ pub(in crate::search::substring::probe) fn is_eligible(
         MatcherKind::Table => true,
         MatcherKind::EqOr => isa != Isa::Scalar && !cover.is_empty(),
         MatcherKind::NibbleN8 => {
-            cover.n_points() > 0 && cover.n_points().div_ceil(PER_BATCH) <= max_nibble_batches(isa)
+            let points = cover.points().len();
+            points > 0 && points.div_ceil(PER_BATCH) <= max_nibble_batches(isa)
         }
     }
 }
