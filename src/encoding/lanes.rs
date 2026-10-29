@@ -41,6 +41,8 @@ const SCALAR: u8 = 0;
 const TREE: u8 = 1;
 #[cfg(target_arch = "x86_64")]
 const RANK: u8 = 2;
+#[cfg(target_arch = "x86_64")]
+const RANK_ROWS: u8 = 3;
 const MAX_LANES: usize = if TREE_LANES > RANK_LANES && TREE_LANES > LANES {
     TREE_LANES
 } else if RANK_LANES > LANES {
@@ -159,11 +161,34 @@ fn parse_arrow_batched_with<I: Offset, O: Offset, const MODE: u8>(
 ) {
     let n = offsets.len() - 1;
     let mut start = 0;
+    #[cfg(target_arch = "x86_64")]
+    let mut parse: BatchParser<I, O> = parse_batch::<I, O, MODE>;
+    #[cfg(target_arch = "x86_64")]
+    let mut probe = MODE == RANK;
     while start < n {
         // At least one row per batch, then whole rows up to `batch_bytes`.
         let limit = offsets[start].to_usize() + batch_bytes;
         let fit = offsets[start + 1..=n].partition_point(|o| o.to_usize() <= limit);
         let end = start + fit.max(1);
+        #[cfg(target_arch = "x86_64")]
+        let end = if probe { end.min(start + 64) } else { end };
+        #[cfg(target_arch = "x86_64")]
+        {
+            let before = codes.len();
+            parse(
+                matcher,
+                bytes,
+                &offsets[start..=end],
+                buffers,
+                codes,
+                row_offsets,
+            );
+            if probe {
+                parse = rank_batch_parser::<I, O>(codes.len() - before, end - start);
+                probe = false;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         parse_batch::<I, O, MODE>(
             matcher,
             bytes,
@@ -227,6 +252,21 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
     );
 }
 
+#[cfg(target_arch = "x86_64")]
+type BatchParser<I, O> =
+    fn(&DictionaryMatcher, &[u8], &[I], &mut LaneBuffers, &mut Vec<Token>, &mut Vec<O>);
+
+#[cfg(target_arch = "x86_64")]
+fn rank_batch_parser<I: OffsetLike, O: Offset>(codes: usize, rows: usize) -> BatchParser<I, O> {
+    // Branches pay off when row completions are infrequent. Use measured codes
+    // per row, accounting for the input's actual dictionary token frequencies.
+    if codes >= 16 * rows {
+        parse_batch::<I, O, RANK_ROWS>
+    } else {
+        parse_batch::<I, O, RANK>
+    }
+}
+
 fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
     matcher: &DictionaryMatcher,
     rows: &R,
@@ -240,13 +280,23 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
 
     let n = rows.num_rows();
     let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    let mut parse: BatchParser<usize, O> = parse_batch::<usize, O, MODE>;
+    #[cfg(target_arch = "x86_64")]
+    let mut probe = MODE == RANK;
     while i < n {
         bytes.clear();
         offsets.clear();
         offsets.push(0);
 
+        // Parse up to 64 rows with the branch-free loop to measure how often
+        // rows end. The probe contributes directly to the output.
+        #[cfg(target_arch = "x86_64")]
+        let limit = if probe { n.min(i + 64) } else { n };
+        #[cfg(not(target_arch = "x86_64"))]
+        let limit = n;
         // At least one row per batch, then rows until `batch_bytes` is reached.
-        while i < n && (offsets.len() == 1 || bytes.len() < batch_bytes) {
+        while i < limit && (offsets.len() == 1 || bytes.len() < batch_bytes) {
             bytes.extend_from_slice(rows.row(i));
             offsets.push(bytes.len());
             i += 1;
@@ -254,6 +304,16 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
 
         // Padding keeps every window load on the fast path.
         bytes.resize(bytes.len() + MAX_TOKEN_SIZE, 0);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let before = codes.len();
+            parse(matcher, &bytes, &offsets, buffers, codes, row_offsets);
+            if probe {
+                parse = rank_batch_parser::<usize, O>(codes.len() - before, offsets.len() - 1);
+                probe = false;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         parse_batch::<usize, O, MODE>(matcher, &bytes, &offsets, buffers, codes, row_offsets);
     }
 
@@ -270,6 +330,13 @@ fn parse_batch<I: OffsetLike, O: Offset, const MODE: u8>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if MODE == RANK_ROWS {
+        // SAFETY: the parse entry point detected AVX-512F and POPCNT.
+        return unsafe {
+            parse_batch_rank_rows(matcher, bytes, offsets, buffers, codes, row_offsets)
+        };
+    }
     #[cfg(target_arch = "x86_64")]
     if MODE == RANK {
         // SAFETY: the parse entry point detected AVX-512F and POPCNT.
@@ -314,6 +381,26 @@ unsafe fn parse_batch_rank<I: OffsetLike, O: Offset>(
     row_offsets: &mut Vec<O>,
 ) {
     parse_batch_with::<I, O, RANK, RANK_LANES>(
+        matcher,
+        bytes,
+        offsets,
+        buffers,
+        codes,
+        row_offsets,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,popcnt")]
+unsafe fn parse_batch_rank_rows<I: OffsetLike, O: Offset>(
+    matcher: &DictionaryMatcher,
+    bytes: &[u8],
+    offsets: &[I],
+    buffers: &mut LaneBuffers,
+    codes: &mut Vec<Token>,
+    row_offsets: &mut Vec<O>,
+) {
+    parse_batch_with::<I, O, RANK_ROWS, RANK_LANES>(
         matcher,
         bytes,
         offsets,
@@ -380,7 +467,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
         let win: [usize; K] =
             std::array::from_fn(|j| (row_end[j] - at[j]).clamp(1, MAX_TOKEN_SIZE));
         #[cfg(target_arch = "x86_64")]
-        let found = if MODE == RANK {
+        let found = if MODE == RANK || MODE == RANK_ROWS {
             // SAFETY: the batch wrapper enables AVX-512F and POPCNT.
             unsafe { matcher.find_all_rank(bytes, &at, &win) }
         } else if MODE == TREE {
@@ -402,6 +489,17 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
             buffers.codes[j][count[j]] = token;
             count[j] += active as usize;
             at[j] += select_unpredictable(active, len, 0);
+
+            #[cfg(target_arch = "x86_64")]
+            if MODE == RANK_ROWS {
+                if at[j] == row_end[j] && running {
+                    buffers.row_ends[j][row[j] - bounds[j]] = count[j];
+                    row[j] += 1;
+                    let next_end = offsets[(row[j] + 1).min(n)].to_usize();
+                    row_end[j] = select_unpredictable(row[j] < last_row[j], next_end, at[j]);
+                }
+                continue;
+            }
 
             // The slot of the current row holds its code count so far, so it
             // is final when the row ends. A lane past its last row writes the
@@ -612,6 +710,67 @@ mod tests {
         check(&mixed, &mixed);
         let binary = binary_strings(200, 30, 5);
         check(&binary, &binary);
+    }
+
+    #[hegel::test(test_cases = 100)]
+    fn reused_buffers_match_scalar_across_row_lengths(tc: TestCase) {
+        let bytes = || gs::vecs(gs::sampled_from(&PROPERTY_ALPHABET[..]));
+        let mut extra: Vec<Vec<u8>> =
+            tc.draw(gs::vecs(bytes().min_size(2).max_size(MAX_TOKEN_SIZE)).max_size(100));
+        extra.extend([vec![0; 16], vec![255; 16], b"a\0".to_vec()]);
+        let extra: Vec<&[u8]> = extra.iter().map(Vec::as_slice).collect();
+        let dict = complete_dictionary(&extra);
+        let matcher = DictionaryMatcher::from_dictionary(dict.as_view());
+
+        // Even 16-byte matches leave at least 32 codes per row in the probe.
+        let byte = tc.draw(gs::sampled_from(&PROPERTY_ALPHABET[..]));
+        let mut rows = vec![vec![byte; 512]; 64];
+        rows.extend(tc.draw(gs::vecs(bytes().max_size(40)).max_size(40)));
+        rows.extend([vec![], vec![255; 17], vec![0; 1], vec![]]);
+        let rows: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+        let expected = reference(&matcher, &rows);
+        let mut buffers = LaneBuffers::default();
+        check_reused_buffers::<SCALAR>(&matcher, &rows, &expected, &mut buffers);
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("popcnt")
+        {
+            check_reused_buffers::<RANK>(&matcher, &rows, &expected, &mut buffers);
+            check_reused_buffers::<RANK_ROWS>(&matcher, &rows, &expected, &mut buffers);
+        }
+    }
+
+    fn check_reused_buffers<const MODE: u8>(
+        matcher: &DictionaryMatcher,
+        rows: &[&[u8]],
+        expected: &(Vec<Token>, Vec<u64>),
+        buffers: &mut LaneBuffers,
+    ) {
+        let mut codes = Vec::new();
+        let mut ends = vec![0u64];
+        let raw = make_raw(rows);
+        parse_arrow_batched_with::<_, u64, MODE>(
+            matcher,
+            &raw.data,
+            &raw.offsets,
+            32 << 10,
+            buffers,
+            &mut codes,
+            &mut ends,
+        );
+        assert_eq!((&codes, &ends), (&expected.0, &expected.1));
+        codes.clear();
+        ends.clear();
+        ends.push(0);
+        parse_rows_batched_with::<_, u64, MODE>(
+            matcher,
+            rows,
+            32 << 10,
+            buffers,
+            &mut codes,
+            &mut ends,
+        );
+        assert_eq!(&(codes, ends), expected);
     }
 
     #[test]

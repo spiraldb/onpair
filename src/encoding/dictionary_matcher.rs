@@ -355,7 +355,12 @@ impl DictionaryMatcher {
         // The key holds all 16 bytes at `at`, also past the window. Every token
         // that is a prefix of the window is a prefix of the whole key, so it is
         // also a prefix of `q`; the length bound below drops the longer ones.
-        let key: [u128; K] = std::array::from_fn(|j| window_key(bytes, at[j]));
+        // Keep the fills in the SIMD caller: outlined array closures lose its
+        // POPCNT feature context when several parser loops use this matcher.
+        let mut key = [0u128; K];
+        for j in 0..K {
+            key[j] = window_key(bytes, at[j]);
+        }
         #[cfg(target_arch = "x86_64")]
         if SIMD && TREE {
             // SAFETY: the SIMD caller guarantees AVX-512F and POPCNT.
@@ -442,7 +447,8 @@ impl DictionaryMatcher {
 
         let mut q = [0usize; K];
         let mut fits_out = [0u32; K];
-        let len: [usize; K] = std::array::from_fn(|j| {
+        let mut len = [0usize; K];
+        for j in 0..K {
             q[j] = base[j] * BLOCK_KEYS + slot[j];
             let found = self.blocks[base[j]].key(slot[j]);
 
@@ -452,19 +458,21 @@ impl DictionaryMatcher {
             // `max_len >= 1` and bit 0 is always set, so `fits` is never zero.
             let fits = u32::from(self.chains[q[j]].lens) & ((1u32 << max_len) - 1);
             fits_out[j] = fits;
-            (u32::BITS - fits.leading_zeros()) as usize
-        });
+            len[j] = (u32::BITS - fits.leading_zeros()) as usize;
+        }
 
         // The prefix token of length `len`; a length of one byte is the
         // single-byte token of the first input byte. The token loads come after
         // all lengths: the next positions then do not wait behind them, which
         // is measurably faster on Intel and costs little elsewhere.
-        std::array::from_fn(|j| {
-            (
+        let mut found = [(0, 0); K];
+        for j in 0..K {
+            found[j] = (
                 self.chains[q[j]].code(&self.prefix_ids, fits_out[j]),
                 len[j],
-            )
-        })
+            );
+        }
+        found
     }
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
