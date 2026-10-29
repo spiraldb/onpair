@@ -12,8 +12,7 @@
 //!   token-level KMP automaton. It needs no frequency index and works with any
 //!   dictionary view, but supports only patterns of up to 255 bytes.
 //!
-//! Both reject the empty pattern with [`ContainsError::EmptyPattern`]: every row
-//! contains it, so callers answer it without a search.
+//! Both match the empty pattern against every row, as [`str::contains`] does.
 
 mod dfa;
 mod error;

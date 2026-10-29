@@ -65,17 +65,27 @@ use crate::search::substring::ContainsError;
 ///
 /// Preparation chooses the filter and compiles the hit verifier once. Each
 /// [`scan`](Self::scan) keeps its state local, so one query can scan any number of
-/// chunks encoded with the same dictionary, concurrently if needed. The pattern
-/// must not be empty: every row contains the empty pattern, so callers answer it
-/// without a scan.
+/// chunks encoded with the same dictionary, concurrently if needed. The empty
+/// pattern matches every row, without a scan.
 #[derive(Debug, Clone)]
 pub struct ContainsScan<'d> {
     dict: CompactDictionaryView<'d>,
-    probe_cover: ProbeCover,
-    isa: Isa,
-    matcher: MatcherKind,
-    verifier: HitVerifier,
-    probe_density: f64,
+    query: Query,
+}
+
+/// What a scan does for its pattern.
+#[derive(Debug, Clone)]
+enum Query {
+    /// The empty pattern, which every row contains.
+    Everything,
+    /// Search for the filter's codes and verify each hit.
+    Scan {
+        probe_cover: ProbeCover,
+        isa: Isa,
+        matcher: MatcherKind,
+        verifier: HitVerifier,
+        probe_density: f64,
+    },
 }
 
 impl<'d> ContainsScan<'d> {
@@ -89,8 +99,7 @@ impl<'d> ContainsScan<'d> {
     /// slower, never incorrect.
     ///
     /// # Errors
-    /// Returns [`ContainsError::EmptyPattern`] if `pattern` is empty,
-    /// [`ContainsError::PatternTooLong`] if it is longer than
+    /// Returns [`ContainsError::PatternTooLong`] if `pattern` is longer than
     /// [`Self::MAX_PATTERN_LEN`], [`ContainsError::FrequencyIndexMismatch`] if
     /// `frequencies` counts a different number of tokens than `dict` has, and
     /// [`ContainsError::MissingByteToken`] if `dict` lacks a single-byte token that
@@ -107,9 +116,6 @@ impl<'d> ContainsScan<'d> {
         dict: CompactDictionaryView<'d>,
         frequencies: TokenFrequencyIndexView<'_>,
     ) -> Result<Self, ContainsError> {
-        if pattern.is_empty() {
-            return Err(ContainsError::EmptyPattern);
-        }
         if pattern.len() > Self::MAX_PATTERN_LEN {
             return Err(ContainsError::PatternTooLong {
                 length: pattern.len(),
@@ -117,6 +123,12 @@ impl<'d> ContainsScan<'d> {
             });
         }
         check_frequencies(dict, frequencies)?;
+        if pattern.is_empty() {
+            return Ok(Self {
+                dict,
+                query: Query::Everything,
+            });
+        }
         let isa = scan::detect_isa();
         let graph = AlignmentGraph::new(dict, pattern, frequencies)?;
         let (cover, matcher, covered_frequency) = plan::select_cover(&graph, frequencies, isa);
@@ -125,11 +137,13 @@ impl<'d> ContainsScan<'d> {
         debug_assert!(!cover.is_empty(), "empty filter for {pattern:?}");
         Ok(Self {
             dict,
-            isa,
-            matcher,
-            probe_cover: cover,
-            verifier: HitVerifier::from_graph(&graph, pattern),
-            probe_density: fraction(covered_frequency, frequencies.total_frequency()),
+            query: Query::Scan {
+                probe_cover: cover,
+                isa,
+                matcher,
+                verifier: HitVerifier::from_graph(&graph, pattern),
+                probe_density: fraction(covered_frequency, frequencies.total_frequency()),
+            },
         })
     }
 
@@ -159,31 +173,48 @@ impl<'d> ContainsScan<'d> {
         if first > last || last > codes.len() {
             panic_malformed(InvalidColumn::BadRowOffsets);
         }
+        let Query::Scan {
+            probe_cover,
+            isa,
+            matcher,
+            verifier,
+            probe_density,
+        } = &self.query
+        else {
+            // Every row contains the empty pattern, even a row without codes.
+            out.extend(0..row_offsets.len() - 1);
+            return;
+        };
         // Without codes, no row can contain the pattern.
         if first == last {
             return;
         }
         scan::run(
-            self.isa,
-            self.matcher,
-            plan::skip_empty_packing(self.probe_density, last - first),
+            *isa,
+            *matcher,
+            plan::skip_empty_packing(*probe_density, last - first),
             ScanInput::new(
                 &codes[..last],
                 row_offsets,
                 self.dict,
-                &self.probe_cover,
-                &self.verifier,
+                probe_cover,
+                verifier,
             ),
             out,
         );
     }
 
-    /// The tokens this scan searches for; never empty.
-    pub fn probe_cover(&self) -> &ProbeCover {
-        &self.probe_cover
+    /// The tokens this scan searches for, never empty, or `None` for the empty
+    /// pattern, which needs no search.
+    pub fn probe_cover(&self) -> Option<&ProbeCover> {
+        match &self.query {
+            Query::Everything => None,
+            Query::Scan { probe_cover, .. } => Some(probe_cover),
+        }
     }
 
-    /// Number of codes in the stream indexed by `frequencies` that hit the filter.
+    /// Number of codes in the stream indexed by `frequencies` that hit the filter;
+    /// zero for the empty pattern.
     ///
     /// # Errors
     /// Returns [`ContainsError::FrequencyIndexMismatch`] if `frequencies` counts a
@@ -193,7 +224,9 @@ impl<'d> ContainsScan<'d> {
         frequencies: TokenFrequencyIndexView<'_>,
     ) -> Result<u32, ContainsError> {
         check_frequencies(self.dict, frequencies)?;
-        Ok(self.probe_cover.frequency(frequencies))
+        Ok(self
+            .probe_cover()
+            .map_or(0, |cover| cover.frequency(frequencies)))
     }
 
     /// [`covered_frequency`](Self::covered_frequency) as a fraction of all indexed

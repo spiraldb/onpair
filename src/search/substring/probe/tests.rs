@@ -10,13 +10,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use super::ContainsScan;
 use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::tests::check_starts;
 use super::plan::{cover_cost, select_cover, select_matcher};
 use super::scan::detect_isa;
+use super::{ContainsScan, Query};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexView};
@@ -112,16 +112,11 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
             .enumerate()
             .filter_map(|(row, bytes)| byte_contains(bytes, pattern).then_some(row))
             .collect();
-        if pattern.is_empty() {
-            assert_eq!(
-                ContainsScan::new(pattern, view.dict, frequencies).unwrap_err(),
-                ContainsError::EmptyPattern
-            );
-        } else {
+        if !pattern.is_empty() {
             check_starts(view.dict, pattern);
             check_graph(view, frequencies, pattern);
-            check_scan(view, frequencies, pattern, &expected);
         }
+        check_scan(view, frequencies, pattern, &expected);
         assert_eq!(
             view.rows_containing_with_scan(pattern, frequencies)
                 .unwrap(),
@@ -150,7 +145,7 @@ fn check_scan(
     let covered = view
         .codes
         .iter()
-        .filter(|&&code| scan.probe_cover().contains(code))
+        .filter(|&&code| scan.probe_cover().is_some_and(|cover| cover.contains(code)))
         .count();
     assert_eq!(
         scan.covered_frequency(frequencies).unwrap() as usize,
@@ -168,7 +163,9 @@ fn check_scan(
         "{pattern:?}"
     );
     // Packing uses the planning stream's density, which this index describes.
-    assert_eq!(scan.probe_density, fraction, "{pattern:?}");
+    if let Query::Scan { probe_density, .. } = scan.query {
+        assert_eq!(probe_density, fraction, "{pattern:?}");
+    }
     let mut actual = vec![usize::MAX];
     let mut appended = actual.clone();
     for _ in 0..2 {
@@ -237,6 +234,7 @@ fn scan_rejects_malformed_row_offsets() {
     let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
     let len = view.codes.len() as u32;
     let scan = ContainsScan::new(b"alpha", view.dict, frequencies.as_view()).unwrap();
+    let everything = ContainsScan::new(b"", view.dict, frequencies.as_view()).unwrap();
     let cases: [&[u32]; 4] = [
         // The first offset after the last, and the last past the code stream.
         &[2, 1],
@@ -246,7 +244,7 @@ fn scan_rejects_malformed_row_offsets() {
         &[0, len, len - 1],
         &[0, 0, len, len - 1],
     ];
-    for offsets in cases {
+    let assert_rejects = |scan: &ContainsScan<'_>, offsets: &[u32]| {
         let panic = catch_unwind(AssertUnwindSafe(|| {
             scan.scan(view.codes, offsets, &mut Vec::new());
         }))
@@ -256,6 +254,13 @@ fn scan_rejects_malformed_row_offsets() {
             message.contains("row offsets must be non-decreasing"),
             "{offsets:?}: {message}"
         );
+    };
+    for offsets in cases {
+        assert_rejects(&scan, offsets);
+    }
+    // The empty pattern reads no inner offsets, but checks the outer ones.
+    for offsets in &cases[..2] {
+        assert_rejects(&everything, offsets);
     }
 }
 
@@ -318,21 +323,25 @@ fn missing_alphabet_does_not_produce_a_partial_cover() {
     );
 }
 
-/// `ContainsScan` rejects the empty pattern, and the column answers it without a
-/// scan: every row matches, including rows without codes.
+/// Every row contains the empty pattern, including rows without codes. A
+/// mismatched frequency index is still an error, as for any pattern.
 #[test]
-fn empty_pattern_is_answered_without_a_scan() {
+fn empty_pattern_matches_every_row() {
     let cases: &[&[&[u8]]] = &[&[b"", b"alpha", b"", b"beta", b""], &[b"", b""], &[]];
     for &rows in cases {
         let column = compress_rows(rows);
         let view = column.view();
         check(view, rows, &[b"", b"absent"]);
-        // The frequency index is not consulted, so even a mismatched one works.
+        let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
+        let scan = ContainsScan::new(b"", view.dict, frequencies.as_view()).unwrap();
+        assert!(scan.probe_cover().is_none());
         let unrelated = TokenFrequencyIndex::build(&[], 1).unwrap();
         assert_eq!(
-            view.rows_containing_with_scan(b"", unrelated.as_view())
-                .unwrap(),
-            (0..rows.len()).collect::<Vec<_>>()
+            view.rows_containing_with_scan(b"", unrelated.as_view()),
+            Err(ContainsError::FrequencyIndexMismatch {
+                index_tokens: 1,
+                dict_tokens: view.dict.num_tokens(),
+            })
         );
     }
 }
@@ -343,7 +352,7 @@ fn prepared_scan_handles_empty_and_partial_inputs() {
     let column = compress_rows(rows);
     let view = column.view();
     let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
-    for pattern in [b"alpha".as_slice(), b"absent"] {
+    for pattern in [b"".as_slice(), b"alpha", b"absent"] {
         let scan = ContainsScan::new(pattern, view.dict, frequencies.as_view()).unwrap();
         for start in 0..=rows.len() {
             for end in start..=rows.len() {
@@ -495,7 +504,7 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
     cumulative[0] = 0;
     let frequencies = TokenFrequencyIndexView::new(&cumulative).unwrap();
     let scan = ContainsScan::new(b"alpha", view.dict, frequencies).unwrap();
-    assert!(!scan.probe_cover().is_empty());
+    assert!(scan.probe_cover().is_some_and(|cover| !cover.is_empty()));
     assert_eq!(scan.covered_frequency(frequencies), Ok(0));
     let mut rows = Vec::new();
     scan.scan(view.codes, view.row_offsets, &mut rows);

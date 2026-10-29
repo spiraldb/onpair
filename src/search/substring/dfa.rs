@@ -53,24 +53,30 @@ impl ContainsDfa {
     /// Maximum pattern length, bounded by the DFA's `u8` state IDs.
     pub const MAX_PATTERN_LEN: usize = State::MAX as usize;
 
-    /// Compiles `pattern` for `dict`.
+    /// Compiles `pattern` for `dict`. The empty pattern matches every row.
     ///
     /// # Errors
-    /// Returns [`ContainsError::EmptyPattern`] if `pattern` is empty, and
-    /// [`ContainsError::PatternTooLong`] if it exceeds [`Self::MAX_PATTERN_LEN`].
+    /// Returns [`ContainsError::PatternTooLong`] if `pattern` exceeds
+    /// [`Self::MAX_PATTERN_LEN`].
     ///
     /// # Precondition
     /// `dict` is sorted, as guaranteed by [`Parser::train`](crate::Parser::train) and
     /// [`CompactDictionary::validate`](crate::CompactDictionary::validate). Otherwise
     /// the automaton's answers are unspecified, and compiling it may panic.
     pub fn new<V: DictionaryView>(pattern: &[u8], dict: V) -> Result<Self, ContainsError> {
-        if pattern.is_empty() {
-            return Err(ContainsError::EmptyPattern);
-        }
         if pattern.len() > Self::MAX_PATTERN_LEN {
             return Err(ContainsError::PatternTooLong {
                 length: pattern.len(),
                 max: Self::MAX_PATTERN_LEN,
+            });
+        }
+        // The start state accepts the empty pattern, so no transition is ever taken.
+        if pattern.is_empty() {
+            return Ok(Self {
+                accept: 0,
+                base: Vec::new(),
+                sparse: Vec::new(),
+                offsets: vec![0],
             });
         }
         let m = pattern.len();
@@ -123,14 +129,16 @@ impl ContainsDfa {
 /// `codes` were encoded with the dictionary `dfa` was compiled for. A code outside
 /// that dictionary never matches.
 pub fn row_contains(codes: &[Token], dfa: &ContainsDfa) -> bool {
+    // Testing before each step accepts the empty pattern, whose start state
+    // accepts, in every row.
     let mut state: State = 0;
     for &code in codes {
-        state = dfa.next(state, code);
         if state == dfa.accept {
             return true;
         }
+        state = dfa.next(state, code);
     }
-    false
+    state == dfa.accept
 }
 
 /// The byte-level KMP failure table: `fail[i]` is the length of the longest proper
@@ -379,12 +387,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_pattern_is_rejected() {
+    fn empty_pattern_matches_every_row() {
         let column = compress_rows(&[b"a", b"", b"abc"]);
-        assert_eq!(
-            ContainsDfa::new(b"", column.view().dict).unwrap_err(),
-            ContainsError::EmptyPattern
-        );
+        let view = column.view();
+        let dfa = ContainsDfa::new(b"", view.dict).unwrap();
+        assert!((0..view.num_rows()).all(|row| row_contains(view.row_codes(row), &dfa)));
     }
 
     #[test]

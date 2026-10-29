@@ -7,9 +7,6 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ContainsError {
-    /// The pattern is empty. Every row contains it, so callers answer it without a
-    /// search.
-    EmptyPattern,
     /// The pattern is longer than the chosen implementation supports.
     PatternTooLong {
         /// Actual pattern length in bytes.
@@ -37,7 +34,6 @@ pub enum ContainsError {
 impl fmt::Display for ContainsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyPattern => write!(f, "substring pattern is empty"),
             Self::PatternTooLong { length, max } => {
                 write!(
                     f,
