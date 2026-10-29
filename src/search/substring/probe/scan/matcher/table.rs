@@ -15,7 +15,7 @@ pub(in crate::search::substring::probe::scan) struct Table {
 }
 
 impl Matcher for Table {
-    fn new(cover: &ProbeCover) -> Self {
+    unsafe fn new(cover: &ProbeCover) -> Self {
         let mut admits = vec![0u8; 1 << 16];
         for &code in cover.points() {
             admits[usize::from(code)] = 0xFF;

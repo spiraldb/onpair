@@ -25,11 +25,12 @@
 //!   128 codes at a time, and packs the hits into mask words; when skipping is
 //!   enabled, groups without hits are zeroed without packing.
 //!
-//! AArch64 builds contain the `neon` kernels, which every AArch64 CPU runs. x86_64
-//! builds contain both the `avx2` and the `avx512` kernels, each compiled for its
-//! own instruction set whatever the build's target features, and `dispatch` runs
-//! the best one the CPU supports. Each file names its matchers in a `Kernels` impl
-//! (`Neon`, `Avx2`, `Avx512`), so dispatch and the tests are written once for all.
+//! AArch64 builds contain the `neon` kernels. x86_64 builds contain both the
+//! `avx2` and the `avx512` kernels, each compiled for its own instruction set
+//! whatever the build's target features. `dispatch` runs the best kernels the CPU
+//! supports, and checks that support before building them. Each file names its
+//! matchers in a `Kernels` impl (`Neon`, `Avx2`, `Avx512`), so dispatch and the
+//! tests are written once for all.
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
@@ -53,12 +54,17 @@ pub(in crate::search::substring::probe::scan) use neon::Neon;
 pub(in crate::search::substring::probe::scan) use table::Table;
 
 /// A cover membership test, prepared once and run on every block.
+///
+/// A vector matcher runs the instructions of its instruction set. Building one is
+/// the unsafe step: once built, it may be checked anywhere.
 pub(in crate::search::substring::probe::scan) trait Matcher:
     Sized
 {
-    /// Prepares `cover`. A vector matcher may only be built for a cover and CPU
-    /// that planning found eligible.
-    fn new(cover: &ProbeCover) -> Self;
+    /// Prepares `cover`, which must be eligible for this matcher.
+    ///
+    /// # Safety
+    /// The CPU supports the matcher's instruction set. The table needs none.
+    unsafe fn new(cover: &ProbeCover) -> Self;
 
     /// Overwrites `bits` with the block's mask. Returns `false` only if the mask is
     /// empty, so the caller can skip row lookup; `true` does not imply a hit.

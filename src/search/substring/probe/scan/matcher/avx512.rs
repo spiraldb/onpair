@@ -94,31 +94,28 @@ fn movemask(bits: &mut [u64; 2], a: Hits, b: Hits) {
     *bits = [a, b];
 }
 
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn hold(range: TokenRange) -> Held {
-    // SAFETY: avx512f and avx512bw, checked by `detect_isa` before planning.
-    unsafe {
-        (
-            _mm512_set1_epi16(range.begin as i16),
-            _mm512_set1_epi16((range.last - range.begin) as i16),
-        )
-    }
+    (
+        _mm512_set1_epi16(range.begin as i16),
+        _mm512_set1_epi16((range.last - range.begin) as i16),
+    )
 }
 
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn inside((lo, width): Held, codes: Vectors) -> Hits {
+fn inside((lo, width): Held, codes: Vectors) -> Hits {
     let inside = |codes| _mm512_cmple_epu16_mask(_mm512_sub_epi16(codes, lo), width);
     join(inside(codes[0]), inside(codes[1]))
 }
 
 /// OR range membership into existing hit lanes.
-/// The caller must have enabled the compiled vector instruction set.
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
+fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
     for &held in held {
-        // SAFETY: the caller provides the instruction set required by these helpers.
-        hit = unsafe { or(hit, inside(held, codes)) };
+        hit = or(hit, inside(held, codes));
     }
     hit
 }
@@ -139,19 +136,20 @@ fn ranges_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
         codes,
         bits,
         #[inline(always)]
-        |codes| unsafe { check_ranges(inside(first, codes), rest, codes) },
+        |codes| check_ranges(inside(first, codes), rest, codes),
     )
 }
 
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn broadcast(code: Token) -> Broadcast {
-    // SAFETY: avx512f and avx512bw, checked by `detect_isa` before planning.
-    unsafe { _mm512_set1_epi16(code as i16) }
+    _mm512_set1_epi16(code as i16)
 }
 
 /// Compares land in mask registers, so nothing to narrow.
 #[target_feature(enable = "avx512f,avx512bw")]
 #[inline]
-unsafe fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
+fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     let mut hit = join(
         _mm512_cmpeq_epi16_mask(codes[0], *first),
         _mm512_cmpeq_epi16_mask(codes[1], *first),
@@ -174,15 +172,22 @@ pub(in crate::search::substring::probe::scan) struct EqOr<const SKIP_MOVEMASK_IF
 }
 
 impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for EqOr<SKIP_MOVEMASK_IF_NO_MATCH> {
-    fn new(cover: &ProbeCover) -> Self {
-        Self {
-            tokens: cover.points().iter().copied().map(broadcast).collect(),
-            ranges: cover.ranges().iter().copied().map(hold).collect(),
+    unsafe fn new(cover: &ProbeCover) -> Self {
+        // SAFETY: the caller guarantees AVX-512, which `broadcast` and `hold` need.
+        unsafe {
+            Self {
+                tokens: cover
+                    .points()
+                    .iter()
+                    .map(|&point| broadcast(point))
+                    .collect(),
+                ranges: cover.ranges().iter().map(|&range| hold(range)).collect(),
+            }
         }
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: planning selects this kernel only after CPU feature detection.
+        // SAFETY: `self` was built by `new`, whose caller guaranteed AVX-512.
         unsafe { eq_or_mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.tokens, &self.ranges, codes, bits) }
     }
 }
@@ -203,7 +208,7 @@ fn eq_or_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
         codes,
         bits,
         #[inline(always)]
-        |codes| unsafe { check_ranges(eq_or_hits(first, rest, codes), ranges, codes) },
+        |codes| check_ranges(eq_or_hits(first, rest, codes), ranges, codes),
     )
 }
 
@@ -212,6 +217,7 @@ struct Batch([Table; 4]);
 
 /// Build tables for at most eight point IDs.
 /// Point `k` contributes bit `1 << k` at each of its four nibble positions.
+#[target_feature(enable = "avx512f,avx512bw")]
 fn batch(tokens: &[Token]) -> Batch {
     let mut rows = [[0u8; 16]; 4];
     for (k, &token) in tokens.iter().enumerate() {
@@ -219,11 +225,13 @@ fn batch(tokens: &[Token]) -> Batch {
             row[usize::from(token >> (4 * shift) & 0x0f)] |= 1 << k;
         }
     }
-    Batch(rows.map(table))
+    Batch(rows.map(|row| table(row)))
 }
 
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn table(row: [u8; 16]) -> Table {
-    // SAFETY: avx512f, checked by `detect_isa`; the row is the load's 16 bytes.
+    // SAFETY: the load reads the row's 16 bytes.
     unsafe { _mm512_broadcast_i32x4(_mm_loadu_si128(row.as_ptr().cast())) }
 }
 
@@ -231,7 +239,7 @@ fn table(row: [u8; 16]) -> Table {
 /// AVX-512 tests surviving point bits directly into the output mask.
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
+fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
     let byte = _mm512_set1_epi16(0x00ff);
     let order = _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7);
     let low_byte = _mm512_permutexvar_epi64(
@@ -295,21 +303,23 @@ pub(in crate::search::substring::probe::scan) struct NibbleN8<
 impl<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher
     for NibbleN8<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>
 {
-    fn new(cover: &ProbeCover) -> Self {
+    unsafe fn new(cover: &ProbeCover) -> Self {
         let codes = cover.points();
-        Self {
-            batches: std::array::from_fn(|at| {
-                let from = (at * PER_BATCH).min(codes.len());
-                let to = (from + PER_BATCH).min(codes.len());
-                batch(&codes[from..to])
-            }),
-            ranges: cover.ranges().iter().copied().map(hold).collect(),
+        // SAFETY: the caller guarantees AVX-512, which `batch` and `hold` need.
+        unsafe {
+            Self {
+                batches: std::array::from_fn(|at| {
+                    let from = (at * PER_BATCH).min(codes.len());
+                    let to = (from + PER_BATCH).min(codes.len());
+                    batch(&codes[from..to])
+                }),
+                ranges: cover.ranges().iter().map(|&range| hold(range)).collect(),
+            }
         }
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: planning checks CPU features and the point count; dispatch
-        // supplies the matching nonzero batch specialization.
+        // SAFETY: `self` was built by `new`, whose caller guaranteed AVX-512.
         unsafe {
             nibble_mask::<BATCHES, SKIP_MOVEMASK_IF_NO_MATCH>(
                 &self.batches,
@@ -334,10 +344,7 @@ fn nibble_mask<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
         codes,
         bits,
         #[inline(always)]
-        |codes| {
-            // SAFETY: the instruction set, inherited from this function.
-            unsafe { check_ranges(probe(batches, codes), ranges, codes) }
-        },
+        |codes| check_ranges(probe(batches, codes), ranges, codes),
     )
 }
 

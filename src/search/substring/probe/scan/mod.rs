@@ -87,8 +87,12 @@ type Mask = [u64; BLOCK / 64];
 
 /// Runs the matcher over every block and appends each verified row once, in
 /// ascending order.
-fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usize>) {
-    let matcher = M::new(input.cover);
+///
+/// # Safety
+/// The CPU supports `M`'s instruction set.
+unsafe fn both_stages<M: Matcher, O: Offset>(input: ScanInput<'_, O>, out: &mut Vec<usize>) {
+    // SAFETY: the caller's guarantee.
+    let matcher = unsafe { M::new(input.cover) };
     let mut resolver = Resolver::new(input);
     let mut bits = [0u64; BLOCK / 64];
     blocks(

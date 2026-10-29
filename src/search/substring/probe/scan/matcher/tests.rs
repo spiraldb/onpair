@@ -20,7 +20,8 @@ use crate::search::substring::probe::scan::{BLOCK, Isa, MatcherKind};
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
     let mut bits = [u64::MAX; BLOCK / 64];
     // A matcher may return true for an empty mask when it always packs.
-    let any_hit = M::new(cover).check(codes, &mut bits);
+    // SAFETY: callers check `supports` before testing a vector matcher.
+    let any_hit = unsafe { M::new(cover) }.check(codes, &mut bits);
     assert!(
         any_hit || bits.iter().all(|&set| set == 0),
         "a set bit under a cleared empty-block flag"
