@@ -523,6 +523,8 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
         }
     }
 
+    // Joining the lanes needs at most one output allocation per batch.
+    codes.reserve(count.iter().sum());
     for j in 0..K {
         let base = codes.len();
         codes.extend_from_slice(&buffers.codes[j][..count[j]]);
