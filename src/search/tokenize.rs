@@ -3,9 +3,9 @@
 
 //! Greedy longest-match tokenisation of a byte string against the dictionary.
 
-use super::lookup::narrow;
+use super::lookup::longest_prefix;
 use crate::core::dictionary::DictionaryView;
-use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
+use crate::core::types::Token;
 
 /// Greedy longest-match tokenisation of `text` against the sorted dictionary,
 /// matching the encoder's own segmentation.
@@ -35,28 +35,9 @@ pub fn tokenize<V: DictionaryView>(text: &[u8], dict: V) -> Vec<Token> {
 
     let mut pos = 0;
     while pos < text.len() {
-        let max_len = (text.len() - pos).min(MAX_TOKEN_SIZE);
-
-        let mut best: Token = 0;
-        // Candidate window over the sorted dictionary, narrowed byte by byte.
-        let mut range = TokenRange {
-            begin: 0,
-            last: (dict.num_tokens() - 1) as Token,
-        };
-
-        for k in 0..max_len {
-            let next = narrow(dict, range, k, text[pos + k]);
-            if next.is_empty() {
-                break;
-            }
-            // The shortest token in range sorts first; length exactly k+1 means
-            // it is an exact match of the bytes consumed so far.
-            if dict.token_len(next.begin) == k + 1 {
-                best = next.begin;
-            }
-            range = next;
-        }
-
+        // Token 0 stands in if no token matches, which completeness rules out.
+        let (longest, _) = longest_prefix(dict, &text[pos..]);
+        let best = longest.map_or(0, |(token, _)| token);
         tokens.push(best);
         pos += dict.token_len(best);
     }

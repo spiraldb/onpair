@@ -4,11 +4,11 @@
 //! Sorted-dictionary prefix lookup.
 //!
 //! Because the dictionary is in strict bytewise-lexicographic order, the set of
-//! tokens sharing a given byte-prefix is a contiguous run of token ids. Both
+//! tokens sharing a given byte-prefix is a contiguous run of token ids. The
 //! operations here narrow such a run one byte at a time.
 
 use crate::core::dictionary::DictionaryView;
-use crate::core::types::{Token, TokenRange};
+use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 
 /// Narrow `range` to the tokens whose byte at index `k` equals `target` (and are
 /// therefore longer than `k`), assuming every token in `range` already agrees on
@@ -65,13 +65,48 @@ pub(super) fn narrow<V: DictionaryView>(
     TokenRange { begin: first, last }
 }
 
+/// One step of greedy tokenization: the longest token that prefixes `bytes`, with
+/// its length, and the range of tokens that start with all of `bytes`, empty unless
+/// `bytes` fits in a token.
+///
+/// The tokens are narrowed by one byte of `bytes` at a time. A token equal to the
+/// bytes narrowed by so far sorts first in the range, so each one found is the
+/// longest prefix yet.
+pub(super) fn longest_prefix<V: DictionaryView>(
+    dict: V,
+    bytes: &[u8],
+) -> (Option<(Token, usize)>, TokenRange) {
+    let Some(last) = dict.num_tokens().checked_sub(1) else {
+        return (None, TokenRange::EMPTY);
+    };
+    let mut range = TokenRange {
+        begin: 0,
+        last: last as Token,
+    };
+    let mut longest = None;
+    for (k, &byte) in bytes.iter().take(MAX_TOKEN_SIZE).enumerate() {
+        range = narrow(dict, range, k, byte);
+        if range.is_empty() {
+            break;
+        }
+        if dict.token_len(range.begin) == k + 1 {
+            longest = Some((range.begin, k + 1));
+        }
+    }
+    let starting_with = if bytes.len() <= MAX_TOKEN_SIZE {
+        range
+    } else {
+        TokenRange::EMPTY
+    };
+    (longest, starting_with)
+}
+
 /// The contiguous range of token ids that have `needle` as a byte-prefix — every
 /// token at least `needle.len()` bytes long whose first `needle.len()` bytes
 /// equal `needle` — or [`TokenRange::EMPTY`] if none.
 ///
 /// An empty `needle` matches the whole dictionary. A `needle` longer than
-/// [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE) yields the empty range (no token is
-/// that long).
+/// [`MAX_TOKEN_SIZE`] yields the empty range (no token is that long).
 pub fn prefix_range<V: DictionaryView>(dict: V, needle: &[u8]) -> TokenRange {
     let n = dict.num_tokens();
     if n == 0 {

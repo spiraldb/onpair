@@ -20,10 +20,10 @@
 //! to choose the filter, and the verifier walks the same graph to confirm a hit.
 
 use super::starts::MatchStarts;
-use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
+use crate::core::dictionary::CompactDictionaryView;
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::TokenFrequencyIndexView;
-use crate::search::lookup::narrow;
+use crate::search::lookup::longest_prefix;
 use crate::search::substring::ContainsError;
 
 /// The tokens an edge accepts.
@@ -211,31 +211,10 @@ impl GraphBuilder<'_, '_, '_> {
     /// that prefixes the rest of the needle. Fails if there is no such token.
     fn build_position(&mut self, offset: usize) -> Result<usize, ContainsError> {
         let remaining = &self.needle[offset..];
-        let num_tokens = self.dict.num_tokens();
-        if num_tokens == 0 {
-            return Err(ContainsError::MissingByteToken { byte: remaining[0] });
-        }
-
-        // Narrow by successive bytes, remembering the longest exact token.
-        let mut range = TokenRange {
-            begin: 0,
-            last: (num_tokens - 1) as Token,
-        };
-        let mut longest = None;
-        for (k, &byte) in remaining.iter().take(MAX_TOKEN_SIZE).enumerate() {
-            range = narrow(self.dict, range, k, byte);
-            if range.is_empty() {
-                break;
-            }
-            // An exact prefix, if present, sorts first in this range.
-            if self.dict.token_len(range.begin) == k + 1 {
-                longest = Some((range.begin, k + 1));
-            }
-        }
-
-        // If the whole remainder fits, this range finishes the match.
-        if remaining.len() <= MAX_TOKEN_SIZE && !range.is_empty() {
-            self.add_edge(offset, self.needle.len(), EdgeKind::Range(range));
+        let (longest, starting_with) = longest_prefix(self.dict, remaining);
+        // The tokens that start with the whole remainder finish the match.
+        if !starting_with.is_empty() {
+            self.add_edge(offset, self.needle.len(), EdgeKind::Range(starting_with));
         }
 
         let Some((token, token_length)) = longest else {
@@ -254,7 +233,7 @@ impl GraphBuilder<'_, '_, '_> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
+    use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
 
     /// Test graph; callers supply edges satisfying the alignment topology.
     pub(in crate::search::substring::probe::alignment) fn synthetic_graph(
