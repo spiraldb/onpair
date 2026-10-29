@@ -93,7 +93,8 @@ impl<'d> ContainsScan<'d> {
     /// [`ContainsError::PatternTooLong`] if it is longer than
     /// [`Self::MAX_PATTERN_LEN`], [`ContainsError::FrequencyIndexMismatch`] if
     /// `frequencies` counts a different number of tokens than `dict` has, and
-    /// [`ContainsError::InvalidData`] if `dict` cannot tokenize `pattern`.
+    /// [`ContainsError::MissingByteToken`] if `dict` lacks a single-byte token that
+    /// `pattern` needs.
     ///
     /// # Precondition
     /// `dict` is conformant (sorted, unique and complete), as guaranteed by

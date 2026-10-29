@@ -22,7 +22,6 @@
 use super::starts::MatchStarts;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
-use crate::core::validate::InvalidColumn;
 use crate::search::index::TokenFrequencyIndexView;
 use crate::search::lookup::narrow;
 use crate::search::substring::ContainsError;
@@ -106,9 +105,8 @@ impl AlignmentGraph {
     /// and that `frequencies` is indexed by its token IDs.
     ///
     /// # Errors
-    /// Returns [`ContainsError::InvalidData`] with
-    /// [`InvalidColumn::IncompleteAlphabet`] if no token prefixes some suffix of the
-    /// needle.
+    /// Returns [`ContainsError::MissingByteToken`] if no token prefixes some suffix of
+    /// the needle, which happens only if the dictionary lacks a single-byte token.
     pub(in crate::search::substring::probe) fn new(
         dict: CompactDictionaryView<'_>,
         needle: &[u8],
@@ -215,9 +213,7 @@ impl GraphBuilder<'_, '_, '_> {
         let remaining = &self.needle[offset..];
         let num_tokens = self.dict.num_tokens();
         if num_tokens == 0 {
-            return Err(ContainsError::InvalidData(
-                InvalidColumn::IncompleteAlphabet,
-            ));
+            return Err(ContainsError::MissingByteToken { byte: remaining[0] });
         }
 
         // Narrow by successive bytes, remembering the longest exact token.
@@ -243,9 +239,7 @@ impl GraphBuilder<'_, '_, '_> {
         }
 
         let Some((token, token_length)) = longest else {
-            return Err(ContainsError::InvalidData(
-                InvalidColumn::IncompleteAlphabet,
-            ));
+            return Err(ContainsError::MissingByteToken { byte: remaining[0] });
         };
 
         let next_offset = offset + token_length;
@@ -323,11 +317,9 @@ pub(super) mod tests {
             edges: Vec::new(),
             built: vec![false; needle.len()],
         };
-        let expected_next =
-            next.map(|id| offset + dict.token_len(id))
-                .ok_or(ContainsError::InvalidData(
-                    InvalidColumn::IncompleteAlphabet,
-                ));
+        let expected_next = next
+            .map(|id| offset + dict.token_len(id))
+            .ok_or(ContainsError::MissingByteToken { byte: remaining[0] });
         assert_eq!(
             builder.build_position(offset),
             expected_next,

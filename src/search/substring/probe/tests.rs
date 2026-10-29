@@ -19,7 +19,6 @@ use super::plan::{cover_cost, select_cover, select_matcher};
 use super::scan::detect_isa;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
-use crate::core::validate::InvalidColumn;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexView};
 use crate::search::substring::{ContainsDfa, ContainsError, row_contains};
 use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
@@ -315,7 +314,7 @@ fn missing_alphabet_does_not_produce_a_partial_cover() {
     let frequencies = TokenFrequencyIndex::build(&[0u16], 1).unwrap();
     assert_eq!(
         ContainsScan::new(b"ab", dict, frequencies.as_view()).unwrap_err(),
-        ContainsError::InvalidData(InvalidColumn::IncompleteAlphabet)
+        ContainsError::MissingByteToken { byte: b'b' }
     );
 }
 

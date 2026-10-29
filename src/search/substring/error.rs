@@ -3,10 +3,9 @@
 
 use std::fmt;
 
-use crate::core::validate::InvalidColumn;
-
 /// Error returned when a substring query cannot be prepared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContainsError {
     /// The pattern is empty. Every row contains it, so callers answer it without a
     /// search.
@@ -26,8 +25,13 @@ pub enum ContainsError {
         /// Tokens in the dictionary.
         dict_tokens: usize,
     },
-    /// The dictionary is invalid.
-    InvalidData(InvalidColumn),
+    /// The dictionary cannot tokenize the pattern: it has no single-byte token for
+    /// `byte`, a byte of the pattern. Trained and validated dictionaries have all
+    /// 256.
+    MissingByteToken {
+        /// The pattern byte without a token.
+        byte: u8,
+    },
 }
 
 impl fmt::Display for ContainsError {
@@ -47,16 +51,11 @@ impl fmt::Display for ContainsError {
                 f,
                 "frequency index counts {index_tokens} tokens; the dictionary has {dict_tokens}"
             ),
-            Self::InvalidData(error) => write!(f, "invalid substring search data: {error}"),
+            Self::MissingByteToken { byte } => {
+                write!(f, "dictionary has no single-byte token for {byte:#04x}")
+            }
         }
     }
 }
 
-impl std::error::Error for ContainsError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidData(error) => Some(error),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for ContainsError {}
