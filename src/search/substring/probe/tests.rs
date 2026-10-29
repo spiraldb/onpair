@@ -14,8 +14,8 @@ use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::tests::check_starts;
-use super::plan::{cover_cost, select_cover, select_matcher};
-use super::scan::detect_isa;
+use super::plan::{self, CostModel};
+use super::scan::{MatcherKind, detect_isa};
 use super::{ContainsScan, Query};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
@@ -551,17 +551,15 @@ fn planned_cost_does_not_exceed_the_frequency_cut() {
                 .iter()
                 .map(|&at| &graph.edges[at as usize]),
         );
-        let baseline_cost = cover_cost(
-            isa,
-            &baseline,
-            select_matcher(isa, &baseline),
-            baseline.frequency(freq),
-            code_count,
-        );
-        let (cover, matcher, covered) = select_cover(&graph, freq, isa);
-        assert_eq!(matcher, select_matcher(isa, &cover));
-        assert_eq!(covered, cover.frequency(freq));
-        let cost = cover_cost(isa, &cover, matcher, covered, code_count);
+        let plan = plan::select(&graph, freq, isa);
+        assert_eq!(plan.hits, plan.cover.frequency(freq));
+        let Some(model) = CostModel::of(isa) else {
+            assert_eq!(plan.matcher, MatcherKind::Table);
+            continue;
+        };
+        let (_, baseline_cost) = model.cheapest(&baseline, baseline.frequency(freq), code_count);
+        let (matcher, cost) = model.cheapest(&plan.cover, plan.hits, code_count);
+        assert_eq!(plan.matcher, matcher);
         assert!(
             cost <= baseline_cost,
             "{pattern:?}: planned {cost} against {baseline_cost}"
