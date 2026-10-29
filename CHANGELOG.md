@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ColumnView::rows_containing_with_scan` runs it over a column view, including
   a view sliced from a larger column.
 - Add `search::index::TokenFrequencyIndex`, the per-token frequency index used
-  for probe planning, built with `build_token_frequency_index` or validated
-  from stored buffers.
+  for probe planning, and `TokenFrequencyIndexView`, which borrows stored
+  prefix sums without copying them.
 - Add row-based training and compression without flattening input first.
 - Add encoding into reusable caller-owned buffers.
 
@@ -31,8 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ColumnView::rows_containing` still matches against every row.
 - **Breaking:** `ColumnView::rows_containing` returns
   `Result<Vec<usize>, ContainsError>`.
-- **Breaking:** Add `InvalidColumn::FrequencyIndex` for invalid token frequency
-  indexes, so exhaustive matches on `InvalidColumn` need a new arm.
 - **Breaking:** Make `DictionaryStorage` an unsafe trait. Custom implementations
   must use `unsafe impl` and uphold the documented buffer stability and cloning
   contract.

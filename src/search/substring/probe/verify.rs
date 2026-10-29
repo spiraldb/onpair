@@ -356,7 +356,7 @@ impl HitVerifier {
 pub(in crate::search::substring::probe) mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
-    use crate::search::index::build_token_frequency_index;
+    use crate::search::index::TokenFrequencyIndex;
     use crate::search::substring::probe::alignment::graph::AlignmentGraph;
     use crate::search::tokenize;
 
@@ -461,7 +461,7 @@ pub(in crate::search::substring::probe) mod tests {
     fn assert_verifier_decides(extra: &[&[u8]], rows: &[&[u8]], needle: &[u8]) {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
-        let frequencies = build_token_frequency_index(&codes, dict.num_tokens()).unwrap();
+        let frequencies = TokenFrequencyIndex::build(&codes, dict.num_tokens()).unwrap();
         let graph = AlignmentGraph::new(dict, needle, frequencies.as_view()).unwrap();
         let verifier = HitVerifier::from_graph(&graph, needle);
         for (row, text) in rows.iter().enumerate() {
@@ -482,7 +482,7 @@ pub(in crate::search::substring::probe) mod tests {
     fn assert_last_hit_decides(extra: &[&[u8]], rows: &[&[u8]], needle: &[u8]) {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
-        let frequencies = build_token_frequency_index(&codes, dict.num_tokens()).unwrap();
+        let frequencies = TokenFrequencyIndex::build(&codes, dict.num_tokens()).unwrap();
         let graph = AlignmentGraph::new(dict, needle, frequencies.as_view()).unwrap();
         let verifier = HitVerifier::from_graph(&graph, needle);
         for (row, text) in rows.iter().enumerate() {

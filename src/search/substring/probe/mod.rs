@@ -57,8 +57,8 @@ use verify::HitVerifier;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex, panic_malformed};
-use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
+use crate::core::validate::{InvalidColumn, panic_malformed};
+use crate::search::index::TokenFrequencyIndexView;
 use crate::search::substring::ContainsError;
 
 /// A substring query prepared for one dictionary.
@@ -91,9 +91,9 @@ impl<'d> ContainsScan<'d> {
     /// # Errors
     /// Returns [`ContainsError::EmptyPattern`] if `pattern` is empty,
     /// [`ContainsError::PatternTooLong`] if it is longer than
-    /// [`Self::MAX_PATTERN_LEN`], and [`ContainsError::InvalidData`] if `frequencies`
-    /// does not have one entry per dictionary token or `dict` cannot tokenize
-    /// `pattern`.
+    /// [`Self::MAX_PATTERN_LEN`], [`ContainsError::FrequencyIndexMismatch`] if
+    /// `frequencies` counts a different number of tokens than `dict` has, and
+    /// [`ContainsError::InvalidData`] if `dict` cannot tokenize `pattern`.
     ///
     /// # Precondition
     /// `dict` is conformant (sorted, unique and complete), as guaranteed by
@@ -101,10 +101,10 @@ impl<'d> ContainsScan<'d> {
     /// [`CompactDictionary::validate`](crate::CompactDictionary::validate), and
     /// `frequencies` is indexed by its token IDs. Only the index length is checked.
     /// Otherwise the rows its scans return are unspecified.
-    pub fn new<S: TokenFrequencyIndexStorage>(
+    pub fn new(
         pattern: &[u8],
         dict: CompactDictionaryView<'d>,
-        frequencies: &TokenFrequencyIndex<S>,
+        frequencies: TokenFrequencyIndexView<'_>,
     ) -> Result<Self, ContainsError> {
         if pattern.is_empty() {
             return Err(ContainsError::EmptyPattern);
@@ -117,9 +117,8 @@ impl<'d> ContainsScan<'d> {
         }
         check_frequencies(dict, frequencies)?;
         let isa = scan::detect_isa();
-        let graph = AlignmentGraph::new(dict, pattern, frequencies.as_view())?;
-        let (cover, matcher, covered_frequency) =
-            plan::select_cover(&graph, frequencies.as_view(), isa);
+        let graph = AlignmentGraph::new(dict, pattern, frequencies)?;
+        let (cover, matcher, covered_frequency) = plan::select_cover(&graph, frequencies, isa);
         // Following greedy edges from the source always reaches the sink, so every
         // cut, and with it the filter, is nonempty.
         debug_assert!(!cover.is_empty(), "empty filter for {pattern:?}");
@@ -186,14 +185,14 @@ impl<'d> ContainsScan<'d> {
     /// Number of codes in the stream indexed by `frequencies` that hit the filter.
     ///
     /// # Errors
-    /// Returns [`ContainsError::InvalidData`] if `frequencies` does not have one entry
-    /// per token of this scan's dictionary.
-    pub fn covered_frequency<S: TokenFrequencyIndexStorage>(
+    /// Returns [`ContainsError::FrequencyIndexMismatch`] if `frequencies` counts a
+    /// different number of tokens than this scan's dictionary has.
+    pub fn covered_frequency(
         &self,
-        frequencies: &TokenFrequencyIndex<S>,
+        frequencies: TokenFrequencyIndexView<'_>,
     ) -> Result<u32, ContainsError> {
         check_frequencies(self.dict, frequencies)?;
-        Ok(self.probe_cover.frequency(frequencies.as_view()))
+        Ok(self.probe_cover.frequency(frequencies))
     }
 
     /// [`covered_frequency`](Self::covered_frequency) as a fraction of all indexed
@@ -201,26 +200,29 @@ impl<'d> ContainsScan<'d> {
     ///
     /// # Errors
     /// Same as [`covered_frequency`](Self::covered_frequency).
-    pub fn covered_fraction<S: TokenFrequencyIndexStorage>(
+    pub fn covered_fraction(
         &self,
-        frequencies: &TokenFrequencyIndex<S>,
+        frequencies: TokenFrequencyIndexView<'_>,
     ) -> Result<f64, ContainsError> {
         let covered = self.covered_frequency(frequencies)?;
         Ok(fraction(covered, frequencies.total_frequency()))
     }
 }
 
-/// Rejects a frequency index without exactly one entry per dictionary token.
-fn check_frequencies<S: TokenFrequencyIndexStorage>(
+/// Rejects a frequency index that counts a different number of tokens than `dict`
+/// has.
+fn check_frequencies(
     dict: CompactDictionaryView<'_>,
-    frequencies: &TokenFrequencyIndex<S>,
+    frequencies: TokenFrequencyIndexView<'_>,
 ) -> Result<(), ContainsError> {
-    if frequencies.num_tokens() == dict.num_tokens() {
+    let (index_tokens, dict_tokens) = (frequencies.num_tokens(), dict.num_tokens());
+    if index_tokens == dict_tokens {
         Ok(())
     } else {
-        Err(ContainsError::InvalidData(
-            InvalidFrequencyIndex::BadLength.into(),
-        ))
+        Err(ContainsError::FrequencyIndexMismatch {
+            index_tokens,
+            dict_tokens,
+        })
     }
 }
 

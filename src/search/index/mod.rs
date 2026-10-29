@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Reusable indexes over compressed search data.
+//! Indexes over a code stream that steer search planning.
 //!
-//! Each index owns its storage contract and validation boundary. Token-frequency
-//! indexes support cheap structural validation of deserialized storage and
-//! optional full validation against a code stream.
+//! A [`TokenFrequencyIndex`] counts how often each token occurs. It is built once
+//! per stream and can be stored next to it: [`TokenFrequencyIndexView`] borrows the
+//! stored prefix sums without copying them.
 
 mod frequency;
 
-pub use frequency::{
-    OwnedTokenFrequencyIndexStorage, TokenFrequencyIndex, TokenFrequencyIndexError,
-    TokenFrequencyIndexStorage, TokenFrequencyIndexView, build_token_frequency_index,
-};
+pub use frequency::{InvalidFrequencyIndex, TokenFrequencyIndex, TokenFrequencyIndexView};

@@ -18,7 +18,15 @@ pub enum ContainsError {
         /// Maximum supported length in bytes.
         max: usize,
     },
-    /// The dictionary or frequency index is invalid.
+    /// The frequency index counts a different number of tokens than the dictionary
+    /// has.
+    FrequencyIndexMismatch {
+        /// Tokens counted by the frequency index.
+        index_tokens: usize,
+        /// Tokens in the dictionary.
+        dict_tokens: usize,
+    },
+    /// The dictionary is invalid.
     InvalidData(InvalidColumn),
 }
 
@@ -32,6 +40,13 @@ impl fmt::Display for ContainsError {
                     "substring pattern has {length} bytes; this implementation supports at most {max}"
                 )
             }
+            Self::FrequencyIndexMismatch {
+                index_tokens,
+                dict_tokens,
+            } => write!(
+                f,
+                "frequency index counts {index_tokens} tokens; the dictionary has {dict_tokens}"
+            ),
             Self::InvalidData(error) => write!(f, "invalid substring search data: {error}"),
         }
     }

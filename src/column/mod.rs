@@ -17,7 +17,7 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
-use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
+use crate::search::index::TokenFrequencyIndexView;
 use crate::search::{
     ContainsDfa, ContainsError, ContainsScan, PrefixQuery, equals, row_contains, starts_with,
     tokenize,
@@ -216,23 +216,21 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// not establish greedy tokenization for externally supplied codes, and on
     /// other rows the result is unspecified.
     ///
-    /// `frequencies` must be associated with this view's dictionary and code
-    /// stream. Build an exact index with
-    /// [`build_token_frequency_index`](crate::search::index::build_token_frequency_index),
-    /// or validate stored weights with [`TokenFrequencyIndex::validate_safety`]
-    /// using this view's token count and code count. Preparation checks only
-    /// index size, not dictionary identity or agreement with the stream.
-    /// Inexact weights affect planning, not query correctness.
+    /// `frequencies` counts the tokens of this view's code stream, as built by
+    /// [`TokenFrequencyIndex::build`](crate::search::index::TokenFrequencyIndex::build)
+    /// or borrowed from storage with [`TokenFrequencyIndexView::new`]. Preparation
+    /// checks only that it counts as many tokens as the dictionary has; inexact
+    /// counts affect planning, not the rows returned.
     ///
     /// An empty pattern matches every row. It is answered without a scan, so it
     /// does not use `frequencies`.
     ///
     /// # Errors
     /// Propagates preparation errors from [`ContainsScan::new`].
-    pub fn rows_containing_with_scan<S: TokenFrequencyIndexStorage>(
+    pub fn rows_containing_with_scan(
         &self,
         pattern: &[u8],
-        frequencies: &TokenFrequencyIndex<S>,
+        frequencies: TokenFrequencyIndexView<'_>,
     ) -> Result<Vec<usize>, ContainsError> {
         if pattern.is_empty() {
             // Visiting each row validates the row layer.
@@ -461,7 +459,7 @@ mod tests {
     #[test]
     fn prefiltered_search_agrees_with_rows_containing() {
         use crate::DictionaryView;
-        use crate::search::index::build_token_frequency_index;
+        use crate::search::index::TokenFrequencyIndex;
         use crate::test_corpus::user_strings;
         let corpus: Vec<Vec<u8>> = user_strings(60)
             .into_iter()
@@ -471,7 +469,7 @@ mod tests {
         let (bytes, offsets) = pack(&rows);
         let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
         let view = col.view();
-        let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+        let freqs = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
 
         let needles: &[&[u8]] = &[
             b"",
@@ -486,7 +484,8 @@ mod tests {
         for &needle in needles {
             let want = view.rows_containing(needle).unwrap();
             assert_eq!(
-                view.rows_containing_with_scan(needle, &freqs).unwrap(),
+                view.rows_containing_with_scan(needle, freqs.as_view())
+                    .unwrap(),
                 want,
                 "prefiltered {needle:?}"
             );
@@ -498,7 +497,7 @@ mod tests {
     #[test]
     fn prefiltered_takes_patterns_the_kmp_table_rejects() {
         use crate::DictionaryView;
-        use crate::search::index::build_token_frequency_index;
+        use crate::search::index::TokenFrequencyIndex;
         let long = vec![b'q'; 400];
         let mut hit = long.clone();
         hit.extend_from_slice(b"tail");
@@ -506,9 +505,11 @@ mod tests {
         let (bytes, offsets) = pack(rows);
         let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
         let view = col.view();
-        let freqs = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+        let freqs = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
 
-        let got = view.rows_containing_with_scan(&long, &freqs).unwrap();
+        let got = view
+            .rows_containing_with_scan(&long, freqs.as_view())
+            .unwrap();
         assert_eq!(got, vec![1]);
     }
 }

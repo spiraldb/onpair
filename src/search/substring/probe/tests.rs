@@ -19,20 +19,10 @@ use super::plan::{cover_cost, select_cover, select_matcher};
 use super::scan::detect_isa;
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
-use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex};
-use crate::search::index::{
-    TokenFrequencyIndex, TokenFrequencyIndexStorage, build_token_frequency_index,
-};
+use crate::core::validate::InvalidColumn;
+use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexView};
 use crate::search::substring::{ContainsDfa, ContainsError, row_contains};
 use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
-
-struct BorrowedFrequencies<'a>(&'a [u32]);
-
-impl TokenFrequencyIndexStorage for BorrowedFrequencies<'_> {
-    fn cumulative(&self) -> &[u32] {
-        self.0
-    }
-}
 
 fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
     let mut bytes = Vec::new();
@@ -75,8 +65,8 @@ fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: impl Fn(&Edge) -> bo
 }
 
 /// Builder guarantees relied on by the infallible cut solver and hit verifier.
-fn check_graph(view: ColumnView<'_, u32>, frequencies: &TokenFrequencyIndex, needle: &[u8]) {
-    let graph = AlignmentGraph::new(view.dict, needle, frequencies.as_view()).unwrap();
+fn check_graph(view: ColumnView<'_, u32>, frequencies: TokenFrequencyIndexView<'_>, needle: &[u8]) {
+    let graph = AlignmentGraph::new(view.dict, needle, frequencies).unwrap();
     assert_eq!(graph.node_count(), needle.len() + 1);
     assert!(graph.edges.len() <= 2 * needle.len() + MAX_TOKEN_SIZE);
     assert!(
@@ -115,7 +105,8 @@ fn check_graph(view: ColumnView<'_, u32>, frequencies: &TokenFrequencyIndex, nee
 
 /// Original bytes are the oracle; repeat execution to check reuse and appending.
 fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let index = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
+    let frequencies = index.as_view();
     for &pattern in patterns {
         let expected: Vec<_> = rows
             .iter()
@@ -124,16 +115,16 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
             .collect();
         if pattern.is_empty() {
             assert_eq!(
-                ContainsScan::new(pattern, view.dict, &frequencies).unwrap_err(),
+                ContainsScan::new(pattern, view.dict, frequencies).unwrap_err(),
                 ContainsError::EmptyPattern
             );
         } else {
             check_starts(view.dict, pattern);
-            check_graph(view, &frequencies, pattern);
-            check_scan(view, &frequencies, pattern, &expected);
+            check_graph(view, frequencies, pattern);
+            check_scan(view, frequencies, pattern, &expected);
         }
         assert_eq!(
-            view.rows_containing_with_scan(pattern, &frequencies)
+            view.rows_containing_with_scan(pattern, frequencies)
                 .unwrap(),
             expected,
             "column scan: {pattern:?}"
@@ -152,7 +143,7 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
 /// check reuse and appending.
 fn check_scan(
     view: ColumnView<'_, u32>,
-    frequencies: &TokenFrequencyIndex,
+    frequencies: TokenFrequencyIndexView<'_>,
     pattern: &[u8],
     expected: &[usize],
 ) {
@@ -194,7 +185,7 @@ fn pattern_limits_are_independent() {
     let rows: &[&[u8]] = &[&long_row, b"abc", b"aaaaaaaaaa"];
     let column = compress_rows(rows);
     let view = column.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
     check(view, rows, &[&long_row[..255], &long_row[..256]]);
     assert_eq!(
         view.rows_containing(&long_row[..256]),
@@ -205,7 +196,7 @@ fn pattern_limits_are_independent() {
     );
     let oversized = vec![b'a'; ContainsScan::MAX_PATTERN_LEN + 1];
     assert_eq!(
-        view.rows_containing_with_scan(&oversized, &frequencies),
+        view.rows_containing_with_scan(&oversized, frequencies.as_view()),
         Err(ContainsError::PatternTooLong {
             length: oversized.len(),
             max: ContainsScan::MAX_PATTERN_LEN,
@@ -229,11 +220,11 @@ fn longest_pattern_reaches_the_largest_offset() {
     let rows: &[&[u8]] = &[&padded, &wrong_first, &pattern[1..], &pattern, &wrong_last];
     let column = compress_rows(rows);
     let view = column.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
     let graph = AlignmentGraph::new(view.dict, &pattern, frequencies.as_view()).unwrap();
     assert_eq!(graph.sink(), u16::MAX);
     assert_eq!(
-        view.rows_containing_with_scan(&pattern, &frequencies),
+        view.rows_containing_with_scan(&pattern, frequencies.as_view()),
         Ok(vec![0, 3])
     );
 }
@@ -244,9 +235,9 @@ fn longest_pattern_reaches_the_largest_offset() {
 fn scan_rejects_malformed_row_offsets() {
     let column = compress_rows(&[b"alpha", b"beta"]);
     let view = column.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
     let len = view.codes.len() as u32;
-    let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
+    let scan = ContainsScan::new(b"alpha", view.dict, frequencies.as_view()).unwrap();
     let cases: [&[u32]; 4] = [
         // The first offset after the last, and the last past the code stream.
         &[2, 1],
@@ -275,8 +266,8 @@ fn scan_rejects_malformed_row_offsets() {
 fn codes_outside_the_dictionary_never_match() {
     let column = compress_rows(&[b"alpha"]);
     let view = column.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
+    let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
+    let scan = ContainsScan::new(b"alpha", view.dict, frequencies.as_view()).unwrap();
     let dfa = ContainsDfa::new(b"alpha", view.dict).unwrap();
     let alpha = view.codes;
     for outside in [view.dict.num_tokens() as Token, Token::MAX] {
@@ -299,17 +290,19 @@ fn codes_outside_the_dictionary_never_match() {
 fn mismatched_frequency_index_is_an_error() {
     let column = compress_rows(&[b"abc"]);
     let view = column.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let scan = ContainsScan::new(b"a", view.dict, &frequencies).unwrap();
-    let bad_length = ContainsError::InvalidData(InvalidFrequencyIndex::BadLength.into());
-    for size in [view.dict.num_tokens() - 1, view.dict.num_tokens() + 1] {
-        let mismatched = build_token_frequency_index::<Token>(&[], size).unwrap();
-        assert_eq!(
-            view.rows_containing_with_scan(b"a", &mismatched),
-            Err(bad_length)
-        );
-        assert_eq!(scan.covered_frequency(&mismatched), Err(bad_length));
-        assert_eq!(scan.covered_fraction(&mismatched), Err(bad_length));
+    let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
+    let scan = ContainsScan::new(b"a", view.dict, frequencies.as_view()).unwrap();
+    let dict_tokens = view.dict.num_tokens();
+    for index_tokens in [dict_tokens - 1, dict_tokens + 1] {
+        let mismatched = TokenFrequencyIndex::build(&[], index_tokens).unwrap();
+        let mismatched = mismatched.as_view();
+        let error = ContainsError::FrequencyIndexMismatch {
+            index_tokens,
+            dict_tokens,
+        };
+        assert_eq!(view.rows_containing_with_scan(b"a", mismatched), Err(error));
+        assert_eq!(scan.covered_frequency(mismatched), Err(error));
+        assert_eq!(scan.covered_fraction(mismatched), Err(error));
     }
 }
 
@@ -319,9 +312,9 @@ fn missing_alphabet_does_not_produce_a_partial_cover() {
     let mut bytes = vec![b'a'];
     bytes.resize(1 + MAX_TOKEN_SIZE, 0);
     let dict = CompactDictionaryView::validate_safety(&bytes, &[0u32, 1]).unwrap();
-    let frequencies = build_token_frequency_index(&[0u16], 1).unwrap();
+    let frequencies = TokenFrequencyIndex::build(&[0u16], 1).unwrap();
     assert_eq!(
-        ContainsScan::new(b"ab", dict, &frequencies).unwrap_err(),
+        ContainsScan::new(b"ab", dict, frequencies.as_view()).unwrap_err(),
         ContainsError::InvalidData(InvalidColumn::IncompleteAlphabet)
     );
 }
@@ -336,9 +329,10 @@ fn empty_pattern_is_answered_without_a_scan() {
         let view = column.view();
         check(view, rows, &[b"", b"absent"]);
         // The frequency index is not consulted, so even a mismatched one works.
-        let unrelated = build_token_frequency_index::<Token>(&[], 1).unwrap();
+        let unrelated = TokenFrequencyIndex::build(&[], 1).unwrap();
         assert_eq!(
-            view.rows_containing_with_scan(b"", &unrelated).unwrap(),
+            view.rows_containing_with_scan(b"", unrelated.as_view())
+                .unwrap(),
             (0..rows.len()).collect::<Vec<_>>()
         );
     }
@@ -349,9 +343,9 @@ fn prepared_scan_handles_empty_and_partial_inputs() {
     let rows: &[&[u8]] = &[b"", b"alpha", b"alphabet", b"beta", b""];
     let column = compress_rows(rows);
     let view = column.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
     for pattern in [b"alpha".as_slice(), b"absent"] {
-        let scan = ContainsScan::new(pattern, view.dict, &frequencies).unwrap();
+        let scan = ContainsScan::new(pattern, view.dict, frequencies.as_view()).unwrap();
         for start in 0..=rows.len() {
             for end in start..=rows.len() {
                 let first = view.row_offsets[start];
@@ -493,38 +487,6 @@ fn cover_merges_overlapping_and_adjacent_runs() {
 }
 
 #[test]
-fn borrowed_frequencies_preserve_the_plan_and_results() {
-    let column = compress_rows(&[b"alpha beta", b"beta gamma", b"alphabet soup", b"delta"]);
-    let view = column.view();
-    let owned = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    let borrowed = TokenFrequencyIndex::validate(
-        BorrowedFrequencies(owned.storage().cumulative()),
-        view.codes,
-        view.dict.num_tokens(),
-    )
-    .unwrap();
-    let owned_scan = ContainsScan::new(b"alpha", view.dict, &owned).unwrap();
-    let borrowed_scan = ContainsScan::new(b"alpha", view.dict, &borrowed).unwrap();
-    assert_eq!(
-        borrowed_scan.probe_cover().points(),
-        owned_scan.probe_cover().points()
-    );
-    assert_eq!(
-        borrowed_scan.probe_cover().ranges(),
-        owned_scan.probe_cover().ranges()
-    );
-    assert_eq!(
-        borrowed_scan.covered_frequency(&borrowed).unwrap(),
-        owned_scan.covered_frequency(&owned).unwrap()
-    );
-    assert_eq!(borrowed_scan.probe_density, owned_scan.probe_density);
-    assert_eq!(
-        view.rows_containing_with_scan(b"alpha", &borrowed).unwrap(),
-        [0, 2]
-    );
-}
-
-#[test]
 fn false_zero_frequencies_cannot_hide_a_true_match() {
     let column = compress_rows(&[b"alpha beta", b"gamma", b"alphabet soup", b"delta"]);
     let view = column.view();
@@ -532,15 +494,10 @@ fn false_zero_frequencies_cannot_hide_a_true_match() {
     // Attribute every occurrence to unused token 0. All real tokens have weight 0.
     let mut cumulative = vec![view.codes.len() as u32; view.dict.num_tokens() + 1];
     cumulative[0] = 0;
-    let frequencies = TokenFrequencyIndex::validate_safety(
-        BorrowedFrequencies(&cumulative),
-        view.dict.num_tokens(),
-        view.codes.len(),
-    )
-    .unwrap();
-    let scan = ContainsScan::new(b"alpha", view.dict, &frequencies).unwrap();
+    let frequencies = TokenFrequencyIndexView::new(&cumulative).unwrap();
+    let scan = ContainsScan::new(b"alpha", view.dict, frequencies).unwrap();
     assert!(!scan.probe_cover().is_empty());
-    assert_eq!(scan.covered_frequency(&frequencies), Ok(0));
+    assert_eq!(scan.covered_frequency(frequencies), Ok(0));
     let mut rows = Vec::new();
     scan.scan(view.codes, view.row_offsets, &mut rows);
     assert_eq!(rows, [0, 2]);
@@ -552,7 +509,7 @@ fn planned_cost_does_not_exceed_the_frequency_cut() {
     let rows: Vec<&[u8]> = corpus.iter().map(|row| row.as_bytes()).collect();
     let column = compress_rows(&rows);
     let view = column.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
     let freq = frequencies.as_view();
     let code_count = freq.total_frequency();
     let isa = detect_isa();

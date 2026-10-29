@@ -315,12 +315,7 @@ pub(super) mod tests {
 
         // One occurrence per token makes every edge's weight its token count.
         let cumulative: Vec<u32> = (0..=dict.num_tokens() as u32).collect();
-        let frequencies = TokenFrequencyIndexView::validate_safety(
-            &cumulative,
-            dict.num_tokens(),
-            dict.num_tokens(),
-        )
-        .unwrap();
+        let frequencies = TokenFrequencyIndexView::new(&cumulative).unwrap();
         let mut builder = GraphBuilder {
             dict,
             needle,

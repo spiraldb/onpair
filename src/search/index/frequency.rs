@@ -3,538 +3,274 @@
 
 //! A prefix-sum index of token frequencies over a code stream.
 
+use std::fmt;
+
 use crate::core::types::{Token, TokenRange};
-use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex};
 
-/// Storage for a token-frequency index's cumulative counts.
+/// Most tokens an index can count: one per [`Token`] value.
+const MAX_TOKENS: usize = Token::MAX as usize + 1;
+
+/// How often each token occurs in a code stream, as prefix sums: entry `i` counts
+/// the codes below token `i`, and the last entry counts them all.
 ///
-/// The returned slice must remain stable and immutable while the storage is
-/// alive. Storage only supplies bytes; [`TokenFrequencyIndex::validate_safety`]
-/// establishes their invariants without copying them.
-pub trait TokenFrequencyIndexStorage {
-    /// The `num_tokens + 1` prefix sums of token occurrences.
-    fn cumulative(&self) -> &[u32];
-}
-
-/// The default owned storage used by [`TokenFrequencyIndex`].
+/// [`ContainsScan`](crate::search::ContainsScan) plans with it, preferring covers of
+/// rare tokens. The index records counts, not the dictionary or stream they came
+/// from, and a scan checks only that it counts as many tokens as the dictionary
+/// has. Counts that do not match the stream make scans slower, never wrong.
+///
+/// Build an index with [`build`](Self::build), store its prefix sums, and borrow
+/// them back with [`TokenFrequencyIndexView::new`]:
+///
+/// ```
+/// use onpair::TokenRange;
+/// use onpair::search::index::{TokenFrequencyIndex, TokenFrequencyIndexView};
+///
+/// let index = TokenFrequencyIndex::build(&[2, 0, 2, 3, 2, 0], 5)?;
+/// assert_eq!(index.as_view().frequency(2), 3);
+///
+/// let stored: Vec<u32> = index.into_cumulative();
+/// let view = TokenFrequencyIndexView::new(&stored)?;
+/// assert_eq!(view.range_frequency(TokenRange { begin: 1, last: 3 }), 4);
+/// assert_eq!(view.total_frequency(), 6);
+/// # Ok::<(), onpair::search::index::InvalidFrequencyIndex>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedTokenFrequencyIndexStorage {
+pub struct TokenFrequencyIndex {
     cumulative: Vec<u32>,
 }
 
-impl OwnedTokenFrequencyIndexStorage {
-    /// Build owned token-frequency storage from its serialized buffer.
-    pub fn new(cumulative: Vec<u32>) -> Self {
-        Self { cumulative }
-    }
-
-    /// Consume the storage and return its serialized buffer without copying.
-    pub fn into_raw(self) -> Vec<u32> {
-        self.cumulative
-    }
-}
-
-impl TokenFrequencyIndexStorage for OwnedTokenFrequencyIndexStorage {
-    #[inline]
-    fn cumulative(&self) -> &[u32] {
-        &self.cumulative
-    }
-}
-
-/// Prefix-sum index of token frequencies in a code stream.
-///
-/// Entry `i` stores the number of codes whose token id is less than `i`. A
-/// structurally valid representation begins with zero, is nondecreasing, and
-/// ends with the indexed code count.
-///
-/// [`validate_safety`](Self::validate_safety) checks the cumulative layout;
-/// [`validate`](Self::validate) also proves exact correspondence with a code
-/// stream. Builder-produced indexes are exact. Safety-only indexes are valid
-/// advisory prefilter weights but cannot change query correctness.
-///
-/// The index stores counts, not the dictionary or stream that defined its token
-/// IDs. Callers must keep it associated with that dictionary and stream; a
-/// matching token count alone does not establish that association.
-///
-/// Build the usual owned representation with [`build_token_frequency_index`],
-/// or validate another storage implementation without copying it:
-///
-/// ```
-/// use onpair::search::index::{
-///     TokenFrequencyIndex, TokenFrequencyIndexStorage,
-/// };
-///
-/// struct Borrowed<'a>(&'a [u32]);
-/// impl TokenFrequencyIndexStorage for Borrowed<'_> {
-///     fn cumulative(&self) -> &[u32] {
-///         self.0
-///     }
-/// }
-///
-/// let cumulative = [0, 2, 2, 5];
-/// let codes = [0, 2, 0, 2, 2];
-/// let index = TokenFrequencyIndex::validate(Borrowed(&cumulative), &codes, 3)?;
-/// assert_eq!(index.frequency(0), 2);
-/// assert_eq!(index.frequency(1), 0);
-/// assert_eq!(index.frequency(2), 3);
-/// # Ok::<(), onpair::InvalidColumn>(())
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TokenFrequencyIndex<S = OwnedTokenFrequencyIndexStorage> {
-    storage: S,
-}
-
-impl<S> TokenFrequencyIndex<S>
-where
-    S: TokenFrequencyIndexStorage,
-{
-    /// Validate the cumulative layout for `num_tokens` and `total_codes`,
-    /// retaining `storage` without copying. This takes `O(num_tokens)` and does
-    /// not prove that individual deltas match a code stream.
+impl TokenFrequencyIndex {
+    /// Counts `codes` over a dictionary of `num_tokens` tokens.
     ///
     /// # Errors
-    /// Returns [`InvalidColumn`] if the representation is malformed.
-    pub fn validate_safety(
-        storage: S,
-        num_tokens: usize,
-        total_codes: usize,
-    ) -> Result<Self, InvalidColumn> {
-        validate_cumulative_safety(storage.cumulative(), num_tokens, total_codes)?;
-        Ok(Self { storage })
+    /// Returns [`InvalidFrequencyIndex::TooManyTokens`] if `num_tokens` exceeds
+    /// 2^16, [`InvalidFrequencyIndex::FrequencyOverflow`] if there are more than
+    /// `u32::MAX` codes, and [`InvalidFrequencyIndex::CodeOutOfRange`] if a code is
+    /// not below `num_tokens`.
+    pub fn build(codes: &[Token], num_tokens: usize) -> Result<Self, InvalidFrequencyIndex> {
+        if num_tokens > MAX_TOKENS {
+            return Err(InvalidFrequencyIndex::TooManyTokens);
+        }
+        if u32::try_from(codes.len()).is_err() {
+            return Err(InvalidFrequencyIndex::FrequencyOverflow);
+        }
+        let mut cumulative = vec![0u32; num_tokens + 1];
+        for &code in codes {
+            *cumulative
+                .get_mut(usize::from(code) + 1)
+                .ok_or(InvalidFrequencyIndex::CodeOutOfRange)? += 1;
+        }
+        for token in 0..num_tokens {
+            cumulative[token + 1] += cumulative[token];
+        }
+        Ok(Self { cumulative })
     }
 
-    /// Validate the layout and its exact correspondence with `codes` in
-    /// `O(codes.len() + num_tokens)` time.
-    pub fn validate(storage: S, codes: &[Token], num_tokens: usize) -> Result<Self, InvalidColumn> {
-        let index = Self::validate_safety(storage, num_tokens, codes.len())?;
-        index.check_correctness(codes)?;
-        Ok(index)
+    /// Adopts stored prefix sums without copying them.
+    ///
+    /// # Errors
+    /// As [`TokenFrequencyIndexView::new`].
+    pub fn from_cumulative(cumulative: Vec<u32>) -> Result<Self, InvalidFrequencyIndex> {
+        check_cumulative(&cumulative)?;
+        Ok(Self { cumulative })
     }
 
-    /// Check that this index's cumulative deltas exactly count `codes`.
-    pub fn check_correctness(&self, codes: &[Token]) -> Result<(), InvalidColumn> {
-        validate_frequency_correctness(self.storage.cumulative(), codes)
+    /// The prefix sums, for storage, without copying them.
+    pub fn into_cumulative(self) -> Vec<u32> {
+        self.cumulative
     }
 
-    /// Borrow the storage backing this index.
-    #[inline]
-    pub fn storage(&self) -> &S {
-        &self.storage
-    }
-
-    /// Consume the index and return its backing storage without copying.
-    #[inline]
-    pub fn into_storage(self) -> S {
-        self.storage
-    }
-
-    /// Borrow this index as a storage-independent, zero-copy view.
+    /// Borrows the index.
     #[inline]
     pub fn as_view(&self) -> TokenFrequencyIndexView<'_> {
         TokenFrequencyIndexView {
-            cumulative: self.storage.cumulative(),
+            cumulative: &self.cumulative,
         }
-    }
-
-    /// Number of token ids covered by this index.
-    #[inline]
-    pub fn num_tokens(&self) -> usize {
-        self.as_view().num_tokens()
-    }
-
-    /// Frequency of `token` in the indexed code stream.
-    ///
-    /// # Panics
-    /// Panics if `token` is outside the indexed token-id domain.
-    #[inline]
-    pub fn frequency(&self, token: Token) -> u32 {
-        self.as_view().frequency(token)
-    }
-
-    /// Summed frequency of the inclusive token-id `range`.
-    ///
-    /// The empty range has frequency zero.
-    ///
-    /// # Panics
-    /// Panics if a non-empty range extends outside the indexed token-id domain.
-    #[inline]
-    pub fn range_frequency(&self, range: TokenRange) -> u32 {
-        self.as_view().range_frequency(range)
-    }
-
-    /// Total number of codes represented by the index.
-    #[inline]
-    pub fn total_frequency(&self) -> u32 {
-        self.as_view().total_frequency()
     }
 }
 
-/// Borrowed, `Copy` view over a validated token-frequency buffer.
-#[derive(Copy, Clone, Debug)]
+/// A borrowed [`TokenFrequencyIndex`], for example over stored prefix sums.
+///
+/// The prefix sums are checked when the view is made, so its queries never
+/// underflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenFrequencyIndexView<'a> {
     cumulative: &'a [u32],
 }
 
 impl<'a> TokenFrequencyIndexView<'a> {
-    /// Validate a borrowed cumulative buffer without copying it.
-    pub fn validate_safety(
-        cumulative: &'a [u32],
-        num_tokens: usize,
-        total_codes: usize,
-    ) -> Result<Self, InvalidColumn> {
-        validate_cumulative_safety(cumulative, num_tokens, total_codes)?;
+    /// Borrows stored prefix sums without copying them.
+    ///
+    /// # Errors
+    /// Returns [`InvalidFrequencyIndex::Empty`] if `cumulative` is empty,
+    /// [`InvalidFrequencyIndex::TooManyTokens`] if it counts more than 2^16 tokens,
+    /// [`InvalidFrequencyIndex::FirstNotZero`] if it does not start at zero, and
+    /// [`InvalidFrequencyIndex::Decreasing`] if it decreases.
+    pub fn new(cumulative: &'a [u32]) -> Result<Self, InvalidFrequencyIndex> {
+        check_cumulative(cumulative)?;
         Ok(Self { cumulative })
     }
 
-    /// Validate a borrowed buffer and its exact correspondence with `codes`.
-    pub fn validate(
-        cumulative: &'a [u32],
-        codes: &[Token],
-        num_tokens: usize,
-    ) -> Result<Self, InvalidColumn> {
-        let view = Self::validate_safety(cumulative, num_tokens, codes.len())?;
-        view.check_correctness(codes)?;
-        Ok(view)
-    }
-
-    /// Check that this view's cumulative deltas exactly count `codes`.
-    pub fn check_correctness(&self, codes: &[Token]) -> Result<(), InvalidColumn> {
-        validate_frequency_correctness(self.cumulative, codes)
-    }
-
-    /// The validated cumulative-frequency buffer.
+    /// The prefix sums: one entry per token, then the total.
     #[inline]
     pub fn cumulative(&self) -> &'a [u32] {
         self.cumulative
     }
 
-    /// Number of token ids covered by this index.
+    /// Number of tokens counted.
     #[inline]
     pub fn num_tokens(&self) -> usize {
         self.cumulative.len() - 1
     }
 
-    /// Frequency of `token` in the indexed code stream.
+    /// How often `token` occurs.
     ///
     /// # Panics
-    /// Panics if `token` is outside the indexed token-id domain.
+    /// Panics if `token` is not below [`num_tokens`](Self::num_tokens).
     #[inline]
     pub fn frequency(&self, token: Token) -> u32 {
-        let token = token as usize;
+        let token = usize::from(token);
         assert!(token < self.num_tokens(), "token outside frequency index");
         self.cumulative[token + 1] - self.cumulative[token]
     }
 
-    /// Summed frequency of the inclusive token-id `range`.
-    ///
-    /// The empty range has frequency zero.
+    /// How often the tokens of the inclusive `range` occur together; zero for the
+    /// empty range.
     ///
     /// # Panics
-    /// Panics if a non-empty range extends outside the indexed token-id domain.
+    /// Panics if a nonempty `range` ends at or past
+    /// [`num_tokens`](Self::num_tokens).
     #[inline]
     pub fn range_frequency(&self, range: TokenRange) -> u32 {
         if range.is_empty() {
             return 0;
         }
-        let begin = range.begin as usize;
-        let last = range.last as usize;
+        let begin = usize::from(range.begin);
+        let last = usize::from(range.last);
         assert!(last < self.num_tokens(), "range outside frequency index");
         self.cumulative[last + 1] - self.cumulative[begin]
     }
 
-    /// Total number of codes represented by the index.
+    /// Number of codes counted.
     #[inline]
-    pub(crate) fn total_frequency(&self) -> u32 {
+    pub fn total_frequency(&self) -> u32 {
         self.cumulative[self.cumulative.len() - 1]
     }
 }
 
-/// Failure to construct a [`TokenFrequencyIndex`].
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum TokenFrequencyIndexError {
-    /// The code stream contains more than `u32::MAX` token occurrences.
-    FrequencyOverflow,
-    /// `num_tokens` exceeds the token-id domain representable by [`Token`].
+/// Why a token frequency index could not be built or borrowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidFrequencyIndex {
+    /// The prefix sums are empty: they need one entry more than the tokens they
+    /// count.
+    Empty,
+    /// The index would count more than 2^16 tokens, more than [`Token`] can name.
     TooManyTokens,
-    /// A code is not in `0..num_tokens`.
+    /// The prefix sums do not start at zero.
+    FirstNotZero,
+    /// The prefix sums decrease.
+    Decreasing,
+    /// A code is not below the token count.
     CodeOutOfRange,
+    /// There are more than `u32::MAX` codes to count.
+    FrequencyOverflow,
 }
 
-impl std::fmt::Display for TokenFrequencyIndexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for InvalidFrequencyIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::FrequencyOverflow => "code stream is too large for a u32 frequency index",
-            Self::TooManyTokens => "token count exceeds the Token id domain",
-            Self::CodeOutOfRange => "code index is outside the frequency index token domain",
+            Self::Empty => "frequency index is empty",
+            Self::TooManyTokens => "frequency index counts more than 2^16 tokens",
+            Self::FirstNotZero => "frequency index must start at zero",
+            Self::Decreasing => "frequency index must be non-decreasing",
+            Self::CodeOutOfRange => "code is outside the frequency index's tokens",
+            Self::FrequencyOverflow => "code stream is too long for a u32 frequency index",
         })
     }
 }
 
-impl std::error::Error for TokenFrequencyIndexError {}
+impl std::error::Error for InvalidFrequencyIndex {}
 
-/// Build the prefix-sum frequency index for `codes` over `num_tokens` token ids.
-///
-/// The resulting index contains `num_tokens + 1` `u32` entries and represents
-/// code streams of up to `u32::MAX` token occurrences.
-///
-/// `codes` may be any code width that fits the [`Token`] id domain — `u8` as
-/// well as [`Token`] itself — since the index counts ids rather than bytes.
-///
-/// ```
-/// use onpair::TokenRange;
-/// use onpair::search::index::build_token_frequency_index;
-///
-/// let index = build_token_frequency_index(&[2u16, 0, 2, 3, 2, 0], 5)?;
-/// assert_eq!(index.frequency(2), 3);
-/// assert_eq!(index.range_frequency(TokenRange { begin: 1, last: 3 }), 4);
-/// # Ok::<(), onpair::search::index::TokenFrequencyIndexError>(())
-/// ```
-///
-/// # Errors
-/// Returns [`TokenFrequencyIndexError::FrequencyOverflow`] if the code count
-/// cannot be represented by `u32`,
-/// [`TokenFrequencyIndexError::TooManyTokens`] if `num_tokens` exceeds the
-/// [`Token`] id domain, or [`TokenFrequencyIndexError::CodeOutOfRange`] if any
-/// code is not less than `num_tokens`.
-pub fn build_token_frequency_index<C: Copy + Into<Token>>(
-    codes: &[C],
-    num_tokens: usize,
-) -> Result<TokenFrequencyIndex, TokenFrequencyIndexError> {
-    checked_frequency_total(codes.len())?;
-    if num_tokens > Token::MAX as usize + 1 {
-        return Err(TokenFrequencyIndexError::TooManyTokens);
+/// Checks that `cumulative` is a prefix sum over at most [`MAX_TOKENS`] tokens.
+fn check_cumulative(cumulative: &[u32]) -> Result<(), InvalidFrequencyIndex> {
+    let Some(&first) = cumulative.first() else {
+        return Err(InvalidFrequencyIndex::Empty);
+    };
+    if cumulative.len() > MAX_TOKENS + 1 {
+        return Err(InvalidFrequencyIndex::TooManyTokens);
     }
-
-    let mut cumulative = vec![0u32; num_tokens + 1];
-    for &code in codes {
-        let count = cumulative
-            .get_mut(code.into() as usize + 1)
-            .ok_or(TokenFrequencyIndexError::CodeOutOfRange)?;
-        *count += 1;
-    }
-    for token in 0..num_tokens {
-        cumulative[token + 1] += cumulative[token];
-    }
-    debug_assert_eq!(cumulative[num_tokens], codes.len() as u32);
-
-    Ok(TokenFrequencyIndex {
-        storage: OwnedTokenFrequencyIndexStorage::new(cumulative),
-    })
-}
-
-fn validate_cumulative_safety(
-    cumulative: &[u32],
-    num_tokens: usize,
-    total_codes: usize,
-) -> Result<(), InvalidColumn> {
-    if num_tokens > Token::MAX as usize + 1 {
-        return Err(InvalidColumn::CodeOutOfRange);
-    }
-    let cumulative_len = num_tokens
-        .checked_add(1)
-        .ok_or(InvalidFrequencyIndex::BadLength)?;
-    if cumulative.len() != cumulative_len {
-        return Err(InvalidFrequencyIndex::BadLength.into());
-    }
-    if cumulative[0] != 0 {
-        return Err(InvalidFrequencyIndex::FirstCumulativeNotZero.into());
+    if first != 0 {
+        return Err(InvalidFrequencyIndex::FirstNotZero);
     }
     if cumulative.windows(2).any(|pair| pair[0] > pair[1]) {
-        return Err(InvalidFrequencyIndex::DecreasingCumulative.into());
-    }
-    let total_codes =
-        u32::try_from(total_codes).map_err(|_| InvalidFrequencyIndex::FrequencyOverflow)?;
-    if cumulative[num_tokens] != total_codes {
-        return Err(InvalidFrequencyIndex::InvalidTotal.into());
+        return Err(InvalidFrequencyIndex::Decreasing);
     }
     Ok(())
-}
-
-fn validate_frequency_correctness(
-    cumulative: &[u32],
-    codes: &[Token],
-) -> Result<(), InvalidColumn> {
-    if u32::try_from(codes.len()).ok() != cumulative.last().copied() {
-        return Err(InvalidFrequencyIndex::FrequenciesMismatch.into());
-    }
-
-    let num_tokens = cumulative.len() - 1;
-    let mut counts = vec![0u32; num_tokens];
-    for &code in codes {
-        let count = counts
-            .get_mut(code as usize)
-            .ok_or(InvalidColumn::CodeOutOfRange)?;
-        *count += 1;
-    }
-    if counts
-        .iter()
-        .zip(cumulative.windows(2))
-        .any(|(&count, pair)| count != pair[1] - pair[0])
-    {
-        return Err(InvalidFrequencyIndex::FrequenciesMismatch.into());
-    }
-    Ok(())
-}
-
-#[inline]
-pub(crate) fn checked_frequency_total(len: usize) -> Result<u32, TokenFrequencyIndexError> {
-    u32::try_from(len).map_err(|_| TokenFrequencyIndexError::FrequencyOverflow)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[derive(Debug)]
-    struct ExternalStorage<'a>(&'a [u32]);
-
-    impl TokenFrequencyIndexStorage for ExternalStorage<'_> {
-        fn cumulative(&self) -> &[u32] {
-            self.0
-        }
-    }
-
-    fn invalid_index(error: InvalidFrequencyIndex) -> InvalidColumn {
-        InvalidColumn::FrequencyIndex(error)
-    }
-
     #[test]
-    fn builder_preserves_frequency_behavior_and_errors() {
-        let codes = [2, 0, 2, 3, 2, 0];
-        let index = build_token_frequency_index(&codes, 5).unwrap();
-
-        assert_eq!(index.num_tokens(), 5);
+    fn build_counts_codes_and_rejects_bad_input() {
+        let index = TokenFrequencyIndex::build(&[2, 0, 2, 3, 2, 0], 5).unwrap();
+        let view = index.as_view();
+        assert_eq!(view.num_tokens(), 5);
+        assert_eq!(view.total_frequency(), 6);
         assert_eq!(
-            (0..5).map(|id| index.frequency(id)).collect::<Vec<_>>(),
+            (0..5)
+                .map(|token| view.frequency(token))
+                .collect::<Vec<_>>(),
             [2, 0, 3, 1, 0]
         );
-        assert_eq!(index.range_frequency(TokenRange { begin: 1, last: 3 }), 4);
-        assert_eq!(index.range_frequency(TokenRange::EMPTY), 0);
-        assert_eq!(index.check_correctness(&codes), Ok(()));
+        assert_eq!(view.range_frequency(TokenRange { begin: 1, last: 3 }), 4);
+        assert_eq!(view.range_frequency(TokenRange::EMPTY), 0);
+
         assert_eq!(
-            build_token_frequency_index(&[0u16, 2], 2),
-            Err(TokenFrequencyIndexError::CodeOutOfRange)
+            TokenFrequencyIndex::build(&[0, 2], 2),
+            Err(InvalidFrequencyIndex::CodeOutOfRange)
         );
         assert_eq!(
-            build_token_frequency_index::<Token>(&[], Token::MAX as usize + 2),
-            Err(TokenFrequencyIndexError::TooManyTokens)
+            TokenFrequencyIndex::build(&[], MAX_TOKENS + 1),
+            Err(InvalidFrequencyIndex::TooManyTokens)
         );
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(
-            checked_frequency_total(u32::MAX as usize + 1),
-            Err(TokenFrequencyIndexError::FrequencyOverflow)
-        );
+        assert!(TokenFrequencyIndex::build(&[Token::MAX], MAX_TOKENS).is_ok());
     }
 
     #[test]
-    fn safety_and_full_validation_distinguish_inexact_frequencies() {
-        let codes = [0, 0, 2, 2];
-        let cumulative = [0, 0, 2, 4];
-        let index =
-            TokenFrequencyIndex::validate_safety(ExternalStorage(&cumulative), 3, codes.len())
-                .unwrap();
+    fn stored_prefix_sums_are_checked_and_never_copied() {
+        let index = TokenFrequencyIndex::build(&[0, 0, 2, 2, 2, 3], 4).unwrap();
+        let stored = index.clone().into_cumulative();
+        let view = TokenFrequencyIndexView::new(&stored).unwrap();
+        assert_eq!(view, index.as_view());
+        assert_eq!(view.cumulative().as_ptr(), stored.as_ptr());
 
-        assert_eq!(index.frequency(0), 0);
-        assert_eq!(
-            index.check_correctness(&codes),
-            Err(invalid_index(InvalidFrequencyIndex::FrequenciesMismatch))
-        );
-        assert_eq!(
-            TokenFrequencyIndex::validate(ExternalStorage(&cumulative), &codes, 3).map(|_| ()),
-            Err(invalid_index(InvalidFrequencyIndex::FrequenciesMismatch))
-        );
-        assert_eq!(
-            TokenFrequencyIndexView::validate(&cumulative, &codes, 3).map(drop),
-            Err(invalid_index(InvalidFrequencyIndex::FrequenciesMismatch))
-        );
+        let pointer = stored.as_ptr();
+        let adopted = TokenFrequencyIndex::from_cumulative(stored).unwrap();
+        assert_eq!(adopted, index);
+        let returned = adopted.into_cumulative();
+        assert_eq!(returned.as_ptr(), pointer);
     }
 
     #[test]
-    fn external_storage_is_retained_and_uses_the_same_queries() {
-        let codes = [0, 0, 2, 2, 2, 3];
-        let cumulative = [0, 2, 2, 5, 6];
-        let original = cumulative.as_ptr();
-        let owned = build_token_frequency_index(&codes, 4).unwrap();
-        let index = TokenFrequencyIndex::validate(ExternalStorage(&cumulative), &codes, 4).unwrap();
-
-        assert_eq!(index.storage().0.as_ptr(), original);
-        assert_eq!(index.as_view().cumulative().as_ptr(), original);
-        assert_eq!(index.frequency(2), owned.frequency(2));
-        assert_eq!(
-            index.range_frequency(TokenRange { begin: 1, last: 3 }),
-            owned.range_frequency(TokenRange { begin: 1, last: 3 })
-        );
-        assert_eq!(
-            TokenFrequencyIndexView::validate(&cumulative, &codes, 4)
-                .unwrap()
-                .cumulative()
-                .as_ptr(),
-            original
-        );
-        assert_eq!(index.into_storage().0.as_ptr(), original);
-    }
-
-    #[test]
-    fn rejects_malformed_stored_representations() {
-        let validate = |cumulative: &[u32], num_tokens, total_codes| {
-            TokenFrequencyIndexView::validate_safety(cumulative, num_tokens, total_codes)
-                .map(|_| ())
-        };
-
-        let cases: &[(&[u32], usize, usize, InvalidColumn)] = &[
-            (
-                &[0, 1],
-                2,
-                1,
-                invalid_index(InvalidFrequencyIndex::BadLength),
-            ),
-            (
-                &[1, 1],
-                1,
-                1,
-                invalid_index(InvalidFrequencyIndex::FirstCumulativeNotZero),
-            ),
-            (
-                &[0, 2, 1],
-                2,
-                1,
-                invalid_index(InvalidFrequencyIndex::DecreasingCumulative),
-            ),
-            (
-                &[0, 1, 3],
-                2,
-                2,
-                invalid_index(InvalidFrequencyIndex::InvalidTotal),
-            ),
-            (
-                &[],
-                Token::MAX as usize + 2,
-                0,
-                InvalidColumn::CodeOutOfRange,
-            ),
+    fn malformed_prefix_sums_are_rejected() {
+        let too_many = vec![0; MAX_TOKENS + 2];
+        let cases: &[(&[u32], InvalidFrequencyIndex)] = &[
+            (&[], InvalidFrequencyIndex::Empty),
+            (&too_many, InvalidFrequencyIndex::TooManyTokens),
+            (&[1, 1], InvalidFrequencyIndex::FirstNotZero),
+            (&[0, 2, 1], InvalidFrequencyIndex::Decreasing),
         ];
-        for &(cumulative, num_tokens, total_codes, error) in cases {
-            assert_eq!(validate(cumulative, num_tokens, total_codes), Err(error));
+        for &(cumulative, error) in cases {
+            assert_eq!(TokenFrequencyIndexView::new(cumulative), Err(error));
+            assert_eq!(
+                TokenFrequencyIndex::from_cumulative(cumulative.to_vec()),
+                Err(error)
+            );
         }
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(
-            validate(&[0], 0, u32::MAX as usize + 1),
-            Err(invalid_index(InvalidFrequencyIndex::FrequencyOverflow))
-        );
-    }
-
-    #[test]
-    fn correctness_rejects_out_of_range_codes_and_wrong_totals() {
-        let out_of_range = TokenFrequencyIndexView::validate_safety(&[0, 1, 1], 2, 1).unwrap();
-        assert_eq!(
-            out_of_range.check_correctness(&[2]),
-            Err(InvalidColumn::CodeOutOfRange)
-        );
-
-        let wrong_total = TokenFrequencyIndexView::validate_safety(&[0, 2], 1, 2).unwrap();
-        assert_eq!(
-            wrong_total.check_correctness(&[0]),
-            Err(invalid_index(InvalidFrequencyIndex::FrequenciesMismatch))
-        );
+        assert!(TokenFrequencyIndexView::new(&[0]).is_ok());
+        assert!(TokenFrequencyIndexView::new(&vec![0; MAX_TOKENS + 1]).is_ok());
     }
 }
