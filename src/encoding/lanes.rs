@@ -369,9 +369,9 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
         // One code per byte at most, plus one slot for the discarded write of
         // an inactive lane.
         let lane_bytes = offsets[r1].to_usize() - start;
-        buffers.codes[j].clear();
+        // Existing entries are initialized and overwritten before being copied
+        // out, so only initialize newly grown storage between batches.
         buffers.codes[j].resize(lane_bytes + 1, 0);
-        buffers.row_ends[j].clear();
         buffers.row_ends[j].resize(r1 - r0 + 1, 0);
     }
 
