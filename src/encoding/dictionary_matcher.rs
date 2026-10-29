@@ -379,8 +379,10 @@ impl DictionaryMatcher {
         // Find the last candidate block whose first key is `<=` the input key.
         // The searches advance one step at a time across all inputs, so their
         // loads sit next to each other and overlap.
-        let largest = size.iter().copied().max().unwrap_or(0);
-        let mut steps = usize::BITS - largest.saturating_sub(1).leading_zeros();
+        // Only the highest set bit of the largest span matters. OR combines
+        // those bits without a chain of dependent maximum selections.
+        let span = size.iter().fold(0, |bits, &n| bits | (n - 1));
+        let mut steps = usize::BITS - span.leading_zeros();
         if SIMD {
             steps = steps.saturating_sub(3);
         }
