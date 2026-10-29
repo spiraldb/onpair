@@ -13,6 +13,7 @@
 /// Safety variants prevent valid access; conformance variants report data that
 /// is structurally usable but semantically inconsistent.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum InvalidColumn {
     // ── Safety / addressability ──────────────────────────────────────────────
     /// The dictionary has no token, so it cannot be used by the search tokenizer.

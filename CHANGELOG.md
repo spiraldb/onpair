@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ColumnView::rows_containing` still matches against every row.
 - **Breaking:** `ColumnView::rows_containing` returns
   `Result<Vec<usize>, ContainsError>`.
+- **Breaking:** Mark the error enums `Error` and `InvalidColumn`
+  `#[non_exhaustive]`, like the new `ContainsError` and
+  `InvalidFrequencyIndex`, so later releases can add variants without a
+  breaking change. Exhaustive matches on them need a wildcard arm.
 - **Breaking:** Make `DictionaryStorage` an unsafe trait. Custom implementations
   must use `unsafe impl` and uphold the documented buffer stability and cloning
   contract.
