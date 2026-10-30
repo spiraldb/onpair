@@ -44,16 +44,13 @@ impl ProbeCover {
 
     /// Whether the cover contains no token IDs.
     #[inline]
-    pub(in crate::search::substring::probe) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.points.is_empty() && self.ranges.is_empty()
     }
 
     /// Occurrences of covered tokens in the indexed stream. Points and ranges are
     /// disjoint, so each occurrence counts once.
-    pub(in crate::search::substring::probe) fn frequency(
-        &self,
-        frequencies: TokenFrequencyIndexView<'_>,
-    ) -> u32 {
+    pub(crate) fn frequency(&self, frequencies: TokenFrequencyIndexView<'_>) -> u32 {
         let points: u32 = self
             .points()
             .iter()
@@ -70,7 +67,7 @@ impl ProbeCover {
     /// Normalizes inclusive ranges, given in any order and possibly overlapping.
     /// Overlapping and adjacent ranges merge, so `[10, 20]` and `[15, 30]` become
     /// `[10, 30]`; single-ID ranges become points.
-    pub(in crate::search::substring::probe) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
+    pub(crate) fn from_runs(mut runs: Vec<TokenRange>) -> Self {
         runs.sort_unstable_by_key(|run| run.begin);
         let mut merged: Vec<TokenRange> = Vec::with_capacity(runs.len());
         for run in runs {
@@ -89,9 +86,7 @@ impl ProbeCover {
 
     /// Builds the cover of a cut. The cover is only sound if the cut crosses every
     /// source-to-sink path, as the cut solver guarantees.
-    pub(in crate::search::substring::probe) fn from_edge_cut<'g>(
-        cut: impl ExactSizeIterator<Item = Edge<'g>>,
-    ) -> Self {
+    pub(crate) fn from_edge_cut<'g>(cut: impl ExactSizeIterator<Item = Edge<'g>>) -> Self {
         let point = |id: Token| TokenRange {
             begin: id,
             last: id,
@@ -111,10 +106,7 @@ impl ProbeCover {
 
     /// Build a test cover without normalization. Ranges must be disjoint.
     #[cfg(test)]
-    pub(in crate::search::substring::probe) fn new(
-        points: Vec<Token>,
-        ranges: Vec<TokenRange>,
-    ) -> Self {
+    pub(crate) fn new(points: Vec<Token>, ranges: Vec<TokenRange>) -> Self {
         Self { points, ranges }
     }
 }

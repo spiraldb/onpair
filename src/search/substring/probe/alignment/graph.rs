@@ -28,31 +28,31 @@ use crate::search::lookup::longest_prefix;
 use crate::search::substring::ContainsError;
 
 /// The alignment graph of one needle.
-pub(in crate::search::substring::probe) struct AlignmentGraph {
+pub(crate) struct AlignmentGraph {
     /// The edges leaving each offset before the sink. Offsets no path reaches have
     /// none.
-    pub(in crate::search::substring::probe) nodes: Vec<Node>,
+    pub(crate) nodes: Vec<Node>,
     /// The alignment edge `0 -> k` of each overlap length `k`, below both the needle
     /// length and `MAX_TOKEN_SIZE`. Index 0 is unused.
-    pub(in crate::search::substring::probe) overlaps: Vec<Option<Overlap>>,
+    pub(crate) overlaps: Vec<Option<Overlap>>,
     /// The tokens that contain the whole needle but do not start with it: the
     /// alignment edge `0 -> n`, absent if empty. Tokens starting with the needle are
     /// on the source's range edge.
-    pub(in crate::search::substring::probe) contained: Box<[Token]>,
+    pub(crate) contained: Box<[Token]>,
 }
 
 /// The edges leaving one offset.
 #[derive(Clone, Copy, Debug, Default)]
-pub(in crate::search::substring::probe) struct Node {
+pub(crate) struct Node {
     /// The greedy edge: its token and the offset after it.
-    pub(in crate::search::substring::probe) greedy: Option<(Token, u16)>,
+    pub(crate) greedy: Option<(Token, u16)>,
     /// The range edge: the tokens that start with the rest of the needle.
-    pub(in crate::search::substring::probe) range: Option<TokenRange>,
+    pub(crate) range: Option<TokenRange>,
 }
 
 /// The alignment edge of one overlap length.
 #[derive(Clone, Debug)]
-pub(in crate::search::substring::probe) enum Overlap {
+pub(crate) enum Overlap {
     /// The tokens that end with the overlapped needle prefix.
     Set(Box<[Token]>),
     /// Too many tokens to list. They cannot be in a filter, so a cut never selects
@@ -62,17 +62,17 @@ pub(in crate::search::substring::probe) enum Overlap {
 
 /// One edge of the graph, as listed by [`AlignmentGraph::edges`].
 #[derive(Clone, Copy, Debug)]
-pub(in crate::search::substring::probe) struct Edge<'g> {
+pub(crate) struct Edge<'g> {
     /// Needle offset before this token.
-    pub(in crate::search::substring::probe) from: u16,
+    pub(crate) from: u16,
     /// Needle offset reached after this token.
-    pub(in crate::search::substring::probe) to: u16,
-    pub(in crate::search::substring::probe) kind: EdgeKind<'g>,
+    pub(crate) to: u16,
+    pub(crate) kind: EdgeKind<'g>,
 }
 
 /// The tokens an edge accepts.
 #[derive(Clone, Copy, Debug)]
-pub(in crate::search::substring::probe) enum EdgeKind<'g> {
+pub(crate) enum EdgeKind<'g> {
     /// One token: a greedy edge.
     Single(Token),
     /// A contiguous range of tokens: a range edge.
@@ -86,7 +86,7 @@ pub(in crate::search::substring::probe) enum EdgeKind<'g> {
 
 impl Edge<'_> {
     /// Whether the edge's tokens are listed, and so can be in a filter.
-    pub(in crate::search::substring::probe) fn cuttable(&self) -> bool {
+    pub(crate) fn cuttable(&self) -> bool {
         !matches!(self.kind, EdgeKind::UnenumeratedSet)
     }
 }
@@ -100,7 +100,7 @@ impl AlignmentGraph {
     /// # Errors
     /// Returns [`ContainsError::MissingByteToken`] if no token prefixes some suffix of
     /// the needle, which happens only if the dictionary lacks a single-byte token.
-    pub(in crate::search::substring::probe) fn new(
+    pub(crate) fn new(
         dict: CompactDictionaryView<'_>,
         needle: &[u8],
     ) -> Result<Self, ContainsError> {
@@ -131,14 +131,14 @@ impl AlignmentGraph {
     }
 
     /// The offset after the whole needle. The source is always 0.
-    pub(in crate::search::substring::probe) fn sink(&self) -> u16 {
+    pub(crate) fn sink(&self) -> u16 {
         // At most `ContainsScan::MAX_PATTERN_LEN`, which fits `u16`.
         self.nodes.len() as u16
     }
 
     /// Every edge, in a fixed order: the greedy and range edges of each offset in
     /// turn, then the alignment edges by length.
-    pub(in crate::search::substring::probe) fn edges(&self) -> impl Iterator<Item = Edge<'_>> {
+    pub(crate) fn edges(&self) -> impl Iterator<Item = Edge<'_>> {
         let sink = self.sink();
         // Offsets fit `u16`, as `sink` does.
         let node_edges = self.nodes.iter().enumerate().flat_map(move |(from, node)| {

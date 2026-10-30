@@ -19,11 +19,11 @@
 //! loading the codes, so its cost barely depends on the point count, and the
 //! weight steers planning toward filters with fewer points.
 
-use super::super::ProbeCover;
-use super::super::scan::{Isa, MatcherKind, PER_BATCH};
+use crate::search::substring::ProbeCover;
+use crate::search::substring::probe::scan::{Isa, MatcherKind, PER_BATCH};
 
 /// The cost model of one instruction set, in table scans.
-pub(in crate::search::substring::probe) struct CostModel {
+pub(crate) struct CostModel {
     /// One point comparison in EqOr.
     pub(super) point: f64,
     /// One inclusive range check in any vector matcher.
@@ -71,7 +71,7 @@ const AVX512BW_COSTS: CostModel = CostModel {
 
 impl CostModel {
     /// The model of `isa`, or `None` on scalar targets, where only the table runs.
-    pub(in crate::search::substring::probe) const fn of(isa: Isa) -> Option<&'static Self> {
+    pub(crate) const fn of(isa: Isa) -> Option<&'static Self> {
         match isa {
             Isa::Neon => Some(&NEON_COSTS),
             Isa::Avx2 => Some(&AVX2_COSTS),
@@ -82,11 +82,7 @@ impl CostModel {
 
     /// Whether `matcher` can run `cover`. Nibble needs points, at most
     /// `max_nibble_batches` batches of them.
-    pub(in crate::search::substring::probe) fn can_run(
-        &self,
-        matcher: MatcherKind,
-        cover: &ProbeCover,
-    ) -> bool {
+    pub(crate) fn can_run(&self, matcher: MatcherKind, cover: &ProbeCover) -> bool {
         match matcher {
             MatcherKind::Table => true,
             MatcherKind::EqOr => !cover.is_empty(),
@@ -100,12 +96,7 @@ impl CostModel {
     /// The cheapest matcher that can run `cover`, and the cost of scanning `codes`
     /// codes for `cover` with it when `hits` of them are hits: zero for an empty
     /// cover or stream. Ties keep the table, then EqOr.
-    pub(in crate::search::substring::probe) fn cheapest(
-        &self,
-        cover: &ProbeCover,
-        hits: u32,
-        codes: u32,
-    ) -> (MatcherKind, f64) {
+    pub(crate) fn cheapest(&self, cover: &ProbeCover, hits: u32, codes: u32) -> (MatcherKind, f64) {
         let mut best = MatcherKind::Table;
         let mut best_cost = self.matcher(best, cover);
         for matcher in [MatcherKind::EqOr, MatcherKind::NibbleN8] {
@@ -147,7 +138,7 @@ impl CostModel {
 
 /// The most batches planning gives Nibble on `isa`, and so the most dispatch
 /// compiles a Nibble kernel for; none on scalar targets.
-pub(in crate::search::substring::probe) const fn max_nibble_batches(isa: Isa) -> usize {
+pub(crate) const fn max_nibble_batches(isa: Isa) -> usize {
     match CostModel::of(isa) {
         Some(model) => model.max_nibble_batches,
         None => 0,

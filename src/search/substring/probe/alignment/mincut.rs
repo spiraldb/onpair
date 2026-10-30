@@ -18,7 +18,7 @@
 use super::graph::Edge;
 
 /// A cut solver for one graph, reusable with different edge weights.
-pub(in crate::search::substring::probe) struct MinCut<'a> {
+pub(crate) struct MinCut<'a> {
     edges: &'a [Edge<'a>],
     /// Internal nodes incident to edges, in increasing needle-offset order.
     active: Vec<u16>,
@@ -43,7 +43,7 @@ impl<'a> MinCut<'a> {
     ///
     /// Relies on the alignment graph's shape: edges go forward, each internal node
     /// has at most one internal successor, and unenumerated edges leave the source.
-    pub(in crate::search::substring::probe) fn new(edges: &'a [Edge<'a>], sink: u16) -> Self {
+    pub(crate) fn new(edges: &'a [Edge<'a>], sink: u16) -> Self {
         let node_count = usize::from(sink) + 1;
         let mut parent = vec![0; node_count];
         let mut forced_source = vec![false; node_count];
@@ -89,10 +89,7 @@ impl<'a> MinCut<'a> {
     /// `weight(i)` weighs the edge at index `i`, and is only called for cuttable
     /// edges. Weights must be nonnegative and their sum must fit in `i64`, which the
     /// planner's weights do.
-    pub(in crate::search::substring::probe) fn solve(
-        &mut self,
-        weight: impl Fn(usize) -> u64,
-    ) -> &[u32] {
+    pub(crate) fn solve(&mut self, weight: impl Fn(usize) -> u64) -> &[u32] {
         let sink = self.parent.len() - 1;
 
         // Alignment edges charge the sink side; range edges charge the source

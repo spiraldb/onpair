@@ -18,7 +18,7 @@ use crate::core::dictionary::CompactDictionaryView;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 
 /// Maximum number of tokens listed for one overlap.
-pub(in crate::search::substring::probe) const MAX_ENUMERATED_TOKENS: usize = 512;
+pub(crate) const MAX_ENUMERATED_TOKENS: usize = 512;
 
 /// Maximum number of tokens listed for a one-byte overlap.
 const MAX_SINGLE_BYTE_TOKENS: usize = 16;
@@ -138,7 +138,7 @@ impl MatchStarts {
 }
 
 #[cfg(test)]
-pub(in crate::search::substring::probe) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
     use crate::test_corpus::make_raw;
@@ -152,10 +152,7 @@ pub(in crate::search::substring::probe) mod tests {
     }
 
     /// Compare the collected starts against independent per-token searches.
-    pub(in crate::search::substring::probe) fn check_starts(
-        dict: CompactDictionaryView<'_>,
-        needle: &[u8],
-    ) {
+    pub(crate) fn check_starts(dict: CompactDictionaryView<'_>, needle: &[u8]) {
         let tokens: Vec<_> = (0..dict.num_tokens())
             .map(|id| (id as Token, dict.token(id as Token)))
             .collect();

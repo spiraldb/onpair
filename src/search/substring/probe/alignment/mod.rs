@@ -7,7 +7,7 @@
 //! begin inside. `mincut` finds the cheapest cut for given edge weights, and
 //! `cover` turns the cut edges into the filter, a `ProbeCover`.
 
-pub(in crate::search::substring::probe) mod cover;
-pub(in crate::search::substring::probe) mod graph;
-pub(in crate::search::substring::probe) mod mincut;
-pub(in crate::search::substring::probe) mod starts;
+pub(super) mod cover;
+pub(super) mod graph;
+pub(super) mod mincut;
+pub(super) mod starts;

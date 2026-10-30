@@ -185,7 +185,7 @@ fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
 }
 
 /// Broadcast point probes and prepared ranges reused across scan blocks.
-pub(in crate::search::substring::probe::scan) struct EqOr {
+pub(crate) struct EqOr {
     /// One broadcast vector per point in the cover; none for a cover of ranges only.
     tokens: Vec<Broadcast>,
     /// Range starts and widths, already broadcast for vector comparisons.
@@ -305,7 +305,7 @@ fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hi
 /// Prepared point batches and ranges for repeated block checks.
 /// `BATCHES` must be positive and large enough to hold every point in the cover;
 /// planning and dispatch choose the supported specialization.
-pub(in crate::search::substring::probe::scan) struct NibbleN8<const BATCHES: usize> {
+pub(crate) struct NibbleN8<const BATCHES: usize> {
     /// Up to eight point probes per batch; unused entries contribute no bits.
     batches: [Batch; BATCHES],
     /// Prepared inclusive ranges, added after point matching.
@@ -359,7 +359,7 @@ fn nibble_mask<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
 }
 
 /// The NEON matchers.
-pub(in crate::search::substring::probe::scan) struct Neon;
+pub(crate) struct Neon;
 
 impl Kernels for Neon {
     const ISA: Isa = Isa::Neon;

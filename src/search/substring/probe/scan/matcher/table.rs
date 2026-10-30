@@ -9,7 +9,7 @@ use super::{Block, Mask, Matcher};
 use crate::search::substring::ProbeCover;
 
 /// The membership table of one cover.
-pub(in crate::search::substring::probe::scan) struct Table {
+pub(crate) struct Table {
     /// 0xFF for covered IDs and zero otherwise; packing extracts the low bit. One
     /// entry per `u16`, so indexing by a code needs no bounds check.
     admits: Box<[u8; 1 << 16]>,

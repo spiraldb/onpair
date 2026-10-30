@@ -110,11 +110,7 @@ pub(super) fn edge_frequency(edge: &Edge<'_>, frequencies: TokenFrequencyIndexVi
 
 /// Whether `matcher` can run `cover` on `isa`, an instruction set this CPU supports.
 #[cfg(test)]
-pub(in crate::search::substring::probe) fn is_eligible(
-    isa: Isa,
-    matcher: MatcherKind,
-    cover: &ProbeCover,
-) -> bool {
+pub(super) fn is_eligible(isa: Isa, matcher: MatcherKind, cover: &ProbeCover) -> bool {
     CostModel::of(isa).map_or(matcher == MatcherKind::Table, |model| {
         model.can_run(matcher, cover)
     })

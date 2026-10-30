@@ -26,11 +26,7 @@ use crate::search::substring::probe::plan::max_nibble_batches;
 ///
 /// # Panics
 /// If this CPU does not support `isa`.
-pub(in crate::search::substring::probe) fn prepare(
-    isa: Isa,
-    kind: MatcherKind,
-    cover: &ProbeCover,
-) -> Arc<dyn Matcher> {
+pub(crate) fn prepare(isa: Isa, kind: MatcherKind, cover: &ProbeCover) -> Arc<dyn Matcher> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = kind;
     match isa {
@@ -88,7 +84,7 @@ const _: () = assert!(
 );
 
 /// Whether this build has kernels for `isa` and this CPU can run them.
-pub(in crate::search::substring::probe) fn supports(isa: Isa) -> bool {
+pub(crate) fn supports(isa: Isa) -> bool {
     match isa {
         Isa::Scalar => true,
         #[cfg(target_arch = "aarch64")]
@@ -105,7 +101,7 @@ pub(in crate::search::substring::probe) fn supports(isa: Isa) -> bool {
 
 /// The fastest instruction set this CPU supports: AVX-512 before AVX2 on x86_64,
 /// NEON on AArch64, and `Isa::Scalar` without any of them.
-pub(in crate::search::substring::probe) fn detect_isa() -> Isa {
+pub(crate) fn detect_isa() -> Isa {
     [Isa::Avx512Bw, Isa::Avx2, Isa::Neon]
         .into_iter()
         .find(|&isa| supports(isa))

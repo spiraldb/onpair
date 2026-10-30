@@ -44,22 +44,20 @@ use super::{Block, Mask};
 use crate::search::substring::ProbeCover;
 
 /// Number of points in one batch of nibble tables.
-pub(in crate::search::substring::probe) const PER_BATCH: usize = 8;
+pub(crate) const PER_BATCH: usize = 8;
 #[cfg(target_arch = "x86_64")]
-pub(in crate::search::substring::probe::scan) use avx2::Avx2;
+pub(super) use avx2::Avx2;
 #[cfg(target_arch = "x86_64")]
-pub(in crate::search::substring::probe::scan) use avx512::Avx512;
+pub(super) use avx512::Avx512;
 #[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::probe::scan) use neon::Neon;
-pub(in crate::search::substring::probe::scan) use table::Table;
+pub(super) use neon::Neon;
+pub(super) use table::Table;
 
 /// A cover membership test, prepared once per query and run on every block.
 ///
 /// A vector matcher runs the instructions of its instruction set. Building one is
 /// the unsafe step: once built, it may be checked anywhere.
-pub(in crate::search::substring::probe) trait Matcher:
-    Send + Sync
-{
+pub(crate) trait Matcher: Send + Sync {
     /// Prepares `cover`, which must be eligible for this matcher.
     ///
     /// # Safety
@@ -77,7 +75,7 @@ pub(in crate::search::substring::probe) trait Matcher:
 
 /// The vector matchers of one instruction set.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(in crate::search::substring::probe::scan) trait Kernels {
+pub(super) trait Kernels {
     /// The instruction set the matchers run on.
     const ISA: super::Isa;
     /// One vector comparison per point, plus range checks.

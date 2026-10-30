@@ -181,7 +181,7 @@ struct OverlapEdge {
 
 /// An alignment graph compiled for hit verification.
 #[derive(Debug, Clone)]
-pub(in crate::search::substring::probe) struct HitVerifier {
+pub(super) struct HitVerifier {
     /// The greedy and range edge of each needle offset before the sink: the graph's
     /// own nodes.
     nodes: Vec<Node>,
@@ -195,10 +195,7 @@ pub(in crate::search::substring::probe) struct HitVerifier {
 
 impl HitVerifier {
     /// Compiles `graph`, which must have been built for `needle`, nonempty.
-    pub(in crate::search::substring::probe) fn from_graph(
-        graph: AlignmentGraph,
-        needle: &[u8],
-    ) -> Self {
+    pub(super) fn from_graph(graph: AlignmentGraph, needle: &[u8]) -> Self {
         let mut token_edges: Vec<(Token, Edge)> = Vec::new();
         for edge in graph.edges() {
             let role = Edge {
@@ -248,7 +245,7 @@ impl HitVerifier {
     /// The row must lie within `codes` and contain the hit, and be greedily
     /// tokenized with the dictionary the graph was built for.
     #[inline]
-    pub(in crate::search::substring::probe) fn check(
+    pub(super) fn check(
         &self,
         dict: CompactDictionaryView<'_>,
         codes: &[Token],
@@ -351,7 +348,7 @@ impl HitVerifier {
 }
 
 #[cfg(test)]
-pub(in crate::search::substring::probe) mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
     use crate::search::substring::probe::alignment::graph::AlignmentGraph;
@@ -359,7 +356,7 @@ pub(in crate::search::substring::probe) mod tests {
 
     /// A hit verifier that accepts every hit: each token's only role spans the whole
     /// needle, so scan tests can exercise matching and row lookup on their own.
-    pub(in crate::search::substring::probe) fn accepting_verifier() -> HitVerifier {
+    pub(crate) fn accepting_verifier() -> HitVerifier {
         let whole = Edge {
             from: SOURCE,
             to: 1,
