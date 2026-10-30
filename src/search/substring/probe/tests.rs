@@ -146,13 +146,13 @@ fn check_scan(
         "{pattern:?}"
     );
     // Packing uses the planning stream's density, which this index describes.
-    if let Query::Scan { hit_density, .. } = scan.query {
+    if let Query::Scan(prepared) = &scan.query {
         let density = if view.codes.is_empty() {
             0.0
         } else {
             covered as f64 / view.codes.len() as f64
         };
-        assert_eq!(hit_density, density, "{pattern:?}");
+        assert_eq!(prepared.hit_density, density, "{pattern:?}");
     }
     let mut actual = vec![usize::MAX];
     let mut appended = actual.clone();

@@ -93,8 +93,8 @@ use crate::search::substring::ContainsError;
 /// the codes around it against the pattern, so the rows it returns are exact.
 ///
 /// Prepare once per pattern and dictionary, then scan any number of chunks encoded
-/// with that dictionary, concurrently if needed. The empty pattern matches every
-/// row, without a scan.
+/// with that dictionary, concurrently if needed. Clones share the prepared search,
+/// so cloning is cheap. The empty pattern matches every row, without a scan.
 ///
 /// # Performance
 ///
@@ -140,23 +140,22 @@ pub struct ContainsScan<'d> {
 
 /// What a scan does for its pattern.
 #[derive(Clone)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a prepared query holds one `Query`, so `Everything`'s unused bytes cost nothing"
-)]
 enum Query {
     /// The empty pattern, which every row contains.
     Everything,
-    /// Search for the cover's codes and verify each hit.
-    Scan {
-        probe_cover: ProbeCover,
-        isa: Isa,
-        kind: MatcherKind,
-        /// The `kind` matcher of `isa`, built for `probe_cover`.
-        matcher: Arc<dyn Matcher>,
-        verifier: HitVerifier,
-        hit_density: f64,
-    },
+    /// Search for the cover's codes and verify each hit. Clones share it.
+    Scan(Arc<Prepared>),
+}
+
+/// The search and verification prepared for a nonempty pattern.
+struct Prepared {
+    probe_cover: ProbeCover,
+    isa: Isa,
+    kind: MatcherKind,
+    /// The `kind` matcher of `isa`, built for `probe_cover`.
+    matcher: Box<dyn Matcher>,
+    verifier: HitVerifier,
+    hit_density: f64,
 }
 
 impl<'d> ContainsScan<'d> {
@@ -209,14 +208,14 @@ impl<'d> ContainsScan<'d> {
         debug_assert!(!plan.cover.is_empty(), "empty cover for {pattern:?}");
         Ok(Self {
             dict,
-            query: Query::Scan {
+            query: Query::Scan(Arc::new(Prepared {
                 matcher: scan::prepare(isa, plan.matcher, &plan.cover),
                 probe_cover: plan.cover,
                 isa,
                 kind: plan.matcher,
                 verifier: HitVerifier::new(&graph, &edges, &plan.cut, pattern),
                 hit_density: fraction(plan.hits, frequencies.total_frequency()),
-            },
+            })),
         })
     }
 
@@ -246,13 +245,7 @@ impl<'d> ContainsScan<'d> {
         if first > last || last > codes.len() {
             panic_malformed(InvalidColumn::BadRowOffsets);
         }
-        let Query::Scan {
-            matcher,
-            verifier,
-            hit_density,
-            ..
-        } = &self.query
-        else {
+        let Query::Scan(prepared) = &self.query else {
             // Every row contains the empty pattern, even a row without codes.
             out.extend(0..row_offsets.len() - 1);
             return;
@@ -262,13 +255,13 @@ impl<'d> ContainsScan<'d> {
             return;
         }
         scan::run(
-            &**matcher,
-            plan::skip_empty_packing(*hit_density, last - first),
+            &*prepared.matcher,
+            plan::skip_empty_packing(prepared.hit_density, last - first),
             ScanInput {
                 codes: &codes[..last],
                 row_offsets,
                 dict: self.dict,
-                verifier,
+                verifier: &prepared.verifier,
             },
             out,
         );
@@ -279,7 +272,7 @@ impl<'d> ContainsScan<'d> {
     pub fn probe_cover(&self) -> Option<&ProbeCover> {
         match &self.query {
             Query::Everything => None,
-            Query::Scan { probe_cover, .. } => Some(probe_cover),
+            Query::Scan(prepared) => Some(&prepared.probe_cover),
         }
     }
 
@@ -308,17 +301,11 @@ impl fmt::Debug for ContainsScan<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("ContainsScan");
         debug.field("probe_cover", &self.probe_cover());
-        if let Query::Scan {
-            isa,
-            kind,
-            hit_density,
-            ..
-        } = &self.query
-        {
+        if let Query::Scan(prepared) = &self.query {
             debug
-                .field("isa", isa)
-                .field("matcher", kind)
-                .field("hit_density", hit_density);
+                .field("isa", &prepared.isa)
+                .field("matcher", &prepared.kind)
+                .field("hit_density", &prepared.hit_density);
         }
         debug.finish_non_exhaustive()
     }

@@ -82,7 +82,7 @@ struct Edge {
 /// edges of a `LISTED` token are in a separate list sorted by token: a hit is tried
 /// only on those, while backward walks need only the dense array. Real edges have
 /// `from < to`, so the sentinels cannot be mistaken for them.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct TokenEdges {
     /// The token at index zero of the dense arrays.
     first_token: Token,
@@ -224,7 +224,7 @@ struct OverlapEdge {
 }
 
 /// An alignment graph compiled for hit verification.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct HitVerifier {
     /// The greedy and range edge of each pattern offset before the sink: the graph's
     /// own nodes.

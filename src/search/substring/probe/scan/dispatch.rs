@@ -12,8 +12,6 @@
 //! kernels and picks the best one the CPU supports at runtime, falling back to the
 //! table without either. Other targets only have the table.
 
-use std::sync::Arc;
-
 use super::matcher::{self, Matcher};
 use super::{Isa, MatcherKind, ProbeCover};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -28,7 +26,7 @@ use crate::search::substring::probe::plan::max_nibble_batches;
 /// # Panics
 /// If `isa` is a vector instruction set this build has kernels for, and this CPU
 /// does not support it.
-pub(crate) fn prepare(isa: Isa, kind: MatcherKind, cover: &ProbeCover) -> Arc<dyn Matcher> {
+pub(crate) fn prepare(isa: Isa, kind: MatcherKind, cover: &ProbeCover) -> Box<dyn Matcher> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = kind;
     match isa {
@@ -39,13 +37,13 @@ pub(crate) fn prepare(isa: Isa, kind: MatcherKind, cover: &ProbeCover) -> Arc<dy
         #[cfg(target_arch = "x86_64")]
         Isa::Avx512Bw => prepare_with::<matcher::Avx512>(kind, cover),
         // SAFETY: the table runs on any CPU.
-        _ => Arc::new(unsafe { matcher::Table::new(cover) }),
+        _ => Box::new(unsafe { matcher::Table::new(cover) }),
     }
 }
 
 /// Builds the `kind` matcher among `K`'s, one instruction set's matchers.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn prepare_with<K: Kernels>(kind: MatcherKind, cover: &ProbeCover) -> Arc<dyn Matcher> {
+fn prepare_with<K: Kernels>(kind: MatcherKind, cover: &ProbeCover) -> Box<dyn Matcher> {
     // Every matcher built below relies on this check.
     assert!(
         supports(K::ISA),
@@ -55,20 +53,20 @@ fn prepare_with<K: Kernels>(kind: MatcherKind, cover: &ProbeCover) -> Arc<dyn Ma
     // below except the table, which needs none.
     unsafe {
         match kind {
-            MatcherKind::Table => Arc::new(matcher::Table::new(cover)),
-            MatcherKind::EqOr => Arc::new(K::EqOr::new(cover)),
+            MatcherKind::Table => Box::new(matcher::Table::new(cover)),
+            MatcherKind::EqOr => Box::new(K::EqOr::new(cover)),
             // An arm is compiled only if planning can give Nibble that many batches on
             // this instruction set.
             MatcherKind::Nibble => match cover.points().len().div_ceil(PER_BATCH) {
-                1 => Arc::new(K::Nibble::<1>::new(cover)),
+                1 => Box::new(K::Nibble::<1>::new(cover)),
                 2 if const { max_nibble_batches(K::ISA) >= 2 } => {
-                    Arc::new(K::Nibble::<2>::new(cover))
+                    Box::new(K::Nibble::<2>::new(cover))
                 }
                 3 if const { max_nibble_batches(K::ISA) >= 3 } => {
-                    Arc::new(K::Nibble::<3>::new(cover))
+                    Box::new(K::Nibble::<3>::new(cover))
                 }
                 4 if const { max_nibble_batches(K::ISA) >= 4 } => {
-                    Arc::new(K::Nibble::<4>::new(cover))
+                    Box::new(K::Nibble::<4>::new(cover))
                 }
                 batches => unreachable!("Nibble planned with {batches} batches, above the cap"),
             },
