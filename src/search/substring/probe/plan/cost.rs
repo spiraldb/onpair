@@ -137,7 +137,8 @@ impl CostModel {
 }
 
 /// The most batches planning gives Nibble on `isa`, and so the most dispatch
-/// compiles a Nibble kernel for; none on scalar targets.
+/// compiles a Nibble kernel for; none for `Isa::Scalar`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) const fn max_nibble_batches(isa: Isa) -> usize {
     match CostModel::of(isa) {
         Some(model) => model.max_nibble_batches,

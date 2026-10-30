@@ -54,6 +54,7 @@ mod table;
 use std::panic::RefUnwindSafe;
 
 use super::{Block, Mask};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::core::types::Token;
 use crate::search::substring::ProbeCover;
 
