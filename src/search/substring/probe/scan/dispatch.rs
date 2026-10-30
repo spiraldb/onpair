@@ -89,8 +89,11 @@ const _: () = assert!(
 pub(crate) fn supports(isa: Isa) -> bool {
     match isa {
         Isa::Scalar => true,
+        // The NEON kernels read the bytes of `u16` lanes in little-endian order.
         #[cfg(target_arch = "aarch64")]
-        Isa::Neon => std::arch::is_aarch64_feature_detected!("neon"),
+        Isa::Neon => {
+            cfg!(target_endian = "little") && std::arch::is_aarch64_feature_detected!("neon")
+        }
         #[cfg(target_arch = "x86_64")]
         Isa::Avx2 => std::is_x86_feature_detected!("avx2"),
         #[cfg(target_arch = "x86_64")]
