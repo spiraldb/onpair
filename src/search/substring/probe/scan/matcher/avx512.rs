@@ -44,7 +44,7 @@ fn load(codes: &[Token; 64]) -> Vectors {
 /// `true` even if every packed bit is zero.
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw")]
-fn words<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
+fn words<const SKIP_EMPTY: bool>(
     codes: &Block,
     bits: &mut Mask,
     hits: impl Fn(Vectors) -> Hits,
@@ -54,7 +54,7 @@ fn words<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     let groups = codes.as_chunks::<64>().0.as_chunks::<2>().0;
     for ([lo, hi], bits) in groups.iter().zip(bits.as_chunks_mut::<2>().0) {
         let (a, b) = (hits(load(lo)), hits(load(hi)));
-        if SKIP_MOVEMASK_IF_NO_MATCH && !any(a, b) {
+        if SKIP_EMPTY && !any(a, b) {
             *bits = [0; 2];
             continue;
         }
@@ -117,16 +117,12 @@ fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
 /// Fill a block mask from prepared ranges; an empty slice clears the mask.
 /// The target-feature boundary keeps range comparisons inside the vector loop.
 #[target_feature(enable = "avx512f,avx512bw")]
-fn ranges_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
-    held: &[Held],
-    codes: &Block,
-    bits: &mut Mask,
-) -> bool {
+fn ranges_mask<const SKIP_EMPTY: bool>(held: &[Held], codes: &Block, bits: &mut Mask) -> bool {
     let Some((&first, rest)) = held.split_first() else {
         bits.fill(0);
         return false;
     };
-    words::<SKIP_MOVEMASK_IF_NO_MATCH>(
+    words::<SKIP_EMPTY>(
         codes,
         bits,
         #[inline(always)]
@@ -196,16 +192,16 @@ impl Matcher for EqOr {
 /// Fill the block mask with point and range matches.
 /// The target-feature boundary lets the comparison closure inline with its caller.
 #[target_feature(enable = "avx512f,avx512bw")]
-fn eq_or_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
+fn eq_or_mask<const SKIP_EMPTY: bool>(
     tokens: &[Broadcast],
     ranges: &[Held],
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
     let Some((first, rest)) = tokens.split_first() else {
-        return ranges_mask::<SKIP_MOVEMASK_IF_NO_MATCH>(ranges, codes, bits);
+        return ranges_mask::<SKIP_EMPTY>(ranges, codes, bits);
     };
-    words::<SKIP_MOVEMASK_IF_NO_MATCH>(
+    words::<SKIP_EMPTY>(
         codes,
         bits,
         #[inline(always)]
@@ -284,14 +280,14 @@ fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hi
 /// Prepared point batches and ranges for repeated block checks.
 /// `BATCHES` must be positive and large enough to hold every point in the cover;
 /// planning and dispatch choose the supported specialization.
-pub(crate) struct NibbleN8<const BATCHES: usize> {
+pub(crate) struct Nibble<const BATCHES: usize> {
     /// Up to eight point probes per batch; unused entries contribute no bits.
     batches: [Batch; BATCHES],
     /// Prepared inclusive ranges, added after point matching.
     ranges: Vec<Held>,
 }
 
-impl<const BATCHES: usize> Matcher for NibbleN8<BATCHES> {
+impl<const BATCHES: usize> Matcher for Nibble<BATCHES> {
     unsafe fn new(cover: &ProbeCover) -> Self {
         let points = cover.points();
         // SAFETY: the caller guarantees AVX-512, which `batch` and `hold` need.
@@ -319,13 +315,13 @@ impl<const BATCHES: usize> Matcher for NibbleN8<BATCHES> {
 /// Fill a block mask with nibble-table and range matches.
 /// The target-feature boundary keeps the probe closure inside the vector loop.
 #[target_feature(enable = "avx512f,avx512bw")]
-fn nibble_mask<const BATCHES: usize, const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
+fn nibble_mask<const BATCHES: usize, const SKIP_EMPTY: bool>(
     batches: &[Batch; BATCHES],
     ranges: &[Held],
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
-    words::<SKIP_MOVEMASK_IF_NO_MATCH>(
+    words::<SKIP_EMPTY>(
         codes,
         bits,
         #[inline(always)]
@@ -339,5 +335,5 @@ pub(crate) struct Avx512;
 impl Kernels for Avx512 {
     const ISA: Isa = Isa::Avx512Bw;
     type EqOr = EqOr;
-    type NibbleN8<const BATCHES: usize> = NibbleN8<BATCHES>;
+    type Nibble<const BATCHES: usize> = Nibble<BATCHES>;
 }

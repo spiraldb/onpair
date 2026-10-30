@@ -4,20 +4,20 @@
 //! Cost model for covers and matchers, with weights per instruction set.
 //!
 //! Costs are in table scans: one is the time the table matcher takes to test one
-//! code, so the table costs 1 on every instruction set. Per code, a filter costs
-//! `matcher + density * candidate`: `matcher` prices the matcher on the filter,
-//! `density` is the fraction of codes the filter covers, and `candidate` prices the
+//! code, so the table costs 1 on every instruction set. Per code, a cover costs
+//! `matcher + density * hit`: `matcher` prices the matcher on the cover, `density`
+//! is the hit density, the fraction of codes that are hits, and `hit` prices the
 //! row lookup and verification of one hit. Matcher selection compares the first
 //! term; cover ranking compares the sum. Scalar targets have no model: only the
-//! table runs there, and its cost does not depend on the filter.
+//! table runs there, and its cost does not depend on the cover.
 //!
-//! The weights set where one choice overtakes another. With NEON's, for filters
+//! The weights set where one choice overtakes another. With NEON's, for covers
 //! without ranges, EqOr beats the table up to 10 points, Nibble beats EqOr from 4
-//! points and the table up to 24, and a filter covering 1% of the codes spends
-//! about one table scan per code on its hits. On x86 the point weight is a
+//! points and the table up to 24, and at a hit density of 1% a cover spends about
+//! one table scan per code on its hits. On x86 the point weight is a
 //! preference rather than a time: on AVX2, EqOr with up to four points is bound by
 //! loading the codes, so its cost barely depends on the point count, and the
-//! weight steers planning toward filters with fewer points.
+//! weight steers planning toward covers with fewer points.
 
 use crate::search::substring::ProbeCover;
 use crate::search::substring::probe::scan::{Isa, MatcherKind, PER_BATCH};
@@ -39,7 +39,7 @@ pub(crate) struct CostModel {
     /// Row lookup and verification of one hit. The cost is flat, although sparse
     /// hits cost more each than dense ones; walk lengths and the hits skipped after
     /// a row matches are not modeled either.
-    pub(super) candidate: f64,
+    pub(super) hit: f64,
 }
 
 const NEON_COSTS: CostModel = CostModel {
@@ -48,7 +48,7 @@ const NEON_COSTS: CostModel = CostModel {
     nibble_base: 0.092,
     nibble_batch: 0.23,
     max_nibble_batches: 3,
-    candidate: 94.0,
+    hit: 94.0,
 };
 
 const AVX2_COSTS: CostModel = CostModel {
@@ -57,7 +57,7 @@ const AVX2_COSTS: CostModel = CostModel {
     nibble_base: 0.14,
     nibble_batch: 0.056,
     max_nibble_batches: 4,
-    candidate: 103.0,
+    hit: 103.0,
 };
 
 const AVX512BW_COSTS: CostModel = CostModel {
@@ -66,7 +66,7 @@ const AVX512BW_COSTS: CostModel = CostModel {
     nibble_base: 0.033,
     nibble_batch: 0.033,
     max_nibble_batches: 4,
-    candidate: 105.0,
+    hit: 105.0,
 };
 
 impl CostModel {
@@ -86,7 +86,7 @@ impl CostModel {
         match matcher {
             MatcherKind::Table => true,
             MatcherKind::EqOr => !cover.is_empty(),
-            MatcherKind::NibbleN8 => {
+            MatcherKind::Nibble => {
                 let points = cover.points().len();
                 points > 0 && points.div_ceil(PER_BATCH) <= self.max_nibble_batches
             }
@@ -99,7 +99,7 @@ impl CostModel {
     pub(crate) fn cheapest(&self, cover: &ProbeCover, hits: u32, codes: u32) -> (MatcherKind, f64) {
         let mut best = MatcherKind::Table;
         let mut best_cost = self.matcher(best, cover);
-        for matcher in [MatcherKind::EqOr, MatcherKind::NibbleN8] {
+        for matcher in [MatcherKind::EqOr, MatcherKind::Nibble] {
             if !self.can_run(matcher, cover) {
                 continue;
             }
@@ -113,7 +113,7 @@ impl CostModel {
             return (best, 0.0);
         }
         let scanning = f64::from(codes) * best_cost;
-        let verifying = f64::from(hits) * self.candidate;
+        let verifying = f64::from(hits) * self.hit;
         (best, scanning + verifying)
     }
 
@@ -129,7 +129,7 @@ impl CostModel {
         match matcher {
             MatcherKind::Table => 1.0,
             MatcherKind::EqOr => self.point * points + self.range * ranges,
-            MatcherKind::NibbleN8 => {
+            MatcherKind::Nibble => {
                 self.nibble_base + self.nibble_batch * batches + self.range * ranges
             }
         }

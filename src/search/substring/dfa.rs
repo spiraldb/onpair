@@ -352,8 +352,8 @@ mod tests {
     }
 
     /// Independent byte-window oracle.
-    fn byte_contains(hay: &[u8], needle: &[u8]) -> bool {
-        needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
+    fn byte_contains(hay: &[u8], pattern: &[u8]) -> bool {
+        pattern.is_empty() || hay.windows(pattern.len()).any(|w| w == pattern)
     }
 
     /// Decode one fixture row into bytes for the containment oracle.

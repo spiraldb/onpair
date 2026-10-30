@@ -87,12 +87,12 @@ fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
     }
     agrees::<K::EqOr>(isa, MatcherKind::EqOr, "eq_or", cover, codes);
     // Use the same point-to-batch mapping as production dispatch.
-    let n8k = MatcherKind::NibbleN8;
+    let nibble = MatcherKind::Nibble;
     match cover.points().len().div_ceil(PER_BATCH) {
-        1 => agrees::<K::NibbleN8<1>>(isa, n8k, "nibble_n8", cover, codes),
-        2 => agrees::<K::NibbleN8<2>>(isa, n8k, "nibble_n16", cover, codes),
-        3 => agrees::<K::NibbleN8<3>>(isa, n8k, "nibble_n24", cover, codes),
-        4 => agrees::<K::NibbleN8<4>>(isa, n8k, "nibble_n32", cover, codes),
+        1 => agrees::<K::Nibble<1>>(isa, nibble, "nibble, 1 batch", cover, codes),
+        2 => agrees::<K::Nibble<2>>(isa, nibble, "nibble, 2 batches", cover, codes),
+        3 => agrees::<K::Nibble<3>>(isa, nibble, "nibble, 3 batches", cover, codes),
+        4 => agrees::<K::Nibble<4>>(isa, nibble, "nibble, 4 batches", cover, codes),
         _ => {}
     }
 }
@@ -145,11 +145,11 @@ fn eq_or_checks_ranges_alone<K: Kernels>(codes: &Block) {
 }
 
 #[test]
-fn agree_on_needles_the_block_holds() {
+fn agree_on_points_the_block_holds() {
     let codes = block();
     for count in [1, 2, 3, 8, 9, 12, 16, 17, 24, 25, 32, 64] {
-        let needles: Vec<Token> = (0..count).map(|k| codes[k * 37]).collect();
-        let cover = ProbeCover::new(needles.to_vec(), vec![]);
+        let points: Vec<Token> = (0..count).map(|k| codes[k * 37]).collect();
+        let cover = ProbeCover::new(points.to_vec(), vec![]);
         assert_eq!(
             expected(&cover, &codes)
                 .iter()
@@ -163,11 +163,11 @@ fn agree_on_needles_the_block_holds() {
 }
 
 #[test]
-fn agree_on_needles_the_block_does_not_hold() {
+fn agree_on_points_the_block_does_not_hold() {
     let mut codes = block();
     codes.fill(7);
-    let needles: Vec<Token> = (0..4).map(|k| 60000 + k).collect();
-    every_matcher(&ProbeCover::new(needles.to_vec(), vec![]), &codes);
+    let points: Vec<Token> = (0..4).map(|k| 60000 + k).collect();
+    every_matcher(&ProbeCover::new(points.to_vec(), vec![]), &codes);
 }
 
 /// A final-code hit must set the last bit in the block mask.
@@ -244,13 +244,13 @@ fn agree_on_the_sign_boundary() {
     for (at, code) in codes.iter_mut().enumerate() {
         *code = [0x7ffe, 0x7fff, 0x8000, 0x8001, 0x8002, 7][at % 6];
     }
-    for needles in [
+    for points in [
         vec![0x7fff],
         vec![0x8000],
         vec![0x8001],
         vec![0x7fff, 0x8000, 0x8001],
     ] {
-        every_matcher(&ProbeCover::new(needles, vec![]), &codes);
+        every_matcher(&ProbeCover::new(points, vec![]), &codes);
     }
     for (lo, hi) in [
         (0x7ffe, 0x8001),
@@ -281,8 +281,8 @@ fn agree_at_the_top_of_the_code_space() {
     for (at, code) in codes.iter_mut().enumerate() {
         *code = [65527, 65531, 65532, 65533, 65534, Token::MAX, 7][at % 7];
     }
-    for needles in [vec![65527], vec![Token::MAX], vec![65527, Token::MAX]] {
-        every_matcher(&ProbeCover::new(needles, vec![]), &codes);
+    for points in [vec![65527], vec![Token::MAX], vec![65527, Token::MAX]] {
+        every_matcher(&ProbeCover::new(points, vec![]), &codes);
     }
     for (lo, hi) in [
         (65532, Token::MAX),

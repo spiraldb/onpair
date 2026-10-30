@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The filter of a cut, as a `ProbeCover`: the tokens a scan searches for.
+//! The cover of a cut, a `ProbeCover`: the tokens a scan searches for.
 //!
 //! Cut edges contribute single tokens, ranges and lists. Normalization merges them
 //! into sorted, disjoint points and inclusive ranges, without changing the covered

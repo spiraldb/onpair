@@ -3,8 +3,8 @@
 
 //! The tokens an occurrence can begin inside: the alignment edges of the graph.
 //!
-//! Such a token either ends with a needle prefix of `k` bytes, an *overlap* giving
-//! the alignment edge `0 -> k`, or contains the whole needle. One pass over the
+//! Such a token either ends with a pattern prefix of `k` bytes, an *overlap* giving
+//! the alignment edge `0 -> k`, or contains the whole pattern. One pass over the
 //! dictionary's concatenated token bytes finds both.
 //!
 //! Overlap lists are capped, more tightly for one-byte overlaps, which are common.
@@ -26,21 +26,21 @@ const MAX_SINGLE_BYTE_TOKENS: usize = 16;
 /// Count marking an overlap whose tokens exceeded the cap.
 const UNENUMERATED: usize = MAX_ENUMERATED_TOKENS + 1;
 
-/// The tokens an occurrence of one needle can begin inside.
+/// The tokens an occurrence of one pattern can begin inside.
 pub(super) struct MatchStarts {
     /// For each overlap length, the number of listed tokens or `UNENUMERATED`.
     counts: [usize; MAX_TOKEN_SIZE],
     /// Listed tokens, by overlap length.
     ids: [[Token; MAX_ENUMERATED_TOKENS]; MAX_TOKEN_SIZE],
-    /// Tokens that contain the whole needle but do not start with it, in ID order.
-    /// Tokens starting with the needle are on the range edge from the source instead.
+    /// Tokens that contain the whole pattern but do not start with it, in ID order.
+    /// Tokens starting with the pattern are on the range edge from the source instead.
     pub(super) contained: Vec<Token>,
 }
 
 impl MatchStarts {
-    /// Finds the match starts of a nonempty needle.
+    /// Finds the match starts of a nonempty pattern.
     #[inline]
-    pub(super) fn new(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Self {
+    pub(super) fn new(dict: CompactDictionaryView<'_>, pattern: &[u8]) -> Self {
         let mut starts = Self {
             counts: [0; MAX_TOKEN_SIZE],
             ids: [[0; MAX_ENUMERATED_TOKENS]; MAX_TOKEN_SIZE],
@@ -48,10 +48,10 @@ impl MatchStarts {
         };
         let (payload, offsets) = dict.token_payload();
 
-        if needle.len() > 1 {
-            starts.collect_single_byte_overlaps(payload, offsets, needle[0]);
+        if pattern.len() > 1 {
+            starts.collect_single_byte_overlaps(payload, offsets, pattern[0]);
         }
-        starts.scan_payload(payload, offsets, needle);
+        starts.scan_payload(payload, offsets, pattern);
         starts
     }
 
@@ -83,7 +83,7 @@ impl MatchStarts {
         self.counts[overlap_len] == UNENUMERATED
     }
 
-    /// Lists tokens ending with the needle's first byte. One-byte tokens are skipped:
+    /// Lists tokens ending with the pattern's first byte. One-byte tokens are skipped:
     /// an occurrence starting with one begins at a token boundary.
     fn collect_single_byte_overlaps(&mut self, payload: &[u8], offsets: &[u32], byte: u8) {
         for (token_id, bounds) in offsets.windows(2).enumerate() {
@@ -98,11 +98,11 @@ impl MatchStarts {
         }
     }
 
-    /// Finds longer overlaps and contained needles in one pass over the payload,
-    /// searching for the needle's first two bytes (or its only byte).
-    fn scan_payload(&mut self, payload: &[u8], offsets: &[u32], needle: &[u8]) {
-        let prefix_len = needle.len().min(2);
-        let finder = Finder::new(&needle[..prefix_len]);
+    /// Finds longer overlaps and contained patterns in one pass over the payload,
+    /// searching for the pattern's first two bytes (or its only byte).
+    fn scan_payload(&mut self, payload: &[u8], offsets: &[u32], pattern: &[u8]) {
+        let prefix_len = pattern.len().min(2);
+        let finder = Finder::new(&pattern[..prefix_len]);
         let mut cursor = 0;
         let mut token_id = 0;
 
@@ -123,14 +123,15 @@ impl MatchStarts {
             if tail.len() < prefix_len {
                 continue;
             }
-            if tail.starts_with(needle) {
+            if tail.starts_with(pattern) {
                 if hit != token_start {
                     self.contained.push(token_id as Token);
                 }
                 // This token's whole matches are accounted for. Only its last
-                // needle.len() - 1 bytes can still start a partial overlap.
-                cursor = token_end - (needle.len() - 1);
-            } else if hit != token_start && tail.len() < needle.len() && needle.starts_with(tail) {
+                // pattern.len() - 1 bytes can still start a partial overlap.
+                cursor = token_end - (pattern.len() - 1);
+            } else if hit != token_start && tail.len() < pattern.len() && pattern.starts_with(tail)
+            {
                 self.record_overlap(tail.len(), token_id as Token, MAX_ENUMERATED_TOKENS);
             }
         }
@@ -152,25 +153,25 @@ pub(crate) mod tests {
     }
 
     /// Compare the collected starts against independent per-token searches.
-    pub(crate) fn check_starts(dict: CompactDictionaryView<'_>, needle: &[u8]) {
+    pub(crate) fn check_starts(dict: CompactDictionaryView<'_>, pattern: &[u8]) {
         let tokens: Vec<_> = (0..dict.num_tokens())
             .map(|id| (id as Token, dict.token(id as Token)))
             .collect();
-        let starts = MatchStarts::new(dict, needle);
+        let starts = MatchStarts::new(dict, pattern);
         let contained: Vec<_> = tokens
             .iter()
             .filter(|(_, token)| {
-                !token.starts_with(needle)
-                    && token.windows(needle.len()).any(|window| window == needle)
+                !token.starts_with(pattern)
+                    && token.windows(pattern.len()).any(|window| window == pattern)
             })
             .map(|&(id, _)| id)
             .collect();
-        assert_eq!(starts.contained, contained, "contained: {needle:?}");
+        assert_eq!(starts.contained, contained, "contained: {pattern:?}");
 
-        for length in 1..needle.len().min(MAX_TOKEN_SIZE) {
+        for length in 1..pattern.len().min(MAX_TOKEN_SIZE) {
             let expected: Vec<_> = tokens
                 .iter()
-                .filter(|(_, token)| token.len() > length && token.ends_with(&needle[..length]))
+                .filter(|(_, token)| token.len() > length && token.ends_with(&pattern[..length]))
                 .map(|&(id, _)| id)
                 .collect();
             let limit = if length == 1 {
@@ -179,13 +180,13 @@ pub(crate) mod tests {
                 MAX_ENUMERATED_TOKENS
             };
             match starts.overlap(length) {
-                None => assert!(expected.is_empty(), "overlap {length}: {needle:?}"),
+                None => assert!(expected.is_empty(), "overlap {length}: {pattern:?}"),
                 Some(Overlap::UnenumeratedSet) => {
-                    assert!(expected.len() > limit, "overlap {length}: {needle:?}");
+                    assert!(expected.len() > limit, "overlap {length}: {pattern:?}");
                 }
                 Some(Overlap::Set(actual)) => {
                     assert!(!expected.is_empty() && expected.len() <= limit);
-                    assert_eq!(&*actual, expected, "overlap {length}: {needle:?}");
+                    assert_eq!(&*actual, expected, "overlap {length}: {pattern:?}");
                 }
             }
         }
@@ -211,7 +212,7 @@ pub(crate) mod tests {
         let mut tokens: Vec<_> = (0..=MAX_ENUMERATED_TOKENS)
             .map(|i| [vec![128 + (i / 256) as u8, i as u8], b"ababa".to_vec()].concat())
             .collect();
-        // A token starting with the needle is covered by the range edge,
+        // A token starting with the pattern is covered by the range edge,
         // even when it contains another occurrence later.
         tokens.push(b"ababa".to_vec());
         let dict = dictionary(tokens);

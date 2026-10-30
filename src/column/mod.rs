@@ -445,10 +445,10 @@ mod tests {
         }
     }
 
-    /// The prefiltered path is an optimization of `rows_containing` and nothing
-    /// else: same rows, same order.
+    /// `rows_containing_with_scan` is an optimization of `rows_containing` and
+    /// nothing else: same rows, same order.
     #[test]
-    fn prefiltered_search_agrees_with_rows_containing() {
+    fn scan_agrees_with_rows_containing() {
         use crate::DictionaryView;
         use crate::search::index::TokenFrequencyIndex;
         use crate::test_corpus::user_strings;
@@ -462,7 +462,7 @@ mod tests {
         let view = col.view();
         let freqs = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
 
-        let needles: &[&[u8]] = &[
+        let patterns: &[&[u8]] = &[
             b"",
             b"h",
             b"https",
@@ -472,21 +472,21 @@ mod tests {
             b"://",
             b"zzz",
         ];
-        for &needle in needles {
-            let want = view.rows_containing(needle).unwrap();
+        for &pattern in patterns {
+            let want = view.rows_containing(pattern).unwrap();
             assert_eq!(
-                view.rows_containing_with_scan(needle, freqs.as_view())
+                view.rows_containing_with_scan(pattern, freqs.as_view())
                     .unwrap(),
                 want,
-                "prefiltered {needle:?}"
+                "{pattern:?}"
             );
         }
     }
 
-    /// The prefilter takes patterns `ContainsDfa` rejects: its own cap is the
-    /// hit verifier's node ids, not the KMP table's 255-byte state width.
+    /// The scan takes patterns `ContainsDfa` rejects: its cap is the largest pattern
+    /// offset the hit verifier stores, not the DFA's 255-byte state width.
     #[test]
-    fn prefiltered_takes_patterns_the_kmp_table_rejects() {
+    fn scan_takes_patterns_the_dfa_rejects() {
         use crate::DictionaryView;
         use crate::search::index::TokenFrequencyIndex;
         let long = vec![b'q'; 400];

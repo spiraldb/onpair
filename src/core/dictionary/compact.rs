@@ -454,7 +454,7 @@ impl<'a> CompactDictionaryView<'a> {
     /// Every byte of the returned buffer belongs to exactly one token, which is
     /// what makes the buffer a valid haystack for a bulk substring search: a match
     /// at `hit` lies inside token `id` exactly when `offsets[id] <= hit` and
-    /// `hit + len <= offsets[id + 1]`. The substring prefilter uses this to sweep
+    /// `hit + len <= offsets[id + 1]`. Substring search uses this to sweep
     /// the whole dictionary with a single `memmem` search rather than one per
     /// token. Trimming the read-padding is the one care needed — it is the only
     /// part of `bytes` belonging to no token.

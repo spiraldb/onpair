@@ -57,16 +57,16 @@ fn prepare_with<K: Kernels>(kind: MatcherKind, cover: &ProbeCover) -> Arc<dyn Ma
             MatcherKind::EqOr => Arc::new(K::EqOr::new(cover)),
             // An arm is compiled only if planning can give Nibble that many batches on
             // this instruction set.
-            MatcherKind::NibbleN8 => match cover.points().len().div_ceil(PER_BATCH) {
-                1 => Arc::new(K::NibbleN8::<1>::new(cover)),
+            MatcherKind::Nibble => match cover.points().len().div_ceil(PER_BATCH) {
+                1 => Arc::new(K::Nibble::<1>::new(cover)),
                 2 if const { max_nibble_batches(K::ISA) >= 2 } => {
-                    Arc::new(K::NibbleN8::<2>::new(cover))
+                    Arc::new(K::Nibble::<2>::new(cover))
                 }
                 3 if const { max_nibble_batches(K::ISA) >= 3 } => {
-                    Arc::new(K::NibbleN8::<3>::new(cover))
+                    Arc::new(K::Nibble::<3>::new(cover))
                 }
                 4 if const { max_nibble_batches(K::ISA) >= 4 } => {
-                    Arc::new(K::NibbleN8::<4>::new(cover))
+                    Arc::new(K::Nibble::<4>::new(cover))
                 }
                 batches => unreachable!("Nibble planned with {batches} batches, above the cap"),
             },

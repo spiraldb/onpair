@@ -23,14 +23,14 @@
 //! * a *range edge* to `n` for a last token that starts with the rest of the pattern.
 //!
 //! Preparation picks a *cut* of this graph: a set of edges that every path crosses.
-//! The codes on its edges form the *filter*, represented as a [`ProbeCover`]: every
+//! The codes on its edges form the *cover*, represented as a [`ProbeCover`]: every
 //! row that contains the pattern contains one of them. Any cut is correct, and the
 //! planner looks for a cheap one: rare codes mean few hits to verify, and few
 //! distinct codes mean a faster matcher.
 //!
 //! The scan then processes the codes block by block:
 //!
-//! 1. a matcher marks every code in the filter, a *hit*;
+//! 1. a matcher marks every code in the cover, a *hit*;
 //! 2. each hit is mapped to its row and verified by walking the alignment graph
 //!    forward and backward through the neighboring codes.
 //!
@@ -39,7 +39,7 @@
 //! # Modules
 //!
 //! * `alignment`: the alignment graph and its minimum cut.
-//! * `cover`: the filter of a cut, a `ProbeCover`.
+//! * `cover`: the cover of a cut, a `ProbeCover`.
 //! * `plan`: the cost model that chooses the cut, its matcher and the mask packing.
 //! * `scan`: the block loop, the SIMD matchers and row resolution.
 //! * `verify`: the hit verifier.
@@ -120,7 +120,7 @@ pub struct ContainsScan<'d> {
 enum Query {
     /// The empty pattern, which every row contains.
     Everything,
-    /// Search for the filter's codes and verify each hit.
+    /// Search for the cover's codes and verify each hit.
     Scan {
         probe_cover: ProbeCover,
         isa: Isa,
@@ -128,7 +128,7 @@ enum Query {
         /// The `kind` matcher of `isa`, built for `probe_cover`.
         matcher: Arc<dyn Matcher>,
         verifier: HitVerifier,
-        probe_density: f64,
+        hit_density: f64,
     },
 }
 
@@ -177,8 +177,8 @@ impl<'d> ContainsScan<'d> {
         let graph = AlignmentGraph::new(dict, pattern)?;
         let plan = plan::select(&graph, frequencies, isa);
         // Following greedy edges from the source always reaches the sink, so every
-        // cut, and with it the filter, is nonempty.
-        debug_assert!(!plan.cover.is_empty(), "empty filter for {pattern:?}");
+        // cut, and with it the cover, is nonempty.
+        debug_assert!(!plan.cover.is_empty(), "empty cover for {pattern:?}");
         Ok(Self {
             dict,
             query: Query::Scan {
@@ -187,7 +187,7 @@ impl<'d> ContainsScan<'d> {
                 isa,
                 kind: plan.matcher,
                 verifier: HitVerifier::from_graph(graph, pattern),
-                probe_density: fraction(plan.hits, frequencies.total_frequency()),
+                hit_density: fraction(plan.hits, frequencies.total_frequency()),
             },
         })
     }
@@ -221,7 +221,7 @@ impl<'d> ContainsScan<'d> {
         let Query::Scan {
             matcher,
             verifier,
-            probe_density,
+            hit_density,
             ..
         } = &self.query
         else {
@@ -235,7 +235,7 @@ impl<'d> ContainsScan<'d> {
         }
         scan::run(
             &**matcher,
-            plan::skip_empty_packing(*probe_density, last - first),
+            plan::skip_empty_packing(*hit_density, last - first),
             ScanInput {
                 codes: &codes[..last],
                 row_offsets,
@@ -283,14 +283,14 @@ impl fmt::Debug for ContainsScan<'_> {
         if let Query::Scan {
             isa,
             kind,
-            probe_density,
+            hit_density,
             ..
         } = &self.query
         {
             debug
                 .field("isa", isa)
                 .field("matcher", kind)
-                .field("probe_density", probe_density);
+                .field("hit_density", hit_density);
         }
         debug.finish_non_exhaustive()
     }

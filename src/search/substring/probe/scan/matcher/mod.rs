@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Membership kernels: mark the codes of a block that belong to the filter.
+//! Membership kernels: mark the codes of a block that belong to the cover.
 //!
 //! Every kernel computes the same mask, with bit `i` set iff code `i` is covered.
 //! `table` holds the portable kernel, a scalar lookup table. The vector kernels have
@@ -11,7 +11,7 @@
 //! - `EqOr` broadcasts each point to all lanes, compares it with the codes, and ORs
 //!   the results together with the range hits. Work grows linearly with the number
 //!   of points and ranges; a cover without points checks only its ranges.
-//! - `NibbleN8` tests up to eight points at once with shuffle tables. A token ID is
+//! - `Nibble` tests up to eight points at once with shuffle tables. A token ID is
 //!   a `u16`, so four 4-bit nibbles. Each batch has one 16-entry table per nibble
 //!   position, and point `k` sets bit `k` in the entry selected by its nibble at
 //!   each position. Looking up a code's four nibbles and ANDing the entries leaves
@@ -84,10 +84,10 @@ pub(super) trait Kernels {
     /// One vector comparison per point, plus range checks.
     type EqOr: Matcher + 'static;
     /// Nibble shuffle tables, eight points per batch, plus range checks.
-    type NibbleN8<const BATCHES: usize>: Matcher + 'static;
+    type Nibble<const BATCHES: usize>: Matcher + 'static;
 }
 
-/// The tables of `NibbleN8`'s batch `at`, which holds the points from
+/// The tables of `Nibble`'s batch `at`, which holds the points from
 /// `at * PER_BATCH` on: one 16-entry row per nibble position, from the least to the
 /// most significant. Point `k` of the batch sets bit `k` in the entry its nibble
 /// selects. A batch past the last point is all zero, and matches no code.

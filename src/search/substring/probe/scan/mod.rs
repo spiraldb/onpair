@@ -4,7 +4,7 @@
 //! Scan execution: find the hits block by block and append the verified rows.
 //!
 //! The codes are processed in blocks of `BLOCK`. For each block, the matcher writes
-//! a bitmask with one bit per code, set if the code is in the filter. The resolver
+//! a bitmask with one bit per code, set if the code is in the cover. The resolver
 //! maps each set bit to its row and runs the hit verifier. A row is appended on its
 //! first verified hit, and its remaining hits are skipped.
 //!
@@ -36,7 +36,7 @@ pub(super) enum Isa {
     Avx512Bw,
 }
 
-/// The kernel that tests codes for membership in the filter.
+/// The kernel that tests codes for membership in the cover.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MatcherKind {
     /// Scalar lookup table; supports any cover and any target.
@@ -44,7 +44,7 @@ pub(super) enum MatcherKind {
     /// One vector equality per point, plus range checks.
     EqOr,
     /// Nibble shuffle tables, eight points per batch, plus range checks.
-    NibbleN8,
+    Nibble,
 }
 
 /// Number of codes per matcher block.
@@ -150,7 +150,7 @@ mod tests {
         };
         let isas = [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw];
         for isa in isas.into_iter().filter(|&isa| supports(isa)) {
-            for kind in [MatcherKind::Table, MatcherKind::EqOr, MatcherKind::NibbleN8] {
+            for kind in [MatcherKind::Table, MatcherKind::EqOr, MatcherKind::Nibble] {
                 if !is_eligible(isa, kind, cover) {
                     continue;
                 }
@@ -188,7 +188,7 @@ mod tests {
         }
     }
 
-    /// Zero padding never becomes a hit, even when the filter contains token 0.
+    /// Zero padding never becomes a hit, even when the cover contains token 0.
     #[test]
     fn padding_never_becomes_a_hit() {
         let low = TokenRange::new(0, 3);
@@ -197,7 +197,7 @@ mod tests {
             ProbeCover::new(Vec::new(), vec![low]),
         ] {
             for len in [1, 2, 63, 64, 65, BLOCK - 1, BLOCK, BLOCK + 1] {
-                // Codes start at 4, so only padding could match the filter.
+                // Codes start at 4, so only padding could match the cover.
                 let codes: Vec<Token> = (0..len).map(|at| (at % 1000 + 4) as Token).collect();
                 check_every_kernel(&cover, &codes, &[0u32, len as u32], &[]);
             }

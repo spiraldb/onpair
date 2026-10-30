@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The alignment graph: every way a needle can be encoded in a greedily tokenized row.
+//! The alignment graph: every way a pattern can be encoded in a greedily tokenized row.
 //!
-//! Nodes are needle offsets, from the source `0` to the sink `n = needle.len()`. An
-//! edge `from -> to` is a token covering `needle[from..to]`. There are three kinds:
+//! Nodes are pattern offsets, from the source `0` to the sink `n = pattern.len()`. An
+//! edge `from -> to` is a token covering `pattern[from..to]`. There are three kinds:
 //!
 //! * **Alignment edges** `0 -> k`: tokens an occurrence begins inside, which end with
-//!   `needle[..k]`, or contain the whole needle if `k = n`.
-//! * **Greedy edges**: the longest token that prefixes `needle[from..]` and ends
-//!   before the sink. Greedy tokenization lets no other token end inside the needle
+//!   `pattern[..k]`, or contain the whole pattern if `k = n`.
+//! * **Greedy edges**: the longest token that prefixes `pattern[from..]` and ends
+//!   before the sink. Greedy tokenization lets no other token end inside the pattern
 //!   there, so each node has at most one.
-//! * **Range edges** `from -> n`: the tokens that start with `needle[from..]`, and so
-//!   finish the needle. They are contiguous in the sorted dictionary.
+//! * **Range edges** `from -> n`: the tokens that start with `pattern[from..]`, and so
+//!   finish the pattern. They are contiguous in the sorted dictionary.
 //!
 //! The graph is stored in that shape: each node's greedy and range edge, and the
 //! alignment edges by length. Without the source and the sink, the greedy edges
 //! form a forest, which the cut solver relies on.
 //!
 //! Every occurrence in a row is a source-to-sink path. The planner cuts all paths
-//! to choose the filter, and the verifier walks the same graph to confirm a hit.
+//! to choose the cover, and the verifier walks the same graph to confirm a hit.
 
 use super::starts::MatchStarts;
 use crate::core::dictionary::CompactDictionaryView;
@@ -27,16 +27,16 @@ use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::lookup::longest_prefix;
 use crate::search::substring::ContainsError;
 
-/// The alignment graph of one needle.
+/// The alignment graph of one pattern.
 pub(crate) struct AlignmentGraph {
     /// The edges leaving each offset before the sink. Offsets no path reaches have
     /// none.
     pub(crate) nodes: Vec<Node>,
-    /// The alignment edge `0 -> k` of each overlap length `k`, below both the needle
+    /// The alignment edge `0 -> k` of each overlap length `k`, below both the pattern
     /// length and `MAX_TOKEN_SIZE`. Index 0 is unused.
     pub(crate) overlaps: Vec<Option<Overlap>>,
-    /// The tokens that contain the whole needle but do not start with it: the
-    /// alignment edge `0 -> n`, absent if empty. Tokens starting with the needle are
+    /// The tokens that contain the whole pattern but do not start with it: the
+    /// alignment edge `0 -> n`, absent if empty. Tokens starting with the pattern are
     /// on the source's range edge.
     pub(crate) contained: Box<[Token]>,
 }
@@ -46,16 +46,16 @@ pub(crate) struct AlignmentGraph {
 pub(crate) struct Node {
     /// The greedy edge: its token and the offset after it.
     pub(crate) greedy: Option<(Token, u16)>,
-    /// The range edge: the tokens that start with the rest of the needle.
+    /// The range edge: the tokens that start with the rest of the pattern.
     pub(crate) range: Option<TokenRange>,
 }
 
 /// The alignment edge of one overlap length.
 #[derive(Clone, Debug)]
 pub(crate) enum Overlap {
-    /// The tokens that end with the overlapped needle prefix.
+    /// The tokens that end with the overlapped pattern prefix.
     Set(Box<[Token]>),
-    /// Too many tokens to list. They cannot be in a filter, so a cut never selects
+    /// Too many tokens to list. They cannot be in a cover, so a cut never selects
     /// the edge.
     UnenumeratedSet,
 }
@@ -63,9 +63,9 @@ pub(crate) enum Overlap {
 /// One edge of the graph, as listed by [`AlignmentGraph::edges`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Edge<'g> {
-    /// Needle offset before this token.
+    /// Pattern offset before this token.
     pub(crate) from: u16,
-    /// Needle offset reached after this token.
+    /// Pattern offset reached after this token.
     pub(crate) to: u16,
     pub(crate) kind: EdgeKind<'g>,
 }
@@ -80,41 +80,41 @@ pub(crate) enum EdgeKind<'g> {
     /// An explicit list of tokens: an alignment edge.
     Set(&'g [Token]),
     /// An alignment edge with too many tokens to list: those ending with
-    /// `needle[..edge.to]`.
+    /// `pattern[..edge.to]`.
     UnenumeratedSet,
 }
 
 impl Edge<'_> {
-    /// Whether the edge's tokens are listed, and so can be in a filter.
+    /// Whether the edge's tokens are listed, and so can be in a cover.
     pub(crate) fn cuttable(&self) -> bool {
         !matches!(self.kind, EdgeKind::UnenumeratedSet)
     }
 }
 
 impl AlignmentGraph {
-    /// Builds the graph of `needle`.
+    /// Builds the graph of `pattern`.
     ///
-    /// The caller checks that the needle is nonempty and at most
+    /// The caller checks that the pattern is nonempty and at most
     /// `ContainsScan::MAX_PATTERN_LEN` bytes, and that the dictionary is conformant.
     ///
     /// # Errors
     /// Returns [`ContainsError::MissingByteToken`] if no token prefixes some suffix of
-    /// the needle, which happens only if the dictionary lacks a single-byte token.
+    /// the pattern, which happens only if the dictionary lacks a single-byte token.
     pub(crate) fn new(
         dict: CompactDictionaryView<'_>,
-        needle: &[u8],
+        pattern: &[u8],
     ) -> Result<Self, ContainsError> {
         let mut builder = GraphBuilder {
             dict,
-            needle,
-            nodes: vec![Node::default(); needle.len()],
-            built: vec![false; needle.len()],
+            pattern,
+            nodes: vec![Node::default(); pattern.len()],
+            built: vec![false; pattern.len()],
         };
-        let starts = MatchStarts::new(dict, needle);
+        let starts = MatchStarts::new(dict, pattern);
 
         // Paths from matches beginning at a token boundary, then from each overlap.
         builder.build_path(0)?;
-        let overlaps: Vec<_> = (0..needle.len().min(MAX_TOKEN_SIZE))
+        let overlaps: Vec<_> = (0..pattern.len().min(MAX_TOKEN_SIZE))
             .map(|length| starts.overlap(length))
             .collect();
         for (length, overlap) in overlaps.iter().enumerate() {
@@ -130,7 +130,7 @@ impl AlignmentGraph {
         })
     }
 
-    /// The offset after the whole needle. The source is always 0.
+    /// The offset after the whole pattern. The source is always 0.
     pub(crate) fn sink(&self) -> u16 {
         // At most `ContainsScan::MAX_PATTERN_LEN`, which fits `u16`.
         self.nodes.len() as u16
@@ -182,7 +182,7 @@ impl AlignmentGraph {
 /// Graph construction state; each reachable offset is built once.
 struct GraphBuilder<'d, 'n> {
     dict: CompactDictionaryView<'d>,
-    needle: &'n [u8],
+    pattern: &'n [u8],
     nodes: Vec<Node>,
     /// Offsets whose outgoing edges have been set.
     built: Vec<bool>,
@@ -190,9 +190,9 @@ struct GraphBuilder<'d, 'n> {
 
 impl GraphBuilder<'_, '_> {
     /// Adds the greedy path from `start`, stopping at the first offset already built.
-    /// The loop is iterative, so stack use does not grow with the needle.
+    /// The loop is iterative, so stack use does not grow with the pattern.
     fn build_path(&mut self, start: usize) -> Result<(), ContainsError> {
-        let n = self.needle.len();
+        let n = self.pattern.len();
         let mut offset = start;
         while !self.built[offset] {
             self.built[offset] = true;
@@ -206,9 +206,9 @@ impl GraphBuilder<'_, '_> {
     }
 
     /// Sets the edges leaving `offset`, and returns the offset after the longest token
-    /// that prefixes the rest of the needle. Fails if there is no such token.
+    /// that prefixes the rest of the pattern. Fails if there is no such token.
     fn build_position(&mut self, offset: usize) -> Result<usize, ContainsError> {
-        let remaining = &self.needle[offset..];
+        let remaining = &self.pattern[offset..];
         let (longest, starting_with) = longest_prefix(self.dict, remaining);
         let node = &mut self.nodes[offset];
         // The tokens that start with the whole remainder finish the match.
@@ -222,8 +222,8 @@ impl GraphBuilder<'_, '_> {
 
         let next_offset = offset + token_length;
         // An exact match of the remainder is already in the range above. Offsets are
-        // at most the needle length, which fits `u16`.
-        if next_offset < self.needle.len() {
+        // at most the pattern length, which fits `u16`.
+        if next_offset < self.pattern.len() {
             node.greedy = Some((token, next_offset as u16));
         }
         Ok(next_offset)
@@ -250,22 +250,22 @@ mod tests {
     }
 
     /// Check one position's edges against token bytes.
-    fn check_position(dict: CompactDictionaryView<'_>, needle: &[u8], offset: usize) {
-        let remaining = &needle[offset..];
+    fn check_position(dict: CompactDictionaryView<'_>, pattern: &[u8], offset: usize) {
+        let remaining = &pattern[offset..];
         let ids = (0..dict.num_tokens()).map(|id| id as Token);
         let next = ids
             .clone()
             .filter(|&id| remaining.starts_with(dict.token(id)))
             .max_by_key(|&id| dict.token_len(id));
-        let terminal: Vec<_> = ids
+        let range_tokens: Vec<_> = ids
             .filter(|&id| dict.token(id).starts_with(remaining))
             .collect();
 
         let mut builder = GraphBuilder {
             dict,
-            needle,
-            nodes: vec![Node::default(); needle.len()],
-            built: vec![false; needle.len()],
+            pattern,
+            nodes: vec![Node::default(); pattern.len()],
+            built: vec![false; pattern.len()],
         };
         let expected_next = next
             .map(|id| offset + dict.token_len(id))
@@ -273,27 +273,27 @@ mod tests {
         assert_eq!(
             builder.build_position(offset),
             expected_next,
-            "{needle:?}, offset={offset}"
+            "{pattern:?}, offset={offset}"
         );
 
         let node = builder.nodes[offset];
         let greedy = next
             .filter(|&id| dict.token_len(id) < remaining.len())
             .map(|id| (id, (offset + dict.token_len(id)) as u16));
-        assert_eq!(node.greedy, greedy, "{needle:?}, offset={offset}");
+        assert_eq!(node.greedy, greedy, "{pattern:?}, offset={offset}");
         let range: Vec<Token> = node
             .range
             .map_or(Vec::new(), |range| (range.begin..=range.last).collect());
-        assert_eq!(range, terminal, "{needle:?}, offset={offset}");
+        assert_eq!(range, range_tokens, "{pattern:?}, offset={offset}");
     }
 
     #[test]
-    fn greedy_and_terminal_edges() {
+    fn greedy_and_range_edges() {
         let dict = dictionary(&[b"app", b"appapple", b"applepie"]);
         check_position(dict.as_view(), b"apple", 0); // Both a range edge and a greedy edge.
         check_position(dict.as_view(), b"appappapple", 0); // Greedy step after narrowing runs out.
         check_position(dict.as_view(), b"app", 0); // Exact token: no duplicate greedy edge.
-        check_position(dict.as_view(), b"xxxapple", 3); // Edges use absolute needle offsets.
+        check_position(dict.as_view(), b"xxxapple", 3); // Edges use absolute pattern offsets.
     }
 
     #[test]

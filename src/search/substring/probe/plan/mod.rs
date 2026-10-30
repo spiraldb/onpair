@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Planning: choose the cut and its filter, the matcher, and the mask packing per scan.
+//! Planning: choose the cut and its cover, the matcher, and the mask packing per scan.
 //!
-//! Every cut of the alignment graph gives a correct filter, so planning only affects
-//! speed. A filter costs matcher work for every scanned code, which grows with its
+//! Every cut of the alignment graph gives a correct cover, so planning only affects
+//! speed. A cover costs matcher work for every scanned code, which grows with its
 //! number of codes, plus verification work for every hit, which grows with their
 //! frequency. For a fixed matcher both terms add up over the cut's edges, so a
-//! minimum cut finds that matcher's cheapest filter, up to how the filter merges
+//! minimum cut finds that matcher's cheapest cover, up to how the cover merges
 //! the edges' shared tokens and overlapping ranges. `select` solves a few such cuts
-//! and keeps the cheapest filter, with its matcher, under the cost model in `cost`.
+//! and keeps the cheapest cover, with its matcher, under the cost model in `cost`.
 //!
 //! Mask packing is chosen per scan, from the expected hit density.
 
@@ -27,18 +27,18 @@ pub(super) use cost::{CostModel, max_nibble_batches};
 /// hits can make skipping pay off above it too.
 const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 2.5e-4;
 
-/// A filter and the matcher chosen for it.
+/// A cover and the matcher chosen for it.
 pub(super) struct Plan {
     pub(super) cover: ProbeCover,
     pub(super) matcher: MatcherKind,
-    /// Occurrences of the filter's tokens in the indexed stream.
+    /// Occurrences of the cover's tokens in the indexed stream.
     pub(super) hits: u32,
 }
 
-/// The cheapest filter of `graph`, with its matcher.
+/// The cheapest cover of `graph`, with its matcher.
 ///
-/// The first cut minimizes frequency alone. That is the table's cheapest filter,
-/// since its speed does not depend on the filter, and the only cut on scalar
+/// The first cut minimizes frequency alone. That is the table's cheapest cover,
+/// since its speed does not depend on the cover, and the only cut on scalar
 /// targets, where only the table runs. Vector targets also try the cuts of
 /// `CutWeights::priced`. Cuts often coincide, so a repeated cut is not evaluated
 /// again: building a cover can cost more than solving for it, as when one edge
@@ -118,15 +118,15 @@ pub(super) fn is_eligible(isa: Isa, matcher: MatcherKind, cover: &ProbeCover) ->
 
 /// Whether vector matchers should skip packing groups without hits in this scan.
 ///
-/// True when hits are sparse (`probe_density`, the covered fraction of the indexed
+/// True when hits are sparse (`hit_density`, the covered fraction of the indexed
 /// stream, is below the threshold) or when the scan's `code_count` codes are
 /// expected to hold less than one hit. The table matcher ignores this policy.
-pub(super) fn skip_empty_packing(probe_density: f64, code_count: usize) -> bool {
-    probe_density < SKIP_PACKING_DENSITY_THRESHOLD || probe_density * (code_count as f64) < 1.0
+pub(super) fn skip_empty_packing(hit_density: f64, code_count: usize) -> bool {
+    hit_density < SKIP_PACKING_DENSITY_THRESHOLD || hit_density * (code_count as f64) < 1.0
 }
 
 /// Additive cut weights: an edge weighs `hit` per hit, plus `point` and `range`
-/// per point and range it adds to the filter.
+/// per point and range it adds to the cover.
 #[derive(Clone, Copy, Debug)]
 struct CutWeights {
     hit: f64,
@@ -138,7 +138,7 @@ impl CutWeights {
     /// The cuts tried after the frequency cut, over `code_count` scanned codes:
     /// - the fewest probes, ties broken by frequency: a point outweighs any one
     ///   edge's hits, and a range weighs as many points as it costs in EqOr.
-    ///   Merging can make this filter cheaper than the priced ones;
+    ///   Merging can make this cover cheaper than the priced ones;
     /// - EqOr's cost per point and per range;
     /// - Nibble's, with each batch's cost spread over its eight points. This only
     ///   approximates Nibble's steps per batch and its limit on batches.
@@ -146,7 +146,7 @@ impl CutWeights {
         let codes = f64::from(code_count);
         let probe = codes + 1.0;
         let cut = |point: f64| Self {
-            hit: model.candidate,
+            hit: model.hit,
             point: codes * point,
             range: codes * model.range,
         };
@@ -162,7 +162,7 @@ impl CutWeights {
     }
 
     /// The weight of `edge`, whose tokens occur `frequency` times, rounded down.
-    /// Points and ranges are counted before the filter merges them.
+    /// Points and ranges are counted before the cover merges them.
     fn of(self, edge: &Edge<'_>, frequency: u32) -> u64 {
         let (points, ranges) = match edge.kind {
             EdgeKind::Single(_) => (1, 0),
@@ -203,7 +203,7 @@ mod tests {
         ] {
             for points in 0..=40 {
                 assert_eq!(
-                    is_eligible(isa, MatcherKind::NibbleN8, &cover(points, 0)),
+                    is_eligible(isa, MatcherKind::Nibble, &cover(points, 0)),
                     points > 0 && points <= limit
                 );
             }

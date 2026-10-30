@@ -32,11 +32,11 @@ fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
     compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap()
 }
 
-fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.is_empty()
+fn byte_contains(haystack: &[u8], pattern: &[u8]) -> bool {
+    pattern.is_empty()
         || haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+            .windows(pattern.len())
+            .any(|window| window == pattern)
 }
 
 fn sink_reachable_avoiding<'g>(
@@ -68,13 +68,17 @@ fn sink_reachable_avoiding<'g>(
 
 /// Builder guarantees relied on by the infallible cut solver and hit verifier, and
 /// the edge frequencies the planner weighs cuts with.
-fn check_graph(view: ColumnView<'_, u32>, frequencies: TokenFrequencyIndexView<'_>, needle: &[u8]) {
-    let graph = AlignmentGraph::new(view.dict, needle).unwrap();
-    assert_eq!(usize::from(graph.sink()), needle.len());
+fn check_graph(
+    view: ColumnView<'_, u32>,
+    frequencies: TokenFrequencyIndexView<'_>,
+    pattern: &[u8],
+) {
+    let graph = AlignmentGraph::new(view.dict, pattern).unwrap();
+    assert_eq!(usize::from(graph.sink()), pattern.len());
     assert!(graph.edges().all(|edge| edge.from < edge.to));
     assert!(
         !sink_reachable_avoiding(&graph, Edge::cuttable),
-        "a path has no probe: {needle:?}"
+        "a path has no probe: {pattern:?}"
     );
     for edge in graph.edges().filter(Edge::cuttable) {
         let cover = ProbeCover::from_edge_cut(std::iter::once(edge));
@@ -86,7 +90,7 @@ fn check_graph(view: ColumnView<'_, u32>, frequencies: TokenFrequencyIndexView<'
         assert_eq!(
             plan::edge_frequency(&edge, frequencies) as usize,
             matched,
-            "{edge:?}: {needle:?}"
+            "{edge:?}: {pattern:?}"
         );
     }
 }
@@ -142,13 +146,13 @@ fn check_scan(
         "{pattern:?}"
     );
     // Packing uses the planning stream's density, which this index describes.
-    if let Query::Scan { probe_density, .. } = scan.query {
+    if let Query::Scan { hit_density, .. } = scan.query {
         let density = if view.codes.is_empty() {
             0.0
         } else {
             covered as f64 / view.codes.len() as f64
         };
-        assert_eq!(probe_density, density, "{pattern:?}");
+        assert_eq!(hit_density, density, "{pattern:?}");
     }
     let mut actual = vec![usize::MAX];
     let mut appended = actual.clone();
@@ -185,7 +189,7 @@ fn pattern_limits_are_independent() {
 }
 
 /// The longest accepted pattern places the sink at `u16::MAX`, the largest
-/// needle offset that graph edges and the hit verifier can store.
+/// pattern offset that graph edges and the hit verifier can store.
 #[test]
 fn longest_pattern_reaches_the_largest_offset() {
     let mut rng = StdRng::seed_from_u64(7);
@@ -474,10 +478,10 @@ fn boundary_match_with_a_maximal_first_token_is_covered() {
     let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
     let column = compress_rows(&rows);
     let dict = column.view().dict;
-    let needle = b"klmnopabcdefghijklmnop";
+    let pattern = b"klmnopabcdefghijklmnop";
     // Internal entry alignments stop at 15 bytes; this needs the source path.
-    assert!((0..dict.num_tokens()).any(|id| dict.token(id as Token) == &needle[..MAX_TOKEN_SIZE]));
-    check(column.view(), &rows, &[needle]);
+    assert!((0..dict.num_tokens()).any(|id| dict.token(id as Token) == &pattern[..MAX_TOKEN_SIZE]));
+    check(column.view(), &rows, &[pattern]);
 }
 
 #[test]

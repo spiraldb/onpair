@@ -12,7 +12,7 @@
 //!
 //! A forward pass, from children to parents in offset order, accumulates subtree
 //! costs. A backward pass assigns sides from the roots down, preferring the sink
-//! side on ties. Unenumerated alignment edges, whose tokens cannot be in a filter,
+//! side on ties. Unenumerated alignment edges, whose tokens cannot be in a cover,
 //! force their target onto the source side, so they are never cut.
 
 use super::graph::Edge;
@@ -20,7 +20,7 @@ use super::graph::Edge;
 /// A cut solver for one graph, reusable with different edge weights.
 pub(crate) struct MinCut<'a> {
     edges: &'a [Edge<'a>],
-    /// Internal nodes incident to edges, in increasing needle-offset order.
+    /// Internal nodes incident to edges, in increasing pattern-offset order.
     active: Vec<u16>,
     /// Next internal node, or the sink for a forest root. Zero means unused.
     parent: Vec<u16>,
@@ -293,7 +293,7 @@ mod tests {
     /// Cutting the greedy edge out of a node leaves its range edge to cut as well.
     /// Direct source-to-sink edges are mandatory; unused offsets are harmless.
     #[test]
-    fn terminal_edges_are_charged_alongside_internal_edges() {
+    fn range_edges_are_charged_alongside_internal_edges() {
         let edges = [
             edge(0, 1, None),
             edge(1, 2, Some(2)),
