@@ -166,7 +166,7 @@ impl<'d> ContainsScan<'d> {
             });
         }
         let isa = scan::detect_isa();
-        let graph = AlignmentGraph::new(dict, pattern, frequencies)?;
+        let graph = AlignmentGraph::new(dict, pattern)?;
         let plan = plan::select(&graph, frequencies, isa);
         // Following greedy edges from the source always reaches the sink, so every
         // cut, and with it the filter, is nonempty.

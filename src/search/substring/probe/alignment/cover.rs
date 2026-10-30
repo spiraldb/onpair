@@ -89,8 +89,8 @@ impl ProbeCover {
 
     /// Builds the cover of a cut. The cover is only sound if the cut crosses every
     /// source-to-sink path, as the cut solver guarantees.
-    pub(in crate::search::substring::probe) fn from_edge_cut<'a>(
-        cut: impl ExactSizeIterator<Item = &'a Edge>,
+    pub(in crate::search::substring::probe) fn from_edge_cut<'g>(
+        cut: impl ExactSizeIterator<Item = Edge<'g>>,
     ) -> Self {
         let point = |id: Token| TokenRange {
             begin: id,
@@ -98,9 +98,9 @@ impl ProbeCover {
         };
         let mut runs = Vec::with_capacity(cut.len());
         for edge in cut {
-            match edge.kind() {
-                EdgeKind::Single(id) => runs.push(point(*id)),
-                EdgeKind::Range(range) => runs.push(*range),
+            match edge.kind {
+                EdgeKind::Single(id) => runs.push(point(id)),
+                EdgeKind::Range(range) => runs.push(range),
                 EdgeKind::Set(ids) => runs.extend(ids.iter().map(|&id| point(id))),
                 // Never cut: there are no listed tokens to probe.
                 EdgeKind::UnenumeratedSet => {}

@@ -16,7 +16,7 @@
 mod cost;
 
 use super::ProbeCover;
-use super::alignment::graph::{AlignmentGraph, Edge};
+use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::scan::{Isa, MatcherKind, PER_BATCH};
 use crate::search::index::TokenFrequencyIndexView;
@@ -50,9 +50,15 @@ pub(super) fn select(
 ) -> Plan {
     let codes = frequencies.total_frequency();
     let model = CostModel::of(isa);
-    let mut solver = MinCut::new(graph);
+    let edges: Vec<_> = graph.edges().collect();
+    // Counted once per edge, since an edge can list thousands of tokens.
+    let edge_hits: Vec<_> = edges
+        .iter()
+        .map(|edge| edge_frequency(edge, frequencies))
+        .collect();
+    let mut solver = MinCut::new(&edges, graph.sink());
     let evaluate = |cut: &[u32]| {
-        let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| &graph.edges[at as usize]));
+        let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| edges[at as usize]));
         let hits = cover.frequency(frequencies);
         let (matcher, cost) = match model {
             Some(model) => model.cheapest(&cover, hits, codes),
@@ -68,14 +74,14 @@ pub(super) fn select(
         )
     };
 
-    let first = solver.solve(|edge| u64::from(edge.frequency())).to_vec();
+    let first = solver.solve(|at| u64::from(edge_hits[at])).to_vec();
     let (mut best, mut best_cost) = evaluate(&first);
     let Some(model) = model else {
         return best;
     };
     let mut seen = vec![first];
     for weights in CutWeights::priced(model, codes) {
-        let cut = solver.solve(|edge| weights.of(edge));
+        let cut = solver.solve(|at| weights.of(&edges[at], edge_hits[at]));
         if seen.iter().any(|earlier| earlier == cut) {
             continue;
         }
@@ -86,6 +92,20 @@ pub(super) fn select(
         }
     }
     best
+}
+
+/// Occurrences of `edge`'s tokens in the indexed stream. A set lists distinct
+/// tokens, so the sum cannot exceed the stream length.
+pub(super) fn edge_frequency(edge: &Edge<'_>, frequencies: TokenFrequencyIndexView<'_>) -> u32 {
+    match edge.kind {
+        EdgeKind::Single(token) => frequencies.frequency(token),
+        EdgeKind::Range(range) => frequencies.range_frequency(range),
+        EdgeKind::Set(tokens) => tokens
+            .iter()
+            .map(|&token| frequencies.frequency(token))
+            .sum(),
+        EdgeKind::UnenumeratedSet => 0,
+    }
 }
 
 /// Whether `matcher` can run `cover` on `isa`, an instruction set this CPU supports.
@@ -145,10 +165,17 @@ impl CutWeights {
         ]
     }
 
-    /// `edge`'s weight, rounded down.
-    fn of(self, edge: &Edge) -> u64 {
-        let hits = self.hit * f64::from(edge.frequency());
-        let scan = self.point * edge.point_count() as f64 + self.range * edge.range_count() as f64;
+    /// The weight of `edge`, whose tokens occur `frequency` times, rounded down.
+    /// Points and ranges are counted before the filter merges them.
+    fn of(self, edge: &Edge<'_>, frequency: u32) -> u64 {
+        let (points, ranges) = match edge.kind {
+            EdgeKind::Single(_) => (1, 0),
+            EdgeKind::Range(_) => (0, 1),
+            EdgeKind::Set(tokens) => (tokens.len(), 0),
+            EdgeKind::UnenumeratedSet => (0, 0),
+        };
+        let hits = self.hit * f64::from(frequency);
+        let scan = self.point * points as f64 + self.range * ranges as f64;
         (hits + scan) as u64
     }
 }

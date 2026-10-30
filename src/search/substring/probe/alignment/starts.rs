@@ -13,7 +13,7 @@
 
 use memchr::memmem::Finder;
 
-use super::graph::EdgeKind;
+use super::graph::Overlap;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 
@@ -56,14 +56,14 @@ impl MatchStarts {
     }
 
     /// The alignment edge for an overlap of `length` bytes, or `None` if no token has one.
-    pub(super) fn overlap(&self, length: usize) -> Option<EdgeKind> {
+    pub(super) fn overlap(&self, length: usize) -> Option<Overlap> {
         let &count = self.counts.get(length)?;
         if count == 0 {
             None
         } else if count > MAX_ENUMERATED_TOKENS {
-            Some(EdgeKind::UnenumeratedSet)
+            Some(Overlap::UnenumeratedSet)
         } else {
-            Some(EdgeKind::Set(self.ids[length][..count].into()))
+            Some(Overlap::Set(self.ids[length][..count].into()))
         }
     }
 
@@ -183,14 +183,13 @@ pub(in crate::search::substring::probe) mod tests {
             };
             match starts.overlap(length) {
                 None => assert!(expected.is_empty(), "overlap {length}: {needle:?}"),
-                Some(EdgeKind::UnenumeratedSet) => {
+                Some(Overlap::UnenumeratedSet) => {
                     assert!(expected.len() > limit, "overlap {length}: {needle:?}");
                 }
-                Some(EdgeKind::Set(actual)) => {
+                Some(Overlap::Set(actual)) => {
                     assert!(!expected.is_empty() && expected.len() <= limit);
                     assert_eq!(&*actual, expected, "overlap {length}: {needle:?}");
                 }
-                Some(other) => panic!("unexpected overlap edge: {other:?}"),
             }
         }
     }

@@ -15,11 +15,11 @@
 //! side on ties. Unenumerated alignment edges, whose tokens cannot be in a filter,
 //! force their target onto the source side, so they are never cut.
 
-use super::graph::{AlignmentGraph, Edge};
+use super::graph::Edge;
 
 /// A cut solver for one graph, reusable with different edge weights.
-pub(in crate::search::substring::probe) struct MinCut<'g> {
-    edges: &'g [Edge],
+pub(in crate::search::substring::probe) struct MinCut<'a> {
+    edges: &'a [Edge<'a>],
     /// Internal nodes incident to edges, in increasing needle-offset order.
     active: Vec<u16>,
     /// Next internal node, or the sink for a forest root. Zero means unused.
@@ -37,18 +37,18 @@ pub(in crate::search::substring::probe) struct MinCut<'g> {
     cut: Vec<u32>,
 }
 
-impl<'g> MinCut<'g> {
-    /// Records the forest of `graph` and allocates the solve buffers.
+impl<'a> MinCut<'a> {
+    /// Records the forest of an alignment graph's `edges`, whose sink is `sink`, and
+    /// allocates the solve buffers.
     ///
     /// Relies on the alignment graph's shape: edges go forward, each internal node
     /// has at most one internal successor, and unenumerated edges leave the source.
-    pub(in crate::search::substring::probe) fn new(graph: &'g AlignmentGraph) -> Self {
-        let node_count = graph.node_count();
-        let sink = graph.sink();
+    pub(in crate::search::substring::probe) fn new(edges: &'a [Edge<'a>], sink: u16) -> Self {
+        let node_count = usize::from(sink) + 1;
         let mut parent = vec![0; node_count];
         let mut forced_source = vec![false; node_count];
 
-        for edge in &graph.edges {
+        for edge in edges {
             let (from, to) = (edge.from, edge.to);
 
             // Mark incident internal nodes. Until a continuation is found,
@@ -72,7 +72,7 @@ impl<'g> MinCut<'g> {
             .collect();
 
         Self {
-            edges: &graph.edges,
+            edges,
             active,
             parent,
             parent_weight: vec![0; node_count],
@@ -83,14 +83,15 @@ impl<'g> MinCut<'g> {
         }
     }
 
-    /// Returns the cheapest cut as ascending indices into the graph's edges. Among
-    /// equal-cost cuts, it picks the one with the inclusion-minimal source side.
+    /// Returns the cheapest cut as ascending indices into the edges. Among equal-cost
+    /// cuts, it picks the one with the inclusion-minimal source side.
     ///
-    /// `weight` is only called for cuttable edges. Weights must be nonnegative and
-    /// their sum must fit in `i64`, which the planner's weights do.
+    /// `weight(i)` weighs the edge at index `i`, and is only called for cuttable
+    /// edges. Weights must be nonnegative and their sum must fit in `i64`, which the
+    /// planner's weights do.
     pub(in crate::search::substring::probe) fn solve(
         &mut self,
-        weight: impl Fn(&Edge) -> u64,
+        weight: impl Fn(usize) -> u64,
     ) -> &[u32] {
         let sink = self.parent.len() - 1;
 
@@ -99,10 +100,13 @@ impl<'g> MinCut<'g> {
         // Direct source-to-sink costs accumulate at the sink and do not affect
         // assignments: those edges must be cut regardless.
         self.delta.fill(0);
-        for edge in self.edges.iter().filter(|edge| edge.cuttable()) {
+        for (at, edge) in self.edges.iter().enumerate() {
+            if !edge.cuttable() {
+                continue;
+            }
             let from = edge.from as usize;
             let to = edge.to as usize;
-            let cost = weight(edge) as i64;
+            let cost = weight(at) as i64;
 
             if from == 0 {
                 self.delta[to] -= cost;
@@ -157,28 +161,48 @@ impl<'g> MinCut<'g> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::substring::probe::alignment::graph::tests::{
-        synthetic_edge, synthetic_graph,
-    };
+    use crate::core::types::Token;
+    use crate::search::substring::probe::alignment::graph::EdgeKind;
+
+    /// Test edge; `None` makes it unenumerated, and a weight is stored as the token.
+    fn edge(from: u16, to: u16, weight: Option<Token>) -> Edge<'static> {
+        Edge {
+            from,
+            to,
+            kind: weight.map_or(EdgeKind::UnenumeratedSet, EdgeKind::Single),
+        }
+    }
+
+    /// The weight `edge` stores.
+    fn weight(edge: &Edge<'_>) -> u64 {
+        match edge.kind {
+            EdgeKind::Single(weight) => u64::from(weight),
+            _ => panic!("no weight: {edge:?}"),
+        }
+    }
 
     /// Return cut endpoints in edge order for readable test expectations.
-    fn cut_steps(graph: &AlignmentGraph) -> Vec<(u16, u16)> {
-        MinCut::new(graph)
-            .solve(|edge| u64::from(edge.frequency()))
+    fn cut_steps(edges: &[Edge<'_>], sink: u16) -> Vec<(u16, u16)> {
+        MinCut::new(edges, sink)
+            .solve(|at| weight(&edges[at]))
             .iter()
-            .map(|&at| (graph.edges[at as usize].from, graph.edges[at as usize].to))
+            .map(|&at| (edges[at as usize].from, edges[at as usize].to))
             .collect()
     }
 
     /// Enumerate all partitions and intersect the optimal source sides.
     /// This checks both optimality and tie-breaking independently of the DP.
-    fn exhaustive_cut(graph: &AlignmentGraph, weight: impl Fn(&Edge) -> u64) -> Vec<u32> {
+    fn exhaustive_cut(
+        edges: &[Edge<'_>],
+        sink: u16,
+        weight: impl Fn(&Edge<'_>) -> u64,
+    ) -> Vec<u32> {
         let mut best = u64::MAX;
         let mut common = u64::MAX;
-        'partitions: for interior in 0..1u64 << (graph.node_count() - 2) {
+        'partitions: for interior in 0..1u64 << (sink - 1) {
             let side = 1 | (interior << 1);
             let mut cost = 0;
-            for edge in &graph.edges {
+            for edge in edges {
                 if side & (1 << edge.from) != 0 && side & (1 << edge.to) == 0 {
                     if !edge.cuttable() {
                         continue 'partitions;
@@ -193,8 +217,7 @@ mod tests {
                 common &= side;
             }
         }
-        graph
-            .edges
+        edges
             .iter()
             .enumerate()
             .filter_map(|(at, edge)| {
@@ -219,23 +242,25 @@ mod tests {
                     continue 'graphs;
                 }
                 if choice != 0 {
-                    let frequency = [None, Some(0), Some(1), Some(3)][choice - 1];
-                    edges.push(synthetic_edge(from, to, frequency));
+                    edges.push(edge(
+                        from,
+                        to,
+                        [None, Some(0), Some(1), Some(3)][choice - 1],
+                    ));
                 }
             }
-            let graph = synthetic_graph(4, edges);
-            let mut solver = MinCut::new(&graph);
+            let mut solver = MinCut::new(&edges, 3);
             for large in [false, true, false] {
-                let weight = |edge: &Edge| {
+                let weight = |edge: &Edge<'_>| {
                     if large {
-                        (1u64 << 32) + u64::from(u32::MAX - edge.frequency())
+                        (1u64 << 32) + (u64::from(u32::MAX) - weight(edge))
                     } else {
-                        u64::from(edge.frequency())
+                        weight(edge)
                     }
                 };
                 assert_eq!(
-                    solver.solve(weight),
-                    exhaustive_cut(&graph, weight),
+                    solver.solve(|at| weight(&edges[at])),
+                    exhaustive_cut(&edges, 3, weight),
                     "graph={configuration}, large={large}"
                 );
             }
@@ -245,63 +270,51 @@ mod tests {
     /// Cut a shared suffix once for 6 instead of two separate branches for 4 + 4.
     #[test]
     fn shared_suffix_beats_two_local_choices() {
-        let graph = synthetic_graph(
-            5,
-            vec![
-                synthetic_edge(0, 1, None),
-                synthetic_edge(0, 2, None),
-                synthetic_edge(1, 3, Some(4)),
-                synthetic_edge(2, 3, Some(4)),
-                synthetic_edge(3, 4, Some(6)),
-            ],
-        );
-        assert_eq!(cut_steps(&graph), vec![(3, 4)]);
+        let edges = [
+            edge(0, 1, None),
+            edge(0, 2, None),
+            edge(1, 3, Some(4)),
+            edge(2, 3, Some(4)),
+            edge(3, 4, Some(6)),
+        ];
+        assert_eq!(cut_steps(&edges, 4), vec![(3, 4)]);
     }
 
     /// Separate paths both need a cut, including a path with a zero-weight edge.
     #[test]
     fn disjoint_paths_are_cut_separately() {
-        let graph = synthetic_graph(
-            5,
-            vec![
-                synthetic_edge(0, 1, None),
-                synthetic_edge(1, 4, Some(5)),
-                synthetic_edge(0, 2, None),
-                synthetic_edge(2, 3, Some(9)),
-                synthetic_edge(3, 4, Some(0)),
-            ],
-        );
-        assert_eq!(cut_steps(&graph), vec![(1, 4), (3, 4)]);
+        let edges = [
+            edge(0, 1, None),
+            edge(1, 4, Some(5)),
+            edge(0, 2, None),
+            edge(2, 3, Some(9)),
+            edge(3, 4, Some(0)),
+        ];
+        assert_eq!(cut_steps(&edges, 4), vec![(1, 4), (3, 4)]);
     }
 
     /// Cutting the greedy edge out of a node leaves its range edge to cut as well.
     /// Direct source-to-sink edges are mandatory; unused offsets are harmless.
     #[test]
     fn terminal_edges_are_charged_alongside_internal_edges() {
-        let graph = synthetic_graph(
-            5,
-            vec![
-                synthetic_edge(0, 1, None),
-                synthetic_edge(1, 2, Some(2)),
-                synthetic_edge(1, 4, Some(5)),
-                synthetic_edge(2, 4, Some(3)),
-                synthetic_edge(0, 4, Some(7)),
-            ],
-        );
-        assert_eq!(cut_steps(&graph), vec![(1, 2), (1, 4), (0, 4)]);
+        let edges = [
+            edge(0, 1, None),
+            edge(1, 2, Some(2)),
+            edge(1, 4, Some(5)),
+            edge(2, 4, Some(3)),
+            edge(0, 4, Some(7)),
+        ];
+        assert_eq!(cut_steps(&edges, 4), vec![(1, 2), (1, 4), (0, 4)]);
     }
 
     /// A long path exercises the iterative solver without growing the call stack.
     #[test]
     fn deep_path_does_not_exhaust_the_stack() {
         // The longest pattern: its sink is the largest `u16` offset.
-        const NODES: usize = u16::MAX as usize + 1;
-        let mut edges: Vec<Edge> = (0..u16::MAX)
-            .map(|v| synthetic_edge(v, v + 1, Some(7)))
-            .collect();
         let cheapest = u16::MAX / 2;
-        edges[usize::from(cheapest)] = synthetic_edge(cheapest, cheapest + 1, Some(3));
-        let graph = synthetic_graph(NODES, edges);
-        assert_eq!(cut_steps(&graph), vec![(cheapest, cheapest + 1)]);
+        let edges: Vec<_> = (0..u16::MAX)
+            .map(|v| edge(v, v + 1, Some(if v == cheapest { 3 } else { 7 })))
+            .collect();
+        assert_eq!(cut_steps(&edges, u16::MAX), vec![(cheapest, cheapest + 1)]);
     }
 }

@@ -11,7 +11,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 use super::alignment::cover::ProbeCover;
-use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
+use super::alignment::graph::{AlignmentGraph, Edge};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::tests::check_starts;
 use super::plan::{self, CostModel};
@@ -40,12 +40,16 @@ fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: impl Fn(&Edge) -> bool) -> bool {
-    let mut adjacency = vec![Vec::new(); graph.node_count()];
-    for edge in &graph.edges {
+fn sink_reachable_avoiding<'g>(
+    graph: &'g AlignmentGraph,
+    blocked: impl Fn(&Edge<'g>) -> bool,
+) -> bool {
+    let node_count = usize::from(graph.sink()) + 1;
+    let mut adjacency = vec![Vec::new(); node_count];
+    for edge in graph.edges() {
         adjacency[edge.from as usize].push(edge);
     }
-    let mut seen = vec![false; graph.node_count()];
+    let mut seen = vec![false; node_count];
     let mut stack = vec![0];
     seen[0] = true;
     while let Some(node) = stack.pop() {
@@ -63,42 +67,28 @@ fn sink_reachable_avoiding(graph: &AlignmentGraph, blocked: impl Fn(&Edge) -> bo
     false
 }
 
-/// Builder guarantees relied on by the infallible cut solver and hit verifier.
+/// Builder guarantees relied on by the infallible cut solver and hit verifier, and
+/// the edge frequencies the planner weighs cuts with.
 fn check_graph(view: ColumnView<'_, u32>, frequencies: TokenFrequencyIndexView<'_>, needle: &[u8]) {
-    let graph = AlignmentGraph::new(view.dict, needle, frequencies).unwrap();
-    assert_eq!(graph.node_count(), needle.len() + 1);
-    assert!(graph.edges.len() <= 2 * needle.len() + MAX_TOKEN_SIZE);
-    assert!(
-        graph
-            .edges
-            .iter()
-            .all(|edge| edge.from < edge.to && edge.to as usize <= needle.len())
-    );
+    let graph = AlignmentGraph::new(view.dict, needle).unwrap();
+    assert_eq!(usize::from(graph.sink()), needle.len());
+    assert!(graph.edges().all(|edge| edge.from < edge.to));
     assert!(
         !sink_reachable_avoiding(&graph, Edge::cuttable),
         "a path has no probe: {needle:?}"
     );
-    let mut has_successor = vec![false; graph.node_count()];
-    for edge in &graph.edges {
-        if edge.from != 0 && edge.to != graph.sink() {
-            assert!(matches!(edge.kind(), EdgeKind::Single(_)));
-            assert!(!std::mem::replace(
-                &mut has_successor[edge.from as usize],
-                true
-            ));
-        }
-        if !edge.cuttable() {
-            assert!(edge.from == 0 && edge.to != graph.sink());
-        }
-    }
-    for edge in graph.edges.iter().filter(|edge| edge.cuttable()) {
+    for edge in graph.edges().filter(Edge::cuttable) {
         let cover = ProbeCover::from_edge_cut(std::iter::once(edge));
         let matched = view
             .codes
             .iter()
             .filter(|&&code| cover.contains(code))
             .count();
-        assert_eq!(edge.frequency() as usize, matched, "{edge:?}: {needle:?}");
+        assert_eq!(
+            plan::edge_frequency(&edge, frequencies) as usize,
+            matched,
+            "{edge:?}: {needle:?}"
+        );
     }
 }
 
@@ -212,7 +202,7 @@ fn longest_pattern_reaches_the_largest_offset() {
     let column = compress_rows(rows);
     let view = column.view();
     let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
-    let graph = AlignmentGraph::new(view.dict, &pattern, frequencies.as_view()).unwrap();
+    let graph = AlignmentGraph::new(view.dict, &pattern).unwrap();
     assert_eq!(graph.sink(), u16::MAX);
     assert_eq!(
         view.rows_containing_with_scan(&pattern, frequencies.as_view()),
@@ -543,13 +533,14 @@ fn planned_cost_does_not_exceed_the_frequency_cut() {
         b".com/page",
         b"https://www.example.com",
     ] {
-        let graph = AlignmentGraph::new(view.dict, pattern, freq).unwrap();
-        let mut solver = MinCut::new(&graph);
+        let graph = AlignmentGraph::new(view.dict, pattern).unwrap();
+        let edges: Vec<_> = graph.edges().collect();
+        let mut solver = MinCut::new(&edges, graph.sink());
         let baseline = ProbeCover::from_edge_cut(
             solver
-                .solve(|edge| u64::from(edge.frequency()))
+                .solve(|at| u64::from(plan::edge_frequency(&edges[at], freq)))
                 .iter()
-                .map(|&at| &graph.edges[at as usize]),
+                .map(|&at| edges[at as usize]),
         );
         let plan = plan::select(&graph, freq, isa);
         assert_eq!(plan.hits, plan.cover.frequency(freq));
