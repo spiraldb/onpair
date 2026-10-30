@@ -174,6 +174,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 
     /// Ascending indices of the rows equal to `needle`. The needle is
     /// [`tokenize`]d once, then matched per row without decoding.
+    ///
+    /// # Panics
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the row offsets decrease or
+    /// reach past the code stream, as [`row_codes`](Self::row_codes) does.
     pub fn rows_equal_to(&self, needle: &[u8]) -> Vec<usize> {
         let query = tokenize(needle, self.dict);
         self.select(|codes| equals(codes, &query))
@@ -181,6 +185,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 
     /// Ascending indices of the rows starting with `prefix`, prepared once as a
     /// [`PrefixQuery`] and matched per row.
+    ///
+    /// # Panics
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the row offsets decrease or
+    /// reach past the code stream, as [`row_codes`](Self::row_codes) does.
     pub fn rows_starting_with(&self, prefix: &[u8]) -> Vec<usize> {
         let query = PrefixQuery::new(prefix, self.dict);
         self.select(|codes| starts_with(codes, &query))
@@ -193,6 +201,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// # Errors
     /// Returns [`ContainsError::PatternTooLong`] if `pattern` exceeds
     /// [`ContainsDfa::MAX_PATTERN_LEN`].
+    ///
+    /// # Panics
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the row offsets decrease or
+    /// reach past the code stream, as [`row_codes`](Self::row_codes) does.
     pub fn rows_containing(&self, pattern: &[u8]) -> Result<Vec<usize>, ContainsError> {
         let dfa = ContainsDfa::new(pattern, self.dict)?;
         Ok(self.select(|codes| row_contains(codes, &dfa)))
@@ -222,6 +234,11 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     ///
     /// # Errors
     /// Propagates preparation errors from [`ContainsScan::new`].
+    ///
+    /// # Panics
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the first row offset exceeds
+    /// the last, or the last reaches past the code stream. Decreasing offsets in
+    /// between may panic the same way, as in [`ContainsScan::scan`].
     pub fn rows_containing_with_scan(
         &self,
         pattern: &[u8],
