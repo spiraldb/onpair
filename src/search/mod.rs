@@ -17,8 +17,8 @@
 //! these properties; [`crate::DictionaryView`] alone guarantees only structural safety.
 //!
 //! Equality, prefix search and [`ContainsScan`] also require rows greedily tokenized
-//! with the same dictionary, as produced by the encoder. Validating external buffers
-//! does not establish greedy tokenization.
+//! with the same dictionary, as [`Parser`](crate::Parser) encodes them. Validating
+//! external buffers does not establish greedy tokenization.
 
 mod equals;
 pub mod index;

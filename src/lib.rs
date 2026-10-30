@@ -95,7 +95,7 @@ pub use crate::encoding::rows::Rows;
 
 /// Compress an Arrow `(bytes, offsets)` value pair end-to-end. Equivalent to
 /// `Parser::train(..)?.parse(..)`, but validates the offsets once instead of in
-/// both the train and parse steps. `offsets` has `n + 1` entries. Its first
+/// both the train and parse steps, and encodes rows greedily as [`Parser`] does. `offsets` has `n + 1` entries. Its first
 /// entry may be non-zero; bytes outside `offsets[0]..offsets[n]` are ignored.
 ///
 /// # Errors
@@ -108,6 +108,7 @@ pub fn compress<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<C
 }
 
 /// Compress a [`Rows`] input without first copying it into a contiguous buffer.
+/// Rows are encoded greedily, as [`Parser`] does.
 pub fn compress_rows<R: Rows + ?Sized, O: Offset>(rows: &R, cfg: Config) -> Column<O> {
     Parser::train_rows(rows, cfg).parse_rows(rows)
 }

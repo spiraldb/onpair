@@ -18,6 +18,10 @@ use crate::encoding::trainer::{TrainResult, train};
 /// A trained encoder. Holds the [`CompactDictionary`] (cloned into each
 /// [`Column`] so columns are self-contained) and a crate-private, encode-side
 /// longest-prefix matcher built from it.
+///
+/// Each row is encoded greedily and on its own: every code is the longest
+/// dictionary token that prefixes the rest of its row. Equality, prefix and
+/// substring search over the codes rely on this, see [`search`](crate::search).
 #[derive(Debug, Clone)]
 pub struct Parser {
     /// The trained dictionary: sorted and read-padded.
