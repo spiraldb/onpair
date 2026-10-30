@@ -3,16 +3,22 @@
 
 //! Substring search over compressed rows, without decoding them.
 //!
-//! There are two implementations:
+//! An occurrence of the pattern can begin and end inside tokens, so the codes that
+//! encode it depend on the bytes around it. Two implementations handle this:
 //!
-//! * [`ContainsScan`] (`probe`) finds every row of a column that contains a pattern.
-//!   It scans the code stream for the codes of a cut of the pattern's alignment
-//!   graph, with SIMD where available, and verifies each hit in place.
-//! * [`ContainsDfa`] with [`row_contains`] (`dfa`) tests one row at a time with a
-//!   token-level KMP automaton. It needs no frequency index and works with any
-//!   dictionary view, but supports only patterns of up to 255 bytes.
+//! * [`ContainsScan`] (`probe`) finds every row of a code stream that contains the
+//!   pattern. It searches the codes for the tokens of a [`ProbeCover`], chosen so
+//!   that every occurrence is encoded with at least one of them, with SIMD where
+//!   available, and verifies each hit on the codes around it. It requires greedily
+//!   tokenized rows, uses a token frequency index to prefer rare tokens, and accepts
+//!   patterns of up to 65535 bytes.
+//! * [`ContainsDfa`] (`dfa`) lifts the pattern's KMP automaton from bytes to tokens,
+//!   and [`row_contains`] runs it over one row at a time, one step per code. It is
+//!   correct for any tokenization and needs only a sorted dictionary and no
+//!   frequency index, but accepts patterns of at most 255 bytes.
 //!
-//! Both match the empty pattern against every row, as [`str::contains`] does.
+//! Both are exact, and both match the empty pattern against every row, as
+//! [`str::contains`] does.
 
 mod dfa;
 mod error;

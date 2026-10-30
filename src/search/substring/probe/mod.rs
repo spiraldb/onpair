@@ -1,47 +1,62 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! [`ContainsScan`]: substring search by scanning for the codes of a cut.
+//! [`ContainsScan`]: substring search by scanning for a cover of the pattern.
 //!
-//! # How it works
+//! # Alignment graph
 //!
-//! Rows are tokenized greedily: each token is the longest dictionary entry that
-//! prefixes the remaining bytes. An occurrence of the pattern may begin inside a
-//! token, but from its first token boundary on, greedy tokenization leaves little
-//! choice. Each later token either ends inside the pattern, and is then the longest
-//! token that prefixes the rest of the pattern, or finishes it, and then starts with
-//! whatever remains.
+//! The encoder tokenizes greedily: each token is the longest dictionary entry that
+//! prefixes the remaining bytes. An occurrence of an `n`-byte pattern may begin
+//! inside a token, but from its first token boundary on, each token either ends
+//! inside the pattern, and is then the longest token prefixing the rest of the
+//! pattern, or reaches past its end, and then starts with the rest of the pattern.
 //!
-//! All possible encodings therefore fit in a small DAG, the *alignment graph*. Its
-//! nodes are the pattern offsets `0..=n`, and every occurrence in a row is a path
-//! from `0` to `n` whose edges are the occurrence's tokens:
+//! Every encoding of an occurrence is therefore a path from `0` to `n` in a small
+//! DAG over the pattern offsets, the *alignment graph*:
 //!
-//! * an *alignment edge* `0 -> k` for a first token that begins before the
-//!   occurrence and ends with its first `k` bytes, or `0 -> n` if it contains the
-//!   whole occurrence;
-//! * a *greedy edge* for each token that begins and ends inside the pattern;
-//! * a *range edge* to `n` for a last token that starts with the rest of the pattern.
+//! * *alignment edges* `0 -> k`: the tokens an occurrence begins inside, which end
+//!   with its first `k` bytes, and `0 -> n`: the tokens that contain it whole;
+//! * at most one *greedy edge* per node: the longest token that prefixes the rest
+//!   of the pattern and ends before `n`;
+//! * at most one *range edge* `i -> n` per node: the tokens that start with the
+//!   rest of the pattern, a contiguous ID range in the sorted dictionary.
 //!
-//! Preparation picks a *cut* of this graph: a set of edges that every path crosses.
-//! The codes on its edges form the *cover*, represented as a [`ProbeCover`]: every
-//! row that contains the pattern contains one of them. Any cut is correct, and the
-//! planner looks for a cheap one: rare codes mean few hits to verify, and few
-//! distinct codes mean a faster matcher.
+//! The graph has at most `2n + MAX_TOKEN_SIZE` edges. Finding the alignment edges
+//! takes one pass over the dictionary's bytes, and every other edge one binary
+//! search. Without the source and the sink, the greedy edges form a forest.
 //!
-//! The scan then processes the codes block by block:
+//! # Cover
 //!
-//! 1. a matcher marks every code in the cover, a *hit*;
-//! 2. each hit is mapped to its row and verified by walking the alignment graph
-//!    forward and backward through the neighboring codes.
+//! A *cut* is a set of edges that every source-to-sink path crosses. The tokens on
+//! its edges form the *cover* ([`ProbeCover`]): every occurrence is encoded with at
+//! least one of them. Any cut is correct, so the choice only affects speed: each
+//! covered code in the stream is a *hit* to locate and verify, and each point or
+//! range adds matcher work on every code. `plan` prices both with a cost model per
+//! instruction set, solves a minimum cut on the forest in linear time for a few
+//! edge weightings, and keeps the cheapest cover with its matcher. Alignment edges
+//! with too many tokens to list are never cut.
 //!
-//! A row is emitted on its first verified hit, and its remaining hits are skipped.
+//! # Scan
+//!
+//! The scan reads the codes in blocks of 4096. A matcher sets one mask bit per hit:
+//! `Table` looks codes up in a 64 KiB table, `EqOr` compares every point, and
+//! `Nibble` tests eight points at once with shuffle tables. The vector matchers
+//! also check ranges, and run on NEON, AVX2 or AVX-512, chosen at runtime. The
+//! resolver maps each hit to its row, and the verifier walks the row's codes
+//! forward and backward from the hit along the alignment graph, for each edge the
+//! hit token is on, until both walks spell the pattern for one of them. A row is
+//! appended on its first verified hit; its later hits are skipped.
+//!
+//! The cover and the walks both rely on greedy tokenization. Patterns made of one
+//! repeated byte are the slow case: their tokens are on many edges, and each hit
+//! may try them all.
 //!
 //! # Modules
 //!
 //! * `alignment`: the alignment graph and its minimum cut.
 //! * `cover`: the cover of a cut, a `ProbeCover`.
-//! * `plan`: the cost model that chooses the cut, its matcher and the mask packing.
-//! * `scan`: the block loop, the SIMD matchers and row resolution.
+//! * `plan`: the cost model that chooses the cover, its matcher and the mask packing.
+//! * `scan`: the block loop, the matchers and row resolution.
 //! * `verify`: the hit verifier.
 
 mod alignment;
