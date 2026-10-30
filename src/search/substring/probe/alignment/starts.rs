@@ -17,10 +17,15 @@ use super::graph::Overlap;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 
-/// Maximum number of tokens listed for one overlap.
+/// Most tokens an overlap edge lists. An overlap shared by more tokens is
+/// unenumerated: its edge is never cut, and the verifier recognizes its tokens by
+/// their suffix. A higher cap lets cuts use more edges, for more setup work and
+/// memory in every query.
 pub(crate) const MAX_ENUMERATED_TOKENS: usize = 512;
 
-/// Maximum number of tokens listed for a one-byte overlap.
+/// Most tokens a one-byte overlap lists. Every token ending with the pattern's
+/// first byte has one, so these overlaps are large, and the lower cap lets their
+/// pass over the dictionary stop early.
 const MAX_SINGLE_BYTE_TOKENS: usize = 16;
 
 /// Count marking an overlap whose tokens exceeded the cap.

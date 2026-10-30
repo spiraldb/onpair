@@ -34,6 +34,12 @@
 //! [`ColumnView::decoded_len`] or [`ColumnView::row_decoded_len`] (plus
 //! [`DECODE_PADDING`]).
 //!
+//! # Search
+//! [`search`] answers equality, prefix and substring queries on the codes, without
+//! decoding rows. On a column view, [`ColumnView::rows_equal_to`],
+//! [`ColumnView::rows_starting_with`], [`ColumnView::rows_containing`] and
+//! [`ColumnView::rows_containing_with_scan`] return the rows that match.
+//!
 //! # Examples
 //! ```
 //! use onpair::{Column, DECODE_PADDING, DEFAULT_CONFIG};
