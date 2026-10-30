@@ -21,11 +21,11 @@
 //!   `ranges_mask` handles covers with ranges only. A code is in `[begin, last]` iff
 //!   `code.wrapping_sub(begin) <= last - begin`: codes below `begin` wrap around to
 //!   large values, so one unsigned comparison suffices.
-//! - A kernel maps `Vectors`, 64 codes, to `Hits`. `words` runs it over a block,
-//!   128 codes at a time, and packs the hits into mask words; when skipping is
-//!   enabled, groups without hits are zeroed without packing. The closures passed
-//!   to `words` are `#[inline(always)]`, since `words` calls each twice per 128
-//!   codes and the compiler would otherwise keep it out of line.
+//! - A kernel maps `Vectors`, a group of 64 codes, to `Hits`. `words` runs it over
+//!   a block, a pair of groups at a time, and packs each group's hits into a mask
+//!   word; when skipping is enabled, a pair without hits is zeroed without packing.
+//!   The closures passed to `words` are `#[inline(always)]`, since `words` calls
+//!   each twice per pair and the compiler would otherwise keep it out of line.
 //!
 //! AArch64 builds contain the `neon` kernels. x86_64 builds contain both the
 //! `avx2` and the `avx512` kernels, each compiled for its own instruction set
@@ -70,9 +70,11 @@ pub(crate) trait Matcher: Send + Sync {
         Self: Sized;
 
     /// Overwrites `bits` with the block's mask. With `skip_empty`, a vector matcher
-    /// tests each 128 codes for a hit and zeroes their mask words without packing
-    /// if there is none. Returns `false` only if the mask is empty, so the caller
-    /// can skip row lookup; `true` does not imply a hit.
+    /// tests each pair of 64-code groups for a hit and zeroes their mask words
+    /// without packing if there is none. On AVX-512 the hits already are mask words,
+    /// so skipping saves no packing there and only lets `check` report an empty
+    /// block. Returns `false` only if the mask is empty, so the caller can skip row
+    /// lookup; `true` does not imply a hit.
     fn check(&self, codes: &Block, bits: &mut Mask, skip_empty: bool) -> bool;
 }
 

@@ -191,8 +191,8 @@ impl<'d> ContainsScan<'d> {
         let isa = scan::detect_isa();
         let graph = AlignmentGraph::new(dict, pattern)?;
         let plan = plan::select(&graph, frequencies, isa);
-        // Following greedy edges from the source always reaches the sink, so every
-        // cut, and with it the cover, is nonempty.
+        // The greedy path from the source, closed by a range edge, has only cuttable
+        // edges, so every cut, and with it the cover, is nonempty.
         debug_assert!(!plan.cover.is_empty(), "empty cover for {pattern:?}");
         Ok(Self {
             dict,

@@ -5,8 +5,8 @@
 //!
 //! The instruction set, the matcher kind and the number of Nibble batches are
 //! resolved into a concrete matcher behind `dyn Matcher`, which every scan of the
-//! query then calls once per block. Whether to skip packing empty groups is decided
-//! per scan, and passed to the matcher.
+//! query then calls once per block. Whether to skip packing pairs of groups without
+//! hits is decided per scan, and passed to the matcher.
 //!
 //! AArch64 always has NEON. An x86_64 build contains both the AVX2 and the AVX-512
 //! kernels and picks the best one the CPU supports at runtime, falling back to the

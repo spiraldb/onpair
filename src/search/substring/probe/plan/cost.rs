@@ -28,7 +28,7 @@ pub(crate) struct CostModel {
     pub(super) point: f64,
     /// One inclusive range check in any vector matcher.
     pub(super) range: f64,
-    /// Nibble setup paid for each scanned vector, independent of batch count.
+    /// Nibble's cost per code that does not depend on the batch count.
     nibble_base: f64,
     /// One batch of up to eight point probes in Nibble.
     pub(super) nibble_batch: f64,

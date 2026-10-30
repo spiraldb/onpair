@@ -126,8 +126,8 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
     }
 }
 
-/// Checks a prepared scan's coverage statistics, and its rows over two runs to
-/// check reuse and appending.
+/// Checks a prepared scan's expected hits and hit density, and its rows over two
+/// runs to check reuse and appending.
 fn check_scan(
     view: ColumnView<'_, u32>,
     frequencies: TokenFrequencyIndexView<'_>,

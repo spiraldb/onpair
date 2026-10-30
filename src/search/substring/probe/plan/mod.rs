@@ -6,9 +6,10 @@
 //! Every cut of the alignment graph gives a correct cover, so planning only affects
 //! speed. A cover costs matcher work for every scanned code, which grows with its
 //! number of codes, plus verification work for every hit, which grows with their
-//! frequency. For a fixed matcher both terms add up over the cut's edges, so a
-//! minimum cut finds that matcher's cheapest cover, up to how the cover merges
-//! the edges' shared tokens and overlapping ranges. `select` solves a few such cuts
+//! frequency. For EqOr both terms add up over the cut's edges, for Nibble
+//! approximately, and for the table only the hits vary, so a minimum cut finds
+//! that matcher's cheapest cover, up to how the cover merges the edges' shared
+//! tokens and overlapping ranges. `select` solves a few such cuts
 //! and keeps the cheapest cover, with its matcher, under the cost model in `cost`.
 //!
 //! Mask packing is chosen per scan, from the expected hit density.
@@ -22,8 +23,8 @@ use super::scan::{Isa, MatcherKind, PER_BATCH};
 use crate::search::index::TokenFrequencyIndexView;
 pub(super) use cost::{CostModel, max_nibble_batches};
 
-/// Hit density below which vector matchers test each 128 codes for a hit before
-/// packing them: 0.025%, about one expected hit per 4096-code block. Clustered
+/// Hit density below which vector matchers test each pair of 64-code groups for a
+/// hit before packing it: 0.025%, about one expected hit per 4096-code block. Clustered
 /// hits can make skipping pay off above it too.
 const SKIP_PACKING_DENSITY_THRESHOLD: f64 = 2.5e-4;
 
@@ -116,7 +117,8 @@ pub(super) fn is_eligible(isa: Isa, matcher: MatcherKind, cover: &ProbeCover) ->
     })
 }
 
-/// Whether vector matchers should skip packing groups without hits in this scan.
+/// Whether vector matchers should skip packing pairs of groups without hits in this
+/// scan.
 ///
 /// True when hits are sparse (`hit_density`, the covered fraction of the indexed
 /// stream, is below the threshold) or when the scan's `code_count` codes are

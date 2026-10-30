@@ -25,8 +25,8 @@ type State = u8;
 /// with [`row_contains`].
 ///
 /// It needs no frequency index and supports patterns of up to
-/// [`MAX_PATTERN_LEN`](Self::MAX_PATTERN_LEN) bytes. To find all matching rows of a
-/// column, see [`ContainsScan`](crate::search::ContainsScan). The automaton is
+/// [`MAX_PATTERN_LEN`](Self::MAX_PATTERN_LEN) bytes. For a whole code stream,
+/// [`ContainsScan`](crate::search::ContainsScan) is usually faster. The automaton is
 /// immutable, so it can be shared between threads.
 ///
 /// # Examples
