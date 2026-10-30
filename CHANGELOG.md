@@ -5,21 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.2.0...HEAD)
+## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.3.0...HEAD)
 
 ### Added
 
-- Add `ContainsScan`, a substring search over the compressed codes. A
-  frequency-aware min-cut cover chooses the probe tokens, SIMD matchers find
-  them (NEON; AVX-512BW or AVX2 on x86_64, chosen at runtime; scalar on other
-  targets), and every hit is verified exactly in the compressed domain.
-  `ColumnView::rows_containing_with_scan` runs it over a column view, including
-  a view sliced from a larger column.
-- Add `search::index::TokenFrequencyIndex`, the per-token frequency index used
-  for probe planning, and `TokenFrequencyIndexView`, which borrows stored
-  prefix sums without copying them.
-- Add row-based training and compression without flattening input first.
-- Add encoding into reusable caller-owned buffers.
+- Add `ContainsScan`, an exact substring search over a whole column's codes,
+  accelerated with SIMD, and `ColumnView::rows_containing_with_scan`, which runs
+  it over a column view.
+- Add `search::index::TokenFrequencyIndex` and its borrowed view
+  `TokenFrequencyIndexView`, the token counts `ContainsScan` plans with.
+- Add `TokenRange::new`.
 
 ### Changed
 
@@ -33,9 +28,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[non_exhaustive]`, like the new `ContainsError` and
   `InvalidFrequencyIndex`, so later releases can add variants without a
   breaking change. Exhaustive matches on them need a wildcard arm.
+
+## [0.3.0](https://github.com/spiraldb/onpair/compare/v0.2.1...v0.3.0) - 2026-10-27
+
+### Changed
+
 - **Breaking:** Make `DictionaryStorage` an unsafe trait. Custom implementations
   must use `unsafe impl` and uphold the documented buffer stability and cloning
   contract.
+- Speed up parsing with a dictionary structure built for lookups only, which
+  avoids dependent loads and scans several input positions at once.
+- Speed up parsing on x86-64 and non-Apple AArch64 by comparing 128-bit keys
+  without a branch.
+
+### Fixed
+
+- Close a soundness hole where a safe `DictionaryStorage` implementation could
+  switch buffers after validation and cause out-of-bounds reads through safe
+  dictionary methods ([#36](https://github.com/spiraldb/onpair/issues/36)).
+
+## [0.2.1](https://github.com/spiraldb/onpair/compare/v0.2.0...v0.2.1) - 2026-09-08
+
+### Added
+
+- Add row-based training and compression without flattening input first.
+- Add encoding into reusable caller-owned buffers.
+
+### Changed
+
 - Scan dynamic training samples sequentially without changing their contents or
   order.
 - Speed up matching for large dictionaries.
@@ -46,9 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Close a soundness hole where a safe `DictionaryStorage` implementation could
-  switch buffers after validation and cause out-of-bounds reads through safe
-  dictionary methods ([#36](https://github.com/spiraldb/onpair/issues/36)).
 - Train on the randomly selected rows returned by partial shuffling, expanding
   the selection when needed to cover the sampling budget.
 - Ignore bytes outside the row offsets when calculating the training budget.
