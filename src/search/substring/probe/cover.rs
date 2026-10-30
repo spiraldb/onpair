@@ -7,7 +7,7 @@
 //! into sorted, disjoint points and inclusive ranges, without changing the covered
 //! set.
 
-use super::graph::{Edge, EdgeKind};
+use super::alignment::graph::{Edge, EdgeKind};
 use crate::core::types::{Token, TokenRange};
 use crate::search::index::TokenFrequencyIndexView;
 

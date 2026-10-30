@@ -10,13 +10,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use super::alignment::cover::ProbeCover;
 use super::alignment::graph::{AlignmentGraph, Edge};
 use super::alignment::mincut::MinCut;
 use super::alignment::starts::tests::check_starts;
 use super::plan::{self, CostModel};
 use super::scan::{MatcherKind, detect_isa};
-use super::{ContainsScan, Query};
+use super::{ContainsScan, ProbeCover, Query};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexView};

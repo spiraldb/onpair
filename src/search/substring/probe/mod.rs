@@ -38,17 +38,19 @@
 //!
 //! # Modules
 //!
-//! * `alignment`: the alignment graph, its minimum cut, and the resulting filter.
+//! * `alignment`: the alignment graph and its minimum cut.
+//! * `cover`: the filter of a cut, a `ProbeCover`.
 //! * `plan`: the cost model that chooses the cut, its matcher and the mask packing.
 //! * `scan`: the block loop, the SIMD matchers and row resolution.
 //! * `verify`: the hit verifier.
 
 mod alignment;
+mod cover;
 mod plan;
 mod scan;
 mod verify;
 
-pub use alignment::cover::ProbeCover;
+pub use cover::ProbeCover;
 
 use std::fmt;
 use std::sync::Arc;
