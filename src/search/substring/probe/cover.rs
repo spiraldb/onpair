@@ -11,12 +11,14 @@ use super::alignment::graph::{Edge, EdgeKind};
 use crate::core::types::{Token, TokenRange};
 use crate::search::index::TokenFrequencyIndexView;
 
-/// The filter of a [`ContainsScan`](crate::search::ContainsScan): the tokens it
-/// searches for, taken from a cut of the pattern's alignment graph.
+/// The tokens a [`ContainsScan`](crate::search::ContainsScan) searches for: every
+/// occurrence of its pattern in a greedily tokenized row is encoded with at least
+/// one of them.
 ///
-/// Every row that contains the pattern contains at least one covered token, so rows
-/// without one are skipped. Rows with a hit are only candidates: the scan verifies
-/// each hit.
+/// Points are single token IDs and ranges are inclusive runs of IDs, since tokens
+/// that share a prefix are contiguous in the sorted dictionary; both are sorted and
+/// disjoint. A covered code in a row is only a *hit*: the scan verifies each one
+/// against the pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeCover {
     /// Individual token IDs.

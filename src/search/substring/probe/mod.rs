@@ -66,13 +66,19 @@ use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::search::index::TokenFrequencyIndexView;
 use crate::search::substring::ContainsError;
 
-/// A substring query prepared for one dictionary.
+/// Finds the rows of a code stream that contain a pattern, without decoding them.
 ///
-/// Preparation chooses the filter, builds its matcher and compiles the hit verifier
-/// once. Each
-/// [`scan`](Self::scan) keeps its state local, so one query can scan any number of
-/// chunks encoded with the same dictionary, concurrently if needed. The empty
-/// pattern matches every row, without a scan.
+/// Among the tokens that encode an occurrence of the pattern in a greedily tokenized
+/// row, at least one belongs to a small set, the pattern's [cover](ProbeCover).
+/// Preparation chooses a cover whose tokens are rare in a
+/// [`TokenFrequencyIndexView`] and cheap to search for. [`scan`](Self::scan) finds
+/// the cover's codes in the stream, with SIMD where the CPU supports it (NEON, AVX2
+/// or AVX-512, detected at runtime), and confirms each of these *hits* by matching
+/// the codes around it against the pattern, so the rows it returns are exact.
+///
+/// Prepare once per pattern and dictionary, then scan any number of chunks encoded
+/// with that dictionary, concurrently if needed. The empty pattern matches every
+/// row, without a scan.
 ///
 /// # Examples
 ///
@@ -133,7 +139,7 @@ impl<'d> ContainsScan<'d> {
     /// Prepares a scan for `pattern`.
     ///
     /// `frequencies` counts how often each token occurs in a representative code
-    /// stream. It only guides the choice of the filter: inaccurate counts can make scans
+    /// stream. It only guides the choice of the cover: inaccurate counts can make scans
     /// slower, never incorrect.
     ///
     /// # Errors
@@ -250,7 +256,7 @@ impl<'d> ContainsScan<'d> {
     }
 
     /// How many codes of the stream counted by `frequencies` this scan would check
-    /// as hits: the occurrences of the filter's tokens, zero for the empty pattern.
+    /// as hits: the occurrences of the cover's tokens, zero for the empty pattern.
     /// Divided by [`total_frequency`](TokenFrequencyIndexView::total_frequency), it
     /// is the expected hit density.
     ///
@@ -268,9 +274,8 @@ impl<'d> ContainsScan<'d> {
     }
 }
 
-/// Shows the plan: the filter, the instruction set, the matcher and the hit
-/// density it was planned for. The dictionary and the verifier's tables are left
-/// out.
+/// Shows the plan: the cover, the instruction set, the matcher and the hit density
+/// it was planned for. The dictionary and the verifier's tables are left out.
 impl fmt::Debug for ContainsScan<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("ContainsScan");
