@@ -239,4 +239,31 @@ mod tests {
             }
         }
     }
+
+    /// Scans use the vector kernels the CPU has. Kernel tests skip an instruction set
+    /// that `supports` rejects, and a scan without one falls back to the table, which
+    /// is exact too, so a dispatch that never picked a vector kernel would pass every
+    /// other test.
+    #[test]
+    fn dispatch_picks_the_vector_kernels_the_cpu_has() {
+        #[cfg(target_arch = "x86_64")]
+        let expected = if std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+        {
+            Isa::Avx512Bw
+        } else if std::is_x86_feature_detected!("avx2") {
+            Isa::Avx2
+        } else {
+            Isa::Scalar
+        };
+        // Every AArch64 CPU has NEON.
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        let expected = Isa::Neon;
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        )))]
+        let expected = Isa::Scalar;
+        assert_eq!(detect_isa(), expected);
+    }
 }
