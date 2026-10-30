@@ -297,13 +297,7 @@ impl<V: DictionaryView> Build<'_, V> {
                     while i <= last && self.base[i] != exit {
                         i += 1;
                     }
-                    self.emit(
-                        TokenRange {
-                            begin: start as Token,
-                            last: (i - 1) as Token,
-                        },
-                        exit,
-                    );
+                    self.emit(TokenRange::new(start as Token, (i - 1) as Token), exit);
                 } else {
                     i += 1;
                 }
@@ -317,13 +311,7 @@ impl<V: DictionaryView> Build<'_, V> {
             cur += 1;
         }
         if cur > begin {
-            self.emit(
-                TokenRange {
-                    begin: begin as Token,
-                    last: (cur - 1) as Token,
-                },
-                kmp_j,
-            );
+            self.emit(TokenRange::new(begin as Token, (cur - 1) as Token), kmp_j);
         }
         if cur > last {
             return;
@@ -340,10 +328,7 @@ impl<V: DictionaryView> Build<'_, V> {
             let kj = self.step_bytes(kmp_j, &[c]);
             let k0 = self.step_bytes(kmp_0, &[c]);
             self.traverse(
-                TokenRange {
-                    begin: cur as Token,
-                    last: sub_hi as Token,
-                },
+                TokenRange::new(cur as Token, sub_hi as Token),
                 depth + 1,
                 kj,
                 k0,

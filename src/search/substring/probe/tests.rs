@@ -482,7 +482,7 @@ fn boundary_match_with_a_maximal_first_token_is_covered() {
 
 #[test]
 fn cover_merges_overlapping_and_adjacent_runs() {
-    let run = |begin, last| TokenRange { begin, last };
+    let run = TokenRange::new;
     let cover = ProbeCover::from_runs(vec![
         run(7, 8),
         run(0, 0),

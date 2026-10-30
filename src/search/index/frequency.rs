@@ -30,7 +30,7 @@ const MAX_TOKENS: usize = Token::MAX as usize + 1;
 ///
 /// let stored: Vec<u32> = index.into_cumulative();
 /// let view = TokenFrequencyIndexView::new(&stored)?;
-/// assert_eq!(view.range_frequency(TokenRange { begin: 1, last: 3 }), 4);
+/// assert_eq!(view.range_frequency(TokenRange::new(1, 3)), 4);
 /// assert_eq!(view.total_frequency(), 6);
 /// # Ok::<(), onpair::search::index::InvalidFrequencyIndex>(())
 /// ```
@@ -225,7 +225,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2, 0, 3, 1, 0]
         );
-        assert_eq!(view.range_frequency(TokenRange { begin: 1, last: 3 }), 4);
+        assert_eq!(view.range_frequency(TokenRange::new(1, 3)), 4);
         assert_eq!(view.range_frequency(TokenRange::EMPTY), 0);
 
         assert_eq!(

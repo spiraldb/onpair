@@ -62,7 +62,7 @@ pub(super) fn narrow<V: DictionaryView>(
         lo
     };
 
-    TokenRange { begin: first, last }
+    TokenRange::new(first, last)
 }
 
 /// One step of greedy tokenization: the longest token that prefixes `bytes`, with
@@ -79,10 +79,7 @@ pub(super) fn longest_prefix<V: DictionaryView>(
     let Some(last) = dict.num_tokens().checked_sub(1) else {
         return (None, TokenRange::EMPTY);
     };
-    let mut range = TokenRange {
-        begin: 0,
-        last: last as Token,
-    };
+    let mut range = TokenRange::new(0, last as Token);
     let mut longest = None;
     for (k, &byte) in bytes.iter().take(MAX_TOKEN_SIZE).enumerate() {
         range = narrow(dict, range, k, byte);
@@ -112,10 +109,7 @@ pub fn prefix_range<V: DictionaryView>(dict: V, needle: &[u8]) -> TokenRange {
     if n == 0 {
         return TokenRange::EMPTY;
     }
-    let mut range = TokenRange {
-        begin: 0,
-        last: (n - 1) as Token,
-    };
+    let mut range = TokenRange::new(0, (n - 1) as Token);
     for (k, &target) in needle.iter().enumerate() {
         range = narrow(dict, range, k, target);
         if range.is_empty() {

@@ -203,7 +203,7 @@ mod tests {
     /// Zero padding never becomes a hit, even when the filter contains token 0.
     #[test]
     fn padding_never_becomes_a_hit() {
-        let low = TokenRange { begin: 0, last: 3 };
+        let low = TokenRange::new(0, 3);
         for cover in [
             ProbeCover::new(vec![0], Vec::new()),
             ProbeCover::new(Vec::new(), vec![low]),

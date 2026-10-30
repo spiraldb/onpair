@@ -188,10 +188,7 @@ mod tests {
         ProbeCover::new(
             (0..points).map(|i| (2 * i) as Token).collect(),
             (0..ranges)
-                .map(|i| TokenRange {
-                    begin: (128 + 4 * i) as Token,
-                    last: (129 + 4 * i) as Token,
-                })
+                .map(|i| TokenRange::new((128 + 4 * i) as Token, (129 + 4 * i) as Token))
                 .collect(),
         )
     }

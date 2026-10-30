@@ -101,25 +101,10 @@ fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
 fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) {
     every_matcher(&cover, codes);
     every_matcher(
-        &ProbeCover::new(
-            cover.points().to_vec(),
-            vec![TokenRange {
-                begin: lo,
-                last: hi,
-            }],
-        ),
+        &ProbeCover::new(cover.points().to_vec(), vec![TokenRange::new(lo, hi)]),
         codes,
     );
-    let two = [
-        TokenRange {
-            begin: lo,
-            last: hi,
-        },
-        TokenRange {
-            begin: 60000,
-            last: 60100,
-        },
-    ];
+    let two = [TokenRange::new(lo, hi), TokenRange::new(60000, 60100)];
     every_matcher(
         &ProbeCover::new(cover.points().to_vec(), two.to_vec()),
         codes,
@@ -149,16 +134,7 @@ fn eq_or_checks_ranges_alone<K: Kernels>(codes: &Block) {
     }
     for ranges in [
         vec![],
-        vec![
-            TokenRange {
-                begin: 0,
-                last: 100,
-            },
-            TokenRange {
-                begin: 1000,
-                last: 2000,
-            },
-        ],
+        vec![TokenRange::new(0, 100), TokenRange::new(1000, 2000)],
     ] {
         let cover = ProbeCover::new(vec![], ranges);
         let want = expected(&cover, codes);
@@ -236,10 +212,7 @@ fn agree_on_ranges_of_wide_codes() {
         (50000, 50020),
         (50021, Token::MAX),
     ] {
-        let ranges = [TokenRange {
-            begin: lo,
-            last: hi,
-        }];
+        let ranges = [TokenRange::new(lo, hi)];
         every_matcher(&ProbeCover::new(vec![], ranges.to_vec()), &codes);
         every_matcher(
             &ProbeCover::new(vec![0 as Token, 30000, 50020], ranges.to_vec()),
@@ -247,13 +220,7 @@ fn agree_on_ranges_of_wide_codes() {
         );
     }
     let all = expected(
-        &ProbeCover::new(
-            vec![],
-            vec![TokenRange {
-                begin: 0,
-                last: Token::MAX,
-            }],
-        ),
+        &ProbeCover::new(vec![], vec![TokenRange::new(0, Token::MAX)]),
         &codes,
     );
     assert!(
@@ -261,13 +228,7 @@ fn agree_on_ranges_of_wide_codes() {
         "a code outside the width"
     );
     let none = expected(
-        &ProbeCover::new(
-            vec![],
-            vec![TokenRange {
-                begin: 50021,
-                last: Token::MAX,
-            }],
-        ),
+        &ProbeCover::new(vec![], vec![TokenRange::new(50021, Token::MAX)]),
         &codes,
     );
     assert!(
@@ -298,21 +259,12 @@ fn agree_on_the_sign_boundary() {
         (0, 0x7fff),
         (0x8000, Token::MAX),
     ] {
-        let range = TokenRange {
-            begin: lo,
-            last: hi,
-        };
+        let range = TokenRange::new(lo, hi);
         every_matcher(&ProbeCover::new(vec![], vec![range]), &codes);
         every_matcher(&ProbeCover::new(vec![7], vec![range]), &codes);
     }
     let across = expected(
-        &ProbeCover::new(
-            vec![],
-            vec![TokenRange {
-                begin: 0x7ffe,
-                last: 0x8001,
-            }],
-        ),
+        &ProbeCover::new(vec![], vec![TokenRange::new(0x7ffe, 0x8001)]),
         &codes,
     );
     assert_eq!(
@@ -337,10 +289,7 @@ fn agree_at_the_top_of_the_code_space() {
         (Token::MAX, Token::MAX),
         (65528, 65531),
     ] {
-        let range = TokenRange {
-            begin: lo,
-            last: hi,
-        };
+        let range = TokenRange::new(lo, hi);
         every_matcher(&ProbeCover::new(vec![], vec![range]), &codes);
         every_matcher(&ProbeCover::new(vec![65527], vec![range]), &codes);
     }
@@ -353,10 +302,7 @@ fn table_rejects_the_codes_around_its_own() {
     for (at, code) in codes.iter_mut().enumerate() {
         *code = [999, 1000, 3000, 3001, 0, Token::MAX][at % 6];
     }
-    let ranges = [TokenRange {
-        begin: 2500 as Token,
-        last: 3000,
-    }];
+    let ranges = [TokenRange::new(2500 as Token, 3000)];
     every_matcher(
         &ProbeCover::new(vec![1000 as Token], ranges.to_vec()),
         &codes,

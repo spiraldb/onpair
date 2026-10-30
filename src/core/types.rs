@@ -37,6 +37,13 @@ impl TokenRange {
     /// The canonical empty range (`begin > last`).
     pub const EMPTY: Self = Self { begin: 1, last: 0 };
 
+    /// The token ids from `begin` through `last`, both inclusive; empty if
+    /// `begin > last`.
+    #[inline]
+    pub const fn new(begin: Token, last: Token) -> Self {
+        Self { begin, last }
+    }
+
     /// Whether the range contains no token ids.
     #[inline]
     pub const fn is_empty(self) -> bool {
@@ -77,7 +84,7 @@ mod tests {
 
     #[test]
     fn token_range_inclusive_len_and_contains() {
-        let r = TokenRange { begin: 3, last: 5 };
+        let r = TokenRange::new(3, 5);
         assert!(!r.is_empty());
         assert_eq!(r.len(), 3);
         // Endpoints are inclusive on both sides.
