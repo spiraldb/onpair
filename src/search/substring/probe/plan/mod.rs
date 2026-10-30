@@ -17,7 +17,7 @@
 mod cost;
 
 use super::ProbeCover;
-use super::alignment::graph::{AlignmentGraph, Edge, EdgeKind};
+use super::alignment::graph::{Edge, EdgeKind};
 use super::alignment::mincut::MinCut;
 use super::scan::{Isa, MatcherKind, PER_BATCH};
 use crate::search::index::TokenFrequencyIndexView;
@@ -36,9 +36,13 @@ pub(super) struct Plan {
     pub(super) matcher: MatcherKind,
     /// Occurrences of the cover's tokens in the indexed stream.
     pub(super) hits: u32,
+    /// The cut the cover comes from, as ascending indices into the edges it was
+    /// planned on. Every occurrence crosses one of these edges at a hit.
+    pub(super) cut: Vec<u32>,
 }
 
-/// The cheapest cover of `graph`, with its matcher.
+/// The cheapest cover of the alignment graph with these `edges` and this `sink`,
+/// with its matcher.
 ///
 /// The first cut minimizes frequency alone. That is the table's cheapest cover,
 /// since its speed does not depend on the cover, and the only cut on scalar
@@ -47,19 +51,19 @@ pub(super) struct Plan {
 /// again: building a cover can cost more than solving for it, as when one edge
 /// lists every token containing a byte.
 pub(super) fn select(
-    graph: &AlignmentGraph,
+    edges: &[Edge<'_>],
+    sink: u16,
     frequencies: TokenFrequencyIndexView<'_>,
     isa: Isa,
 ) -> Plan {
     let codes = frequencies.total_frequency();
     let model = CostModel::of(isa);
-    let edges: Vec<_> = graph.edges().collect();
     // Counted once per edge, since an edge can list thousands of tokens.
     let edge_hits: Vec<_> = edges
         .iter()
         .map(|edge| edge_frequency(edge, frequencies))
         .collect();
-    let mut solver = MinCut::new(&edges, graph.sink());
+    let mut solver = MinCut::new(edges, sink);
     let evaluate = |cut: &[u32]| {
         let cover = ProbeCover::from_edge_cut(cut.iter().map(|&at| edges[at as usize]));
         let hits = cover.frequency(frequencies);
@@ -72,28 +76,26 @@ pub(super) fn select(
                 cover,
                 matcher,
                 hits,
+                cut: cut.to_vec(),
             },
             cost,
         )
     };
 
-    let first = solver.solve(|at| u64::from(edge_hits[at])).to_vec();
-    let (mut best, mut best_cost) = evaluate(&first);
-    let Some(model) = model else {
-        return best;
-    };
-    let mut seen = vec![first];
-    for weights in CutWeights::priced(model, codes) {
-        let cut = solver.solve(|at| weights.of(&edges[at], edge_hits[at]));
-        if seen.iter().any(|earlier| earlier == cut) {
-            continue;
-        }
-        let (plan, cost) = evaluate(cut);
-        seen.push(cut.to_vec());
-        if cost < best_cost {
-            (best, best_cost) = (plan, cost);
+    let mut plans = vec![evaluate(solver.solve(|at| u64::from(edge_hits[at])))];
+    if let Some(model) = model {
+        for weights in CutWeights::priced(model, codes) {
+            let cut = solver.solve(|at| weights.of(&edges[at], edge_hits[at]));
+            if plans.iter().all(|(plan, _)| plan.cut != cut) {
+                plans.push(evaluate(cut));
+            }
         }
     }
+    // The cheapest plan; among equal costs, the earliest.
+    let (best, _) = plans
+        .into_iter()
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .expect("the first cut is always evaluated");
     best
 }
 

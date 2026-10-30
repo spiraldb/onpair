@@ -43,13 +43,14 @@
 //! `Nibble` tests eight points at once with shuffle tables. The vector matchers
 //! also check ranges, and run on NEON, AVX2 or AVX-512, chosen at runtime. The
 //! resolver maps each hit to its row, and the verifier walks the row's codes
-//! forward and backward from the hit along the alignment graph, for each edge the
-//! hit token is on, until both walks spell the pattern for one of them. A row is
-//! appended on its first verified hit; its later hits are skipped.
+//! forward and backward from the hit along the alignment graph, for each cut edge
+//! the hit token is on, until both walks spell the pattern for one of them: every
+//! occurrence crosses the cut at a hit. A row is appended on its first verified
+//! hit; its later hits are skipped.
 //!
 //! The cover and the walks both rely on greedy tokenization. Patterns made of one
-//! repeated byte are the slow case: their tokens are on many edges, and each hit
-//! may try them all.
+//! repeated byte are the slow case on data rich in that byte: every token of their
+//! cover is a run of it, so a scan verifies many hits.
 //!
 //! # Modules
 //!
@@ -103,8 +104,8 @@ use crate::search::substring::ContainsError;
 /// that are hits, which [`expected_hits`](Self::expected_hits) estimates before
 /// scanning. Verifying a hit costs roughly as much as matching a hundred codes, so
 /// from a hit density of about 1% on, verification takes most of the time. Patterns
-/// made of one repeated byte, such as `aaaa`, are the slow case: each hit may be
-/// checked at many positions in the pattern.
+/// made of one repeated byte, such as `aaaa`, are the slow case on data rich in that
+/// byte: every token they can be found by is a run of it, so hits are many.
 ///
 /// # Examples
 ///
@@ -200,7 +201,9 @@ impl<'d> ContainsScan<'d> {
         }
         let isa = scan::detect_isa();
         let graph = AlignmentGraph::new(dict, pattern)?;
-        let plan = plan::select(&graph, frequencies, isa);
+        // Planning and verification share one list of edges, which the cut indexes.
+        let edges: Vec<_> = graph.edges().collect();
+        let plan = plan::select(&edges, graph.sink(), frequencies, isa);
         // The greedy path from the source, closed by a range edge, has only cuttable
         // edges, so every cut, and with it the cover, is nonempty.
         debug_assert!(!plan.cover.is_empty(), "empty cover for {pattern:?}");
@@ -211,7 +214,7 @@ impl<'d> ContainsScan<'d> {
                 probe_cover: plan.cover,
                 isa,
                 kind: plan.matcher,
-                verifier: HitVerifier::from_graph(graph, pattern),
+                verifier: HitVerifier::new(&graph, &edges, &plan.cut, pattern),
                 hit_density: fraction(plan.hits, frequencies.total_frequency()),
             },
         })

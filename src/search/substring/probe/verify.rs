@@ -3,8 +3,10 @@
 
 //! Hit verification: does a full occurrence of the pattern pass through this code?
 //!
-//! A hit token can be on several edges of the alignment graph. For each edge
-//! `from -> to`, the verifier walks the row in both directions:
+//! A hit token can be on several edges of the alignment graph, but only the edges
+//! of the planner's cut need trying: every occurrence crosses the cut, and its code
+//! there is a hit on a cut edge. For each cut edge `from -> to` the hit token is on,
+//! the verifier walks the row in both directions:
 //!
 //! * forward from `to`, matching each next code against the node's greedy edge,
 //!   until a code on the node's range edge completes the pattern;
@@ -15,12 +17,15 @@
 //! boundaries. The hit is confirmed as soon as both walks succeed for one edge.
 //! A token that contains the whole pattern is accepted without walking.
 //!
-//! Highly repetitive patterns are the slow case: a token such as a run of one byte
-//! can be on an edge at almost every offset, and each hit may try all of them.
+//! In a highly repetitive pattern, a token such as a run of one byte can be on an
+//! edge at almost every offset, but a hit is tried only on its cut edges, usually
+//! few.
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::Token;
-use crate::search::substring::probe::alignment::graph::{AlignmentGraph, EdgeKind, Node, Overlap};
+use crate::search::substring::probe::alignment::graph::{
+    AlignmentGraph, Edge as GraphEdge, EdgeKind, Node, Overlap,
+};
 
 /// Pattern offset before any bytes have matched.
 const SOURCE: u16 = 0;
@@ -73,8 +78,9 @@ struct Edge {
 
 /// The edges each token is on, looked up by token.
 ///
-/// A dense array holds, per token, its only edge, `NONE`, or `LISTED`. The edges of
-/// a `LISTED` token are in a separate list sorted by token. Real edges have
+/// A dense array holds, per token, its only edge, `NONE`, or `LISTED`. The cut
+/// edges of a `LISTED` token are in a separate list sorted by token: a hit is tried
+/// only on those, while backward walks need only the dense array. Real edges have
 /// `from < to`, so the sentinels cannot be mistaken for them.
 #[derive(Debug, Clone, Default)]
 struct TokenEdges {
@@ -86,7 +92,7 @@ struct TokenEdges {
     /// `LISTED` tokens consult it: a single edge from the source to the sink already
     /// passes both walks.
     complete: Vec<bool>,
-    /// Edges of `LISTED` tokens, sorted by token.
+    /// The cut edges of `LISTED` tokens, sorted by token.
     listed: Vec<(Token, Edge)>,
 }
 
@@ -100,50 +106,58 @@ const LISTED: Edge = Edge {
 };
 
 impl TokenEdges {
-    /// Indexes `token_edges`, which may repeat a pair. `sink` identifies complete
-    /// matches. Pairs go straight into the dense arrays, so only the edges of
-    /// `LISTED` tokens are sorted.
-    fn new(token_edges: Vec<(Token, Edge)>, sink: u16) -> Self {
+    /// Indexes the tokens of `edges`, and lists for `LISTED` tokens the edges that
+    /// `cut` indexes. `sink` identifies complete matches. Tokens go straight into the
+    /// dense arrays, so only the cut edges of `LISTED` tokens are sorted.
+    fn new(edges: &[GraphEdge<'_>], cut: &[u32], sink: u16) -> Self {
         let complete = Edge {
             from: SOURCE,
             to: sink,
         };
-        let Some((first_token, last_token)) = token_edges
+        let Some((first_token, last_token)) = edges
             .iter()
-            .map(|&(token, _)| (token, token))
-            .reduce(|(lo, hi), (token, _)| (lo.min(token), hi.max(token)))
+            .filter_map(token_bounds)
+            .reduce(|(lo, hi), (first, last)| (lo.min(first), hi.max(last)))
         else {
             return Self::default();
         };
         let span = usize::from(last_token - first_token) + 1;
-        let mut edges = Self {
+        let mut index = Self {
             first_token,
             single: vec![NONE; span],
             complete: Vec::new(),
             listed: Vec::new(),
         };
-        for (token, edge) in token_edges {
-            let at = usize::from(token - first_token);
-            if edge == complete {
-                if edges.complete.is_empty() {
-                    edges.complete.resize(span, false);
+        for graph_edge in edges {
+            let edge = endpoints(graph_edge);
+            for_each_token(graph_edge, |token| {
+                let at = usize::from(token - first_token);
+                if edge == complete {
+                    if index.complete.is_empty() {
+                        index.complete.resize(span, false);
+                    }
+                    index.complete[at] = true;
                 }
-                edges.complete[at] = true;
-            }
-            let slot = &mut edges.single[at];
-            match *slot {
-                NONE => *slot = edge,
-                LISTED => edges.listed.push((token, edge)),
-                held if held == edge => {}
-                held => {
-                    edges.listed.extend([(token, held), (token, edge)]);
-                    *slot = LISTED;
-                }
-            }
+                let slot = &mut index.single[at];
+                *slot = match *slot {
+                    NONE => edge,
+                    held if held == edge => held,
+                    _ => LISTED,
+                };
+            });
         }
-        edges.listed.sort_unstable();
-        edges.listed.dedup();
-        edges
+        for &at in cut {
+            let graph_edge = &edges[at as usize];
+            let edge = endpoints(graph_edge);
+            for_each_token(graph_edge, |token| {
+                if index.single[usize::from(token - first_token)] == LISTED {
+                    index.listed.push((token, edge));
+                }
+            });
+        }
+        index.listed.sort_unstable();
+        index.listed.dedup();
+        index
     }
 
     /// Whether `token` contains the whole pattern, which needs no walk to confirm.
@@ -160,13 +174,43 @@ impl TokenEdges {
         self.single.get(at).copied().unwrap_or(NONE)
     }
 
-    /// The edges of a `LISTED` token, lazily.
+    /// The cut edges of a `LISTED` token, lazily.
     fn listed(&self, token: Token) -> impl Iterator<Item = Edge> + '_ {
         let first = self.listed.partition_point(|&(t, _)| t < token);
         self.listed[first..]
             .iter()
             .take_while(move |&&(t, _)| t == token)
             .map(|&(_, edge)| edge)
+    }
+}
+
+/// The endpoints of `edge`.
+fn endpoints(edge: &GraphEdge<'_>) -> Edge {
+    Edge {
+        from: edge.from,
+        to: edge.to,
+    }
+}
+
+/// The lowest and the highest token `edge` lists, or `None` if it lists none.
+fn token_bounds(edge: &GraphEdge<'_>) -> Option<(Token, Token)> {
+    match edge.kind {
+        EdgeKind::Single(token) => Some((token, token)),
+        EdgeKind::Range(range) => Some((range.begin, range.last)),
+        EdgeKind::Set(tokens) => Some((*tokens.iter().min()?, *tokens.iter().max()?)),
+        EdgeKind::UnenumeratedSet => None,
+    }
+}
+
+/// Calls `f` on each token `edge` lists. An unenumerated set lists none: its tokens
+/// are recognized by their suffix, through `overlaps`.
+#[inline]
+fn for_each_token(edge: &GraphEdge<'_>, mut f: impl FnMut(Token)) {
+    match edge.kind {
+        EdgeKind::Single(token) => f(token),
+        EdgeKind::Range(range) => (range.begin..=range.last).for_each(f),
+        EdgeKind::Set(tokens) => tokens.iter().for_each(|&token| f(token)),
+        EdgeKind::UnenumeratedSet => {}
     }
 }
 
@@ -185,8 +229,8 @@ pub(super) struct HitVerifier {
     /// The greedy and range edge of each pattern offset before the sink: the graph's
     /// own nodes.
     nodes: Vec<Node>,
-    /// The edges each token is on: those to try for a hit, and those to follow when
-    /// walking backward.
+    /// The edges each token is on: the cut ones to try for a hit, and all of them to
+    /// follow when walking backward.
     edges: TokenEdges,
     /// The alignment edge into each overlap length, by length (at most 15). Backward
     /// walks check a token's suffix against it instead of searching an edge list.
@@ -194,27 +238,15 @@ pub(super) struct HitVerifier {
 }
 
 impl HitVerifier {
-    /// Compiles `graph`, which must have been built for `pattern`, nonempty.
-    pub(super) fn from_graph(graph: AlignmentGraph, pattern: &[u8]) -> Self {
-        let mut token_edges: Vec<(Token, Edge)> = Vec::new();
-        for edge in graph.edges() {
-            let endpoints = Edge {
-                from: edge.from,
-                to: edge.to,
-            };
-            match edge.kind {
-                EdgeKind::Single(token) => token_edges.push((token, endpoints)),
-                EdgeKind::Range(range) => {
-                    token_edges.extend((range.begin..=range.last).map(|token| (token, endpoints)));
-                }
-                EdgeKind::Set(tokens) => {
-                    token_edges.extend(tokens.iter().map(|&token| (token, endpoints)));
-                }
-                // Its tokens are recognized by their suffix, through `overlaps`.
-                EdgeKind::UnenumeratedSet => {}
-            }
-        }
-        let edges = TokenEdges::new(token_edges, graph.sink());
+    /// Compiles `graph`, the alignment graph of `pattern`, nonempty, whose edges are
+    /// `edges`. A hit is tried only on the edges `cut` indexes, which every
+    /// occurrence crosses, as the planner's cut does.
+    pub(super) fn new(
+        graph: &AlignmentGraph,
+        edges: &[GraphEdge<'_>],
+        cut: &[u32],
+        pattern: &[u8],
+    ) -> Self {
         let overlaps = graph
             .overlaps
             .iter()
@@ -227,8 +259,8 @@ impl HitVerifier {
             })
             .collect();
         Self {
-            nodes: graph.nodes,
-            edges,
+            nodes: graph.nodes.clone(),
+            edges: TokenEdges::new(edges, cut, graph.sink()),
             overlaps,
         }
     }
@@ -351,7 +383,10 @@ impl HitVerifier {
 pub(super) mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
+    use crate::search::index::TokenFrequencyIndex;
     use crate::search::substring::probe::alignment::graph::AlignmentGraph;
+    use crate::search::substring::probe::plan;
+    use crate::search::substring::probe::scan::Isa;
     use crate::search::tokenize;
 
     /// A hit verifier that accepts every hit: each token's only edge spans the whole
@@ -451,22 +486,35 @@ pub(super) mod tests {
         (dict, codes, row_offsets)
     }
 
-    /// Tries every row code as a hit and compares the result with byte containment.
+    /// Every edge of `edges`, as a cut: each hit is tried on all its edges.
+    fn every_edge(edges: &[GraphEdge<'_>]) -> Vec<u32> {
+        (0..edges.len() as u32).collect()
+    }
+
+    /// Tries every row code as a hit and compares the result with byte containment,
+    /// with hits tried on every edge, then on each instruction set's planned cut.
     fn assert_verifier_decides(extra: &[&[u8]], rows: &[&[u8]], pattern: &[u8]) {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
+        let index = TokenFrequencyIndex::build(&codes, dict.num_tokens()).unwrap();
         let graph = AlignmentGraph::new(dict, pattern).unwrap();
-        let verifier = HitVerifier::from_graph(graph, pattern);
-        for (row, text) in rows.iter().enumerate() {
-            let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);
-            let verified = (start..end).any(|hit| verifier.check(dict, &codes, start, end, hit));
-            let contains = text.windows(pattern.len()).any(|window| window == pattern);
-            assert_eq!(
-                verified,
-                contains,
-                "row {row} {:?}",
-                String::from_utf8_lossy(text)
-            );
+        let edges: Vec<_> = graph.edges().collect();
+        let planned = [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw]
+            .map(|isa| plan::select(&edges, graph.sink(), index.as_view(), isa).cut);
+        for cut in [every_edge(&edges)].into_iter().chain(planned) {
+            let verifier = HitVerifier::new(&graph, &edges, &cut, pattern);
+            for (row, text) in rows.iter().enumerate() {
+                let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);
+                let verified =
+                    (start..end).any(|hit| verifier.check(dict, &codes, start, end, hit));
+                let contains = text.windows(pattern.len()).any(|window| window == pattern);
+                assert_eq!(
+                    verified,
+                    contains,
+                    "row {row} {:?}, cut {cut:?}",
+                    String::from_utf8_lossy(text)
+                );
+            }
         }
     }
 
@@ -476,7 +524,8 @@ pub(super) mod tests {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
         let graph = AlignmentGraph::new(dict, pattern).unwrap();
-        let verifier = HitVerifier::from_graph(graph, pattern);
+        let edges: Vec<_> = graph.edges().collect();
+        let verifier = HitVerifier::new(&graph, &edges, &every_edge(&edges), pattern);
         for (row, text) in rows.iter().enumerate() {
             let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);
             let verified = start < end && verifier.check(dict, &codes, start, end, end - 1);

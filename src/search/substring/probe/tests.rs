@@ -545,7 +545,7 @@ fn planned_cost_does_not_exceed_the_frequency_cut() {
                 .iter()
                 .map(|&at| edges[at as usize]),
         );
-        let plan = plan::select(&graph, freq, isa);
+        let plan = plan::select(&edges, graph.sink(), freq, isa);
         assert_eq!(plan.hits, plan.cover.frequency(freq));
         let Some(model) = CostModel::of(isa) else {
             assert_eq!(plan.matcher, MatcherKind::Table);
