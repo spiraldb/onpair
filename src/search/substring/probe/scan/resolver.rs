@@ -152,7 +152,12 @@ mod tests {
         let codes = [0 as Token; CODES];
         let verifier = accepting_verifier();
         let dict = byte_dictionary();
-        let input = ScanInput::new(&codes, row_offsets, dict.as_view(), &verifier);
+        let input = ScanInput {
+            codes: &codes,
+            row_offsets,
+            dict: dict.as_view(),
+            verifier: &verifier,
+        };
         let mut out = Vec::new();
         let mut resolver = Resolver::new(input);
         for (block, bits) in mask.chunks_exact(BLOCK / 64).enumerate() {

@@ -230,7 +230,12 @@ impl<'d> ContainsScan<'d> {
         scan::run(
             &**matcher,
             plan::skip_empty_packing(*probe_density, last - first),
-            ScanInput::new(&codes[..last], row_offsets, self.dict, verifier),
+            ScanInput {
+                codes: &codes[..last],
+                row_offsets,
+                dict: self.dict,
+                verifier,
+            },
             out,
         );
     }

@@ -54,27 +54,10 @@ pub(super) const BLOCK: usize = 4096;
 /// prepared hit verifier.
 #[derive(Clone, Copy)]
 pub(super) struct ScanInput<'a, O> {
-    codes: &'a [Token],
-    row_offsets: &'a [O],
-    dict: CompactDictionaryView<'a>,
-    verifier: &'a HitVerifier,
-}
-
-impl<'a, O> ScanInput<'a, O> {
-    /// Borrow the encoded region and the hit verifier prepared for it.
-    pub(super) const fn new(
-        codes: &'a [Token],
-        row_offsets: &'a [O],
-        dict: CompactDictionaryView<'a>,
-        verifier: &'a HitVerifier,
-    ) -> Self {
-        Self {
-            codes,
-            row_offsets,
-            dict,
-            verifier,
-        }
-    }
+    pub(super) codes: &'a [Token],
+    pub(super) row_offsets: &'a [O],
+    pub(super) dict: CompactDictionaryView<'a>,
+    pub(super) verifier: &'a HitVerifier,
 }
 
 /// Token codes passed to a matcher in one call.
@@ -159,6 +142,12 @@ mod tests {
     ) {
         let dict = byte_dictionary();
         let verifier = accepting_verifier();
+        let input = ScanInput {
+            codes,
+            row_offsets,
+            dict: dict.as_view(),
+            verifier: &verifier,
+        };
         let isas = [Isa::Scalar, Isa::Neon, Isa::Avx2, Isa::Avx512Bw];
         for isa in isas.into_iter().filter(|&isa| supports(isa)) {
             for kind in [MatcherKind::Table, MatcherKind::EqOr, MatcherKind::NibbleN8] {
@@ -167,7 +156,6 @@ mod tests {
                 }
                 let matcher = prepare(isa, kind, cover);
                 for skip_empty in [false, true] {
-                    let input = ScanInput::new(codes, row_offsets, dict.as_view(), &verifier);
                     let mut out = Vec::new();
                     run(&*matcher, skip_empty, input, &mut out);
                     assert_eq!(out, expected, "{isa:?}, {kind:?}, skip_empty={skip_empty}");
