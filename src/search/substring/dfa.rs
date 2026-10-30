@@ -99,23 +99,23 @@ impl ContainsDfa {
                 offsets: vec![0],
             });
         }
-        let m = pattern.len();
+        let accept = pattern.len();
         let num_tokens = dict.num_tokens();
         let mut build = Build {
             dict,
-            p: pattern,
-            m,
+            pattern,
+            accept,
             fail: kmp_failure(pattern),
             base: vec![0; num_tokens],
             sparse: Vec::new(),
-            offsets: vec![0u32; m + 1],
+            offsets: vec![0u32; accept + 1],
             range_start: 0,
         };
         build.base_pass();
         build.sparse_pass();
 
         Ok(Self {
-            accept: m as State,
+            accept: accept as State,
             base: build.base,
             sparse: build.sparse,
             offsets: build.offsets,
@@ -185,10 +185,9 @@ fn kmp_failure(pattern: &[u8]) -> Vec<State> {
 /// Construction state of a `ContainsDfa`.
 struct Build<'a, V> {
     dict: V,
-    /// Pattern bytes.
-    p: &'a [u8],
-    /// Pattern length and accepting state.
-    m: usize,
+    pattern: &'a [u8],
+    /// The accepting state: the pattern length.
+    accept: usize,
     /// Byte-level failure links for falling back to shorter matched prefixes.
     fail: Vec<State>,
     base: Vec<State>,
@@ -202,13 +201,13 @@ impl<V: DictionaryView> Build<'_, V> {
     /// Runs the byte automaton over `data` from state `s`. Acceptance is final.
     fn step_bytes(&self, mut s: State, data: &[u8]) -> State {
         for &b in data {
-            if s as usize == self.m {
-                return self.m as State;
+            if s as usize == self.accept {
+                return self.accept as State;
             }
-            while s > 0 && self.p[s as usize] != b {
+            while s > 0 && self.pattern[s as usize] != b {
                 s = self.fail[s as usize - 1];
             }
-            if self.p[s as usize] == b {
+            if self.pattern[s as usize] == b {
                 s += 1;
             }
         }
@@ -217,18 +216,15 @@ impl<V: DictionaryView> Build<'_, V> {
 
     /// Fills `base`: the state each token leads to from state 0.
     fn base_pass(&mut self) {
-        let p0 = self.p[0];
+        let first = self.pattern[0];
         for t in 0..self.base.len() {
+            let token = self.dict.token(t as Token);
             // A token without the pattern's first byte cannot leave state 0.
-            let s = {
-                let tok = self.dict.token(t as Token);
-                if tok.contains(&p0) {
-                    self.step_bytes(0, tok)
-                } else {
-                    0
-                }
+            self.base[t] = if token.contains(&first) {
+                self.step_bytes(0, token)
+            } else {
+                0
             };
-            self.base[t] = s;
         }
     }
 
@@ -249,7 +245,7 @@ impl<V: DictionaryView> Build<'_, V> {
     /// Fills `sparse` with the exceptions of every nonzero, non-accepting state.
     fn sparse_pass(&mut self) {
         let mut relevant: Vec<u8> = Vec::new();
-        for j in 1..self.m {
+        for j in 1..self.accept {
             self.range_start = self.sparse.len();
             self.offsets[j] = self.range_start as u32;
 
@@ -258,7 +254,7 @@ impl<V: DictionaryView> Build<'_, V> {
             relevant.clear();
             let mut s = j as State;
             while s > 0 {
-                relevant.push(self.p[s as usize]);
+                relevant.push(self.pattern[s as usize]);
                 s = self.fail[s as usize - 1];
             }
             relevant.sort_unstable();
@@ -274,7 +270,7 @@ impl<V: DictionaryView> Build<'_, V> {
                 self.traverse(range, 1, kj, k0);
             }
         }
-        self.offsets[self.m] = self.sparse.len() as u32;
+        self.offsets[self.accept] = self.sparse.len() as u32;
     }
 
     /// Records the exceptions among the tokens `tr`, which share their first `depth`
@@ -288,8 +284,8 @@ impl<V: DictionaryView> Build<'_, V> {
 
         // Acceptance survives the remaining token bytes. Record only tokens
         // whose complete base transition does not already accept.
-        if kmp_j as usize == self.m {
-            let exit = self.m as State;
+        if kmp_j as usize == self.accept {
+            let exit = self.accept as State;
             let mut i = begin;
             while i <= last {
                 if self.base[i] != exit {
