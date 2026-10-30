@@ -22,10 +22,12 @@ use super::{PER_BATCH, matcher::Kernels};
 use crate::search::substring::probe::plan::max_nibble_batches;
 
 /// Builds the `kind` matcher of `isa` for `cover`. `kind` must be eligible for the
-/// cover on `isa`, as planning ensures.
+/// cover on `isa`, as planning ensures. `Isa::Scalar`, and a vector instruction set
+/// this build has no kernels for, get the table.
 ///
 /// # Panics
-/// If this CPU does not support `isa`.
+/// If `isa` is a vector instruction set this build has kernels for, and this CPU
+/// does not support it.
 pub(crate) fn prepare(isa: Isa, kind: MatcherKind, cover: &ProbeCover) -> Arc<dyn Matcher> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = kind;
