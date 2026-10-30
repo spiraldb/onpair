@@ -167,8 +167,7 @@ impl<'d> ContainsScan<'d> {
     /// # Precondition
     /// `dict` is conformant (sorted, unique and complete), as guaranteed by
     /// [`Parser::train`](crate::Parser::train) and
-    /// [`CompactDictionary::validate`](crate::CompactDictionary::validate), and
-    /// `frequencies` is indexed by its token IDs. Only the index length is checked.
+    /// [`CompactDictionary::validate`](crate::CompactDictionary::validate).
     /// Otherwise the rows its scans return are unspecified.
     pub fn new(
         pattern: &[u8],
