@@ -23,7 +23,9 @@
 //!   large values, so one unsigned comparison suffices.
 //! - A kernel maps `Vectors`, 64 codes, to `Hits`. `words` runs it over a block,
 //!   128 codes at a time, and packs the hits into mask words; when skipping is
-//!   enabled, groups without hits are zeroed without packing.
+//!   enabled, groups without hits are zeroed without packing. The closures passed
+//!   to `words` are `#[inline(always)]`, since `words` calls each twice per 128
+//!   codes and the compiler would otherwise keep it out of line.
 //!
 //! AArch64 builds contain the `neon` kernels. x86_64 builds contain both the
 //! `avx2` and the `avx512` kernels, each compiled for its own instruction set
@@ -41,6 +43,7 @@ mod neon;
 mod table;
 
 use super::{Block, Mask};
+use crate::core::types::Token;
 use crate::search::substring::ProbeCover;
 
 /// Number of points in one batch of nibble tables.
@@ -82,6 +85,23 @@ pub(super) trait Kernels {
     type EqOr: Matcher + 'static;
     /// Nibble shuffle tables, eight points per batch, plus range checks.
     type NibbleN8<const BATCHES: usize>: Matcher + 'static;
+}
+
+/// The tables of `NibbleN8`'s batch `at`, which holds the points from
+/// `at * PER_BATCH` on: one 16-entry row per nibble position, from the least to the
+/// most significant. Point `k` of the batch sets bit `k` in the entry its nibble
+/// selects. A batch past the last point is all zero, and matches no code.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn nibble_rows(points: &[Token], at: usize) -> [[u8; 16]; 4] {
+    let from = (at * PER_BATCH).min(points.len());
+    let to = (from + PER_BATCH).min(points.len());
+    let mut rows = [[0u8; 16]; 4];
+    for (k, &point) in points[from..to].iter().enumerate() {
+        for (shift, row) in rows.iter_mut().enumerate() {
+            row[usize::from(point >> (4 * shift) & 0x0f)] |= 1 << k;
+        }
+    }
+    rows
 }
 
 #[cfg(test)]

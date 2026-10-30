@@ -6,13 +6,10 @@
 //! 64 codes fill two 512-bit vectors of `u16` lanes. Comparisons land in mask
 //! registers, so the hits of 64 codes are already one `u64` mask word: there is
 //! nothing to narrow or pack.
-//!
-//! The closures passed to `words` are `#[inline(always)]`, since `words` calls each
-//! twice per 128 codes and the compiler would otherwise keep it out of line.
 
 use std::arch::x86_64::*;
 
-use super::{Block, Kernels, Mask, Matcher, PER_BATCH};
+use super::{Block, Kernels, Mask, Matcher, nibble_rows};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::ProbeCover;
 use crate::search::substring::probe::scan::Isa;
@@ -219,17 +216,10 @@ fn eq_or_mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
 /// Four lookup tables ordered from the least to the most significant nibble.
 struct Batch([Table; 4]);
 
-/// Build tables for at most eight point IDs.
-/// Point `k` contributes bit `1 << k` at each of its four nibble positions.
+/// The tables of batch `at` of `points`.
 #[target_feature(enable = "avx512f,avx512bw")]
-fn batch(tokens: &[Token]) -> Batch {
-    let mut rows = [[0u8; 16]; 4];
-    for (k, &token) in tokens.iter().enumerate() {
-        for (shift, row) in rows.iter_mut().enumerate() {
-            row[usize::from(token >> (4 * shift) & 0x0f)] |= 1 << k;
-        }
-    }
-    Batch(rows.map(|row| table(row)))
+fn batch(points: &[Token], at: usize) -> Batch {
+    Batch(nibble_rows(points, at).map(|row| table(row)))
 }
 
 #[inline]
@@ -303,15 +293,11 @@ pub(crate) struct NibbleN8<const BATCHES: usize> {
 
 impl<const BATCHES: usize> Matcher for NibbleN8<BATCHES> {
     unsafe fn new(cover: &ProbeCover) -> Self {
-        let codes = cover.points();
+        let points = cover.points();
         // SAFETY: the caller guarantees AVX-512, which `batch` and `hold` need.
         unsafe {
             Self {
-                batches: std::array::from_fn(|at| {
-                    let from = (at * PER_BATCH).min(codes.len());
-                    let to = (from + PER_BATCH).min(codes.len());
-                    batch(&codes[from..to])
-                }),
+                batches: std::array::from_fn(|at| batch(points, at)),
                 ranges: cover.ranges().iter().map(|&range| hold(range)).collect(),
             }
         }
