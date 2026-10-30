@@ -117,9 +117,7 @@ impl MatchStarts {
             cursor = hit + 1;
 
             // Hits arrive in order, so the token cursor only moves forward.
-            while offsets[token_id + 1] as usize <= hit {
-                token_id += 1;
-            }
+            token_id = token_at(offsets, token_id, hit);
             let token_start = offsets[token_id] as usize;
             let token_end = offsets[token_id + 1] as usize;
             let tail = &payload[hit..token_end];
@@ -141,6 +139,21 @@ impl MatchStarts {
             }
         }
     }
+}
+
+/// The token holding payload byte `at`, searched forward from token `from`, which
+/// starts at or before it. Most hits land a token or two after the previous one, but
+/// some land thousands of tokens later, so the search gallops to a bound, then
+/// binary searches below it.
+fn token_at(offsets: &[u32], from: usize, at: usize) -> usize {
+    let ends = &offsets[from + 1..];
+    let mut bound = 1;
+    while bound < ends.len() && ends[bound - 1] as usize <= at {
+        bound *= 2;
+    }
+    // The previous probe passed, so every token below half the bound ends by `at`.
+    let passed = bound / 2;
+    from + passed + ends[passed..bound.min(ends.len())].partition_point(|&end| end as usize <= at)
 }
 
 #[cfg(test)]
