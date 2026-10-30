@@ -128,7 +128,7 @@ fn find_row<O: Offset>(offsets: &[O], from: usize, code: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    //! Check row resolution against an independent offset-search oracle.
+    //! Tests of row resolution against an independent offset-search oracle.
     //!
     //! The same masks are resolved with u32 and u64 row offsets. Fixtures vary
     //! hit density and row length, including empty rows, long gaps, and rows that
@@ -146,7 +146,7 @@ mod tests {
     const BLOCKS: usize = 4;
     const CODES: usize = BLOCKS * BLOCK;
 
-    /// Resolve a whole mask in block order, omitting blocks without hits.
+    /// Resolves a whole mask in block order, omitting blocks without hits.
     /// The hit verifier accepts every hit, so rows depend only on lookup and deduplication.
     fn resolve<O: Offset>(mask: &[u64], row_offsets: &[O]) -> Vec<usize> {
         let codes = [0 as Token; CODES];
@@ -190,7 +190,7 @@ mod tests {
         rows
     }
 
-    /// Check basic oracle properties before comparing resolver output.
+    /// Checks basic oracle properties before comparing resolver output.
     fn expected(mask: &[u64], row_offsets: &[u32]) -> Vec<usize> {
         let rows = expected_rows(mask, row_offsets);
         assert!(
@@ -202,7 +202,7 @@ mod tests {
         rows
     }
 
-    /// Check the resolver with both stored offset widths.
+    /// Checks the resolver with both stored offset widths.
     fn check_resolver(case: &str, mask: &[u64], row_offsets: &[u32]) {
         let expected = expected(mask, row_offsets);
         assert_eq!(resolve(mask, row_offsets), expected, "u32 on {case}");
@@ -214,14 +214,14 @@ mod tests {
         assert_eq!(resolve(mask, &wide), expected, "u64 on {case}");
     }
 
-    /// Create fixed-size rows, truncating the final row at the stream end.
+    /// Creates fixed-size rows, truncating the final row at the stream end.
     fn uniform(codes: usize) -> Vec<u32> {
         let mut offsets: Vec<u32> = (0..CODES as u32).step_by(codes).collect();
         offsets.push(CODES as u32);
         offsets
     }
 
-    /// Create uneven row lengths, including empty rows that lookup must skip.
+    /// Creates uneven row lengths, including empty rows that lookup must skip.
     fn ragged() -> Vec<u32> {
         let mut offsets = vec![0u32];
         let mut state = 0x2545_F491u32;
@@ -238,12 +238,12 @@ mod tests {
         offsets
     }
 
-    /// Allocate a cleared mask for the fixture stream.
+    /// Allocates a cleared mask for the fixture stream.
     fn empty_mask() -> Vec<u64> {
         vec![0u64; CODES / 64]
     }
 
-    /// Set one hit every `stride` code positions.
+    /// Sets one hit every `stride` code positions.
     fn strided(stride: usize) -> Vec<u64> {
         let mut mask = empty_mask();
         for code in (0..CODES).step_by(stride) {

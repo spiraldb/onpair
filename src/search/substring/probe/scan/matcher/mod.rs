@@ -1,38 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Membership kernels: mark the codes of a block that belong to the cover.
+//! Membership kernels, which mark the codes of a block that belong to the cover.
 //!
 //! Every kernel computes the same mask, with bit `i` set iff code `i` is covered.
 //! `table` holds the portable kernel, a scalar lookup table. The vector kernels have
-//! one file per instruction set, `neon`, `avx2` and `avx512`, each with the same
-//! items:
+//! one file per instruction set, `neon`, `avx2` and `avx512`. The files define the
+//! same items, described here once; each documents only what is specific to its
+//! instruction set.
 //!
-//! - `EqOr` broadcasts each point to all lanes, compares it with the codes, and ORs
-//!   the results together with the range hits. Work grows linearly with the number
-//!   of points and ranges; a cover without points checks only its ranges.
+//! - `EqOr` compares the codes with each point, broadcast to all lanes by
+//!   `broadcast`, and ORs the results (`eq_or_hits`) together with the range hits.
+//!   Work grows linearly with the number of points and ranges; a cover without
+//!   points checks only its ranges.
 //! - `Nibble` tests up to eight points at once with shuffle tables. A token ID is
 //!   a `u16`, so four 4-bit nibbles. Each batch has one 16-entry table per nibble
 //!   position, and point `k` sets bit `k` in the entry selected by its nibble at
 //!   each position. Looking up a code's four nibbles and ANDing the entries leaves
-//!   bit `k` iff the code equals point `k`. Batches are ORed together, then range
-//!   hits are added. Planning caps the batch count per instruction set.
-//! - `check_ranges` adds the cover's ranges to either kernel's point hits, and
-//!   `ranges_mask` handles covers with ranges only. A code is in `[begin, last]` iff
+//!   bit `k` iff the code equals point `k`. `batch` loads the rows `nibble_rows`
+//!   builds into one `Table` each, and `probe` looks a group's nibbles up in every
+//!   batch. Batches are ORed together, then range hits are added. `BATCHES` must
+//!   hold every point of the cover: planning caps it per instruction set, and
+//!   `dispatch` picks the specialization.
+//! - `hold` broadcasts a range's start and width, and `inside` tests a group of
+//!   codes against them. A code is in `[begin, last]` iff
 //!   `code.wrapping_sub(begin) <= last - begin`: codes below `begin` wrap around to
-//!   large values, so one unsigned comparison suffices.
-//! - A kernel maps `Vectors`, a group of 64 codes, to `Hits`. `words` runs it over
-//!   a block, a pair of groups at a time, and packs each group's hits into a mask
-//!   word; when skipping is enabled, a pair without hits is zeroed without packing.
-//!   The closures passed to `words` are `#[inline(always)]`, since `words` calls
-//!   each twice per pair and the compiler would otherwise keep it out of line.
+//!   large values, so one unsigned comparison suffices. `check_ranges` adds the
+//!   cover's ranges to either kernel's point hits, and `ranges_mask` handles covers
+//!   with ranges only, clearing the mask if there are none.
+//! - A kernel maps `Vectors`, a group of 64 codes read by `load`, to `Hits`, which
+//!   `or` combines. `words` runs it over a block, a pair of groups at a time, and
+//!   `movemask` packs each group's hits into a mask word; when skipping is enabled,
+//!   a pair without hits (`any`) is zeroed without packing. `words` returns `false`
+//!   only if the mask is empty, and without skipping always returns `true`.
+//! - `eq_or_mask`, `nibble_mask` and `ranges_mask` are the `#[target_feature]`
+//!   functions each matcher's `check` calls. The kernel and `words` inline into
+//!   them, so the loop runs with the instruction set enabled. The closures passed
+//!   to `words` are `#[inline(always)]`, since `words` calls each twice per pair
+//!   and the compiler would otherwise keep it out of line.
 //!
-//! AArch64 builds contain the `neon` kernels. x86_64 builds contain both the
-//! `avx2` and the `avx512` kernels, each compiled for its own instruction set
-//! whatever the build's target features. `dispatch` builds the best kernels the
-//! CPU supports, once per query, and checks that support first. Each file names its
-//! matchers in a `Kernels` impl (`Neon`, `Avx2`, `Avx512`), so dispatch is written
-//! once for all.
+//! Each vector file is compiled for its own instruction set, whatever the build's
+//! target features, and names its matchers in a `Kernels` impl (`Neon`, `Avx2`,
+//! `Avx512`), so `dispatch`, which picks one, is written once for all.
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;

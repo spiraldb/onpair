@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Build the planned matcher, once per query.
+//! The planned matcher, built once per query.
 //!
 //! The instruction set, the matcher kind and the number of Nibble batches are
 //! resolved into a concrete matcher behind `dyn Matcher`, which every scan of the

@@ -29,7 +29,7 @@ fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block, skip_empty: bool) -> Mask
     bits
 }
 
-/// Build the expected bit mask directly from scalar cover membership.
+/// Builds the expected bit mask directly from scalar cover membership.
 fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
     let mut bits = [0u64; BLOCK / 64];
     for (at, &code) in codes.iter().enumerate() {
@@ -40,7 +40,7 @@ fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
     bits
 }
 
-/// Compare a matcher eligible on `isa` with the independent mask oracle, in both
+/// Compares a matcher eligible on `isa` with the independent mask oracle, in both
 /// packing modes.
 fn agrees<M: Matcher>(isa: Isa, kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
     if !is_eligible(isa, kind, cover) {
@@ -55,7 +55,7 @@ fn agrees<M: Matcher>(isa: Isa, kind: MatcherKind, name: &str, cover: &ProbeCove
     }
 }
 
-/// Create distinct codes so a selected point has exactly one hit per block.
+/// Creates distinct codes so a selected point has exactly one hit per block.
 fn block() -> Block {
     let mut codes = [0 as Token; BLOCK];
     for (at, code) in codes.iter_mut().enumerate() {
@@ -64,7 +64,7 @@ fn block() -> Block {
     codes
 }
 
-/// Check all kernels and packing variants on every instruction set this CPU
+/// Checks all kernels and packing variants on every instruction set this CPU
 /// supports.
 fn every_matcher(cover: &ProbeCover, codes: &Block) {
     agrees::<Table>(Isa::Scalar, MatcherKind::Table, "table", cover, codes);
@@ -77,7 +77,7 @@ fn every_matcher(cover: &ProbeCover, codes: &Block) {
     }
 }
 
-/// Check the vector kernels and packing variants of `K`, if this CPU supports its
+/// Checks the vector kernels and packing variants of `K`, if this CPU supports its
 /// instruction set.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
@@ -97,7 +97,7 @@ fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
     }
 }
 
-/// Check the point set alone, then with one and two ranges.
+/// Checks the point set alone, then with one and two ranges.
 fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) {
     every_matcher(&cover, codes);
     every_matcher(
@@ -200,7 +200,7 @@ fn agree_on_codes_sharing_a_low_byte() {
     every_matcher_ranged(cover, 0x0302, 0x0402, &codes);
 }
 
-/// Test full-domain, singleton, populated, and absent ranges.
+/// Tests full-domain, singleton, populated, and absent ranges.
 #[test]
 fn agree_on_ranges_of_wide_codes() {
     let codes = block();

@@ -102,7 +102,7 @@ impl ProbeCover {
         Self::from_runs(runs)
     }
 
-    /// Build a test cover without normalization. Ranges must be disjoint.
+    /// Builds a test cover without normalization. Ranges must be disjoint.
     #[cfg(test)]
     pub(crate) fn new(points: Vec<Token>, ranges: Vec<TokenRange>) -> Self {
         Self { points, ranges }

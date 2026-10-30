@@ -249,7 +249,7 @@ mod tests {
         CompactDictionary::from_raw(bytes, offsets)
     }
 
-    /// Check one position's edges against token bytes.
+    /// Checks one position's edges against token bytes.
     fn check_position(dict: CompactDictionaryView<'_>, pattern: &[u8], offset: usize) {
         let remaining = &pattern[offset..];
         let ids = (0..dict.num_tokens()).map(|id| id as Token);

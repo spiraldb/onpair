@@ -35,7 +35,7 @@ struct PatternPrefix {
 }
 
 impl PatternPrefix {
-    /// Pack a nonempty prefix of at most 16 bytes into a masked integer.
+    /// Packs a nonempty prefix of at most 16 bytes into a masked integer.
     fn new(prefix: &[u8]) -> Self {
         let mut bytes = [0u8; 16];
         bytes[..prefix.len()].copy_from_slice(prefix);
@@ -428,7 +428,7 @@ pub(super) mod tests {
         assert!(!PatternPrefix::new(b"a").is_tail_of(dict, 1));
     }
 
-    /// Build a complete dictionary and greedily encode the fixture rows.
+    /// Builds a complete dictionary and greedily encodes the fixture rows.
     fn column(extra: &[&[u8]], rows: &[&[u8]]) -> (CompactDictionary, Vec<Token>, Vec<u32>) {
         let mut tokens: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
         tokens.extend(extra.iter().map(|t| t.to_vec()));
@@ -451,7 +451,7 @@ pub(super) mod tests {
         (dict, codes, row_offsets)
     }
 
-    /// Try every row code as a hit and compare the result with byte containment.
+    /// Tries every row code as a hit and compares the result with byte containment.
     fn assert_verifier_decides(extra: &[&[u8]], rows: &[&[u8]], pattern: &[u8]) {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();

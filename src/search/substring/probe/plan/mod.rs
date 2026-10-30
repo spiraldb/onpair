@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Planning: choose the cut and its cover, the matcher, and the mask packing per scan.
+//! Planning, which chooses the cut and its cover, the matcher, and the mask packing.
 //!
 //! Every cut of the alignment graph gives a correct cover, so planning only affects
 //! speed. A cover costs matcher work for every scanned code, which grows with its
@@ -185,7 +185,7 @@ mod tests {
     use crate::search::substring::ContainsScan;
     use crate::search::substring::probe::alignment::starts::MAX_ENUMERATED_TOKENS;
 
-    /// Build separated points and ranges with the requested probe counts.
+    /// Builds separated points and ranges with the requested probe counts.
     fn cover(points: usize, ranges: usize) -> ProbeCover {
         ProbeCover::new(
             (0..points).map(|i| (2 * i) as Token).collect(),

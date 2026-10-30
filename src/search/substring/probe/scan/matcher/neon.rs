@@ -6,6 +6,9 @@
 //! 64 codes fill eight 128-bit vectors of `u16` lanes. Comparisons yield
 //! 0xFFFF/0x0000 lanes, which `narrow` reduces to one byte per code; `movemask`
 //! packs 128 such bytes into two mask words with lane bits and pairwise adds.
+//!
+//! The items are described in the parent module; only what is specific to NEON
+//! is documented here.
 
 use std::arch::aarch64::*;
 
@@ -17,19 +20,15 @@ use crate::search::substring::probe::scan::Isa;
 /// Membership results for 64 codes: one 0xFF/0x00 byte per code.
 type Hits = [uint8x16_t; 4];
 
-/// 64 token codes split across this target's vector registers.
 type Vectors = [uint16x8_t; 8];
 
-/// Range start and width (`last - begin`), broadcast into vector lanes.
 type Held = (uint16x8_t, uint16x8_t);
 
-/// A token broadcast to every lane.
 type Broadcast = uint16x8_t;
 
 /// A 16-byte shuffle row.
 type Table = uint8x16_t;
 
-/// Load 64 codes without requiring aligned pointers.
 #[inline]
 #[target_feature(enable = "neon")]
 fn load(codes: &[Token; 64]) -> Vectors {
@@ -37,10 +36,6 @@ fn load(codes: &[Token; 64]) -> Vectors {
     std::array::from_fn(|i| unsafe { vld1q_u16(codes.as_ptr().add(8 * i)) })
 }
 
-/// Fill all mask words by comparing 128 codes per iteration.
-/// When skipping is enabled, empty pairs bypass packing and are zeroed.
-/// `false` guarantees an empty mask; without skipping, the return is always
-/// `true` even if every packed bit is zero.
 #[inline]
 #[target_feature(enable = "neon")]
 fn words<const SKIP_EMPTY: bool>(
@@ -63,14 +58,12 @@ fn words<const SKIP_EMPTY: bool>(
     written
 }
 
-/// Union two sets of hit results without changing code order.
 #[inline]
 #[target_feature(enable = "neon")]
 fn or(hit: Hits, with: Hits) -> Hits {
     std::array::from_fn(|at| vorrq_u8(hit[at], with[at]))
 }
 
-/// Whether either 64-code group has a hit.
 #[inline]
 #[target_feature(enable = "neon")]
 fn any(a: Hits, b: Hits) -> bool {
@@ -79,7 +72,7 @@ fn any(a: Hits, b: Hits) -> bool {
     vmaxvq_u8(vorrq_u8(a, b)) != 0
 }
 
-/// Keep the low byte of each 0xFFFF/0x0000 comparison lane in code order.
+/// Keeps the low byte of each 0xFFFF/0x0000 comparison lane, in code order.
 #[inline]
 #[target_feature(enable = "neon")]
 fn narrow(hit: [uint16x8_t; 8]) -> Hits {
@@ -94,7 +87,7 @@ fn narrow(hit: [uint16x8_t; 8]) -> Hits {
     ]
 }
 
-/// Pack 128 hit bytes into two words using lane bits and pairwise adds.
+/// Packs 128 hit bytes into two mask words with lane bits and pairwise adds.
 #[inline]
 #[target_feature(enable = "neon")]
 fn movemask(bits: &mut [u64; 2], a: Hits, b: Hits) {
@@ -130,7 +123,6 @@ fn inside((lo, width): Held, codes: Vectors) -> Hits {
     narrow(hit)
 }
 
-/// OR range membership into existing hit lanes.
 #[inline]
 #[target_feature(enable = "neon")]
 fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
@@ -140,8 +132,6 @@ fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
     hit
 }
 
-/// Fill a block mask from prepared ranges; an empty slice clears the mask.
-/// The target-feature boundary keeps range comparisons inside the vector loop.
 #[target_feature(enable = "neon")]
 fn ranges_mask<const SKIP_EMPTY: bool>(held: &[Held], codes: &Block, bits: &mut Mask) -> bool {
     let Some((&first, rest)) = held.split_first() else {
@@ -177,11 +167,8 @@ fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     narrow(hit)
 }
 
-/// Broadcast point probes and prepared ranges reused across scan blocks.
 pub(crate) struct EqOr {
-    /// One broadcast vector per point in the cover; none for a cover of ranges only.
     tokens: Vec<Broadcast>,
-    /// Range starts and widths, already broadcast for vector comparisons.
     ranges: Vec<Held>,
 }
 
@@ -213,8 +200,6 @@ impl Matcher for EqOr {
     }
 }
 
-/// Fill the block mask with point and range matches.
-/// The target-feature boundary lets the comparison closure inline with its caller.
 #[target_feature(enable = "neon")]
 fn eq_or_mask<const SKIP_EMPTY: bool>(
     tokens: &[Broadcast],
@@ -233,10 +218,8 @@ fn eq_or_mask<const SKIP_EMPTY: bool>(
     )
 }
 
-/// Four lookup tables ordered from the least to the most significant nibble.
 struct Batch([Table; 4]);
 
-/// The tables of batch `at` of `points`.
 #[target_feature(enable = "neon")]
 fn batch(points: &[Token], at: usize) -> Batch {
     Batch(nibble_rows(points, at).map(|row| table(row)))
@@ -249,6 +232,8 @@ fn table(row: [u8; 16]) -> Table {
     unsafe { vld1q_u8(row.as_ptr()) }
 }
 
+/// `vuzp1q`/`vuzp2q` split each 16 codes into their low and high bytes, in code
+/// order, and `vtstq` turns a byte with a point bit left into a 0xFF hit.
 #[inline]
 #[target_feature(enable = "neon")]
 fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
@@ -288,13 +273,8 @@ fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hi
     })
 }
 
-/// Prepared point batches and ranges for repeated block checks.
-/// `BATCHES` must be positive and large enough to hold every point in the cover;
-/// planning and dispatch choose the supported specialization.
 pub(crate) struct Nibble<const BATCHES: usize> {
-    /// Up to eight point probes per batch; unused entries contribute no bits.
     batches: [Batch; BATCHES],
-    /// Prepared inclusive ranges, added after point matching.
     ranges: Vec<Held>,
 }
 
@@ -323,8 +303,6 @@ impl<const BATCHES: usize> Matcher for Nibble<BATCHES> {
     }
 }
 
-/// Fill a block mask with nibble-table and range matches.
-/// The target-feature boundary keeps the probe closure inside the vector loop.
 #[target_feature(enable = "neon")]
 fn nibble_mask<const BATCHES: usize, const SKIP_EMPTY: bool>(
     batches: &[Batch; BATCHES],

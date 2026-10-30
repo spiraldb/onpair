@@ -152,7 +152,7 @@ pub(crate) mod tests {
         CompactDictionary::from_raw(raw.data, raw.offsets)
     }
 
-    /// Compare the collected starts against independent per-token searches.
+    /// Compares the collected starts against independent per-token searches.
     pub(crate) fn check_starts(dict: CompactDictionaryView<'_>, pattern: &[u8]) {
         let tokens: Vec<_> = (0..dict.num_tokens())
             .map(|id| (id as Token, dict.token(id as Token)))

@@ -6,6 +6,9 @@
 //! 64 codes fill four 256-bit vectors of `u16` lanes. Comparisons yield
 //! 0xFFFF/0x0000 lanes, which `narrow` packs to one byte per code, restoring code
 //! order across 128-bit lanes; `movemask` extracts one bit per byte.
+//!
+//! The items are described in the parent module; only what is specific to AVX2
+//! is documented here.
 
 use std::arch::x86_64::*;
 
@@ -17,20 +20,16 @@ use crate::search::substring::probe::scan::Isa;
 /// Membership results for 64 codes: one 0xFF/0x00 byte per code.
 type Hits = [__m256i; 2];
 
-/// 64 token codes split across this target's vector registers.
 type Vectors = [__m256i; 4];
 
-/// Range start and width (`last - begin`), broadcast into vector lanes.
 type Held = (__m256i, __m256i);
 
-/// A token broadcast to every lane.
 type Broadcast = __m256i;
 
 /// A 16-byte shuffle row, broadcast into both 128-bit lanes since `vpshufb`
 /// indexes within lanes.
 type Table = __m256i;
 
-/// Load 64 codes without requiring aligned pointers.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn load(codes: &[Token; 64]) -> Vectors {
@@ -38,10 +37,6 @@ fn load(codes: &[Token; 64]) -> Vectors {
     std::array::from_fn(|i| unsafe { _mm256_loadu_si256(codes.as_ptr().add(16 * i).cast()) })
 }
 
-/// Fill all mask words by comparing 128 codes per iteration.
-/// When skipping is enabled, empty pairs bypass packing and are zeroed.
-/// `false` guarantees an empty mask; without skipping, the return is always
-/// `true` even if every packed bit is zero.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn words<const SKIP_EMPTY: bool>(
@@ -64,14 +59,12 @@ fn words<const SKIP_EMPTY: bool>(
     written
 }
 
-/// Union two sets of hit results without changing code order.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn or(hit: Hits, with: Hits) -> Hits {
     std::array::from_fn(|at| _mm256_or_si256(hit[at], with[at]))
 }
 
-/// Whether either 64-code group has a hit.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn any(a: Hits, b: Hits) -> bool {
@@ -79,8 +72,9 @@ fn any(a: Hits, b: Hits) -> bool {
     _mm256_testz_si256(or, or) == 0
 }
 
-/// Pack 16-bit comparison lanes into bytes, then restore original code order.
-/// The permutation corrects the 128-bit lane ordering of `packs_epi16`.
+/// Packs 16-bit comparison lanes into bytes, then restores code order:
+/// `packs_epi16` interleaves its inputs' 128-bit lanes, and the permutation
+/// undoes it.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn narrow(hit: [__m256i; 4]) -> Hits {
@@ -88,7 +82,7 @@ fn narrow(hit: [__m256i; 4]) -> Hits {
     [byte(hit[0], hit[1]), byte(hit[2], hit[3])]
 }
 
-/// Extract one bit per hit byte into two output words.
+/// Extracts one bit per hit byte into the two mask words.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn movemask(bits: &mut [u64; 2], a: Hits, b: Hits) {
@@ -122,7 +116,6 @@ fn inside((lo, width): Held, codes: Vectors) -> Hits {
     narrow(hit)
 }
 
-/// OR range membership into existing hit lanes.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
@@ -132,8 +125,6 @@ fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
     hit
 }
 
-/// Fill a block mask from prepared ranges; an empty slice clears the mask.
-/// The target-feature boundary keeps range comparisons inside the vector loop.
 #[target_feature(enable = "avx2")]
 fn ranges_mask<const SKIP_EMPTY: bool>(held: &[Held], codes: &Block, bits: &mut Mask) -> bool {
     let Some((&first, rest)) = held.split_first() else {
@@ -169,11 +160,8 @@ fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
     narrow(hit)
 }
 
-/// Broadcast point probes and prepared ranges reused across scan blocks.
 pub(crate) struct EqOr {
-    /// One broadcast vector per point in the cover; none for a cover of ranges only.
     tokens: Vec<Broadcast>,
-    /// Range starts and widths, already broadcast for vector comparisons.
     ranges: Vec<Held>,
 }
 
@@ -205,8 +193,6 @@ impl Matcher for EqOr {
     }
 }
 
-/// Fill the block mask with point and range matches.
-/// The target-feature boundary lets the comparison closure inline with its caller.
 #[target_feature(enable = "avx2")]
 fn eq_or_mask<const SKIP_EMPTY: bool>(
     tokens: &[Broadcast],
@@ -225,10 +211,8 @@ fn eq_or_mask<const SKIP_EMPTY: bool>(
     )
 }
 
-/// Four lookup tables ordered from the least to the most significant nibble.
 struct Batch([Table; 4]);
 
-/// The tables of batch `at` of `points`.
 #[target_feature(enable = "avx2")]
 fn batch(points: &[Token], at: usize) -> Batch {
     Batch(nibble_rows(points, at).map(|row| table(row)))
@@ -241,8 +225,9 @@ fn table(row: [u8; 16]) -> Table {
     unsafe { _mm256_broadcastsi128_si256(_mm_loadu_si128(row.as_ptr().cast())) }
 }
 
-/// Pack low and high bytes separately and restore their original code order.
-/// Convert surviving point bits to 0xFF lanes for the later movemask.
+/// `packus` splits each 32 codes into their low and high bytes, and
+/// `permute4x64` restores their code order across the 128-bit lanes. Comparing
+/// twice with zero turns a byte with a point bit left into a 0xFF hit.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
@@ -288,13 +273,8 @@ fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hi
     })
 }
 
-/// Prepared point batches and ranges for repeated block checks.
-/// `BATCHES` must be positive and large enough to hold every point in the cover;
-/// planning and dispatch choose the supported specialization.
 pub(crate) struct Nibble<const BATCHES: usize> {
-    /// Up to eight point probes per batch; unused entries contribute no bits.
     batches: [Batch; BATCHES],
-    /// Prepared inclusive ranges, added after point matching.
     ranges: Vec<Held>,
 }
 
@@ -323,8 +303,6 @@ impl<const BATCHES: usize> Matcher for Nibble<BATCHES> {
     }
 }
 
-/// Fill a block mask with nibble-table and range matches.
-/// The target-feature boundary keeps the probe closure inside the vector loop.
 #[target_feature(enable = "avx2")]
 fn nibble_mask<const BATCHES: usize, const SKIP_EMPTY: bool>(
     batches: &[Batch; BATCHES],

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Scan execution: find the hits block by block and append the verified rows.
+//! Scan execution, which finds the hits block by block and appends the verified rows.
 //!
 //! The codes are processed in blocks of `BLOCK`. For each block, the matcher writes
 //! a bitmask with one bit per code, set if the code is in the cover. The resolver

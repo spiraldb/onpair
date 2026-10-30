@@ -356,7 +356,7 @@ mod tests {
         pattern.is_empty() || hay.windows(pattern.len()).any(|w| w == pattern)
     }
 
-    /// Decode one fixture row into bytes for the containment oracle.
+    /// Decodes one fixture row into bytes for the containment oracle.
     fn decode_row(view: crate::ColumnView<'_, u32>, k: usize) -> Vec<u8> {
         let mut buf =
             vec![std::mem::MaybeUninit::uninit(); view.row_decoded_len(k) + crate::DECODE_PADDING];
@@ -365,7 +365,7 @@ mod tests {
         unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) }.to_vec()
     }
 
-    /// Compare row search with byte containment using compact and wide dictionaries.
+    /// Compares row search with byte containment using compact and wide dictionaries.
     fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
         let col = compress_rows(rows);
         let view = col.view();

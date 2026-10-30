@@ -161,7 +161,7 @@ mod tests {
     use crate::core::types::Token;
     use crate::search::substring::probe::alignment::graph::EdgeKind;
 
-    /// Test edge; `None` makes it unenumerated, and a weight is stored as the token.
+    /// A test edge; `None` makes it unenumerated, and a weight is stored as the token.
     fn edge(from: u16, to: u16, weight: Option<Token>) -> Edge<'static> {
         Edge {
             from,
@@ -178,7 +178,7 @@ mod tests {
         }
     }
 
-    /// Return cut endpoints in edge order for readable test expectations.
+    /// Returns cut endpoints in edge order for readable test expectations.
     fn cut_steps(edges: &[Edge<'_>], sink: u16) -> Vec<(u16, u16)> {
         MinCut::new(edges, sink)
             .solve(|at| weight(&edges[at]))
@@ -187,7 +187,7 @@ mod tests {
             .collect()
     }
 
-    /// Enumerate all partitions and intersect the optimal source sides.
+    /// Enumerates all partitions and intersects the optimal source sides.
     /// This checks both optimality and tie-breaking independently of the DP.
     fn exhaustive_cut(
         edges: &[Edge<'_>],
@@ -264,7 +264,7 @@ mod tests {
         }
     }
 
-    /// Cut a shared suffix once for 6 instead of two separate branches for 4 + 4.
+    /// Cuts a shared suffix once for 6 instead of two separate branches for 4 + 4.
     #[test]
     fn shared_suffix_beats_two_local_choices() {
         let edges = [
