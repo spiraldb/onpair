@@ -19,23 +19,11 @@
 //! can take a role at almost every offset, and each hit may try all of them.
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
-use crate::core::types::{Token, TokenRange};
-use crate::search::substring::probe::alignment::graph::{AlignmentGraph, EdgeKind};
+use crate::core::types::Token;
+use crate::search::substring::probe::alignment::graph::{AlignmentGraph, EdgeKind, Node, Overlap};
 
 /// Needle offset before any bytes have matched.
 const SOURCE: u16 = 0;
-
-/// The edges leaving one needle offset.
-#[derive(Debug, Clone, Default)]
-struct Node {
-    /// The greedy edge: its token and target offset.
-    greedy_step: Option<(Token, u16)>,
-    /// The range edge: the tokens that finish the needle from this offset.
-    terminal_range: Option<TokenRange>,
-    /// For an unenumerated alignment edge into this offset, the needle prefix that a
-    /// preceding token must end with.
-    entry: Option<NeedlePrefix>,
-}
 
 /// A needle prefix of at most 16 bytes, packed to compare with a token suffix in
 /// one 128-bit operation.
@@ -182,61 +170,67 @@ impl EdgesByToken {
     }
 }
 
+/// An alignment edge `0 -> k` with `k` below 16, as backward walks check it.
+#[derive(Debug, Clone, Copy)]
+struct OverlapEdge {
+    /// `needle[..k]`, which its tokens end with.
+    prefix: NeedlePrefix,
+    /// Whether its tokens are listed, and so have the role `0 -> k`.
+    listed: bool,
+}
+
 /// An alignment graph compiled for hit verification.
 #[derive(Debug, Clone)]
 pub(in crate::search::substring::probe) struct HitVerifier {
-    /// Outgoing edges, by needle offset.
+    /// The greedy and range edge of each needle offset before the sink: the graph's
+    /// own nodes.
     nodes: Vec<Node>,
     /// The roles of each token: the edges to try for a hit, and the edges to follow
     /// when walking backward.
     edges: EdgesByToken,
-    /// The needle prefix of each partial alignment edge, by length (at most 15).
-    /// Backward walks use it to check an overlap without searching a role list.
-    overlaps: Vec<Option<NeedlePrefix>>,
+    /// The alignment edge into each overlap length, by length (at most 15). Backward
+    /// walks check a token's suffix against it instead of searching a role list.
+    overlaps: Vec<Option<OverlapEdge>>,
 }
 
 impl HitVerifier {
     /// Compiles `graph`, which must have been built for `needle`, nonempty.
     pub(in crate::search::substring::probe) fn from_graph(
-        graph: &AlignmentGraph,
+        graph: AlignmentGraph,
         needle: &[u8],
     ) -> Self {
-        let mut nodes = vec![Node::default(); usize::from(graph.sink()) + 1];
-        let mut overlaps = vec![None; needle.len().min(16)];
         let mut token_edges: Vec<(Token, Edge)> = Vec::new();
         for edge in graph.edges() {
-            let (from, to) = (edge.from, edge.to);
-            let compiled_edge = Edge { from, to };
+            let role = Edge {
+                from: edge.from,
+                to: edge.to,
+            };
             match edge.kind {
-                EdgeKind::Single(token) => {
-                    let node = &mut nodes[from as usize];
-                    node.greedy_step = Some((token, to));
-                    token_edges.push((token, compiled_edge));
-                }
+                EdgeKind::Single(token) => token_edges.push((token, role)),
                 EdgeKind::Range(range) => {
-                    nodes[from as usize].terminal_range = Some(range);
-                    token_edges
-                        .extend((range.begin..=range.last).map(|token| (token, compiled_edge)));
+                    token_edges.extend((range.begin..=range.last).map(|token| (token, role)));
                 }
-                // An alignment edge: partial (an overlap), or complete for tokens
-                // that contain the needle. Keep the prefix of a partial one for
-                // backward walks.
-                EdgeKind::Set(ids) => {
-                    if from == SOURCE && to != graph.sink() {
-                        overlaps[to as usize] = Some(NeedlePrefix::new(&needle[..to as usize]));
-                    }
-                    token_edges.extend(ids.iter().map(|&token| (token, compiled_edge)));
+                EdgeKind::Set(tokens) => {
+                    token_edges.extend(tokens.iter().map(|&token| (token, role)));
                 }
-                EdgeKind::UnenumeratedSet => {
-                    // Always a partial alignment edge, so `to` is at most 15.
-                    nodes[to as usize].entry = Some(NeedlePrefix::new(&needle[..to as usize]));
-                    overlaps[to as usize] = nodes[to as usize].entry;
-                }
+                // Its tokens are recognized by their suffix, through `overlaps`.
+                EdgeKind::UnenumeratedSet => {}
             }
         }
         let edges = EdgesByToken::new(token_edges, graph.sink());
+        let overlaps = graph
+            .overlaps
+            .iter()
+            .enumerate()
+            .map(|(length, overlap)| {
+                overlap.as_ref().map(|overlap| OverlapEdge {
+                    prefix: NeedlePrefix::new(&needle[..length]),
+                    listed: matches!(overlap, Overlap::Set(_)),
+                })
+            })
+            .collect();
         Self {
-            nodes,
+            nodes: graph.nodes,
             edges,
             overlaps,
         }
@@ -244,7 +238,8 @@ impl HitVerifier {
 
     /// The offset after the whole needle.
     fn sink(&self) -> u16 {
-        (self.nodes.len() - 1) as u16
+        // At most `ContainsScan::MAX_PATTERN_LEN`, which fits `u16`.
+        self.nodes.len() as u16
     }
 
     /// Whether an occurrence of the needle within `codes[row_start..row_end]` covers
@@ -285,10 +280,10 @@ impl HitVerifier {
         while code_index < row_end {
             let code = codes[code_index];
             let at = &self.nodes[node as usize];
-            if at.terminal_range.is_some_and(|range| range.contains(code)) {
+            if at.range.is_some_and(|range| range.contains(code)) {
                 return true;
             }
-            match at.greedy_step {
+            match at.greedy {
                 Some((step_token, next_node)) if step_token == code => {
                     node = next_node;
                     code_index += 1;
@@ -325,29 +320,33 @@ impl HitVerifier {
                 if length > node {
                     // The match starts inside this token, so check its suffix.
                     return self
-                        .overlaps
-                        .get(node as usize)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|prefix| prefix.is_tail_of(dict, code));
+                        .overlap(node)
+                        .is_some_and(|overlap| overlap.prefix.is_tail_of(dict, code));
                 }
                 // Length fixes the predecessor; token identity confirms the step.
                 let from = node - length;
-                match self.nodes[from as usize].greedy_step {
+                match self.nodes[from as usize].greedy {
                     Some((expected, _)) if expected == code => node = from,
                     _ => return false,
                 }
             } else if edge != NONE && edge.to == node {
                 node = edge.from;
             } else {
-                // An unenumerated alignment edge may still match this token's suffix.
-                return self.nodes[node as usize]
-                    .entry
-                    .as_ref()
-                    .is_some_and(|prefix| prefix.is_tail_of(dict, code));
+                // No role of this token enters `node`, but an unenumerated alignment
+                // edge may: its tokens have no roles.
+                return self.overlap(node).is_some_and(|overlap| {
+                    !overlap.listed && overlap.prefix.is_tail_of(dict, code)
+                });
             }
             code_end -= 1;
         }
         true
+    }
+
+    /// The alignment edge into `node`, if `node` is an overlap length that has one.
+    #[inline]
+    fn overlap(&self, node: u16) -> Option<&OverlapEdge> {
+        self.overlaps.get(node as usize)?.as_ref()
     }
 }
 
@@ -366,7 +365,7 @@ pub(in crate::search::substring::probe) mod tests {
             to: 1,
         };
         HitVerifier {
-            nodes: vec![Node::default(); 2],
+            nodes: vec![Node::default(); 1],
             edges: EdgesByToken {
                 first_token: 0,
                 edge_of_token: vec![whole; 1 << 16],
@@ -460,7 +459,7 @@ pub(in crate::search::substring::probe) mod tests {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
         let graph = AlignmentGraph::new(dict, needle).unwrap();
-        let verifier = HitVerifier::from_graph(&graph, needle);
+        let verifier = HitVerifier::from_graph(graph, needle);
         for (row, text) in rows.iter().enumerate() {
             let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);
             let verified = (start..end).any(|hit| verifier.check(dict, &codes, start, end, hit));
@@ -480,7 +479,7 @@ pub(in crate::search::substring::probe) mod tests {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
         let graph = AlignmentGraph::new(dict, needle).unwrap();
-        let verifier = HitVerifier::from_graph(&graph, needle);
+        let verifier = HitVerifier::from_graph(graph, needle);
         for (row, text) in rows.iter().enumerate() {
             let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);
             let verified = start < end && verifier.check(dict, &codes, start, end, end - 1);

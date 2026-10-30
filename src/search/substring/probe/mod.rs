@@ -178,7 +178,7 @@ impl<'d> ContainsScan<'d> {
                 probe_cover: plan.cover,
                 isa,
                 kind: plan.matcher,
-                verifier: HitVerifier::from_graph(&graph, pattern),
+                verifier: HitVerifier::from_graph(graph, pattern),
                 probe_density: fraction(plan.hits, frequencies.total_frequency()),
             },
         })
