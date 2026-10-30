@@ -427,7 +427,13 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
     let mut bounds = [0usize; MAX_LANES + 1];
     for (j, bound) in bounds.iter_mut().enumerate().take(K + 1).skip(1) {
         let target = first + total * j / K;
-        *bound = offsets.partition_point(|o| o.to_usize() < target).min(n);
+        let after = offsets.partition_point(|o| o.to_usize() < target).min(n);
+        let before = after.saturating_sub(1);
+        *bound = if target - offsets[before].to_usize() < offsets[after].to_usize() - target {
+            before
+        } else {
+            after
+        };
     }
     bounds[K] = n;
 
