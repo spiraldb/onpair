@@ -7,10 +7,14 @@
 //!
 //! * Equality: [`tokenize`](tokenize()) the needle, then call [`equals`](equals()).
 //! * Prefix: build a [`PrefixQuery`], then call [`starts_with`].
-//! * Substring per row: build a [`ContainsDfa`], then call [`row_contains`].
+//! * Substring per row: build a [`ContainsDfa`], then call [`row_contains`]. It
+//!   takes one step per code, is exact for rows of any tokenization, needs no
+//!   frequency index, and accepts patterns of up to 255 bytes.
 //! * Substring across rows: build a [`ContainsScan`], then call [`ContainsScan::scan`]
-//!   to append exact matching row indices. Preparation uses a reusable
-//!   [`index::TokenFrequencyIndex`].
+//!   to append the indices of the matching rows. It searches the whole code stream
+//!   for a few rare tokens, with SIMD where available, and is usually faster. It
+//!   plans with a reusable [`index::TokenFrequencyIndex`], requires greedily
+//!   tokenized rows, and accepts patterns of up to 65535 bytes.
 //!
 //! Search requires a dictionary with unique tokens in bytewise-lexicographic order
 //! and all 256 single-byte tokens. Training or full dictionary validation establishes

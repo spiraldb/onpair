@@ -95,6 +95,17 @@ use crate::search::substring::ContainsError;
 /// with that dictionary, concurrently if needed. The empty pattern matches every
 /// row, without a scan.
 ///
+/// # Performance
+///
+/// Preparation reads the whole dictionary once, so reuse a prepared scan across
+/// chunks. A scan makes one pass over the codes to find the hits, then verifies
+/// each hit. The second part grows with the hit density, the fraction of codes
+/// that are hits, which [`expected_hits`](Self::expected_hits) estimates before
+/// scanning. Verifying a hit costs roughly as much as matching a hundred codes, so
+/// from a hit density of about 1% on, verification takes most of the time. Patterns
+/// made of one repeated byte, such as `aaaa`, are the slow case: each hit may be
+/// checked at many positions in the pattern.
+///
 /// # Examples
 ///
 /// ```

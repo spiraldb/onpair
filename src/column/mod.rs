@@ -196,7 +196,9 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 
     /// Ascending indices of the rows containing `pattern` as a substring,
     /// prepared once as a [`ContainsDfa`] and matched per row. The empty pattern
-    /// matches every row.
+    /// matches every row. For rows the encoder produced,
+    /// [`rows_containing_with_scan`](Self::rows_containing_with_scan) is usually
+    /// faster.
     ///
     /// # Errors
     /// Returns [`ContainsError::PatternTooLong`] if `pattern` exceeds
