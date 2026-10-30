@@ -51,6 +51,8 @@ mod avx512;
 mod neon;
 mod table;
 
+use std::panic::RefUnwindSafe;
+
 use super::{Block, Mask};
 use crate::core::types::Token;
 use crate::search::substring::ProbeCover;
@@ -68,8 +70,10 @@ pub(super) use table::Table;
 /// A cover membership test, prepared once per query and run on every block.
 ///
 /// A vector matcher runs the instructions of its instruction set. Building one is
-/// the unsafe step: once built, it may be checked anywhere.
-pub(crate) trait Matcher: Send + Sync {
+/// the unsafe step: once built, it may be checked anywhere. A matcher is never
+/// mutated after it is built, so prepared scans can share it across threads and
+/// keep using it after a caught panic.
+pub(crate) trait Matcher: Send + Sync + RefUnwindSafe {
     /// Prepares `cover`, which must be eligible for this matcher.
     ///
     /// # Safety

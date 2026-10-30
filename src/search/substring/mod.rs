@@ -20,9 +20,12 @@ pub use dfa::{ContainsDfa, row_contains};
 pub use error::ContainsError;
 pub use probe::{ContainsScan, ProbeCover};
 
-// Both document that one prepared query can be shared between threads.
+use std::panic::{RefUnwindSafe, UnwindSafe};
+
+// Both document that one prepared query can be shared between threads. Both also
+// stay usable after a caught panic, as their state never changes once prepared.
 const _: () = {
-    const fn send_sync<T: Send + Sync>() {}
-    send_sync::<ContainsDfa>();
-    send_sync::<ContainsScan<'static>>();
+    const fn shareable<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+    shareable::<ContainsDfa>();
+    shareable::<ContainsScan<'static>>();
 };
