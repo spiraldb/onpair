@@ -52,7 +52,7 @@ jobs:
           cargo codspeed build --profile bench -m simulation
 
       - name: Run benchmarks - Simulation
-        uses: CodSpeedHQ/action@78102a468f96d8e0ccb92d0ec49425753fc42062 # v5.6.0
+        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
         with:
           run: cargo codspeed run
           mode: simulation
@@ -79,7 +79,7 @@ jobs:
           cargo codspeed build --profile bench -m walltime
 
       - name: Run benchmarks - Walltime
-        uses: CodSpeedHQ/action@78102a468f96d8e0ccb92d0ec49425753fc42062 # v5.6.0
+        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
         with:
           run: cargo codspeed run
           mode: walltime
