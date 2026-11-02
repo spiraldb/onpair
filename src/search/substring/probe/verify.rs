@@ -656,4 +656,23 @@ pub(super) mod tests {
             b"google",
         );
     }
+
+    /// More than 512 tokens end with `go`, so this overlap of two bytes is unenumerated
+    /// as well, and the walk reaches the source through the token's suffix.
+    #[test]
+    fn entry_through_a_two_byte_set() {
+        let tails: Vec<Vec<u8>> = (b'a'..=b'z')
+            .flat_map(|first| (b'a'..=b'z').map(move |second| vec![first, second, b'g', b'o']))
+            .collect();
+        let mut extra: Vec<&[u8]> = tails.iter().map(Vec::as_slice).collect();
+        extra.extend_from_slice(&[b"og", b"le"]);
+        let (dict, _, _) = column(&extra, &[]);
+        let graph = AlignmentGraph::new(dict.as_view(), b"google").unwrap();
+        assert!(matches!(graph.overlaps[2], Some(Overlap::UnenumeratedSet)));
+        assert_verifier_decides(
+            &extra,
+            &[b"zzgoogle", b"zzgoogl", b"google", b"zzgo ogle"],
+            b"google",
+        );
+    }
 }

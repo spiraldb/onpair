@@ -16,10 +16,14 @@ use super::alignment::starts::tests::check_starts;
 use super::plan::{self, CostModel};
 use super::scan::{MatcherKind, detect_isa};
 use super::{ContainsScan, ProbeCover, Query};
-use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
+use crate::core::dictionary::{
+    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, pad_raw,
+};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexView};
 use crate::search::substring::{ContainsDfa, ContainsError, row_contains};
+use crate::search::tokenize;
+use crate::test_corpus::make_raw;
 use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
 
 fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
@@ -468,6 +472,60 @@ fn scan_matches_bytes_on_binary_corpus() {
         &rows,
         &[b"", b"\x00", b"\xff", b"\x00\x01", &[7], &[200, 201]],
     );
+}
+
+/// A dictionary of exactly 2^16 tokens, with the patterns' tokens at the top of the
+/// `u16` range, so IDs reach the last entry of every per-token table. Indexes counting
+/// nothing, or every token once, give the scans another cover or hit density.
+#[test]
+fn scan_matches_bytes_at_the_top_of_the_token_range() {
+    let mut tokens: Vec<Vec<u8>> = (0..=255).map(|byte| vec![byte]).collect();
+    tokens.extend((0..(1u32 << 16) - 256).map(|n| vec![0xFF, (n >> 8) as u8, n as u8]));
+    tokens.sort();
+    assert_eq!(tokens[usize::from(Token::MAX)], [0xFF, 0xFE, 0xFF]);
+    let mut raw = make_raw(&tokens);
+    pad_raw(&mut raw.data, &raw.offsets);
+    let dict = CompactDictionary::from_raw(raw.data, raw.offsets);
+
+    let last = [0xFF, 0xFE, 0xFF];
+    let before_last = [0xFF, 0xFE, 0xFE];
+    let both = [last, before_last].concat();
+    let rows: &[&[u8]] = &[
+        &both,
+        &[b"x", both.as_slice(), b"y"].concat(),
+        &[last, last, before_last].concat(),
+        &[before_last, last].concat(),
+        &last,
+        &before_last,
+        b"",
+    ];
+    let (mut codes, mut row_offsets) = (Vec::new(), vec![0u32]);
+    for row in rows {
+        codes.extend(tokenize(row, dict.as_view()));
+        row_offsets.push(codes.len() as u32);
+    }
+    assert!(codes.contains(&Token::MAX));
+    let view = ColumnView {
+        dict: dict.as_view(),
+        codes: &codes,
+        row_offsets: &row_offsets,
+    };
+    let patterns: &[&[u8]] = &[&[0xFF], &last, &both];
+    check(view, rows, patterns);
+    let tokens = view.dict.num_tokens() as u32;
+    for cumulative in [vec![0; tokens as usize + 1], (0..=tokens).collect()] {
+        let frequencies = TokenFrequencyIndexView::new(&cumulative).unwrap();
+        for &pattern in patterns {
+            let expected: Vec<_> = (0..rows.len())
+                .filter(|&row| byte_contains(rows[row], pattern))
+                .collect();
+            let mut found = Vec::new();
+            ContainsScan::new(pattern, view.dict, frequencies)
+                .unwrap()
+                .scan(view.codes, view.row_offsets, &mut found);
+            assert_eq!(found, expected, "{pattern:?}");
+        }
+    }
 }
 
 #[test]
