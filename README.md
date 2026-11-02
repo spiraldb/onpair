@@ -51,7 +51,7 @@ cargo add onpair
 ```
 
 ```rust
-use onpair::{compress, Config, DECODE_PADDING};
+use onpair::{compress, Config};
 
 // Three values in the Arrow layout OnPair takes: one byte buffer plus offsets.
 let values = b"catdogbird";
@@ -60,15 +60,13 @@ let offsets = [0u32, 3, 6, 10]; // "cat", "dog", "bird"
 let column = compress(values, &offsets, Config::default()).unwrap();
 let view = column.view();
 
-// A value decodes to its original length, so a buffer of the longest value plus
-// DECODE_PADDING (which absorbs the decoder's 16-byte tail write) fits any row.
-let max_len = 4; // longest value in this column
-let mut decoded = Vec::<u8>::with_capacity(max_len + DECODE_PADDING);
-// SAFETY: capacity >= this row's decoded length + DECODE_PADDING.
-let len = unsafe { view.decompress_row_into(1, decoded.spare_capacity_mut()) };
-unsafe { decoded.set_len(len) }; // SAFETY: decode initialized `len` bytes.
+// A row decompresses to its original value, so a buffer of the longest value fits
+// any row.
+let longest = 4; // "bird"
+let mut buffer = Vec::with_capacity(longest);
 
-assert_eq!(decoded, b"dog");
+let row = view.decompress_row_into(1, buffer.spare_capacity_mut()).unwrap();
+assert_eq!(row, b"dog");
 ```
 
 `Config::default()` caps the dictionary at 2^12 entries; raise `max_dict_bits`

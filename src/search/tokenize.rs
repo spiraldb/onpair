@@ -50,19 +50,14 @@ mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
     use crate::test_corpus::{binary_strings, make_raw, random_ascii_strings, user_strings};
-    use crate::{DECODE_PADDING, DEFAULT_CONFIG, MAX_TOKEN_SIZE, Parser, decode_into, decoded_len};
+    use crate::{DEFAULT_CONFIG, MAX_TOKEN_SIZE, Parser, decompress_into};
+    use std::mem::MaybeUninit;
 
     /// Decode `codes` against `dict` into a fresh `Vec` (test helper; the crate
     /// exposes only the into-buffer decoder).
     fn decode_to_vec<V: DictionaryView>(codes: &[Token], dict: V) -> Vec<u8> {
-        let n = decoded_len(codes, dict);
-        let mut out = Vec::with_capacity(n + DECODE_PADDING);
-        // SAFETY: a built/padded test dict is read-padded, codes are in range, and
-        // the buffer carries DECODE_PADDING headroom.
-        let w = unsafe { decode_into(codes, dict, out.spare_capacity_mut()) };
-        // SAFETY: the decoder initialized exactly `w` leading bytes.
-        unsafe { out.set_len(w) };
-        out
+        let mut out = vec![MaybeUninit::uninit(); codes.len() * MAX_TOKEN_SIZE];
+        decompress_into(codes, dict, &mut out).unwrap().to_vec()
     }
 
     /// A sorted, complete (all 256 single bytes), read-padded compact dictionary

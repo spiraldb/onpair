@@ -621,7 +621,7 @@ impl<'a> From<&'a CompactDictionary> for CompactDictionaryView<'a> {
 mod tests {
     use super::*;
     use crate::search::{ContainsDfa, PrefixQuery, row_contains, starts_with, tokenize};
-    use crate::{DECODE_PADDING, decode_into, decoded_len, try_decode_into};
+    use crate::{DECOMPRESS_PADDING, decoded_len, decompress_into, decompress_into_unchecked};
     use std::mem::MaybeUninit;
     use std::sync::Arc;
 
@@ -808,8 +808,9 @@ mod tests {
         // The unchecked fast path performs its fixed-width source reads and
         // destination over-stores. The validated dictionary and this padding
         // together prove that those accesses stay in bounds.
-        let mut padded_out = Vec::with_capacity(decoded_len + DECODE_PADDING);
-        let written = unsafe { decode_into(codes, view, padded_out.spare_capacity_mut()) };
+        let mut padded_out = Vec::with_capacity(decoded_len + DECOMPRESS_PADDING);
+        let spare = padded_out.spare_capacity_mut();
+        let written = unsafe { decompress_into_unchecked(codes, view, spare) }.len();
         unsafe { padded_out.set_len(written) };
         assert_eq!(padded_out, expected);
 
@@ -817,10 +818,10 @@ mod tests {
         // proving that its exact-copy tail never writes beyond the caller's
         // buffer for a safety-valid dictionary.
         let mut exact_out = vec![MaybeUninit::uninit(); decoded_len];
-        let written = try_decode_into(codes, view, &mut exact_out).unwrap();
-        let exact_bytes =
-            unsafe { std::slice::from_raw_parts(exact_out.as_ptr().cast::<u8>(), written) };
-        assert_eq!(exact_bytes, expected.as_slice());
+        assert_eq!(
+            decompress_into(codes, view, &mut exact_out).unwrap(),
+            expected
+        );
     }
 
     /// A conformant dictionary: all 256 single-byte tokens plus `extra`, sorted and

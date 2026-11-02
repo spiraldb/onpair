@@ -4,16 +4,18 @@
 //! Token decode.
 //!
 //! Decoding is a gather-copy: each code names a dictionary token; the output is
-//! those tokens concatenated. [`decode_into`] copies a fixed 16 bytes per token
-//! (one `copy16` store) whatever the token's true length — no per-token length
-//! branch. The cost is two paddings to keep that over-read in bounds: the
+//! those tokens concatenated. [`decompress_into_unchecked`] copies a fixed 16 bytes
+//! per token (one `copy16` store) whatever the token's true length — no per-token
+//! length branch. The cost is two paddings to keep that over-read in bounds: the
 //! dictionary's read-padding backs the source over-read, and the output buffer's
-//! [`DECODE_PADDING`] backs the destination over-store. It is generic over the
-//! dictionary representation ([`DictionaryView`]) — a load-free
+//! [`DECOMPRESS_PADDING`] backs the destination over-store. [`decompress_into`]
+//! needs no output padding: it derives the bound from the buffer. Both are generic
+//! over the dictionary representation ([`DictionaryView`]) — a load-free
 //! [`WideDictionaryView`](crate::core::dictionary::WideDictionaryView) or a
 //! [`CompactDictionaryView`](crate::core::dictionary::CompactDictionaryView).
 //! Codes are bounds-checked in the loop; [`ColumnView`](crate::ColumnView) wraps
-//! it as the buffer-sized [`decompress_into`](crate::ColumnView::decompress_into).
+//! these as [`decompress_into`](crate::ColumnView::decompress_into) and
+//! [`decompress_row_into`](crate::ColumnView::decompress_row_into).
 
 use std::mem::MaybeUninit;
 
@@ -23,11 +25,11 @@ use crate::core::validate::{InvalidColumn, panic_malformed};
 
 mod copy;
 
-/// Trailing bytes a [`decode_into`] output buffer needs **beyond** the decoded
-/// length. The decoder over-stores a fixed [`MAX_TOKEN_SIZE`]-byte chunk for the
-/// final token — up to `MAX_TOKEN_SIZE - 1` bytes past the logical end — so an
-/// output buffer is sized as `decoded_len + DECODE_PADDING`.
-pub const DECODE_PADDING: usize = MAX_TOKEN_SIZE;
+/// Trailing bytes a [`decompress_into_unchecked`] output buffer needs **beyond** the
+/// decompressed bytes. The decoder over-stores a fixed [`MAX_TOKEN_SIZE`]-byte chunk
+/// for the final token — up to `MAX_TOKEN_SIZE - 1` bytes past the logical end.
+/// [`decompress_into`] needs none.
+pub const DECOMPRESS_PADDING: usize = MAX_TOKEN_SIZE;
 
 /// Exact decoded byte length of `codes` against `dict` (the sum of token
 /// lengths) — sizes a decode buffer.
@@ -53,20 +55,20 @@ pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
     sum
 }
 
-/// Decode `codes` against `dict` into `out`, returning the bytes written. It
-/// over-reads a fixed 16 bytes per token, relying on the structural invariants
-/// guaranteed by [`DictionaryView`]. Each code is bounds-checked in the loop (a
-/// near-free, predicted-not-taken branch); an out-of-range code panics with
-/// [`InvalidColumn::CodeOutOfRange`].
+/// [`decompress_into`] without the buffer check: only the buffer size is the
+/// caller's promise. It over-reads a fixed 16 bytes per token, relying on the
+/// structural invariants guaranteed by [`DictionaryView`]. Each code is still
+/// bounds-checked in the loop (a near-free, predicted-not-taken branch); an
+/// out-of-range code panics with [`InvalidColumn::CodeOutOfRange`].
 ///
 /// # Safety
-/// `out.len() >= decoded_len(codes, dict) + DECODE_PADDING`, or `out` holds
+/// `out` holds the decompressed bytes plus [`DECOMPRESS_PADDING`], or
 /// [`MAX_TOKEN_SIZE`] bytes per code.
-pub unsafe fn decode_into<V: DictionaryView>(
+pub unsafe fn decompress_into_unchecked<'o, V: DictionaryView>(
     codes: &[Token],
     dict: V,
-    out: &mut [MaybeUninit<u8>],
-) -> usize {
+    out: &'o mut [MaybeUninit<u8>],
+) -> &'o mut [u8] {
     let ntok = dict.num_tokens();
     let dst = out.as_mut_ptr().cast::<u8>();
     let mut w = 0usize;
@@ -75,7 +77,7 @@ pub unsafe fn decode_into<V: DictionaryView>(
             panic_malformed(InvalidColumn::CodeOutOfRange);
         }
         // SAFETY: code in range ⇒ token_ptr is readable for 16 bytes (the dict is
-        // read-padded). The trailing DECODE_PADDING keeps the last token's
+        // read-padded). The trailing DECOMPRESS_PADDING keeps the last token's
         // over-store within `out`; with MAX_TOKEN_SIZE bytes per code, each store
         // starts at most MAX_TOKEN_SIZE bytes per preceding code in, so it ends
         // within `out` too.
@@ -86,12 +88,13 @@ pub unsafe fn decode_into<V: DictionaryView>(
             w += len;
         }
     }
-    w
+    // SAFETY: the loop initialized the first `w` bytes of `out`.
+    unsafe { std::slice::from_raw_parts_mut(dst, w) }
 }
 
-/// [`try_decode_into`]'s `out` could not hold the decoded bytes. Nothing was
-/// written past the end of `out`; size it from [`decoded_len`] and retry (the
-/// checked decode needs no [`DECODE_PADDING`] slack — see [`try_decode_into`]).
+/// [`decompress_into`]'s `out` could not hold the decompressed bytes. Nothing was
+/// written past the end of `out`; retry with a larger buffer. [`MAX_TOKEN_SIZE`]
+/// bytes per code always fit.
 ///
 /// This is a *buffer-capacity* outcome, deliberately distinct from
 /// [`InvalidColumn`]: a too-small caller buffer is not a
@@ -103,36 +106,35 @@ pub struct OutputTooSmall;
 
 impl std::fmt::Display for OutputTooSmall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("output buffer too small for decoded bytes")
+        f.write_str("output buffer too small for decompressed bytes")
     }
 }
 
 impl std::error::Error for OutputTooSmall {}
 
-/// Decode `codes` against `dict` into `out` — the **safe,
-/// buffer-checked** counterpart of [`decode_into`]. Returns `Ok(bytes_written)`, or
-/// `Err(`[`OutputTooSmall`]`)` if `out` cannot hold the result (in which case
+/// Decompresses `codes` against `dict` into `out` and returns the decompressed bytes,
+/// the front of `out`, or [`OutputTooSmall`] if `out` cannot hold them (in which case
 /// nothing is written past the end of `out`). Never reads or writes out of bounds.
 ///
-/// Like [`decode_into`] it over-copies a fixed [`MAX_TOKEN_SIZE`] bytes per token,
-/// but it keeps that over-store in bounds *without* a per-token output check or a
-/// [`decoded_len`] pre-pass. Each round it issues `(out.len() - written) /
+/// Like [`decompress_into_unchecked`] it over-copies a fixed [`MAX_TOKEN_SIZE`] bytes
+/// per token, but it keeps that over-store in bounds *without* a per-token output
+/// check or a length pre-pass. Each round it issues `(out.len() - written) /
 /// MAX_TOKEN_SIZE` over-copies: since every token is at most [`MAX_TOKEN_SIZE`],
 /// that many 16-byte stores from the current cursor cannot reach the end of `out`,
 /// so the whole batch needs no per-store check; then it recomputes. Once fewer than
 /// [`MAX_TOKEN_SIZE`] bytes remain, the tail is finished with exact per-token copies
-/// — so `out` needs **no** [`DECODE_PADDING`] slack: a buffer of exactly
-/// [`decoded_len`] suffices (and an over-store-padded one stays on the fast path
+/// — so `out` needs **no** [`DECOMPRESS_PADDING`] slack: a buffer of exactly the
+/// decompressed length suffices (and an over-store-padded one stays on the fast path
 /// throughout).
 ///
 /// With [`MAX_TOKEN_SIZE`] bytes per code in `out`, no store can leave it whatever the
 /// tokens are, so one check replaces the rounds and the exact copies. That sizing
 /// costs nothing to compute and is the fastest for short inputs such as single rows.
 ///
-/// Bounds-checking codes (the obligation [`decode_into`] leaves to the dictionary's
-/// trust) is necessary but **not** sufficient for memory safety: in-range codes can
-/// address [`MAX_TOKEN_SIZE`]-byte tokens, so a buffer sized from any figure other
-/// than this column's own decoded length can still overflow. This routine derives
+/// Bounds-checking codes is necessary but **not** sufficient for memory safety:
+/// in-range codes can address [`MAX_TOKEN_SIZE`]-byte tokens, so a buffer sized from
+/// any figure other than this column's own decompressed length can still overflow
+/// [`decompress_into_unchecked`]. This routine derives
 /// the bound from `out` itself, so it is sound for any `(codes, out)` pair.
 ///
 /// The [`DictionaryView`] contract guarantees that token reads and the fixed
@@ -140,16 +142,16 @@ impl std::error::Error for OutputTooSmall {}
 ///
 /// # Panics
 /// With [`InvalidColumn::CodeOutOfRange`] on a code that does not index the
-/// dictionary — the same malformation backstop as [`decode_into`] / [`decoded_len`]
+/// dictionary — the same malformation backstop as [`decompress_into_unchecked`]
 /// (never UB). Buffer fit is this function's recoverable concern.
-pub fn try_decode_into<V: DictionaryView>(
+pub fn decompress_into<'o, V: DictionaryView>(
     codes: &[Token],
     dict: V,
-    out: &mut [MaybeUninit<u8>],
-) -> Result<usize, OutputTooSmall> {
+    out: &'o mut [MaybeUninit<u8>],
+) -> Result<&'o mut [u8], OutputTooSmall> {
     if out.len() / MAX_TOKEN_SIZE >= codes.len() {
         // SAFETY: `out` holds MAX_TOKEN_SIZE bytes per code.
-        return Ok(unsafe { decode_into(codes, dict, out) });
+        return Ok(unsafe { decompress_into_unchecked(codes, dict, out) });
     }
 
     let ntok = dict.num_tokens();
@@ -206,7 +208,8 @@ pub fn try_decode_into<V: DictionaryView>(
         }
         w += len;
     }
-    Ok(w)
+    // SAFETY: the loops above initialized the first `w` bytes of `out`.
+    Ok(unsafe { std::slice::from_raw_parts_mut(dst, w) })
 }
 
 #[cfg(test)]
@@ -236,9 +239,10 @@ mod tests {
     /// Decode into a padded buffer and return the initialized bytes.
     fn vec_decode<V: DictionaryView>(codes: &[Token], dict: V) -> Vec<u8> {
         let n = decoded_len(codes, dict);
-        let mut out = Vec::with_capacity(n + DECODE_PADDING);
-        // SAFETY: read-padded dict, in-range codes, buffer + DECODE_PADDING.
-        let w = unsafe { decode_into(codes, dict, out.spare_capacity_mut()) };
+        let mut out = Vec::with_capacity(n + DECOMPRESS_PADDING);
+        // SAFETY: read-padded dict, in-range codes, buffer + DECOMPRESS_PADDING.
+        let w = unsafe { decompress_into_unchecked(codes, dict, out.spare_capacity_mut()) }.len();
+        // SAFETY: the decoder initialized the first `w` bytes.
         unsafe { out.set_len(w) };
         out
     }
@@ -275,7 +279,7 @@ mod tests {
     #[test]
     fn decodes_short_final_token() {
         // Ends in a 1-byte token: the last over-store must land in the
-        // DECODE_PADDING room. Miri checks the bound.
+        // DECOMPRESS_PADDING room. Miri checks the bound.
         let tokens: &[&[u8]] = &[b"a", b"bcde"];
         let mut codes: Vec<Token> = (0..40).map(|i| (i % 2) as Token).collect();
         *codes.last_mut().unwrap() = 0;
@@ -311,12 +315,12 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "code index out of range")]
-    fn decode_into_panics_on_out_of_range_code() {
+    fn unchecked_panics_on_out_of_range_code() {
         let (bytes, offsets) = padded(&[b"a", b"b"]);
         let view = CompactDictionaryView::from_raw(&bytes, &offsets);
         let mut out = vec![MaybeUninit::uninit(); 64];
         // SAFETY: read-padded dict + generous buffer; the bad code must panic.
-        unsafe { decode_into(&[0, 5], view, &mut out) };
+        unsafe { decompress_into_unchecked(&[0, 5], view, &mut out) };
     }
 
     #[test]
@@ -327,28 +331,26 @@ mod tests {
         let _ = decoded_len(&[0, 5], view);
     }
 
-    /// `try_decode_into` agrees with `decode_into` both on a tight (exactly
-    /// `decoded_len`, no padding) buffer — exercising the exact-copy tail — and on a
-    /// padded one that stays on the all-over-copy fast path.
+    /// `decompress_into` agrees with the unchecked version both on a tight (exact
+    /// length, no padding) buffer — exercising the exact-copy tail — and on a padded
+    /// one that stays on the all-over-copy fast path.
     #[test]
-    fn try_decode_matches_decode_into() {
+    fn checked_matches_unchecked() {
         let tokens: &[&[u8]] = &[b"a", b"bc", b"def", b"ghij"];
         let codes: Vec<Token> = (0..40).map(|i| (i % 4) as Token).collect();
         let (bytes, offsets) = padded(tokens);
         let view = CompactDictionaryView::from_raw(&bytes, &offsets);
         let want = expected(tokens, &codes);
 
-        for cap in [want.len(), want.len() + DECODE_PADDING] {
+        for cap in [want.len(), want.len() + DECOMPRESS_PADDING] {
             let mut out = vec![MaybeUninit::uninit(); cap];
-            let w = try_decode_into(&codes, view, &mut out).unwrap();
-            assert_eq!(w, want.len());
-            let got = unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), w) };
+            let got = decompress_into(&codes, view, &mut out).unwrap();
             assert_eq!(got, want.as_slice(), "cap {cap}");
         }
     }
 
     #[test]
-    fn try_decode_fits_exact_and_rejects_one_short() {
+    fn fits_exact_and_rejects_one_short() {
         let tokens: &[&[u8]] = &[b"a", b"bcde"];
         let codes: Vec<Token> = vec![1, 1, 1]; // 12 decoded bytes
         let (bytes, offsets) = padded(tokens);
@@ -356,11 +358,11 @@ mod tests {
 
         // Exactly enough succeeds; one byte short is rejected, never overflowing.
         assert_eq!(
-            try_decode_into(&codes, view, &mut [MaybeUninit::uninit(); 12]),
+            decompress_into(&codes, view, &mut [MaybeUninit::uninit(); 12]).map(|out| out.len()),
             Ok(12)
         );
         assert_eq!(
-            try_decode_into(&codes, view, &mut [MaybeUninit::uninit(); 11]),
+            decompress_into(&codes, view, &mut [MaybeUninit::uninit(); 11]),
             Err(OutputTooSmall)
         );
     }
@@ -368,7 +370,7 @@ mod tests {
     /// A full store per code leaves no slack at all for full-width tokens, and one
     /// byte less goes back to the rounds, whatever the tokens.
     #[test]
-    fn try_decode_at_one_store_per_code() {
+    fn at_one_store_per_code() {
         let full = [b'z'; MAX_TOKEN_SIZE];
         let tokens: &[&[u8]] = &[b"a", &full];
         let (bytes, offsets) = padded(tokens);
@@ -377,32 +379,35 @@ mod tests {
             let want = expected(tokens, &codes);
             let room = codes.len() * MAX_TOKEN_SIZE;
             let mut out = vec![MaybeUninit::uninit(); room];
-            assert_eq!(try_decode_into(&codes, view, &mut out), Ok(want.len()));
-            // SAFETY: the decoder initialized the first `want.len()` bytes.
-            let got = unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), want.len()) };
-            assert_eq!(got, want);
-            let one_short = try_decode_into(&codes, view, &mut out[..room - 1]);
+            assert_eq!(decompress_into(&codes, view, &mut out).unwrap(), want);
+            let one_short = decompress_into(&codes, view, &mut out[..room - 1]);
             let fits = want.len() < room;
-            assert_eq!(one_short, fits.then_some(want.len()).ok_or(OutputTooSmall));
+            assert_eq!(
+                one_short.map(|out| out.len()),
+                fits.then_some(want.len()).ok_or(OutputTooSmall)
+            );
         }
     }
 
     #[test]
     #[should_panic(expected = "code index out of range")]
-    fn try_decode_panics_on_out_of_range_code() {
+    fn panics_on_out_of_range_code() {
         let (bytes, offsets) = padded(&[b"a", b"b"]);
         let view = CompactDictionaryView::from_raw(&bytes, &offsets);
         // Generous buffer, so the bad code is hit on the fast path, not the tail.
         let mut out = vec![MaybeUninit::uninit(); 64];
         // A malformed code panics like the other decoders — recover via `validate`.
-        let _ = try_decode_into(&[0, 5], view, &mut out);
+        let _ = decompress_into(&[0, 5], view, &mut out);
     }
 
     #[test]
-    fn try_decode_empty_codes_into_empty_buffer() {
+    fn empty_codes_into_empty_buffer() {
         let (bytes, offsets) = padded(&[b"a", b"b"]);
         let view = CompactDictionaryView::from_raw(&bytes, &offsets);
-        assert_eq!(try_decode_into(&[], view, &mut []), Ok(0));
+        assert_eq!(
+            decompress_into(&[], view, &mut []).map(|out| out.len()),
+            Ok(0)
+        );
     }
 
     /// The exact-copy tail (`copy_token_bytes`) must reproduce a token of every
@@ -410,15 +415,13 @@ mod tests {
     /// `len < MAX_TOKEN_SIZE` the whole decode goes through the tail (`batch == 0`),
     /// hitting the 1, 2|3, 4..7 and 8..15 arms.
     #[test]
-    fn try_decode_tail_reproduces_every_length_bucket() {
+    fn tail_reproduces_every_length_bucket() {
         for len in [1usize, 2, 3, 4, 5, 7, 8, 11, 15] {
             let tok = vec![b'a' + (len as u8); len];
             let (bytes, offsets) = padded(&[tok.as_slice()]);
             let view = CompactDictionaryView::from_raw(&bytes, &offsets);
             let mut out = vec![MaybeUninit::uninit(); len]; // exact ⇒ tail-only
-            let w = try_decode_into(&[0], view, &mut out).unwrap();
-            assert_eq!(w, len, "len {len}");
-            let got = unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), w) };
+            let got = decompress_into(&[0], view, &mut out).unwrap();
             assert_eq!(got, tok.as_slice(), "len {len}");
         }
     }

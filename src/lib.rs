@@ -29,10 +29,10 @@
 //! the code stream). Borrow it as a [`ColumnView`] — or build a view directly
 //! from buffers deserialized from storage — and decode into a caller-owned buffer:
 //! the whole column with [`ColumnView::decompress_into`], one row with
-//! [`ColumnView::decompress_row_into`], or [`decode_into`] over a reusable
-//! [`WideDictionary`]. The caller owns buffer sizing: size it from
-//! [`ColumnView::decoded_len`] or [`ColumnView::row_decoded_len`] (plus
-//! [`DECODE_PADDING`]).
+//! [`ColumnView::decompress_row_into`], or [`decompress_into`] over a reusable
+//! [`WideDictionary`]. The caller owns buffer sizing: OnPair does not store the
+//! original lengths, so keep them with the column. A buffer of the original length
+//! is enough, and for a row [`MAX_TOKEN_SIZE`] bytes per code is the fastest.
 //!
 //! # Search
 //! [`search`] answers equality, prefix and substring queries on the codes, without
@@ -42,8 +42,7 @@
 //!
 //! # Examples
 //! ```
-//! use onpair::{Column, DECODE_PADDING, DEFAULT_CONFIG};
-//! use std::mem::MaybeUninit;
+//! use onpair::{Column, DEFAULT_CONFIG};
 //!
 //! // Compress an Arrow (bytes, offsets) value pair.
 //! let bytes = b"catdogcat";
@@ -51,19 +50,20 @@
 //! let col = Column::compress(bytes, &offsets, DEFAULT_CONFIG).unwrap();
 //! let view = col.view();
 //!
-//! // Random-access a single row into a caller buffer — no full decode, no
-//! // wide-table build. Size it from the row's decoded length plus DECODE_PADDING.
-//! let mut row = vec![MaybeUninit::uninit(); view.row_decoded_len(1) + DECODE_PADDING];
-//! // SAFETY: `col` is valid by construction and `row` is sized as required.
-//! let n = unsafe { view.decompress_row_into(1, &mut row) };
-//! assert_eq!(unsafe { std::slice::from_raw_parts(row.as_ptr().cast::<u8>(), n) }, b"dog");
+//! // Decompression restores the original values, so their lengths size the buffers.
+//! // OnPair does not store these lengths: keep them with the column.
+//! let column_len = bytes.len();
+//! let row_len = (offsets[2] - offsets[1]) as usize;
 //!
-//! // Bulk-decode the whole column into a caller buffer, sized from the decoded length.
-//! let mut buf = vec![MaybeUninit::uninit(); view.decoded_len() + DECODE_PADDING];
-//! // SAFETY: `col` is freshly compressed (valid by construction) and `buf` is sized.
-//! let n = unsafe { view.decompress_into(&mut buf) };
-//! let out = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
-//! assert_eq!(out, b"catdogcat");
+//! // Random-access one row, decoded straight from the compact dictionary.
+//! let mut row = Vec::with_capacity(row_len);
+//! let decompressed = view.decompress_row_into(1, row.spare_capacity_mut()).unwrap();
+//! assert_eq!(decompressed, b"dog");
+//!
+//! // Decompress the whole column.
+//! let mut all = Vec::with_capacity(column_len);
+//! let decompressed = view.decompress_into(all.spare_capacity_mut()).unwrap();
+//! assert_eq!(decompressed, b"catdogcat");
 //! ```
 //!
 //! The trained encoder is also available directly via [`Parser`], to reuse one
@@ -87,7 +87,7 @@ pub use crate::core::offset::Offset;
 pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 pub use crate::core::validate::InvalidColumn;
 pub use crate::decoding::{
-    DECODE_PADDING, OutputTooSmall, decode_into, decoded_len, try_decode_into,
+    DECOMPRESS_PADDING, OutputTooSmall, decoded_len, decompress_into, decompress_into_unchecked,
 };
 pub use crate::encoding::config::{Config, DEFAULT_CONFIG, Error, MaxDictBits, Threshold};
 pub use crate::encoding::parser::Parser;
