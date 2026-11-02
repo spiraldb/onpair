@@ -28,7 +28,7 @@ type Broadcast = __m256i;
 
 /// A 16-byte shuffle row, broadcast into both 128-bit lanes since `vpshufb`
 /// indexes within lanes.
-type Table = __m256i;
+type NibbleTable = __m256i;
 
 #[inline]
 #[target_feature(enable = "avx2")]
@@ -161,7 +161,7 @@ fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
 }
 
 pub(crate) struct EqOr {
-    tokens: Vec<Broadcast>,
+    points: Vec<Broadcast>,
     ranges: Vec<Held>,
 }
 
@@ -170,7 +170,7 @@ impl Matcher for EqOr {
         // SAFETY: the caller guarantees AVX2, which `broadcast` and `hold` need.
         unsafe {
             Self {
-                tokens: cover
+                points: cover
                     .points()
                     .iter()
                     .map(|&point| broadcast(point))
@@ -181,13 +181,13 @@ impl Matcher for EqOr {
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask, skip_empty: bool) -> bool {
-        let (tokens, ranges) = (&self.tokens, &self.ranges);
+        let (points, ranges) = (&self.points, &self.ranges);
         // SAFETY: `self` was built by `new`, whose caller guaranteed AVX2.
         unsafe {
             if skip_empty {
-                eq_or_mask::<true>(tokens, ranges, codes, bits)
+                eq_or_mask::<true>(points, ranges, codes, bits)
             } else {
-                eq_or_mask::<false>(tokens, ranges, codes, bits)
+                eq_or_mask::<false>(points, ranges, codes, bits)
             }
         }
     }
@@ -195,12 +195,12 @@ impl Matcher for EqOr {
 
 #[target_feature(enable = "avx2")]
 fn eq_or_mask<const SKIP_EMPTY: bool>(
-    tokens: &[Broadcast],
+    points: &[Broadcast],
     ranges: &[Held],
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
-    let Some((first, rest)) = tokens.split_first() else {
+    let Some((first, rest)) = points.split_first() else {
         return ranges_mask::<SKIP_EMPTY>(ranges, codes, bits);
     };
     words::<SKIP_EMPTY>(
@@ -211,16 +211,16 @@ fn eq_or_mask<const SKIP_EMPTY: bool>(
     )
 }
 
-struct Batch([Table; 4]);
+struct Batch([NibbleTable; 4]);
 
 #[target_feature(enable = "avx2")]
 fn batch(points: &[Token], at: usize) -> Batch {
-    Batch(nibble_rows(points, at).map(|row| table(row)))
+    Batch(nibble_rows(points, at).map(|row| nibble_table(row)))
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn table(row: [u8; 16]) -> Table {
+fn nibble_table(row: [u8; 16]) -> NibbleTable {
     // SAFETY: the load reads the row's 16 bytes.
     unsafe { _mm256_broadcastsi128_si256(_mm_loadu_si128(row.as_ptr().cast())) }
 }
@@ -230,7 +230,7 @@ fn table(row: [u8; 16]) -> Table {
 /// twice with zero turns a byte with a point bit left into a 0xFF hit.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
+fn nibble_hits<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
     let byte = _mm256_set1_epi16(0x00ff);
     let nibble = _mm256_set1_epi8(0x0f);
     let zero = _mm256_setzero_si256();
@@ -314,7 +314,7 @@ fn nibble_mask<const BATCHES: usize, const SKIP_EMPTY: bool>(
         codes,
         bits,
         #[inline(always)]
-        |codes| check_ranges(probe(batches, codes), ranges, codes),
+        |codes| check_ranges(nibble_hits(batches, codes), ranges, codes),
     )
 }
 

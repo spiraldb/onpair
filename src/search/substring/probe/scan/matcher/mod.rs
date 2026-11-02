@@ -18,10 +18,10 @@
 //!   position, and point `k` sets bit `k` in the entry selected by its nibble at
 //!   each position. Looking up a code's four nibbles and ANDing the entries leaves
 //!   bit `k` iff the code equals point `k`. `batch` loads the rows `nibble_rows`
-//!   builds into one `Table` each, and `probe` looks a group's nibbles up in every
-//!   batch. Batches are ORed together, then range hits are added. `BATCHES` must
-//!   hold every point of the cover: planning caps it per instruction set, and
-//!   `dispatch` picks the specialization.
+//!   builds into one `NibbleTable` each, and `nibble_hits` looks a group's nibbles
+//!   up in every batch. Batches are ORed together, then range hits are added.
+//!   `BATCHES` must hold every point of the cover: planning caps it per instruction
+//!   set, and `dispatch` picks the specialization.
 //! - `hold` broadcasts a range's start and width, and `inside` tests a group of
 //!   codes against them. A code is in `[begin, last]` iff
 //!   `code.wrapping_sub(begin) <= last - begin`: codes below `begin` wrap around to

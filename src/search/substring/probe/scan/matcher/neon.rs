@@ -27,7 +27,7 @@ type Held = (uint16x8_t, uint16x8_t);
 type Broadcast = uint16x8_t;
 
 /// A 16-byte shuffle row.
-type Table = uint8x16_t;
+type NibbleTable = uint8x16_t;
 
 #[inline]
 #[target_feature(enable = "neon")]
@@ -168,7 +168,7 @@ fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
 }
 
 pub(crate) struct EqOr {
-    tokens: Vec<Broadcast>,
+    points: Vec<Broadcast>,
     ranges: Vec<Held>,
 }
 
@@ -177,7 +177,7 @@ impl Matcher for EqOr {
         // SAFETY: the caller guarantees NEON, which `broadcast` and `hold` need.
         unsafe {
             Self {
-                tokens: cover
+                points: cover
                     .points()
                     .iter()
                     .map(|&point| broadcast(point))
@@ -188,13 +188,13 @@ impl Matcher for EqOr {
     }
 
     fn check(&self, codes: &Block, bits: &mut Mask, skip_empty: bool) -> bool {
-        let (tokens, ranges) = (&self.tokens, &self.ranges);
+        let (points, ranges) = (&self.points, &self.ranges);
         // SAFETY: `self` was built by `new`, whose caller guaranteed NEON.
         unsafe {
             if skip_empty {
-                eq_or_mask::<true>(tokens, ranges, codes, bits)
+                eq_or_mask::<true>(points, ranges, codes, bits)
             } else {
-                eq_or_mask::<false>(tokens, ranges, codes, bits)
+                eq_or_mask::<false>(points, ranges, codes, bits)
             }
         }
     }
@@ -202,12 +202,12 @@ impl Matcher for EqOr {
 
 #[target_feature(enable = "neon")]
 fn eq_or_mask<const SKIP_EMPTY: bool>(
-    tokens: &[Broadcast],
+    points: &[Broadcast],
     ranges: &[Held],
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
-    let Some((first, rest)) = tokens.split_first() else {
+    let Some((first, rest)) = points.split_first() else {
         return ranges_mask::<SKIP_EMPTY>(ranges, codes, bits);
     };
     words::<SKIP_EMPTY>(
@@ -218,16 +218,16 @@ fn eq_or_mask<const SKIP_EMPTY: bool>(
     )
 }
 
-struct Batch([Table; 4]);
+struct Batch([NibbleTable; 4]);
 
 #[target_feature(enable = "neon")]
 fn batch(points: &[Token], at: usize) -> Batch {
-    Batch(nibble_rows(points, at).map(|row| table(row)))
+    Batch(nibble_rows(points, at).map(|row| nibble_table(row)))
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn table(row: [u8; 16]) -> Table {
+fn nibble_table(row: [u8; 16]) -> NibbleTable {
     // SAFETY: the load reads the row's 16 bytes.
     unsafe { vld1q_u8(row.as_ptr()) }
 }
@@ -236,7 +236,7 @@ fn table(row: [u8; 16]) -> Table {
 /// order, and `vtstq` turns a byte with a point bit left into a 0xFF hit.
 #[inline]
 #[target_feature(enable = "neon")]
-fn probe<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
+fn nibble_hits<const BATCHES: usize>(batches: &[Batch; BATCHES], codes: Vectors) -> Hits {
     let nibble = vdupq_n_u8(0x0f);
     std::array::from_fn(|at| {
         let lo = vreinterpretq_u8_u16(codes[2 * at]);
@@ -314,7 +314,7 @@ fn nibble_mask<const BATCHES: usize, const SKIP_EMPTY: bool>(
         codes,
         bits,
         #[inline(always)]
-        |codes| check_ranges(probe(batches, codes), ranges, codes),
+        |codes| check_ranges(nibble_hits(batches, codes), ranges, codes),
     )
 }
 
