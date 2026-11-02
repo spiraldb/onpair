@@ -72,6 +72,9 @@ assert_eq!(row, b"dog");
 `Config::default()` caps the dictionary at 2^12 entries; raise `max_dict_bits`
 for a larger one, up to 2^16.
 
+`Column` is the way to try the crate. To keep OnPair data in your own storage, see
+[Storing OnPair data](https://docs.rs/onpair/latest/onpair/#storing-onpair-data).
+
 
 ## Further reading
 

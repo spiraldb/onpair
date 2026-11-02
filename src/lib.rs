@@ -23,24 +23,10 @@
 //! dictionary; decoding is a gather-copy, so individual rows decode in
 //! isolation at no extra cost.
 //!
-//! # Layout
-//! A compressed [`Column`] is a [`CompactDictionary`] (token bytes + offsets), a
-//! code stream (one [`Token`] per emitted token), and a row layer (offsets into
-//! the code stream). Borrow it as a [`ColumnView`] — or build a view directly
-//! from buffers deserialized from storage — and decode into a caller-owned buffer:
-//! the whole column with [`ColumnView::decompress_into`], one row with
-//! [`ColumnView::decompress_row_into`], or [`decompress_into`] over a reusable
-//! [`WideDictionary`]. The caller owns buffer sizing: OnPair does not store the
-//! original lengths, so keep them with the column. A buffer of the original length
-//! is enough, and for a row [`MAX_TOKEN_SIZE`] bytes per code is the fastest.
+//! # Trying OnPair
+//! [`Column`] compresses Arrow `(bytes, offsets)` values and owns the result, and its
+//! [`view`](Column::view) decompresses and searches them.
 //!
-//! # Search
-//! [`search`] answers equality, prefix and substring queries on the codes, without
-//! decoding rows. On a column view, [`ColumnView::rows_equal_to`],
-//! [`ColumnView::rows_starting_with`], [`ColumnView::rows_containing`] and
-//! [`ColumnView::rows_containing_with_scan`] return the rows that match.
-//!
-//! # Examples
 //! ```
 //! use onpair::{Column, DEFAULT_CONFIG};
 //!
@@ -65,6 +51,71 @@
 //! let decompressed = view.decompress_into(all.spare_capacity_mut()).unwrap();
 //! assert_eq!(decompressed, b"catdogcat");
 //! ```
+//!
+//! # Storing OnPair data
+//! A storage engine keeps the parts of a column and calls the free functions on them.
+//! [`Column`] and [`ColumnView`] are conveniences over the same calls.
+//!
+//! **What to store.** [`Column::into_raw`] gives the parts: a [`CompactDictionary`]
+//! (token bytes and offsets), a code stream (one [`Token`] per token of the input),
+//! and the row offsets into the code stream. The
+//! [interchange format](https://github.com/spiraldb/onpair/blob/develop/docs/interchange-format.md)
+//! specifies them.
+//!
+//! OnPair does not store two things an engine may want beside them: each row's
+//! decompressed length, which sizes output buffers, and a
+//! [`TokenFrequencyIndex`](search::index::TokenFrequencyIndex), which
+//! [`ContainsScan`](search::ContainsScan) plans with.
+//!
+//! **Reading it back.** Buffers from storage can be corrupt.
+//! [`CompactDictionaryView::validate_safety`] checks what memory safety needs, and
+//! [`CompactDictionaryView::validate`] also checks what correct search needs. Without
+//! the second, search can give wrong answers, but stays memory safe.
+//!
+//! **Decompressing.** Build a [`WideDictionary`] once for whole columns and keep it.
+//! Single rows go straight to the compact view, because building the wide form costs
+//! time proportional to the dictionary. The output is `&mut [MaybeUninit<u8>]`, so a
+//! `Vec`'s [`spare_capacity_mut`](Vec::spare_capacity_mut) works without zeroing it.
+//!
+//! | You have | Call | Buffer |
+//! |---|---|---|
+//! | A whole column | [`decompress_into`] | Its decompressed length |
+//! | A row | [`decompress_into`] | [`MAX_TOKEN_SIZE`] bytes per code |
+//! | A row, and a length you trust | [`decompress_into_unchecked`] | That length plus [`DECOMPRESS_PADDING`] |
+//!
+//! The last row is the fastest for short rows, and offers nothing for whole columns. A
+//! length read from storage is not one to trust: if it were corrupt, the unchecked call
+//! would write out of bounds. Use the safe call and compare the length it returns.
+//!
+//! ```
+//! use onpair::{Column, CompactDictionaryView, DEFAULT_CONFIG, Dictionary};
+//!
+//! let bytes = b"catdogcat";
+//! let offsets: [u32; 4] = [0, 3, 6, 9];
+//! let (dict, codes, _) = Column::compress(bytes, &offsets, DEFAULT_CONFIG)?.into_raw();
+//!
+//! // Validate the dictionary read back from storage, and build the wide form once.
+//! let view = CompactDictionaryView::validate(dict.bytes(), dict.offsets())?;
+//! let wide = view.to_wide();
+//!
+//! // Decompress into a buffer's spare capacity, sized from the stored length.
+//! let stored_len = bytes.len();
+//! let mut out = Vec::with_capacity(stored_len);
+//! let n = onpair::decompress_into(&codes, wide.as_view(), out.spare_capacity_mut())?.len();
+//! assert_eq!(n, stored_len);
+//! // SAFETY: `decompress_into` initialized the first `n` bytes.
+//! unsafe { out.set_len(n) };
+//! assert_eq!(out, bytes);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # Search
+//! [`search`] answers equality, prefix and substring queries on the codes, without
+//! decoding rows. On a column view, [`ColumnView::rows_equal_to`],
+//! [`ColumnView::rows_starting_with`], [`ColumnView::rows_containing`] and
+//! [`ColumnView::rows_containing_with_scan`] return the rows that match. To search
+//! many chunks encoded with one dictionary, prepare a
+//! [`ContainsScan`](search::ContainsScan) once and scan each of them.
 //!
 //! The trained encoder is also available directly via [`Parser`], to reuse one
 //! dictionary across several corpora.
