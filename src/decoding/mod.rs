@@ -60,7 +60,8 @@ pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
 /// [`InvalidColumn::CodeOutOfRange`].
 ///
 /// # Safety
-/// `out.len() >= decoded_len(codes, dict) + DECODE_PADDING`.
+/// `out.len() >= decoded_len(codes, dict) + DECODE_PADDING`, or `out` holds
+/// [`MAX_TOKEN_SIZE`] bytes per code.
 pub unsafe fn decode_into<V: DictionaryView>(
     codes: &[Token],
     dict: V,
@@ -74,8 +75,10 @@ pub unsafe fn decode_into<V: DictionaryView>(
             panic_malformed(InvalidColumn::CodeOutOfRange);
         }
         // SAFETY: code in range ⇒ token_ptr is readable for 16 bytes (the dict is
-        // read-padded); the trailing DECODE_PADDING keeps the last token's
-        // over-store within `out`.
+        // read-padded). The trailing DECODE_PADDING keeps the last token's
+        // over-store within `out`; with MAX_TOKEN_SIZE bytes per code, each store
+        // starts at most MAX_TOKEN_SIZE bytes per preceding code in, so it ends
+        // within `out` too.
         unsafe {
             let src = dict.token_ptr(code);
             let len = dict.token_len_unchecked(code);
@@ -122,6 +125,10 @@ impl std::error::Error for OutputTooSmall {}
 /// [`decoded_len`] suffices (and an over-store-padded one stays on the fast path
 /// throughout).
 ///
+/// With [`MAX_TOKEN_SIZE`] bytes per code in `out`, no store can leave it whatever the
+/// tokens are, so one check replaces the rounds and the exact copies. That sizing
+/// costs nothing to compute and is the fastest for short inputs such as single rows.
+///
 /// Bounds-checking codes (the obligation [`decode_into`] leaves to the dictionary's
 /// trust) is necessary but **not** sufficient for memory safety: in-range codes can
 /// address [`MAX_TOKEN_SIZE`]-byte tokens, so a buffer sized from any figure other
@@ -140,6 +147,11 @@ pub fn try_decode_into<V: DictionaryView>(
     dict: V,
     out: &mut [MaybeUninit<u8>],
 ) -> Result<usize, OutputTooSmall> {
+    if out.len() / MAX_TOKEN_SIZE >= codes.len() {
+        // SAFETY: `out` holds MAX_TOKEN_SIZE bytes per code.
+        return Ok(unsafe { decode_into(codes, dict, out) });
+    }
+
     let ntok = dict.num_tokens();
     let cap = out.len();
     let dst = out.as_mut_ptr().cast::<u8>();
@@ -351,6 +363,28 @@ mod tests {
             try_decode_into(&codes, view, &mut [MaybeUninit::uninit(); 11]),
             Err(OutputTooSmall)
         );
+    }
+
+    /// A full store per code leaves no slack at all for full-width tokens, and one
+    /// byte less goes back to the rounds, whatever the tokens.
+    #[test]
+    fn try_decode_at_one_store_per_code() {
+        let full = [b'z'; MAX_TOKEN_SIZE];
+        let tokens: &[&[u8]] = &[b"a", &full];
+        let (bytes, offsets) = padded(tokens);
+        let view = CompactDictionaryView::from_raw(&bytes, &offsets);
+        for codes in [[1, 1, 1], [0, 1, 0], [1, 0, 1], [0, 0, 0]] {
+            let want = expected(tokens, &codes);
+            let room = codes.len() * MAX_TOKEN_SIZE;
+            let mut out = vec![MaybeUninit::uninit(); room];
+            assert_eq!(try_decode_into(&codes, view, &mut out), Ok(want.len()));
+            // SAFETY: the decoder initialized the first `want.len()` bytes.
+            let got = unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), want.len()) };
+            assert_eq!(got, want);
+            let one_short = try_decode_into(&codes, view, &mut out[..room - 1]);
+            let fits = want.len() < room;
+            assert_eq!(one_short, fits.then_some(want.len()).ok_or(OutputTooSmall));
+        }
     }
 
     #[test]
