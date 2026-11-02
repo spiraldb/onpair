@@ -27,7 +27,6 @@ use resolver::Resolver;
 /// The vector instruction set the kernels and cost weights are chosen for.
 /// Scans use `detect_isa`; planning tests may pass any value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Some variants are only constructed on other build targets.
 pub(super) enum Isa {
     /// No vector kernels: only the table matcher is available.
     Scalar,
