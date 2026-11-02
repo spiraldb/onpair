@@ -427,9 +427,15 @@ mod tests {
     #[test]
     fn repeating_pattern_exercises_failure_links() {
         // Patterns with internal repetition stress the KMP failure function and
-        // the sparse cross-token transitions.
-        let rows: &[&[u8]] = &[b"aaaaab", b"aabaab", b"ababab", b"aaa"];
-        check(rows, &[b"aa", b"aaa", b"aab", b"abab", b"aaaa", b"aabaa"]);
+        // the sparse cross-token transitions. The last row matches the last pattern
+        // only through a failure link that took a fallback to compute.
+        let rows: &[&[u8]] = &[b"aaaaab", b"aabaab", b"ababab", b"aaa", b"aabaaabaaaa"];
+        check(
+            rows,
+            &[
+                b"aa", b"aaa", b"aab", b"abab", b"aaaa", b"aabaa", b"aabaaaa",
+            ],
+        );
     }
 
     #[test]
@@ -455,5 +461,57 @@ mod tests {
         let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
         let patterns: &[&[u8]] = &[b"\x00", b"\xff", b"\x00\x01", &[7u8], &[200u8, 201]];
         check(&rows, patterns);
+    }
+
+    /// Every string of `a` and `b` of at most `max` bytes.
+    fn ab_strings(max: u32) -> Vec<Vec<u8>> {
+        (0..=max)
+            .flat_map(|len| {
+                (0..1u32 << len)
+                    .map(move |bits| (0..len).map(|at| b'a' + (bits >> at & 1) as u8).collect())
+            })
+            .collect()
+    }
+
+    /// Every way to split `row` into tokens of `dict`.
+    fn tokenizations<V: DictionaryView>(dict: V, row: &[u8]) -> Vec<Vec<Token>> {
+        if row.is_empty() {
+            return vec![Vec::new()];
+        }
+        (0..dict.num_tokens())
+            .map(|token| token as Token)
+            .filter(|&token| row.starts_with(dict.token(token)))
+            .flat_map(|token| {
+                tokenizations(dict, &row[dict.token_len(token)..])
+                    .into_iter()
+                    .map(move |rest| [vec![token], rest].concat())
+            })
+            .collect()
+    }
+
+    /// The automaton is exact for any tokenization: every split of a row into tokens
+    /// gets the answer of the row's bytes. The encoder's rows cannot show this, because
+    /// an automaton without the transitions they never take still passes on them.
+    #[test]
+    fn matches_bytes_on_any_tokenization() {
+        use crate::test_corpus::complete_dictionary;
+        let dict = complete_dictionary(&[b"aa", b"ab", b"aba", b"abab", b"ba", b"bab"]);
+        let view = dict.as_view();
+        let rows: Vec<(Vec<u8>, Vec<Vec<Token>>)> = ab_strings(7)
+            .into_iter()
+            .map(|row| {
+                let splits = tokenizations(view, &row);
+                (row, splits)
+            })
+            .collect();
+        for pattern in ab_strings(5) {
+            let dfa = ContainsDfa::new(&pattern, view).unwrap();
+            for (row, splits) in &rows {
+                let want = byte_contains(row, &pattern);
+                for codes in splits {
+                    assert_eq!(row_contains(codes, &dfa), want, "{row:?}, {codes:?}");
+                }
+            }
+        }
     }
 }
