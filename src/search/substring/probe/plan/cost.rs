@@ -32,10 +32,6 @@ pub(crate) struct CostModel {
     nibble_base: f64,
     /// One batch of up to eight point probes in Nibble.
     pub(super) nibble_batch: f64,
-    /// Most batches planning gives Nibble. Up to it each batch costs
-    /// `nibble_batch`; past it the cost per batch can jump, as on AVX2 after the
-    /// fourth.
-    max_nibble_batches: usize,
     /// Row lookup and verification of one hit. The cost is flat, although sparse
     /// hits cost more each than dense ones; walk lengths and the hits skipped after
     /// a row matches are not modeled either.
@@ -47,7 +43,6 @@ const NEON_COSTS: CostModel = CostModel {
     range: 0.138,
     nibble_base: 0.092,
     nibble_batch: 0.23,
-    max_nibble_batches: 3,
     hit: 94.0,
 };
 
@@ -56,7 +51,6 @@ const AVX2_COSTS: CostModel = CostModel {
     range: 0.056,
     nibble_base: 0.14,
     nibble_batch: 0.056,
-    max_nibble_batches: 4,
     hit: 103.0,
 };
 
@@ -65,17 +59,8 @@ const AVX512BW_COSTS: CostModel = CostModel {
     range: 0.066,
     nibble_base: 0.033,
     nibble_batch: 0.033,
-    max_nibble_batches: 4,
     hit: 105.0,
 };
-
-// Every batch count planning can give Nibble has a matcher.
-const _: () = assert!(
-    NEON_COSTS.max_nibble_batches <= MAX_NIBBLE_BATCHES
-        && AVX2_COSTS.max_nibble_batches <= MAX_NIBBLE_BATCHES
-        && AVX512BW_COSTS.max_nibble_batches <= MAX_NIBBLE_BATCHES,
-    "a Nibble batch cap exceeds the matchers dispatch builds"
-);
 
 impl CostModel {
     /// The model of `isa`, or `None` on scalar targets, where only the table runs.
@@ -89,14 +74,14 @@ impl CostModel {
     }
 
     /// Whether `matcher` can run `cover`. Nibble needs points, at most
-    /// `max_nibble_batches` batches of them.
+    /// `MAX_NIBBLE_BATCHES` batches of them.
     pub(crate) fn can_run(&self, matcher: MatcherKind, cover: &ProbeCover) -> bool {
         match matcher {
             MatcherKind::Table => true,
             MatcherKind::EqOr => !cover.is_empty(),
             MatcherKind::Nibble => {
                 let points = cover.points().len();
-                points > 0 && points.div_ceil(PER_BATCH) <= self.max_nibble_batches
+                points > 0 && points.div_ceil(PER_BATCH) <= MAX_NIBBLE_BATCHES
             }
         }
     }

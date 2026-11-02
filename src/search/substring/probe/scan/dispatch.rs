@@ -39,8 +39,9 @@ pub(crate) enum MatcherKind {
     Nibble,
 }
 
-/// The most batches a Nibble matcher can have: `prepare_with` builds one for each
-/// count up to this.
+/// The most batches planning gives Nibble, and `prepare_with` builds a matcher for
+/// each count up to it. Up to it each batch costs the same; past it the cost per
+/// batch can jump, as on AVX2 after the fourth.
 pub(crate) const MAX_NIBBLE_BATCHES: usize = 4;
 
 /// Builds the `kind` matcher of `isa` for `cover`. `kind` must be eligible for the

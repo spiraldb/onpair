@@ -201,7 +201,7 @@ mod tests {
     fn nibble_admission_respects_batch_caps() {
         for (isa, limit) in [
             (Isa::Scalar, 0),
-            (Isa::Neon, 24),
+            (Isa::Neon, 32),
             (Isa::Avx2, 32),
             (Isa::Avx512Bw, 32),
         ] {
