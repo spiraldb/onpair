@@ -337,23 +337,23 @@ fn empty_pattern_matches_every_row() {
     }
 }
 
-/// `Debug` shows the plan, not the dictionary or the verifier's tables.
+/// `Debug` shows the plan, not the cover's tokens, the dictionary or the verifier's
+/// tables.
 #[test]
 fn debug_shows_the_plan() {
     let column = compress_rows(&[b"alpha beta", b"gamma"]);
     let view = column.view();
     let index = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
     let empty = ContainsScan::new(b"", view.dict, index.as_view()).unwrap();
-    assert_eq!(
-        format!("{empty:?}"),
-        "ContainsScan { probe_cover: None, .. }"
-    );
+    assert_eq!(format!("{empty:?}"), "ContainsScan { .. }");
     let scan = ContainsScan::new(b"alpha", view.dict, index.as_view()).unwrap();
     let debug = format!("{scan:?}");
     assert!(
-        debug.starts_with("ContainsScan { probe_cover: Some(ProbeCover {")
+        debug.starts_with("ContainsScan { cover_points: ")
+            && debug.contains(", cover_ranges: ")
             && debug.contains(", matcher: ")
             && debug.ends_with(", .. }")
+            && !debug.contains("ProbeCover")
             && !debug.contains("bytes"),
         "{debug}"
     );

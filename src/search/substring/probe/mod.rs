@@ -295,14 +295,17 @@ impl<'d> ContainsScan<'d> {
     }
 }
 
-/// Shows the plan: the cover, the instruction set, the matcher and the hit density
-/// it was planned for. The dictionary and the verifier's tables are left out.
+/// Shows the plan: the size of the cover, the instruction set, the matcher and the
+/// hit density it was planned for, or nothing for the empty pattern. The cover
+/// itself is in [`probe_cover`](Self::probe_cover), since it can run to thousands of
+/// characters. The dictionary and the verifier's tables are left out.
 impl fmt::Debug for ContainsScan<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("ContainsScan");
-        debug.field("probe_cover", &self.probe_cover());
         if let Query::Scan(prepared) = &self.query {
             debug
+                .field("cover_points", &prepared.probe_cover.points().len())
+                .field("cover_ranges", &prepared.probe_cover.ranges().len())
                 .field("isa", &prepared.isa)
                 .field("matcher", &prepared.kind)
                 .field("hit_density", &prepared.hit_density);
