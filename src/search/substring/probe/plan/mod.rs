@@ -22,8 +22,6 @@ use super::alignment::mincut::MinCut;
 use super::scan::{Isa, MatcherKind, PER_BATCH};
 use crate::search::index::TokenFrequencyIndexView;
 pub(super) use cost::CostModel;
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(super) use cost::max_nibble_batches;
 
 /// Hit density below which vector matchers test each pair of 64-code groups for a
 /// hit before packing it: 0.025%, about one expected hit per 4096-code block. Clustered

@@ -20,7 +20,7 @@
 //! weight steers planning toward covers with fewer points.
 
 use crate::search::substring::ProbeCover;
-use crate::search::substring::probe::scan::{Isa, MatcherKind, PER_BATCH};
+use crate::search::substring::probe::scan::{Isa, MAX_NIBBLE_BATCHES, MatcherKind, PER_BATCH};
 
 /// The cost model of one instruction set, in table scans.
 pub(crate) struct CostModel {
@@ -68,6 +68,14 @@ const AVX512BW_COSTS: CostModel = CostModel {
     max_nibble_batches: 4,
     hit: 105.0,
 };
+
+// Every batch count planning can give Nibble has a matcher.
+const _: () = assert!(
+    NEON_COSTS.max_nibble_batches <= MAX_NIBBLE_BATCHES
+        && AVX2_COSTS.max_nibble_batches <= MAX_NIBBLE_BATCHES
+        && AVX512BW_COSTS.max_nibble_batches <= MAX_NIBBLE_BATCHES,
+    "a Nibble batch cap exceeds the matchers dispatch builds"
+);
 
 impl CostModel {
     /// The model of `isa`, or `None` on scalar targets, where only the table runs.
@@ -133,15 +141,5 @@ impl CostModel {
                 self.nibble_base + self.nibble_batch * batches + self.range * ranges
             }
         }
-    }
-}
-
-/// The most batches planning gives Nibble on `isa`, and so the most dispatch
-/// compiles a Nibble kernel for; none for `Isa::Scalar`.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(crate) const fn max_nibble_batches(isa: Isa) -> usize {
-    match CostModel::of(isa) {
-        Some(model) => model.max_nibble_batches,
-        None => 0,
     }
 }

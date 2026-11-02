@@ -20,31 +20,9 @@ use super::verify::HitVerifier;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
-pub(super) use dispatch::{detect_isa, prepare};
+pub(super) use dispatch::{Isa, MAX_NIBBLE_BATCHES, MatcherKind, detect_isa, prepare};
 pub(super) use matcher::{Matcher, PER_BATCH};
 use resolver::Resolver;
-
-/// The vector instruction set the kernels and cost weights are chosen for.
-/// Scans use `detect_isa`; planning tests may pass any value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Isa {
-    /// No vector kernels: only the table matcher is available.
-    Scalar,
-    Neon,
-    Avx2,
-    Avx512Bw,
-}
-
-/// The kernel that tests codes for membership in the cover.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum MatcherKind {
-    /// Scalar lookup table; supports any cover and any target.
-    Table,
-    /// One vector equality per point, plus range checks.
-    EqOr,
-    /// Nibble shuffle tables, eight points per batch, plus range checks.
-    Nibble,
-}
 
 /// Number of codes per matcher block.
 pub(super) const BLOCK: usize = 4096;

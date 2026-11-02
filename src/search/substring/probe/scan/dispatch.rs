@@ -12,12 +12,36 @@
 //! kernels and picks the best one the CPU supports at runtime, falling back to the
 //! table without either. Other targets only have the table.
 
+use super::ProbeCover;
 use super::matcher::{self, Matcher};
-use super::{Isa, MatcherKind, ProbeCover};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::{PER_BATCH, matcher::Kernels};
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use crate::search::substring::probe::plan::max_nibble_batches;
+
+/// The vector instruction set the kernels and cost weights are chosen for.
+/// Scans use `detect_isa`; planning tests may pass any value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Isa {
+    /// No vector kernels: only the table matcher is available.
+    Scalar,
+    Neon,
+    Avx2,
+    Avx512Bw,
+}
+
+/// The kernel that tests codes for membership in the cover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MatcherKind {
+    /// Scalar lookup table; supports any cover and any target.
+    Table,
+    /// One vector equality per point, plus range checks.
+    EqOr,
+    /// Nibble shuffle tables, eight points per batch, plus range checks.
+    Nibble,
+}
+
+/// The most batches a Nibble matcher can have: `prepare_with` builds one for each
+/// count up to this.
+pub(crate) const MAX_NIBBLE_BATCHES: usize = 4;
 
 /// Builds the `kind` matcher of `isa` for `cover`. `kind` must be eligible for the
 /// cover on `isa`, as planning ensures. `Isa::Scalar`, and a vector instruction set
@@ -55,33 +79,16 @@ fn prepare_with<K: Kernels>(kind: MatcherKind, cover: &ProbeCover) -> Box<dyn Ma
         match kind {
             MatcherKind::Table => Box::new(matcher::Table::new(cover)),
             MatcherKind::EqOr => Box::new(K::EqOr::new(cover)),
-            // An arm is compiled only if planning can give Nibble that many batches on
-            // this instruction set.
             MatcherKind::Nibble => match cover.points().len().div_ceil(PER_BATCH) {
                 1 => Box::new(K::Nibble::<1>::new(cover)),
-                2 if const { max_nibble_batches(K::ISA) >= 2 } => {
-                    Box::new(K::Nibble::<2>::new(cover))
-                }
-                3 if const { max_nibble_batches(K::ISA) >= 3 } => {
-                    Box::new(K::Nibble::<3>::new(cover))
-                }
-                4 if const { max_nibble_batches(K::ISA) >= 4 } => {
-                    Box::new(K::Nibble::<4>::new(cover))
-                }
+                2 => Box::new(K::Nibble::<2>::new(cover)),
+                3 => Box::new(K::Nibble::<3>::new(cover)),
+                4 => Box::new(K::Nibble::<4>::new(cover)),
                 batches => unreachable!("Nibble planned with {batches} batches, above the cap"),
             },
         }
     }
 }
-
-// Every batch count planning can give Nibble has an arm in `prepare_with`.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-const _: () = assert!(
-    max_nibble_batches(Isa::Neon) <= 4
-        && max_nibble_batches(Isa::Avx2) <= 4
-        && max_nibble_batches(Isa::Avx512Bw) <= 4,
-    "a Nibble batch cap exceeds the batch counts `prepare_with` compiles"
-);
 
 /// Whether this build has kernels for `isa` and this CPU can run them.
 pub(crate) fn supports(isa: Isa) -> bool {
