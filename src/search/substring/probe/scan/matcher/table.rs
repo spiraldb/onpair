@@ -10,20 +10,20 @@ use crate::search::substring::ProbeCover;
 
 /// The membership table of one cover.
 pub(crate) struct Table {
-    /// 0xFF for covered IDs and zero otherwise; packing extracts the low bit. One
-    /// entry per `u16`, so indexing by a code needs no bounds check.
-    admits: Box<[u8; 1 << 16]>,
+    /// Whether each ID is covered. One entry per `u16`, so indexing by a code needs
+    /// no bounds check.
+    admits: Box<[bool; 1 << 16]>,
 }
 
 impl Matcher for Table {
     unsafe fn new(cover: &ProbeCover) -> Self {
         // Built on the heap, without a 64 KiB array on the stack.
-        let mut admits: Box<[u8; 1 << 16]> = vec![0; 1 << 16].try_into().unwrap();
+        let mut admits: Box<[bool; 1 << 16]> = vec![false; 1 << 16].try_into().unwrap();
         for &code in cover.points() {
-            admits[usize::from(code)] = 0xFF;
+            admits[usize::from(code)] = true;
         }
         for range in cover.ranges() {
-            admits[usize::from(range.begin)..=usize::from(range.last)].fill(0xFF);
+            admits[usize::from(range.begin)..=usize::from(range.last)].fill(true);
         }
         Self { admits }
     }
@@ -37,7 +37,7 @@ impl Matcher for Table {
             for (group, codes) in codes.chunks_exact(8).enumerate() {
                 let mut byte = 0u64;
                 for (bit, &code) in codes.iter().enumerate() {
-                    byte |= u64::from(self.admits[usize::from(code)] & 1) << bit;
+                    byte |= u64::from(self.admits[usize::from(code)]) << bit;
                 }
                 packed |= byte << (8 * group);
             }
