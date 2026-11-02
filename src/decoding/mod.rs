@@ -31,30 +31,6 @@ mod copy;
 /// [`decompress_into`] needs none.
 pub const DECOMPRESS_PADDING: usize = MAX_TOKEN_SIZE;
 
-/// Exact decoded byte length of `codes` against `dict` (the sum of token
-/// lengths) — sizes a decode buffer.
-///
-/// Bounds-checks each code, so a malformed code stream panics with
-/// [`InvalidColumn::CodeOutOfRange`] rather than reading out of bounds. The sum
-/// is only meaningful for a dictionary satisfying [`DictionaryView`]'s
-/// structural invariants.
-#[inline]
-pub fn decoded_len<V: DictionaryView>(codes: &[Token], dict: V) -> usize {
-    let n = dict.num_tokens();
-    let mut sum = 0usize;
-    for &c in codes {
-        if (c as usize) >= n {
-            panic_malformed(InvalidColumn::CodeOutOfRange);
-        }
-        // SAFETY: c < num_tokens.
-        let len = unsafe { dict.token_len_unchecked(c) };
-        sum = sum
-            .checked_add(len)
-            .unwrap_or_else(|| panic_malformed(InvalidColumn::DecodedLenOverflow));
-    }
-    sum
-}
-
 /// [`decompress_into`] without the buffer check: only the buffer size is the
 /// caller's promise. It over-reads a fixed 16 bytes per token, relying on the
 /// structural invariants guaranteed by [`DictionaryView`]. Each code is still
@@ -236,10 +212,9 @@ mod tests {
             .collect()
     }
 
-    /// Decode into a padded buffer and return the initialized bytes.
-    fn vec_decode<V: DictionaryView>(codes: &[Token], dict: V) -> Vec<u8> {
-        let n = decoded_len(codes, dict);
-        let mut out = Vec::with_capacity(n + DECOMPRESS_PADDING);
+    /// Decode `len` bytes into a padded buffer and return the initialized bytes.
+    fn vec_decode<V: DictionaryView>(codes: &[Token], dict: V, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + DECOMPRESS_PADDING);
         // SAFETY: read-padded dict, in-range codes, buffer + DECOMPRESS_PADDING.
         let w = unsafe { decompress_into_unchecked(codes, dict, out.spare_capacity_mut()) }.len();
         // SAFETY: the decoder initialized the first `w` bytes.
@@ -254,11 +229,10 @@ mod tests {
         let view = CompactDictionaryView::from_raw(&bytes, &offsets);
         let want = expected(tokens, codes);
 
-        assert_eq!(decoded_len(codes, view), want.len());
-        assert_eq!(vec_decode(codes, view), want, "compact");
+        assert_eq!(vec_decode(codes, view, want.len()), want, "compact");
 
         let wide = view.to_wide();
-        assert_eq!(vec_decode(codes, wide.as_view()), want, "wide");
+        assert_eq!(vec_decode(codes, wide.as_view(), want.len()), want, "wide");
     }
 
     #[test]
@@ -321,14 +295,6 @@ mod tests {
         let mut out = vec![MaybeUninit::uninit(); 64];
         // SAFETY: read-padded dict + generous buffer; the bad code must panic.
         unsafe { decompress_into_unchecked(&[0, 5], view, &mut out) };
-    }
-
-    #[test]
-    #[should_panic(expected = "code index out of range")]
-    fn decoded_len_panics_on_out_of_range_code() {
-        let (bytes, offsets) = padded(&[b"a", b"b"]);
-        let view = CompactDictionaryView::from_raw(&bytes, &offsets);
-        let _ = decoded_len(&[0, 5], view);
     }
 
     /// `decompress_into` agrees with the unchecked version both on a tight (exact

@@ -87,7 +87,7 @@ pub use crate::core::offset::Offset;
 pub use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 pub use crate::core::validate::InvalidColumn;
 pub use crate::decoding::{
-    DECOMPRESS_PADDING, OutputTooSmall, decoded_len, decompress_into, decompress_into_unchecked,
+    DECOMPRESS_PADDING, OutputTooSmall, decompress_into, decompress_into_unchecked,
 };
 pub use crate::encoding::config::{Config, DEFAULT_CONFIG, Error, MaxDictBits, Threshold};
 pub use crate::encoding::parser::Parser;

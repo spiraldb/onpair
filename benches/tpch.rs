@@ -247,7 +247,7 @@ fn decompress_all(bencher: Bencher, param: (&'static str, u8)) {
     let (col, bits) = param;
     let c = corpus_for(col);
     let column = build_column(col, bits);
-    let cap = column.view().decoded_len();
+    let cap = c.total_bytes;
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
         .bench(|| {

@@ -250,7 +250,7 @@ fn train_and_compress(bencher: Bencher, bits: u8) {
 fn decompress_all(bencher: Bencher, bits: u8) {
     let c = corpus();
     let col = compress_column(bits);
-    let cap = col.view().decoded_len();
+    let cap = c.total_bytes;
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
         .bench(|| {

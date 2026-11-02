@@ -621,7 +621,7 @@ impl<'a> From<&'a CompactDictionary> for CompactDictionaryView<'a> {
 mod tests {
     use super::*;
     use crate::search::{ContainsDfa, PrefixQuery, row_contains, starts_with, tokenize};
-    use crate::{DECOMPRESS_PADDING, decoded_len, decompress_into, decompress_into_unchecked};
+    use crate::{DECOMPRESS_PADDING, decompress_into, decompress_into_unchecked};
     use std::mem::MaybeUninit;
     use std::sync::Arc;
 
@@ -802,13 +802,11 @@ mod tests {
             .iter()
             .flat_map(|&code| view.token(code).iter().copied())
             .collect();
-        let decoded_len = decoded_len(codes, view);
-        assert_eq!(decoded_len, expected.len());
 
         // The unchecked fast path performs its fixed-width source reads and
         // destination over-stores. The validated dictionary and this padding
         // together prove that those accesses stay in bounds.
-        let mut padded_out = Vec::with_capacity(decoded_len + DECOMPRESS_PADDING);
+        let mut padded_out = Vec::with_capacity(expected.len() + DECOMPRESS_PADDING);
         let spare = padded_out.spare_capacity_mut();
         let written = unsafe { decompress_into_unchecked(codes, view, spare) }.len();
         unsafe { padded_out.set_len(written) };
@@ -817,7 +815,7 @@ mod tests {
         // The checked path must also succeed with an exactly-sized destination,
         // proving that its exact-copy tail never writes beyond the caller's
         // buffer for a safety-valid dictionary.
-        let mut exact_out = vec![MaybeUninit::uninit(); decoded_len];
+        let mut exact_out = vec![MaybeUninit::uninit(); expected.len()];
         assert_eq!(
             decompress_into(codes, view, &mut exact_out).unwrap(),
             expected

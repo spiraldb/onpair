@@ -106,19 +106,6 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         unsafe { self.codes.get_unchecked(a..b) }
     }
 
-    /// Exact decoded byte length of the whole column. `O(codes)`; an out-of-range
-    /// code panics with [`InvalidColumn::CodeOutOfRange`].
-    #[inline]
-    pub fn decoded_len(&self) -> usize {
-        decoding::decoded_len(self.codes, self.dict)
-    }
-
-    /// Exact decoded byte length of row `k`. Precondition: `k < num_rows()`.
-    #[inline]
-    pub fn row_decoded_len(&self, k: usize) -> usize {
-        decoding::decoded_len(self.row_codes(k), self.dict)
-    }
-
     /// Decompress the whole column into `out` and return the decompressed bytes, the
     /// front of `out`. Expands the dictionary to its load-free `WideDictionary` form
     /// once — the fast layout for a bulk decode, reached directly per code with no
@@ -333,7 +320,6 @@ mod tests {
         let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
         let view = col.view();
 
-        assert_eq!(view.decoded_len(), bytes.len());
         assert_eq!(decode_all(view), bytes);
         assert_eq!(view.num_rows(), rows.len());
         for (k, row) in rows.iter().enumerate() {
