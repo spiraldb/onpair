@@ -41,7 +41,12 @@ impl ProbeCover {
 
     /// Whether `token` is covered, as a point or in a range.
     pub fn contains(&self, token: Token) -> bool {
-        self.points.contains(&token) || self.ranges.iter().any(|range| range.contains(token))
+        let next = self.ranges.partition_point(|range| range.last < token);
+        self.points.binary_search(&token).is_ok()
+            || self
+                .ranges
+                .get(next)
+                .is_some_and(|range| range.contains(token))
     }
 
     /// Whether the cover contains no token IDs.
@@ -102,9 +107,11 @@ impl ProbeCover {
         Self::from_runs(runs)
     }
 
-    /// Builds a test cover without normalization. Ranges must be disjoint.
+    /// Builds a test cover without merging. Ranges must be disjoint.
     #[cfg(test)]
-    pub(crate) fn new(points: Vec<Token>, ranges: Vec<TokenRange>) -> Self {
+    pub(crate) fn new(mut points: Vec<Token>, mut ranges: Vec<TokenRange>) -> Self {
+        points.sort_unstable();
+        ranges.sort_unstable_by_key(|range| range.begin);
         Self { points, ranges }
     }
 }
