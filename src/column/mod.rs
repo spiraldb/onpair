@@ -206,7 +206,8 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     ///
     /// # Panics
     /// Panics with [`InvalidColumn::BadRowOffsets`] if the row offsets decrease or
-    /// reach past the code stream, as [`row_codes`](Self::row_codes) does.
+    /// reach past the code stream, as [`row_codes`](Self::row_codes) does. May also
+    /// panic if the dictionary is not sorted, as [`ContainsDfa::new`] may.
     pub fn rows_containing(&self, pattern: &[u8]) -> Result<Vec<usize>, ContainsError> {
         let dfa = ContainsDfa::new(pattern, self.dict)?;
         Ok(self.select(|codes| row_contains(codes, &dfa)))
