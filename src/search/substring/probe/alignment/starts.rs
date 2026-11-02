@@ -159,16 +159,8 @@ fn token_at(offsets: &[u32], from: usize, at: usize) -> usize {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
-    use crate::test_corpus::make_raw;
-
-    fn dictionary(mut tokens: Vec<Vec<u8>>) -> CompactDictionary {
-        tokens.sort();
-        tokens.dedup();
-        let mut raw = make_raw(&tokens);
-        pad_raw(&mut raw.data, &raw.offsets);
-        CompactDictionary::from_raw(raw.data, raw.offsets)
-    }
+    use crate::core::dictionary::{Dictionary, DictionaryView, pad_raw};
+    use crate::test_corpus::{dictionary, make_raw};
 
     /// Compares the collected starts against independent per-token searches.
     pub(crate) fn check_starts(dict: CompactDictionaryView<'_>, pattern: &[u8]) {
@@ -217,10 +209,10 @@ pub(crate) mod tests {
             (b"ab".as_slice(), MAX_ENUMERATED_TOKENS),
         ] {
             for count in [0, limit - 1, limit, limit + 1, limit * 3] {
-                let tokens = (0..count)
+                let tokens: Vec<_> = (0..count)
                     .map(|i| [vec![128 + (i / 256) as u8, i as u8], suffix.to_vec()].concat())
                     .collect();
-                check_starts(dictionary(tokens).as_view(), b"abc");
+                check_starts(dictionary(&tokens).as_view(), b"abc");
             }
         }
     }
@@ -233,7 +225,7 @@ pub(crate) mod tests {
         // A token starting with the pattern is covered by the range edge,
         // even when it contains another occurrence later.
         tokens.push(b"ababa".to_vec());
-        let dict = dictionary(tokens);
+        let dict = dictionary(&tokens);
         check_starts(dict.as_view(), b"aba");
         assert_eq!(
             MatchStarts::new(dict.as_view(), b"aba").contained.len(),

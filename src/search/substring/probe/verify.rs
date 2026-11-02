@@ -382,12 +382,13 @@ impl HitVerifier {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
+    use crate::core::dictionary::{CompactDictionary, Dictionary};
     use crate::search::index::TokenFrequencyIndex;
     use crate::search::substring::probe::alignment::graph::AlignmentGraph;
     use crate::search::substring::probe::plan;
     use crate::search::substring::probe::scan::Isa;
     use crate::search::tokenize;
+    use crate::test_corpus::complete_dictionary;
 
     /// A hit verifier that accepts every hit: each token's only edge spans the whole
     /// pattern, so scan tests can exercise matching and row lookup on their own.
@@ -465,18 +466,7 @@ pub(super) mod tests {
 
     /// Builds a complete dictionary and greedily encodes the fixture rows.
     fn column(extra: &[&[u8]], rows: &[&[u8]]) -> (CompactDictionary, Vec<Token>, Vec<u32>) {
-        let mut tokens: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
-        tokens.extend(extra.iter().map(|t| t.to_vec()));
-        tokens.sort();
-        tokens.dedup();
-        let mut bytes = Vec::new();
-        let mut offsets = vec![0u32];
-        for token in &tokens {
-            bytes.extend_from_slice(token);
-            offsets.push(bytes.len() as u32);
-        }
-        pad_raw(&mut bytes, &offsets);
-        let dict = CompactDictionary::from_raw(bytes, offsets);
+        let dict = complete_dictionary(extra);
         let mut codes = Vec::new();
         let mut row_offsets = vec![0u32];
         for row in rows {

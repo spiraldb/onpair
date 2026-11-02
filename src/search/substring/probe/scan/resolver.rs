@@ -138,9 +138,9 @@ mod tests {
     use crate::core::dictionary::Dictionary;
     use crate::core::offset::Offset;
     use crate::core::types::Token;
-    use crate::search::substring::probe::scan::tests::byte_dictionary;
     use crate::search::substring::probe::scan::{BLOCK, ScanInput};
     use crate::search::substring::probe::verify::tests::accepting_verifier;
+    use crate::test_corpus::complete_dictionary;
 
     /// Enough blocks to place a row across an entire intervening block.
     const BLOCKS: usize = 4;
@@ -151,7 +151,8 @@ mod tests {
     fn resolve<O: Offset>(mask: &[u64], row_offsets: &[O]) -> Vec<usize> {
         let codes = [0 as Token; CODES];
         let verifier = accepting_verifier();
-        let dict = byte_dictionary();
+        // The accepting verifier never reads the dictionary.
+        let dict = complete_dictionary(&[]);
         let input = ScanInput {
             codes: &codes,
             row_offsets,

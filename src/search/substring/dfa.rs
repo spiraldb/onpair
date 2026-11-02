@@ -340,23 +340,7 @@ impl<V: DictionaryView> Build<'_, V> {
 mod tests {
     use super::*;
     use crate::core::dictionary::Dictionary;
-    use crate::{Column, DEFAULT_CONFIG, compress};
-
-    /// Compress byte rows for the DFA fixtures.
-    fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
-        let mut bytes = Vec::new();
-        let mut offsets = vec![0u32];
-        for r in rows {
-            bytes.extend_from_slice(r);
-            offsets.push(bytes.len() as u32);
-        }
-        compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap()
-    }
-
-    /// Independent byte-window oracle.
-    fn byte_contains(hay: &[u8], pattern: &[u8]) -> bool {
-        pattern.is_empty() || hay.windows(pattern.len()).any(|w| w == pattern)
-    }
+    use crate::test_corpus::{byte_contains, compress_rows};
 
     /// Decodes one fixture row into bytes for the containment oracle.
     fn decode_row(view: crate::ColumnView<'_, u32>, k: usize) -> Vec<u8> {

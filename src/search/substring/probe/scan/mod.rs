@@ -116,19 +116,11 @@ fn clear_from(bits: &mut Mask, valid: usize) {
 mod tests {
     use super::dispatch::supports;
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
+    use crate::core::dictionary::Dictionary;
     use crate::core::types::TokenRange;
     use crate::search::substring::probe::plan::is_eligible;
     use crate::search::substring::probe::verify::tests::accepting_verifier;
-
-    /// A dictionary of the 256 single-byte tokens, for scans whose verifier never
-    /// reads it.
-    pub(super) fn byte_dictionary() -> CompactDictionary {
-        let mut bytes: Vec<u8> = (0..=255).collect();
-        let offsets: Vec<u32> = (0..=256).collect();
-        pad_raw(&mut bytes, &offsets);
-        CompactDictionary::from_raw(bytes, offsets)
-    }
+    use crate::test_corpus::complete_dictionary;
 
     /// Runs every kernel eligible on every instruction set this CPU supports, in both
     /// packing modes, with a verifier that accepts every hit, and checks that each
@@ -139,7 +131,8 @@ mod tests {
         row_offsets: &[O],
         expected: &[usize],
     ) {
-        let dict = byte_dictionary();
+        // The accepting verifier never reads the dictionary.
+        let dict = complete_dictionary(&[]);
         let verifier = accepting_verifier();
         let input = ScanInput {
             codes,

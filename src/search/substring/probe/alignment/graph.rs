@@ -233,21 +233,8 @@ impl GraphBuilder<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
-
-    fn dictionary(tokens: &[&[u8]]) -> CompactDictionary {
-        let mut tokens = tokens.to_vec();
-        tokens.sort_unstable();
-        tokens.dedup();
-        let mut bytes = Vec::new();
-        let mut offsets = vec![0u32];
-        for token in tokens {
-            bytes.extend_from_slice(token);
-            offsets.push(bytes.len() as u32);
-        }
-        pad_raw(&mut bytes, &offsets);
-        CompactDictionary::from_raw(bytes, offsets)
-    }
+    use crate::core::dictionary::{Dictionary, DictionaryView};
+    use crate::test_corpus::dictionary;
 
     /// Checks one position's edges against token bytes.
     fn check_position(dict: CompactDictionaryView<'_>, pattern: &[u8], offset: usize) {
@@ -289,7 +276,7 @@ mod tests {
 
     #[test]
     fn greedy_and_range_edges() {
-        let dict = dictionary(&[b"app", b"appapple", b"applepie"]);
+        let dict = dictionary(&[b"app".as_slice(), b"appapple", b"applepie"]);
         check_position(dict.as_view(), b"apple", 0); // Both a range edge and a greedy edge.
         check_position(dict.as_view(), b"appappapple", 0); // Greedy step after narrowing runs out.
         check_position(dict.as_view(), b"app", 0); // Exact token: no duplicate greedy edge.
@@ -308,7 +295,7 @@ mod tests {
 
     #[test]
     fn missing_token_prefix_is_an_error() {
-        check_position(dictionary(&[]).as_view(), b"apple", 0);
+        check_position(dictionary::<&[u8]>(&[]).as_view(), b"apple", 0);
         let dict = dictionary(&[b"applepie"]);
         check_position(dict.as_view(), b"apple", 0); // A range edge but no greedy edge.
         check_position(dict.as_view(), b"absent", 0); // Neither kind of match.
@@ -327,8 +314,7 @@ mod tests {
             if complete {
                 tokens.extend((0..=255).map(|byte| vec![byte]));
             }
-            let refs: Vec<_> = tokens.iter().map(Vec::as_slice).collect();
-            let dict = dictionary(&refs);
+            let dict = dictionary(&tokens);
             for token in &tokens {
                 for len in 1..=token.len() {
                     check_position(dict.as_view(), &token[..len], 0);

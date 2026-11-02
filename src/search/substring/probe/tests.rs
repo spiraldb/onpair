@@ -16,32 +16,13 @@ use super::alignment::starts::tests::check_starts;
 use super::plan::{self, CostModel};
 use super::scan::{MatcherKind, detect_isa};
 use super::{ContainsScan, ProbeCover, Query};
-use crate::core::dictionary::{
-    CompactDictionary, CompactDictionaryView, Dictionary, DictionaryView, pad_raw,
-};
+use crate::ColumnView;
+use crate::core::dictionary::{CompactDictionaryView, Dictionary, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexView};
 use crate::search::substring::{ContainsDfa, ContainsError, row_contains};
 use crate::search::tokenize;
-use crate::test_corpus::make_raw;
-use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
-
-fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
-    let mut bytes = Vec::new();
-    let mut offsets = vec![0u32];
-    for row in rows {
-        bytes.extend_from_slice(row);
-        offsets.push(bytes.len() as u32);
-    }
-    compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap()
-}
-
-fn byte_contains(haystack: &[u8], pattern: &[u8]) -> bool {
-    pattern.is_empty()
-        || haystack
-            .windows(pattern.len())
-            .any(|window| window == pattern)
-}
+use crate::test_corpus::{byte_contains, compress_rows, dictionary};
 
 fn sink_reachable_avoiding<'g>(
     graph: &'g AlignmentGraph,
@@ -483,9 +464,7 @@ fn scan_matches_bytes_at_the_top_of_the_token_range() {
     tokens.extend((0..(1u32 << 16) - 256).map(|n| vec![0xFF, (n >> 8) as u8, n as u8]));
     tokens.sort();
     assert_eq!(tokens[usize::from(Token::MAX)], [0xFF, 0xFE, 0xFF]);
-    let mut raw = make_raw(&tokens);
-    pad_raw(&mut raw.data, &raw.offsets);
-    let dict = CompactDictionary::from_raw(raw.data, raw.offsets);
+    let dict = dictionary(&tokens);
 
     let last = [0xFF, 0xFE, 0xFF];
     let before_last = [0xFF, 0xFE, 0xFE];
