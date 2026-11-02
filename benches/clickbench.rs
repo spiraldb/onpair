@@ -250,11 +250,11 @@ fn train_and_compress(bencher: Bencher, bits: u8) {
 fn decompress_all(bencher: Bencher, bits: u8) {
     let c = corpus();
     let col = compress_column(bits);
-    let cap = c.total_bytes;
+    // Outside the closure: a fresh allocation in it would time the page faults too.
+    let mut buf = vec![MaybeUninit::uninit(); c.total_bytes];
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
-        .bench(|| {
-            let mut buf = vec![MaybeUninit::uninit(); cap];
+        .bench_local(|| {
             let out = col.view().decompress_into(&mut buf).unwrap();
             divan::black_box(out);
         });
