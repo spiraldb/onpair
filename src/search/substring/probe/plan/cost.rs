@@ -17,7 +17,9 @@
 //! one table scan per code on its hits. On x86 the point weight is a
 //! preference rather than a time: on AVX2, EqOr with up to four points is bound by
 //! loading the codes, so its cost barely depends on the point count, and the
-//! weight steers planning toward covers with fewer points.
+//! weight steers planning toward covers with fewer points. AVX-512 runs AVX2's EqOr
+//! kernel, so it has AVX2's point and range weights, and Nibble overtakes EqOr there
+//! from 5 points.
 
 use crate::search::substring::ProbeCover;
 use crate::search::substring::probe::scan::{Isa, MAX_NIBBLE_BATCHES, MatcherKind, PER_BATCH};
@@ -55,9 +57,9 @@ const AVX2_COSTS: CostModel = CostModel {
 };
 
 const AVX512BW_COSTS: CostModel = CostModel {
-    point: 0.033,
-    range: 0.066,
-    nibble_base: 0.033,
+    point: 0.028,
+    range: 0.056,
+    nibble_base: 0.093,
     nibble_batch: 0.033,
     hit: 105.0,
 };

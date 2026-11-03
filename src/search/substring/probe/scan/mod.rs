@@ -217,7 +217,8 @@ mod tests {
     #[test]
     fn dispatch_picks_the_vector_kernels_the_cpu_has() {
         #[cfg(target_arch = "x86_64")]
-        let expected = if std::is_x86_feature_detected!("avx512f")
+        let expected = if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("avx512f")
             && std::is_x86_feature_detected!("avx512bw")
         {
             Isa::Avx512Bw

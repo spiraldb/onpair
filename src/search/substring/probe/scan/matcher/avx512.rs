@@ -7,6 +7,10 @@
 //! registers, so the hits of 64 codes are already one `u64` mask word: there is
 //! nothing to narrow or pack.
 //!
+//! There is no EqOr kernel: AVX-512 CPUs run AVX2's. EqOr does little work per code,
+//! so it is limited by how fast the codes load, and 512-bit loads rarely help and are
+//! often slower. Nibble does enough work per code to gain from the width.
+//!
 //! The items are described in the parent module; only what is specific to AVX-512
 //! is documented here.
 
@@ -23,8 +27,6 @@ type Hits = u64;
 type Vectors = [__m512i; 2];
 
 type Held = (__m512i, __m512i);
-
-type Broadcast = __m512i;
 
 /// A 16-byte shuffle row, broadcast into every 128-bit lane since `vpshufb`
 /// indexes within lanes.
@@ -104,94 +106,6 @@ fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
         hit = or(hit, inside(held, codes));
     }
     hit
-}
-
-#[target_feature(enable = "avx512f,avx512bw")]
-fn ranges_mask<const SKIP_EMPTY: bool>(held: &[Held], codes: &Block, bits: &mut Mask) -> bool {
-    let Some((&first, rest)) = held.split_first() else {
-        bits.fill(0);
-        return false;
-    };
-    words::<SKIP_EMPTY>(
-        codes,
-        bits,
-        #[inline(always)]
-        |codes| check_ranges(inside(first, codes), rest, codes),
-    )
-}
-
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw")]
-fn broadcast(code: Token) -> Broadcast {
-    _mm512_set1_epi16(code as i16)
-}
-
-/// Comparisons land in mask registers, so there is nothing to narrow.
-#[target_feature(enable = "avx512f,avx512bw")]
-#[inline]
-fn eq_or_hits(first: &Broadcast, rest: &[Broadcast], codes: Vectors) -> Hits {
-    let mut hit = join(
-        _mm512_cmpeq_epi16_mask(codes[0], *first),
-        _mm512_cmpeq_epi16_mask(codes[1], *first),
-    );
-    for token in rest {
-        hit |= join(
-            _mm512_cmpeq_epi16_mask(codes[0], *token),
-            _mm512_cmpeq_epi16_mask(codes[1], *token),
-        );
-    }
-    hit
-}
-
-pub(crate) struct EqOr {
-    points: Vec<Broadcast>,
-    ranges: Vec<Held>,
-}
-
-impl Matcher for EqOr {
-    unsafe fn new(cover: &ProbeCover) -> Self {
-        // SAFETY: the caller guarantees AVX-512, which `broadcast` and `hold` need.
-        unsafe {
-            Self {
-                points: cover
-                    .points()
-                    .iter()
-                    .map(|&point| broadcast(point))
-                    .collect(),
-                ranges: cover.ranges().iter().map(|&range| hold(range)).collect(),
-            }
-        }
-    }
-
-    fn check(&self, codes: &Block, bits: &mut Mask, skip_empty: bool) -> bool {
-        let (points, ranges) = (&self.points, &self.ranges);
-        // SAFETY: `self` was built by `new`, whose caller guaranteed AVX-512.
-        unsafe {
-            if skip_empty {
-                eq_or_mask::<true>(points, ranges, codes, bits)
-            } else {
-                eq_or_mask::<false>(points, ranges, codes, bits)
-            }
-        }
-    }
-}
-
-#[target_feature(enable = "avx512f,avx512bw")]
-fn eq_or_mask<const SKIP_EMPTY: bool>(
-    points: &[Broadcast],
-    ranges: &[Held],
-    codes: &Block,
-    bits: &mut Mask,
-) -> bool {
-    let Some((first, rest)) = points.split_first() else {
-        return ranges_mask::<SKIP_EMPTY>(ranges, codes, bits);
-    };
-    words::<SKIP_EMPTY>(
-        codes,
-        bits,
-        #[inline(always)]
-        |codes| check_ranges(eq_or_hits(first, rest, codes), ranges, codes),
-    )
 }
 
 struct Batch([NibbleTable; 4]);
@@ -306,11 +220,11 @@ fn nibble_mask<const BATCHES: usize, const SKIP_EMPTY: bool>(
     )
 }
 
-/// The AVX-512BW matchers.
+/// The AVX-512BW matchers, with AVX2's EqOr.
 pub(crate) struct Avx512;
 
 impl Kernels for Avx512 {
     const ISA: Isa = Isa::Avx512Bw;
-    type EqOr = EqOr;
+    type EqOr = super::avx2::EqOr;
     type Nibble<const BATCHES: usize> = Nibble<BATCHES>;
 }

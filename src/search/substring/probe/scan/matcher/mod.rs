@@ -6,8 +6,8 @@
 //! Every kernel computes the same mask, with bit `i` set iff code `i` is covered.
 //! `table` holds the portable kernel, a scalar lookup table. The vector kernels have
 //! one file per instruction set, `neon`, `avx2` and `avx512`. The files define the
-//! same items, described here once; each documents only what is specific to its
-//! instruction set.
+//! same items, described here once, except that `avx512` has no EqOr; each
+//! documents only what is specific to its instruction set.
 //!
 //! - `EqOr` compares the codes with each point, broadcast to all lanes by
 //!   `broadcast`, and ORs the results (`eq_or_hits`) together with the range hits.
@@ -95,7 +95,8 @@ pub(crate) trait Matcher: Send + Sync + RefUnwindSafe {
 /// The vector matchers of one instruction set.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(super) trait Kernels {
-    /// The instruction set the matchers run on.
+    /// The instruction set the matchers run on. A CPU that supports it can run all
+    /// of them, including any borrowed from another instruction set.
     const ISA: super::Isa;
     /// One vector comparison per point, plus range checks.
     type EqOr: Matcher + 'static;

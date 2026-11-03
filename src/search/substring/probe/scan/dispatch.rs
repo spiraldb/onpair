@@ -74,8 +74,8 @@ fn prepare_with<K: Kernels>(kind: MatcherKind, cover: &ProbeCover) -> Box<dyn Ma
         supports(K::ISA),
         "vector kernels on a CPU without their instructions"
     );
-    // SAFETY: the CPU supports `K::ISA`, the instruction set of every matcher
-    // below except the table, which needs none.
+    // SAFETY: the CPU supports `K::ISA`, which covers every matcher below except
+    // the table, which needs none.
     unsafe {
         match kind {
             MatcherKind::Table => Box::new(matcher::Table::new(cover)),
@@ -102,9 +102,12 @@ pub(crate) fn supports(isa: Isa) -> bool {
         }
         #[cfg(target_arch = "x86_64")]
         Isa::Avx2 => std::is_x86_feature_detected!("avx2"),
+        // AVX-512 runs AVX2's EqOr.
         #[cfg(target_arch = "x86_64")]
         Isa::Avx512Bw => {
-            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+            std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("avx512f")
+                && std::is_x86_feature_detected!("avx512bw")
         }
         _ => false,
     }
