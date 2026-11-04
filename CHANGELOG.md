@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `ContainsScan`, an exact substring search over a whole column's codes,
-  accelerated with SIMD, and `ColumnView::rows_containing_with_scan`, which runs
-  it over a column view.
+- Add `ContainsScan`, a substring search over a whole column's codes,
+  accelerated with SIMD and exact on greedily tokenized rows, as the encoder
+  writes them, for patterns of up to `ContainsScan::MAX_PATTERN_LEN` bytes. Add
+  `ColumnView::rows_containing_with_scan`, which runs it over a column view, and
+  `ContainsScan::probe_cover` (a `ProbeCover`) and `ContainsScan::expected_hits`,
+  which describe the search it prepared.
+- Add `ContainsError`, returned when a substring search cannot be prepared.
 - Add `search::index::TokenFrequencyIndex` and its borrowed view
-  `TokenFrequencyIndexView`, the token counts `ContainsScan` plans with.
+  `TokenFrequencyIndexView`, the token counts `ContainsScan` plans with, and
+  `InvalidFrequencyIndex`, the error building or loading one returns.
 - Add `TokenRange::new`.
 
 ### Changed

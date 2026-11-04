@@ -22,9 +22,9 @@ pub enum ContainsError {
         /// Tokens in the dictionary.
         dict_tokens: usize,
     },
-    /// The dictionary cannot tokenize the pattern: it has no single-byte token for
-    /// `byte`, a byte of the pattern. Trained and validated dictionaries have all
-    /// 256.
+    /// The dictionary cannot tokenize the pattern: no single-byte token was found
+    /// for `byte`, a byte of the pattern. Conformant dictionaries, such as trained
+    /// ones, have all 256, so the dictionary is incomplete or unsorted.
     MissingByteToken {
         /// The pattern byte without a token.
         byte: u8,
@@ -48,7 +48,10 @@ impl fmt::Display for ContainsError {
                 "frequency index counts {index_tokens} tokens; the dictionary has {dict_tokens}"
             ),
             Self::MissingByteToken { byte } => {
-                write!(f, "dictionary has no single-byte token for {byte:#04x}")
+                write!(
+                    f,
+                    "found no single-byte token for {byte:#04x}; the dictionary is incomplete or unsorted"
+                )
             }
         }
     }

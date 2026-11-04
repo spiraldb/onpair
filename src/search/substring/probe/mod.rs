@@ -88,9 +88,10 @@ use crate::search::substring::ContainsError;
 /// row, at least one belongs to a small set, the pattern's [cover](ProbeCover).
 /// Preparation chooses a cover whose tokens are rare in a
 /// [`TokenFrequencyIndexView`] and cheap to search for. [`scan`](Self::scan) finds
-/// the cover's codes in the stream, with SIMD where the CPU supports it (NEON, AVX2
-/// or AVX-512, detected at runtime), and confirms each of these *hits* by matching
-/// the codes around it against the pattern, so the rows it returns are exact.
+/// the cover's codes in the stream and confirms each of these *hits* by matching the
+/// codes around it against the pattern, so the rows it returns are exact. It uses
+/// SIMD where the CPU has it (NEON, AVX2 or AVX-512), detected at runtime, so no
+/// build flags are needed; other CPUs use a portable fallback.
 ///
 /// Prepare once per pattern and dictionary, then scan any number of chunks encoded
 /// with that dictionary, concurrently if needed. Clones share the prepared search,
@@ -172,8 +173,8 @@ impl<'d> ContainsScan<'d> {
     /// Returns [`ContainsError::PatternTooLong`] if `pattern` is longer than
     /// [`Self::MAX_PATTERN_LEN`], [`ContainsError::FrequencyIndexMismatch`] if
     /// `frequencies` counts a different number of tokens than `dict` has, and
-    /// [`ContainsError::MissingByteToken`] if `dict` lacks a single-byte token that
-    /// `pattern` needs.
+    /// [`ContainsError::MissingByteToken`] if no single-byte token is found for a byte
+    /// of `pattern`, as on an incomplete or unsorted `dict`.
     ///
     /// # Precondition
     /// `dict` is conformant (sorted, unique and complete), as guaranteed by
@@ -223,8 +224,9 @@ impl<'d> ContainsScan<'d> {
     /// ascending order.
     ///
     /// Row `i` is `codes[row_offsets[i]..row_offsets[i + 1]]`. Codes outside
-    /// `row_offsets[0]..row_offsets[last]` belong to no row and are never read, so a
-    /// view sliced from a larger column can pass its whole code buffer.
+    /// `row_offsets[0]..row_offsets[last]` belong to no row, and with non-decreasing
+    /// offsets they are never read, so a view sliced from a larger column can pass
+    /// its whole code buffer.
     ///
     /// # Panics
     /// Panics with [`InvalidColumn::BadRowOffsets`] if the first offset exceeds the

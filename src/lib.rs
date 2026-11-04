@@ -95,8 +95,9 @@ pub use crate::encoding::rows::Rows;
 
 /// Compress an Arrow `(bytes, offsets)` value pair end-to-end. Equivalent to
 /// `Parser::train(..)?.parse(..)`, but validates the offsets once instead of in
-/// both the train and parse steps, and encodes rows greedily as [`Parser`] does. `offsets` has `n + 1` entries. Its first
-/// entry may be non-zero; bytes outside `offsets[0]..offsets[n]` are ignored.
+/// both the train and parse steps. Rows are encoded greedily, as [`Parser`] does.
+/// `offsets` has `n + 1` entries. Its first entry may be non-zero; bytes outside
+/// `offsets[0]..offsets[n]` are ignored.
 ///
 /// # Errors
 /// [`Error::InvalidArg`] if `offsets` is empty or its last entry exceeds
