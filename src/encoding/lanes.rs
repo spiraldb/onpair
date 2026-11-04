@@ -11,6 +11,10 @@
 //! branches, so the CPU overlaps the memory accesses of the lanes. Each lane
 //! writes its codes to its own buffer; the buffers are joined in row order
 //! after the batch.
+//!
+//! Lanes parse only the non-empty rows. An empty row needs no search, and
+//! columns of short strings often hold many of them; its end is the end of
+//! the last non-empty row before it.
 
 use std::hint::select_unpredictable;
 
@@ -32,6 +36,10 @@ const LANES: usize = 6;
 /// cache.
 const BATCH_BYTES: usize = 256 << 10;
 
+/// Maximum rows per batch. Short or empty rows fill a batch with many rows
+/// before [`BATCH_BYTES`]; this bound keeps the per-row buffers in cache.
+const BATCH_ROWS: usize = 1 << 14;
+
 /// Reusable per-lane buffers.
 #[derive(Default)]
 pub(crate) struct LaneBuffers {
@@ -40,10 +48,16 @@ pub(crate) struct LaneBuffers {
     /// Per lane: code count at the end of each row, then one spare slot for
     /// the writes after the last row.
     row_ends: [Vec<usize>; LANES],
+    /// Byte range of each non-empty row of the current batch.
+    spans: Vec<(usize, usize)>,
+    /// Entry `k` is the code count at the end of the first `k` non-empty rows
+    /// of the current batch, as an index into the output codes.
+    span_ends: Vec<usize>,
     /// Copy of the rows of one batch, for inputs that are not contiguous.
     bytes: Vec<u8>,
-    /// Row offsets into `bytes`.
-    offsets: Vec<usize>,
+    /// Per row of the current batch: the number of non-empty rows up to and
+    /// including it.
+    filled: Vec<u32>,
 }
 
 /// Encode the rows of an Arrow pair: row `i` is
@@ -80,23 +94,42 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
+    let mut spans = std::mem::take(&mut buffers.spans);
+    let mut span_ends = std::mem::take(&mut buffers.span_ends);
+
     let n = offsets.len() - 1;
     let mut start = 0;
     while start < n {
-        // At least one row per batch, then whole rows up to `batch_bytes`.
+        // At least one row per batch, then whole rows up to `batch_bytes` and
+        // `BATCH_ROWS`.
         let limit = offsets[start].to_usize() + batch_bytes;
-        let fit = offsets[start + 1..=n].partition_point(|o| o.to_usize() <= limit);
+        let last = n.min(start + BATCH_ROWS);
+        let fit = offsets[start + 1..=last].partition_point(|o| o.to_usize() <= limit);
         let end = start + fit.max(1);
-        parse_batch(
-            matcher,
-            bytes,
-            &offsets[start..=end],
-            buffers,
-            codes,
-            row_offsets,
-        );
+        let batch = &offsets[start..=end];
+
+        spans.clear();
+        for w in batch.windows(2) {
+            let (row_start, row_end) = (w[0].to_usize(), w[1].to_usize());
+            if row_end > row_start {
+                spans.push((row_start, row_end));
+            }
+        }
+
+        parse_spans(matcher, bytes, &mut spans, buffers, codes, &mut span_ends);
+
+        // A row ends where the last non-empty row up to it ends.
+        let mut k = 0;
+        row_offsets.extend(batch.windows(2).map(|w| {
+            k += (w[1].to_usize() > w[0].to_usize()) as usize;
+            O::from_usize(span_ends[k])
+        }));
+
         start = end;
     }
+
+    buffers.spans = spans;
+    buffers.span_ends = span_ends;
 }
 
 /// Encode any [`Rows`] input. Rows are copied into a contiguous, padded
@@ -120,51 +153,78 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
     row_offsets: &mut Vec<O>,
 ) {
     let mut bytes = std::mem::take(&mut buffers.bytes);
-    let mut offsets = std::mem::take(&mut buffers.offsets);
+    let mut filled = std::mem::take(&mut buffers.filled);
+    let mut spans = std::mem::take(&mut buffers.spans);
+    let mut span_ends = std::mem::take(&mut buffers.span_ends);
 
     let n = rows.num_rows();
     let mut i = 0;
     while i < n {
         bytes.clear();
-        offsets.clear();
-        offsets.push(0);
+        filled.clear();
+        spans.clear();
 
-        // At least one row per batch, then rows until `batch_bytes` is reached.
-        while i < n && (offsets.len() == 1 || bytes.len() < batch_bytes) {
-            bytes.extend_from_slice(rows.row(i));
-            offsets.push(bytes.len());
+        // At least one row per batch, then rows until `batch_bytes` or
+        // `BATCH_ROWS` is reached. Empty rows add no bytes and no span.
+        let last = n.min(i + BATCH_ROWS);
+        while i < last && (filled.is_empty() || bytes.len() < batch_bytes) {
+            let row = rows.row(i);
+            if !row.is_empty() {
+                let start = bytes.len();
+                bytes.extend_from_slice(row);
+                spans.push((start, bytes.len()));
+            }
+            filled.push(spans.len() as u32);
             i += 1;
         }
 
         // Padding keeps every window load on the fast path.
         bytes.resize(bytes.len() + MAX_TOKEN_SIZE, 0);
-        parse_batch(matcher, &bytes, &offsets, buffers, codes, row_offsets);
+        parse_spans(matcher, &bytes, &mut spans, buffers, codes, &mut span_ends);
+
+        // A row ends where the last non-empty row up to it ends.
+        row_offsets.extend(filled.iter().map(|&k| O::from_usize(span_ends[k as usize])));
     }
 
     buffers.bytes = bytes;
-    buffers.offsets = offsets;
+    buffers.filled = filled;
+    buffers.spans = spans;
+    buffers.span_ends = span_ends;
 }
 
-/// Encode one batch of contiguous rows with all lanes.
-fn parse_batch<I: OffsetLike, O: Offset>(
+/// Encode the non-empty rows `spans`, given as byte ranges of `bytes` in
+/// order, with all lanes. Appends their codes to `codes`. Sets `span_ends[k]`
+/// to the length of `codes` after the first `k` rows.
+///
+/// Every row must hold at least one byte, and each row must start where the
+/// one before it ends.
+fn parse_spans(
     matcher: &DictionaryMatcher,
     bytes: &[u8],
-    offsets: &[I],
+    spans: &mut Vec<(usize, usize)>,
     buffers: &mut LaneBuffers,
     codes: &mut Vec<Token>,
-    row_offsets: &mut Vec<O>,
+    span_ends: &mut Vec<usize>,
 ) {
-    let n = offsets.len() - 1;
-    let first = offsets[0].to_usize();
-    let total = offsets[n].to_usize() - first;
+    span_ends.clear();
+    span_ends.push(codes.len());
+
+    let m = spans.len();
+    let (Some(&(first, _)), Some(&(_, rest))) = (spans.first(), spans.last()) else {
+        return;
+    };
 
     // Lane `j` parses rows `bounds[j]..bounds[j + 1]`, split by byte count.
+    let total = rest - first;
     let mut bounds = [0usize; LANES + 1];
     for (j, bound) in bounds.iter_mut().enumerate().skip(1) {
         let target = first + total * j / LANES;
-        *bound = offsets.partition_point(|o| o.to_usize() < target).min(n);
+        *bound = spans.partition_point(|&(start, _)| start < target);
     }
-    bounds[LANES] = n;
+    bounds[LANES] = m;
+
+    // A spare span past the last row: lanes read it after their last row.
+    spans.push((rest, rest));
 
     // Per lane: position, end of the current row, current row, end row, and
     // number of codes written.
@@ -176,21 +236,17 @@ fn parse_batch<I: OffsetLike, O: Offset>(
 
     for j in 0..LANES {
         let (r0, r1) = (bounds[j], bounds[j + 1]);
-        let start = offsets[r0].to_usize();
-        at[j] = start;
         row[j] = r0;
         last_row[j] = r1;
 
         // An empty lane starts finished: no bytes left.
-        row_end[j] = if r0 < r1 {
-            offsets[r0 + 1].to_usize()
-        } else {
-            start
-        };
+        let (start, end) = spans[r0];
+        at[j] = start;
+        row_end[j] = select_unpredictable(r0 < r1, end, start);
 
         // One code per byte at most, plus one slot for the discarded write of
         // an inactive lane.
-        let lane_bytes = offsets[r1].to_usize() - start;
+        let lane_bytes = spans[r1].0 - start;
         buffers.codes[j].clear();
         buffers.codes[j].resize(lane_bytes + 1, 0);
         buffers.row_ends[j].clear();
@@ -199,8 +255,10 @@ fn parse_batch<I: OffsetLike, O: Offset>(
 
     loop {
         // An inactive lane still runs one search; its result is discarded.
-        let win: [usize; LANES] =
-            std::array::from_fn(|j| (row_end[j] - at[j]).clamp(1, MAX_TOKEN_SIZE));
+        let mut win = [0usize; LANES];
+        for j in 0..LANES {
+            win[j] = (row_end[j] - at[j]).clamp(1, MAX_TOKEN_SIZE);
+        }
         let found = matcher.find_all(bytes, &at, &win);
 
         let mut busy = false;
@@ -208,25 +266,23 @@ fn parse_batch<I: OffsetLike, O: Offset>(
             let running = row[j] < last_row[j];
             busy |= running;
 
-            let active = row_end[j] > at[j];
             let (token, len) = found[j];
             buffers.codes[j][count[j]] = token;
-            count[j] += active as usize;
-            at[j] += select_unpredictable(active, len, 0);
+            count[j] += running as usize;
+            at[j] += select_unpredictable(running, len, 0);
 
             // The slot of the current row holds its code count so far, so it
             // is final when the row ends. A lane past its last row writes the
             // spare slot.
             buffers.row_ends[j][row[j] - bounds[j]] = count[j];
 
-            // A row ends when its bytes are used up. The next row starts where
-            // this one ends.
+            // A row ends when its bytes are used up.
             let done = at[j] == row_end[j] && running;
             row[j] += done as usize;
 
-            // After its last row a lane keeps `row_end == at`, so it stays
-            // inactive.
-            let next_end = offsets[(row[j] + 1).min(n)].to_usize();
+            // The next row starts where this one ends. After its last row a
+            // lane keeps `row_end == at`, so it stays inactive.
+            let next_end = spans[row[j].min(m)].1;
             let next_end = select_unpredictable(row[j] < last_row[j], next_end, at[j]);
             row_end[j] = select_unpredictable(done, next_end, row_end[j]);
         }
@@ -241,31 +297,7 @@ fn parse_batch<I: OffsetLike, O: Offset>(
         codes.extend_from_slice(&buffers.codes[j][..count[j]]);
 
         let rows = bounds[j + 1] - bounds[j];
-        row_offsets.extend(
-            buffers.row_ends[j][..rows]
-                .iter()
-                .map(|&end| O::from_usize(base + end)),
-        );
-    }
-}
-
-/// Row offsets of a batch: the caller's Arrow offsets, or `usize` offsets
-/// into a batch copy.
-trait OffsetLike: Copy {
-    fn to_usize(self) -> usize;
-}
-
-impl<T: Offset> OffsetLike for T {
-    #[inline]
-    fn to_usize(self) -> usize {
-        Offset::to_usize(self)
-    }
-}
-
-impl OffsetLike for usize {
-    #[inline]
-    fn to_usize(self) -> usize {
-        self
+        span_ends.extend(buffers.row_ends[j][..rows].iter().map(|&end| base + end));
     }
 }
 
@@ -437,6 +469,20 @@ mod tests {
             &train,
             &[b"".as_slice(), b"a", b"", b"", b"hello world", b"x", b""],
         );
+    }
+
+    #[test]
+    fn lanes_handle_mostly_empty_rows_across_row_bound() {
+        // More rows than `BATCH_ROWS`, so batches end on the row bound.
+        let train = user_strings(100);
+        let input: Vec<&[u8]> = (0..BATCH_ROWS * 2 + 3)
+            .map(|i| match i % 7 {
+                0 => b"hello".as_slice(),
+                3 => b"x",
+                _ => b"",
+            })
+            .collect();
+        check(&train, &input);
     }
 
     #[test]

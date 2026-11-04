@@ -130,20 +130,20 @@ impl DictionaryMatcher {
             chains.push(PrefixChain::new(dict, &chain));
         }
 
-        // `starts[p]` is the first token whose 2-byte prefix is `p` or larger.
-        let mut starts = vec![0usize; PREFIX_SLOTS + 1];
-        for &key in &keys[..n] {
-            starts[(key >> 112) as usize + 1] += 1;
+        // Slot `p` holds the block of the last token before the tokens whose
+        // 2-byte prefix is `p` or larger. Keys are sorted, so the slots up to
+        // the prefix of token `i` that no earlier token filled all have `i`
+        // tokens before them. At most 2^16 tokens, so at most 2^13 blocks: a
+        // block fits a `u16`.
+        let block_before = |i: usize| ((i.max(1) - 1) / BLOCK_KEYS) as u16;
+        let mut first_blocks = Vec::with_capacity(PREFIX_SLOTS + 1);
+        for (i, &key) in keys.iter().enumerate() {
+            let prefix = (key >> 112) as usize;
+            if first_blocks.len() <= prefix {
+                first_blocks.resize(prefix + 1, block_before(i));
+            }
         }
-        for p in 0..PREFIX_SLOTS {
-            starts[p + 1] += starts[p];
-        }
-
-        // At most 2^16 tokens, so at most 2^13 blocks: a block fits a `u16`.
-        let first_blocks = starts
-            .iter()
-            .map(|&start| ((start.max(1) - 1) / BLOCK_KEYS) as u16)
-            .collect();
+        first_blocks.resize(PREFIX_SLOTS + 1, block_before(n));
 
         // At least one `u128::MAX` pads the last block, so a search past the
         // last token stops there.
@@ -195,7 +195,15 @@ impl DictionaryMatcher {
         // The key holds all 16 bytes at `at`, also past the window. Every token
         // that is a prefix of the window is a prefix of the whole key, so it is
         // also a prefix of `q`; the length bound below drops the longer ones.
-        let key: [u128; K] = std::array::from_fn(|j| window_key(bytes, at[j]));
+        //
+        // The per-input arrays are filled with plain loops, not
+        // `std::array::from_fn`. Its closures are only `#[inline]` hints, and
+        // with more than one caller LLVM keeps them out of line. The lane state
+        // then goes through the stack.
+        let mut key = [0u128; K];
+        for j in 0..K {
+            key[j] = window_key(bytes, at[j]);
+        }
 
         // Candidate blocks: from the block of the last token before the
         // input's 2-byte prefix to the block of the last token with that
@@ -239,7 +247,8 @@ impl DictionaryMatcher {
         }
 
         let mut q = [0usize; K];
-        let len: [usize; K] = std::array::from_fn(|j| {
+        let mut len = [0usize; K];
+        for j in 0..K {
             q[j] = base[j] * BLOCK_KEYS + slot[j];
             let found = self.blocks[base[j]].0[slot[j]];
 
@@ -248,18 +257,20 @@ impl DictionaryMatcher {
 
             // `max_len >= 1` and bit 0 is always set, so `fits` is never zero.
             let fits = u32::from(self.chains[q[j]].lens) & ((1u32 << max_len) - 1);
-            (u32::BITS - fits.leading_zeros()) as usize
-        });
+            len[j] = (u32::BITS - fits.leading_zeros()) as usize;
+        }
 
         // The prefix token of length `len`; a length of one byte is the
         // single-byte token of the first input byte. The token loads come after
         // all lengths: the next positions then do not wait behind them, which
         // is measurably faster on Intel and costs little elsewhere.
-        std::array::from_fn(|j| {
+        let mut found = [(0 as Token, 0usize); K];
+        for j in 0..K {
             let longer = self.chains[q[j]].ids[len[j].max(2) - 2];
             let single = self.singles[(key[j] >> 120) as usize];
-            (select_unpredictable(len[j] == 1, single, longer), len[j])
-        })
+            found[j] = (select_unpredictable(len[j] == 1, single, longer), len[j]);
+        }
+        found
     }
 }
 
