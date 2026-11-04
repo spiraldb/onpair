@@ -1,0 +1,19 @@
+{
+  "/home/ec2-user/onpair-rank-results/u32-stages/baseline/tpch": "9d5bef3cdd4f0d51014a12fadde40fa92a992a982da0e833eb9cff2ba27882b9",
+  "/home/ec2-user/onpair-rank-results/u32-stages/baseline/clickbench": "8e5e5b08c806a167437d4b0eaf1feefd471c63dbc4ee996ebaa7f68fac9f6766",
+  "/home/ec2-user/onpair-rank-results/layout/tpch-16346e64bc501ea6": "be9683dde173f12cdf36a0f15c5105d9f2645b601372b262323463dd57f8e88b",
+  "/home/ec2-user/onpair-rank-results/layout/clickbench-898b05cd8056b428": "e75c84b386f970f2c4e4609eddd7aa4bc1c8c0cbe873344e8b7d98ceeb59fb3e",
+  "/home/ec2-user/onpair-rank-results/in-block/tpch-16346e64bc501ea6": "e602ac787efc98d1b88cfdde7ae81f4633abed4c75cd03ef0fc05494353a0cbe",
+  "/home/ec2-user/onpair-rank-results/in-block/clickbench-898b05cd8056b428": "1057cfa1942a3d94453ca10e54ba5e46626bcdb24e3b5ca0466e09ea72f33edb",
+  "/home/ec2-user/onpair-rank-results/samples/tpch-16346e64bc501ea6": "b0c1eeff67826794a65d4f426196349ecde0af07efa5404c73830e3b495c344c",
+  "/home/ec2-user/onpair-rank-results/samples/clickbench-898b05cd8056b428": "9eef6b11a388b80c3f83e854e42bbac6173968a829aaa3f228fb8eb3f4243937",
+  "/home/ec2-user/onpair-rank-results/prefix-stages/pool/tpch": "f9c7c03f801646321a4068231ffcb39b5edae723764b48c966332e025f648bb2",
+  "/home/ec2-user/onpair-rank-results/prefix-stages/pool/clickbench": "d157a425489dd5d12e186d04ec7b318fab13a4350f14c67fac59ab5126841311",
+  "/home/ec2-user/onpair-rank-results/prefix-stages/tree4/tpch": "862006fb1a5a3c54b313c67b17d88f39240006a8aaaf06dcab21ac96b2650854",
+  "/home/ec2-user/onpair-rank-results/prefix-stages/tree4/clickbench": "a6ff444600cba4fc16914ab626e54080cc4cc647f9834b761d14d2850ced6054",
+  "/home/ec2-user/onpair-rank-results/prefix-stages/final/tpch": "b2d43955f6520d0a2708af1a8d36724ba24b634dd8c171b9760065edf03c0136",
+  "/home/ec2-user/onpair-rank-results/prefix-stages/final/clickbench": "3ea8838c3b8903351334f4286b0c3f31412886107adebb3acad45001a5226e02",
+  "/home/ec2-user/onpair-rank-results/fineweb-32mib-8mib.parquet": "e343822bd56a891bac0b665b609204408a83eb70b9ecb7d3c9cc8906cc14d514",
+  "/home/ec2-user/onpair-rank-results/paper-book-reviews-32mib-8mib.parquet": "852646b4499123d33e002c8e270825b65ce688d745d0ec6cb19c31828890babc",
+  "/home/ec2-user/onpair-rank-results/clickbench-32mib-8mib.parquet": "f0e906f21678c5e03b6465e750f47f4a83a93b4b75bd2e183e5970d004548edc"
+}
