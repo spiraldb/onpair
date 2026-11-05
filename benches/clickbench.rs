@@ -35,7 +35,6 @@ use arrow_array::cast::AsArray;
 use divan::Bencher;
 use onpair::Column;
 use onpair::Config;
-use onpair::DECODE_PADDING;
 use onpair::MaxDictBits;
 use onpair::Threshold;
 use onpair::compress;
@@ -251,14 +250,13 @@ fn train_and_compress(bencher: Bencher, bits: u8) {
 fn decompress_all(bencher: Bencher, bits: u8) {
     let c = corpus();
     let col = compress_column(bits);
-    let cap = col.view().decoded_len() + DECODE_PADDING;
+    // Outside the closure: a fresh allocation in it would time the page faults too.
+    let mut buf = vec![MaybeUninit::uninit(); c.total_bytes];
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))
-        .bench(|| {
-            let mut buf = vec![MaybeUninit::uninit(); cap];
-            // SAFETY: trusted column; `buf` is sized to decoded_len() + DECODE_PADDING.
-            let n = unsafe { col.view().decompress_into(&mut buf) };
-            divan::black_box(&buf[..n]);
+        .bench_local(|| {
+            let out = col.view().decompress_into(&mut buf).unwrap();
+            divan::black_box(out);
         });
 }
 

@@ -59,9 +59,6 @@ pub enum InvalidColumn {
     CodeOutOfRange,
     /// Row offsets are not non-decreasing, or the last exceeds the code count.
     BadRowOffsets,
-    /// The column's tokens sum to more than `usize::MAX` decoded bytes, so the
-    /// decoded-length computation overflows and would under-size the output buffer.
-    DecodedLenOverflow,
     /// A dictionary token has zero length (offsets are not strictly increasing),
     /// so the search tokenizer would not make progress.
     EmptyToken,
@@ -84,7 +81,6 @@ impl std::fmt::Display for InvalidColumn {
             Self::MissingPadding => "dictionary bytes lack the required trailing decoder padding",
             Self::CodeOutOfRange => "code index out of range for dictionary",
             Self::BadRowOffsets => "row offsets must be non-decreasing and within the code stream",
-            Self::DecodedLenOverflow => "column decodes to more than usize::MAX bytes",
             Self::EmptyToken => "dictionary contains an empty token",
             Self::UnsortedTokens => "dictionary tokens must be sorted and unique",
             Self::IncompleteAlphabet => "dictionary is missing one or more single-byte tokens",

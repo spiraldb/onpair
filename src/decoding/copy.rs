@@ -10,7 +10,7 @@
 //!
 //! [`copy_token_bytes`] is the exact-length companion, for the one place that must
 //! not over-store: the no-padding tail of
-//! [`try_decode_into`](super::try_decode_into), where fewer than `MAX_TOKEN_SIZE`
+//! [`decompress_into`](super::decompress_into), where fewer than `MAX_TOKEN_SIZE`
 //! output bytes remain. It copies exactly `len` bytes with at most two overlapping
 //! power-of-two stores — no `memcpy` call — so a short final stretch, or an entire
 //! small decode that never enters the over-copy fast path (e.g. a single short row
@@ -20,7 +20,7 @@
 ///
 /// Callers advance the output cursor by the token's true length; the extra bytes
 /// are overwritten by the next token, and the trailing
-/// [`DECODE_PADDING`](super::DECODE_PADDING) room absorbs the last token's
+/// [`DECOMPRESS_PADDING`](super::DECOMPRESS_PADDING) room absorbs the last token's
 /// over-store.
 ///
 /// # Safety

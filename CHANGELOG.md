@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** The plain decompression names are the safe ones and return the
+  decompressed bytes. `ColumnView::decompress_into`,
+  `ColumnView::decompress_row_into` and `decompress_into` (formerly
+  `try_decode_into`) check the buffer, need no padding, and return
+  `Result<&mut [u8], OutputTooSmall>`. The previous unchecked versions are
+  `ColumnView::decompress_into_unchecked`,
+  `ColumnView::decompress_row_into_unchecked` and `decompress_into_unchecked`
+  (formerly `decode_into`): still `unsafe`, and codes are still range-checked.
+  `DECODE_PADDING` is now `DECOMPRESS_PADDING`.
 - **Breaking:** Replace `search::contains` and `ContainsTable` with
   `row_contains` and `ContainsDfa`. `ContainsDfa::new` returns
   `ContainsError::PatternTooLong` for patterns longer than
@@ -33,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[non_exhaustive]`, like the new `ContainsError` and
   `InvalidFrequencyIndex`, so later releases can add variants without a
   breaking change. Exhaustive matches on them need a wildcard arm.
+
+### Removed
+
+- **Breaking:** Remove `decoded_len`, `ColumnView::decoded_len`,
+  `ColumnView::row_decoded_len` and `InvalidColumn::DecodedLenOverflow`.
 
 ## [0.3.0](https://github.com/spiraldb/onpair/compare/v0.2.1...v0.3.0) - 2026-10-27
 

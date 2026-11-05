@@ -16,7 +16,7 @@ use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, Dictiona
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
-use crate::decoding;
+use crate::decoding::{self, OutputTooSmall};
 use crate::search::index::TokenFrequencyIndexView;
 use crate::search::{
     ContainsDfa, ContainsError, ContainsScan, PrefixQuery, equals, row_contains, starts_with,
@@ -106,70 +106,97 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         unsafe { self.codes.get_unchecked(a..b) }
     }
 
-    /// Exact decoded byte length of the whole column — sizes a
-    /// [`decompress_into`](Self::decompress_into) buffer (plus
-    /// [`DECODE_PADDING`](crate::DECODE_PADDING)). `O(codes)`; an out-of-range code
-    /// panics with [`InvalidColumn::CodeOutOfRange`].
-    #[inline]
-    pub fn decoded_len(&self) -> usize {
-        decoding::decoded_len(self.codes, self.dict)
-    }
-
-    /// Exact decoded byte length of row `k` — sizes a buffer for a
-    /// [`decode_into`](crate::decode_into) over [`row_codes`](Self::row_codes).
-    /// Precondition: `k < num_rows()`.
-    #[inline]
-    pub fn row_decoded_len(&self, k: usize) -> usize {
-        decoding::decoded_len(self.row_codes(k), self.dict)
-    }
-
-    /// Decode the whole column into `out`, returning the bytes written. Expands the
-    /// dictionary to its load-free `WideDictionary` form once — the fast layout
-    /// for a bulk decode, reached directly per code with no offset indirection —
-    /// then over-reads a fixed 16 bytes per token via
-    /// [`decode_into`](crate::decode_into). The caller owns buffer sizing: size
-    /// `out` from [`decoded_len`](Self::decoded_len) plus
-    /// [`DECODE_PADDING`](crate::DECODE_PADDING).
+    /// Decompress the whole column into `out` and return the decompressed bytes, the
+    /// front of `out`. Expands the dictionary to its load-free `WideDictionary` form
+    /// once — the fast layout for a bulk decode, reached directly per code with no
+    /// offset indirection. The original values' total length is enough for `out`.
     ///
-    /// For repeated decodes, retain the materialized wide form and decode over its
-    /// view with [`decode_into`](crate::decode_into), so the wide form is not
+    /// For repeated decompressions, retain the materialized wide form and pass its
+    /// view to [`decompress_into`](crate::decompress_into), so the wide form is not
     /// rebuilt on every call.
+    ///
+    /// # Errors
+    /// Returns [`OutputTooSmall`] if `out` cannot hold the decompressed bytes.
+    ///
+    /// # Panics
+    /// With [`InvalidColumn::CodeOutOfRange`] on an out-of-range code.
+    #[inline]
+    pub fn decompress_into<'o>(
+        &self,
+        out: &'o mut [MaybeUninit<u8>],
+    ) -> Result<&'o mut [u8], OutputTooSmall> {
+        // Expand to the load-free wide form (fast for a bulk decode). The
+        // dictionary view guarantees the preconditions of `to_wide`.
+        let wide = self.dict.to_wide();
+        decoding::decompress_into(self.codes, wide.as_view(), out)
+    }
+
+    /// [`decompress_into`](Self::decompress_into) without the buffer check. Codes are
+    /// still range-checked.
     ///
     /// # Panics
     /// With [`InvalidColumn::CodeOutOfRange`] on an out-of-range code.
     ///
     /// # Safety
-    /// `out.len() >= self.decoded_len() + DECODE_PADDING`.
+    /// `out` holds the decompressed bytes plus
+    /// [`DECOMPRESS_PADDING`](crate::DECOMPRESS_PADDING), or
+    /// [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE) bytes per code.
     #[inline]
-    pub unsafe fn decompress_into(&self, out: &mut [MaybeUninit<u8>]) -> usize {
-        // Expand to the load-free wide form (fast for a bulk decode). The
-        // dictionary view guarantees the preconditions of `to_wide`.
+    pub unsafe fn decompress_into_unchecked<'o>(
+        &self,
+        out: &'o mut [MaybeUninit<u8>],
+    ) -> &'o mut [u8] {
         let wide = self.dict.to_wide();
         // SAFETY: the wide form is read-padded by construction (`n` exact 16-byte
         // rows); the only caller precondition is the buffer size.
-        unsafe { decoding::decode_into(self.codes, wide.as_view(), out) }
+        unsafe { decoding::decompress_into_unchecked(self.codes, wide.as_view(), out) }
     }
 
-    /// Decode row `k` into `out`, returning the bytes written — the random-access
-    /// analog of [`decompress_into`](Self::decompress_into). Same fixed 16-byte
-    /// over-copy per token, but decoded directly over the compact dictionary with
-    /// no wide-table build (the wide form would cost `O(num_tokens)` to materialize,
-    /// dwarfing a single short row). The caller owns buffer sizing and reuse — size
-    /// `out` from [`row_decoded_len`](Self::row_decoded_len) plus
-    /// [`DECODE_PADDING`](crate::DECODE_PADDING), and reuse it across rows to avoid
-    /// per-row allocation. Precondition: `k < num_rows()`.
+    /// Decompress row `k` into `out` and return its bytes, the front of `out` — the
+    /// random-access analog of [`decompress_into`](Self::decompress_into). Same fixed
+    /// 16-byte over-copy per token, but decoded directly over the compact dictionary
+    /// with no wide-table build (the wide form would cost `O(num_tokens)` to
+    /// materialize, dwarfing a single short row).
+    /// [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE) bytes per code of
+    /// [`row_codes`](Self::row_codes) always fit, and are the fastest.
     ///
-    /// Each code is bounds-checked in the loop; an out-of-range code panics with
-    /// [`InvalidColumn::CodeOutOfRange`] (never UB).
+    /// # Errors
+    /// Returns [`OutputTooSmall`] if `out` cannot hold the row's bytes.
+    ///
+    /// # Panics
+    /// If `k >= num_rows()`, or with [`InvalidColumn::BadRowOffsets`] if the row offsets
+    /// decrease or reach past the code stream, as [`row_codes`](Self::row_codes) does.
+    /// With [`InvalidColumn::CodeOutOfRange`] on an out-of-range code.
+    #[inline]
+    pub fn decompress_row_into<'o>(
+        &self,
+        k: usize,
+        out: &'o mut [MaybeUninit<u8>],
+    ) -> Result<&'o mut [u8], OutputTooSmall> {
+        decoding::decompress_into(self.row_codes(k), self.dict, out)
+    }
+
+    /// [`decompress_row_into`](Self::decompress_row_into) without the buffer check.
+    /// Codes are still range-checked.
+    ///
+    /// # Panics
+    /// If `k >= num_rows()`, or with [`InvalidColumn::BadRowOffsets`] if the row offsets
+    /// decrease or reach past the code stream, as [`row_codes`](Self::row_codes) does.
+    /// With [`InvalidColumn::CodeOutOfRange`] on an out-of-range code.
     ///
     /// # Safety
-    /// `out.len() >= self.row_decoded_len(k) + DECODE_PADDING`.
+    /// `out` holds the row's bytes plus
+    /// [`DECOMPRESS_PADDING`](crate::DECOMPRESS_PADDING), or
+    /// [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE) bytes per code.
     #[inline]
-    pub unsafe fn decompress_row_into(&self, k: usize, out: &mut [MaybeUninit<u8>]) -> usize {
+    pub unsafe fn decompress_row_into_unchecked<'o>(
+        &self,
+        k: usize,
+        out: &'o mut [MaybeUninit<u8>],
+    ) -> &'o mut [u8] {
         // SAFETY: `self.dict` is structurally valid and read-padded, so each token's fixed
-        // 16-byte over-read stays in bounds; the caller guarantees `out` holds the
-        // row's decoded length plus DECODE_PADDING for the final over-store.
-        unsafe { decoding::decode_into(self.row_codes(k), self.dict, out) }
+        // 16-byte over-read stays in bounds; the caller guarantees the room in `out`.
+        unsafe { decoding::decompress_into_unchecked(self.row_codes(k), self.dict, out) }
     }
 
     /// Ascending indices of the rows equal to `needle`. The needle is
@@ -263,7 +290,12 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ColumnView, Config, DECODE_PADDING, DEFAULT_CONFIG, MaxDictBits, compress};
+    use crate::decoding::OutputTooSmall;
+    use crate::test_corpus::decode_row;
+    use crate::{
+        ColumnView, Config, DECOMPRESS_PADDING, DEFAULT_CONFIG, MAX_TOKEN_SIZE, MaxDictBits,
+        compress,
+    };
 
     fn pack(rows: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
         let mut bytes = Vec::new();
@@ -275,26 +307,11 @@ mod tests {
         (bytes, offsets)
     }
 
-    /// Decode the whole column into a fresh `Vec` through the caller-buffer API,
-    /// sizing from `decoded_len` (test helper; the crate exposes only into-buffer
-    /// decode).
+    /// Decode the whole column into a fresh `Vec` through the caller-buffer API (test
+    /// helper; the crate exposes only into-buffer decode).
     fn decode_all(view: ColumnView<'_, u32>) -> Vec<u8> {
-        let mut buf = vec![std::mem::MaybeUninit::uninit(); view.decoded_len() + DECODE_PADDING];
-        // SAFETY: view from a trusted column; buffer carries DECODE_PADDING headroom.
-        let w = unsafe { view.decompress_into(&mut buf) };
-        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) };
-        got.to_vec()
-    }
-
-    /// Decode a single row into a fresh `Vec` through the into-buffer API — the
-    /// per-row counterpart of `decode_all`.
-    fn decode_row(view: ColumnView<'_, u32>, k: usize) -> Vec<u8> {
-        let mut buf =
-            vec![std::mem::MaybeUninit::uninit(); view.row_decoded_len(k) + DECODE_PADDING];
-        // SAFETY: buffer sized for row `k`; view from a trusted column.
-        let w = unsafe { view.decompress_row_into(k, &mut buf) };
-        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) };
-        got.to_vec()
+        let mut buf = vec![std::mem::MaybeUninit::uninit(); view.codes.len() * MAX_TOKEN_SIZE];
+        view.decompress_into(&mut buf).unwrap().to_vec()
     }
 
     #[test]
@@ -304,7 +321,6 @@ mod tests {
         let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
         let view = col.view();
 
-        assert_eq!(view.decoded_len(), bytes.len());
         assert_eq!(decode_all(view), bytes);
         assert_eq!(view.num_rows(), rows.len());
         for (k, row) in rows.iter().enumerate() {
@@ -312,11 +328,50 @@ mod tests {
         }
     }
 
+    /// The safe calls need no padding: buffers of exactly the original lengths work,
+    /// and one byte less is an error. The unchecked ones take the padding.
+    #[test]
+    fn decompresses_into_exact_and_padded_buffers() {
+        let rows: &[&[u8]] = &[b"alpha", b"", b"beta beta", b"gamma"];
+        let (bytes, offsets) = pack(rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+
+        let mut out = vec![std::mem::MaybeUninit::uninit(); bytes.len()];
+        assert_eq!(view.decompress_into(&mut out).unwrap(), bytes);
+        assert_eq!(
+            view.decompress_into(&mut out[..bytes.len() - 1]),
+            Err(OutputTooSmall)
+        );
+        let mut padded = vec![std::mem::MaybeUninit::uninit(); bytes.len() + DECOMPRESS_PADDING];
+        // SAFETY: `padded` holds the column plus DECOMPRESS_PADDING.
+        assert_eq!(
+            unsafe { view.decompress_into_unchecked(&mut padded) },
+            bytes
+        );
+
+        for (k, row) in rows.iter().enumerate() {
+            let mut out = vec![std::mem::MaybeUninit::uninit(); row.len()];
+            assert_eq!(view.decompress_row_into(k, &mut out).unwrap(), *row);
+            if !row.is_empty() {
+                assert_eq!(
+                    view.decompress_row_into(k, &mut out[..row.len() - 1]),
+                    Err(OutputTooSmall)
+                );
+            }
+            // SAFETY: `padded` holds every row plus DECOMPRESS_PADDING.
+            assert_eq!(
+                unsafe { view.decompress_row_into_unchecked(k, &mut padded) },
+                *row
+            );
+        }
+    }
+
     /// Decoding over the wide form (what `decompress_into` builds) and directly
     /// over the compact dictionary agree, and both reproduce the input.
     #[test]
     fn compact_and_wide_decode_agree() {
-        use crate::decode_into;
+        use crate::decompress_into;
         let rows: &[&[u8]] = &[b"alpha", b"", b"beta beta", b"gamma", b"alpha"];
         let (bytes, offsets) = pack(rows);
         let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
@@ -326,11 +381,11 @@ mod tests {
         assert_eq!(decode_all(view), bytes);
 
         // Compact path: decode the same codes directly over the compact view.
-        let mut buf = vec![std::mem::MaybeUninit::uninit(); view.decoded_len() + DECODE_PADDING];
-        // SAFETY: read-padded compact dict (from a Column); buffer carries headroom.
-        let w = unsafe { decode_into(view.codes, view.dict, &mut buf) };
-        let got = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) };
-        assert_eq!(got, bytes.as_slice());
+        let mut buf = vec![std::mem::MaybeUninit::uninit(); bytes.len()];
+        assert_eq!(
+            decompress_into(view.codes, view.dict, &mut buf).unwrap(),
+            bytes
+        );
     }
 
     #[test]

@@ -6,13 +6,15 @@
 // `decoder`, and `search` all draw from the same data and can be compared
 // head-to-head against the upstream test suite.
 
+use std::mem::MaybeUninit;
+
 use rand::RngExt;
 use rand::SeedableRng;
 
 use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, DictionaryView, pad_raw};
-use crate::core::types::Token;
+use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::encoding::lpm::LongestPrefixMatcher;
-use crate::{Column, DEFAULT_CONFIG, compress};
+use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
 
 /// Bytes for property tests. Few distinct bytes make shared prefixes and
 /// nested tokens common; `0` and `0xFF` are the zero padding of keys and the
@@ -75,6 +77,12 @@ pub(crate) fn make_raw<S: AsRef<[u8]>>(strings: &[S]) -> Raw {
 pub(crate) fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
     let raw = make_raw(rows);
     compress(&raw.data, &raw.offsets, DEFAULT_CONFIG).unwrap()
+}
+
+/// Row `k`'s bytes, through the into-buffer API.
+pub(crate) fn decode_row(view: ColumnView<'_, u32>, k: usize) -> Vec<u8> {
+    let mut out = vec![MaybeUninit::uninit(); view.row_codes(k).len() * MAX_TOKEN_SIZE];
+    view.decompress_row_into(k, &mut out).unwrap().to_vec()
 }
 
 /// Whether `pattern` occurs in `haystack`, compared window by window: the byte-level

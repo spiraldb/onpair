@@ -73,16 +73,7 @@ pub fn starts_with(codes: &[Token], query: &PrefixQuery) -> bool {
 mod tests {
     use super::*;
     use crate::core::dictionary::Dictionary;
-    use crate::test_corpus::compress_rows;
-
-    /// Decode row `k` to bytes via the into-buffer API, for the oracle.
-    fn decode_row(view: crate::ColumnView<'_, u32>, k: usize) -> Vec<u8> {
-        let mut buf =
-            vec![std::mem::MaybeUninit::uninit(); view.row_decoded_len(k) + crate::DECODE_PADDING];
-        // SAFETY: buffer sized for row `k`; view from a trusted column.
-        let w = unsafe { view.decompress_row_into(k, &mut buf) };
-        unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), w) }.to_vec()
-    }
+    use crate::test_corpus::{compress_rows, decode_row};
 
     /// Driving `starts_with` over every row must agree with a brute-force
     /// decode-and-`starts_with` oracle. The query is built from both the compact
