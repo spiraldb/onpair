@@ -17,7 +17,11 @@ use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
-use crate::search::{ContainsTable, PrefixQuery, contains, equals, starts_with, tokenize};
+use crate::search::index::TokenFrequencyIndexView;
+use crate::search::{
+    ContainsDfa, ContainsError, ContainsScan, PrefixQuery, equals, row_contains, starts_with,
+    tokenize,
+};
 
 /// Owned compressed column, produced by [`Column::compress`] /
 /// [`Parser::parse`](crate::Parser::parse). Self-contained: it carries its own
@@ -37,8 +41,8 @@ pub struct Column<O: Offset> {
 
 impl<O: Offset> Column<O> {
     /// Compress an Arrow `(bytes, offsets)` value pair end-to-end (train a
-    /// dictionary, then encode). `offsets` has `n + 1` entries; string `i` is
-    /// `bytes[offsets[i]..offsets[i + 1]]`.
+    /// dictionary, then encode greedily, as [`Parser`](crate::Parser) does).
+    /// `offsets` has `n + 1` entries; string `i` is `bytes[offsets[i]..offsets[i + 1]]`.
     ///
     /// # Errors
     /// [`Error::InvalidArg`](crate::Error::InvalidArg) if `offsets` is empty or
@@ -170,6 +174,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 
     /// Ascending indices of the rows equal to `needle`. The needle is
     /// [`tokenize`]d once, then matched per row without decoding.
+    ///
+    /// # Panics
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the row offsets decrease or
+    /// reach past the code stream, as [`row_codes`](Self::row_codes) does.
     pub fn rows_equal_to(&self, needle: &[u8]) -> Vec<usize> {
         let query = tokenize(needle, self.dict);
         self.select(|codes| equals(codes, &query))
@@ -177,17 +185,72 @@ impl<'a, O: Offset> ColumnView<'a, O> {
 
     /// Ascending indices of the rows starting with `prefix`, prepared once as a
     /// [`PrefixQuery`] and matched per row.
+    ///
+    /// # Panics
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the row offsets decrease or
+    /// reach past the code stream, as [`row_codes`](Self::row_codes) does.
     pub fn rows_starting_with(&self, prefix: &[u8]) -> Vec<usize> {
         let query = PrefixQuery::new(prefix, self.dict);
         self.select(|codes| starts_with(codes, &query))
     }
 
     /// Ascending indices of the rows containing `pattern` as a substring,
-    /// prepared once as a [`ContainsTable`] and matched per row. Panics if
-    /// `pattern` exceeds 255 bytes.
-    pub fn rows_containing(&self, pattern: &[u8]) -> Vec<usize> {
-        let table = ContainsTable::new(pattern, self.dict);
-        self.select(|codes| contains(codes, &table))
+    /// prepared once as a [`ContainsDfa`] and matched per row. The empty pattern
+    /// matches every row. For rows the encoder produced,
+    /// [`rows_containing_with_scan`](Self::rows_containing_with_scan) is usually
+    /// faster.
+    ///
+    /// # Errors
+    /// Returns [`ContainsError::PatternTooLong`] if `pattern` exceeds
+    /// [`ContainsDfa::MAX_PATTERN_LEN`].
+    ///
+    /// # Panics
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the row offsets decrease or
+    /// reach past the code stream, as [`row_codes`](Self::row_codes) does. May also
+    /// panic if the dictionary is not sorted, as [`ContainsDfa::new`] may.
+    pub fn rows_containing(&self, pattern: &[u8]) -> Result<Vec<usize>, ContainsError> {
+        let dfa = ContainsDfa::new(pattern, self.dict)?;
+        Ok(self.select(|codes| row_contains(codes, &dfa)))
+    }
+
+    /// Ascending indices of the rows containing `pattern`, found by one
+    /// [`ContainsScan`] over the whole code stream.
+    ///
+    /// To reuse a scan across chunks, or to inspect its
+    /// [`probe_cover`](ContainsScan::probe_cover) and
+    /// [`expected_hits`](ContainsScan::expected_hits) before choosing a search
+    /// operation, prepare a [`ContainsScan`] directly.
+    ///
+    /// Rows must be greedily tokenized with this view's conformant dictionary,
+    /// as produced by the encoder; on such rows it returns the same rows as
+    /// [`rows_containing`](Self::rows_containing). Buffer validation alone does
+    /// not establish greedy tokenization for externally supplied codes, and on
+    /// other rows the result is unspecified.
+    ///
+    /// `frequencies` counts the tokens of this view's code stream, as built by
+    /// [`TokenFrequencyIndex::build`](crate::search::index::TokenFrequencyIndex::build)
+    /// or borrowed from storage with [`TokenFrequencyIndexView::new`]. Preparation
+    /// checks only that it counts as many tokens as the dictionary has; inexact
+    /// counts affect planning, not the rows returned.
+    ///
+    /// The empty pattern matches every row, without a scan.
+    ///
+    /// # Errors
+    /// Propagates preparation errors from [`ContainsScan::new`].
+    ///
+    /// # Panics
+    /// Panics with [`InvalidColumn::BadRowOffsets`] if the first row offset exceeds
+    /// the last, or the last reaches past the code stream. Decreasing offsets in
+    /// between may panic the same way, as in [`ContainsScan::scan`].
+    pub fn rows_containing_with_scan(
+        &self,
+        pattern: &[u8],
+        frequencies: TokenFrequencyIndexView<'_>,
+    ) -> Result<Vec<usize>, ContainsError> {
+        let scan = ContainsScan::new(pattern, self.dict, frequencies)?;
+        let mut rows = Vec::new();
+        scan.scan(self.codes, self.row_offsets, &mut rows);
+        Ok(rows)
     }
 
     /// Ascending indices of the rows whose codes satisfy `pred`.
@@ -329,7 +392,7 @@ mod tests {
         // Duplicates are returned once per row, in ascending row order.
         assert_eq!(view.rows_equal_to(b"apple"), vec![0, 4]);
         assert_eq!(view.rows_starting_with(b"ap"), vec![0, 2, 4]);
-        assert_eq!(view.rows_containing(b"an"), vec![1]);
+        assert_eq!(view.rows_containing(b"an").unwrap(), vec![1]);
         // Absent needles select nothing.
         assert_eq!(view.rows_equal_to(b"grape"), Vec::<usize>::new());
     }
@@ -345,7 +408,7 @@ mod tests {
         // matches every row.
         assert_eq!(view.rows_equal_to(b""), vec![1, 3]);
         assert_eq!(view.rows_starting_with(b""), vec![0, 1, 2, 3]);
-        assert_eq!(view.rows_containing(b""), vec![0, 1, 2, 3]);
+        assert_eq!(view.rows_containing(b"").unwrap(), vec![0, 1, 2, 3]);
     }
 
     /// The column predicates must agree with a brute-force decode-and-match
@@ -394,7 +457,70 @@ mod tests {
                     needle.is_empty() || r.windows(needle.len()).any(|w| w == needle)
                 })
                 .collect();
-            assert_eq!(view.rows_containing(needle), con, "contains {needle:?}");
+            assert_eq!(
+                view.rows_containing(needle).unwrap(),
+                con,
+                "contains {needle:?}"
+            );
         }
+    }
+
+    /// `rows_containing_with_scan` is an optimization of `rows_containing` and
+    /// nothing else: same rows, same order.
+    #[test]
+    fn scan_agrees_with_rows_containing() {
+        use crate::DictionaryView;
+        use crate::search::index::TokenFrequencyIndex;
+        use crate::test_corpus::user_strings;
+        let corpus: Vec<Vec<u8>> = user_strings(60)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+        let (bytes, offsets) = pack(&rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        let freqs = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
+
+        let patterns: &[&[u8]] = &[
+            b"",
+            b"h",
+            b"https",
+            b"https://www.example.com/",
+            b"example",
+            b".com",
+            b"://",
+            b"zzz",
+        ];
+        for &pattern in patterns {
+            let want = view.rows_containing(pattern).unwrap();
+            assert_eq!(
+                view.rows_containing_with_scan(pattern, freqs.as_view())
+                    .unwrap(),
+                want,
+                "{pattern:?}"
+            );
+        }
+    }
+
+    /// The scan takes patterns `ContainsDfa` rejects: its cap is the largest pattern
+    /// offset the hit verifier stores, not the DFA's 255-byte state width.
+    #[test]
+    fn scan_takes_patterns_the_dfa_rejects() {
+        use crate::DictionaryView;
+        use crate::search::index::TokenFrequencyIndex;
+        let long = vec![b'q'; 400];
+        let mut hit = long.clone();
+        hit.extend_from_slice(b"tail");
+        let rows: &[&[u8]] = &[b"short", hit.as_slice(), b"qqq"];
+        let (bytes, offsets) = pack(rows);
+        let col = compress(&bytes, &offsets, DEFAULT_CONFIG).unwrap();
+        let view = col.view();
+        let freqs = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
+
+        let got = view
+            .rows_containing_with_scan(&long, freqs.as_view())
+            .unwrap();
+        assert_eq!(got, vec![1]);
     }
 }

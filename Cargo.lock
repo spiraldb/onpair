@@ -927,6 +927,7 @@ dependencies = [
  "codspeed-divan-compat",
  "hashbrown",
  "hegeltest",
+ "memchr",
  "parquet",
  "rand",
  "rstest",

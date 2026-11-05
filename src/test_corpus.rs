@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 //
-// Shared test corpus generators. These replicate the helpers in the C++
+// Shared test helpers. The corpus generators replicate those in the C++
 // `tests/helpers/corpus.h` so the unit tests in `trainer`, `parser`,
 // `decoder`, and `search` all draw from the same data and can be compared
 // head-to-head against the upstream test suite.
@@ -9,29 +9,31 @@
 use rand::RngExt;
 use rand::SeedableRng;
 
-use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, DictionaryView};
+use crate::core::dictionary::{CompactDictionary, CompactDictionaryView, DictionaryView, pad_raw};
 use crate::core::types::Token;
 use crate::encoding::lpm::LongestPrefixMatcher;
+use crate::{Column, DEFAULT_CONFIG, compress};
 
 /// Bytes for property tests. Few distinct bytes make shared prefixes and
 /// nested tokens common; `0` and `0xFF` are the zero padding of keys and the
 /// pad key.
 pub(crate) const PROPERTY_ALPHABET: [u8; 5] = [b'a', b'b', b'c', 0, 0xFF];
 
-/// Sorted, complete dictionary: every single byte plus `extra`.
-pub(crate) fn complete_dictionary(extra: &[&[u8]]) -> CompactDictionary {
-    let mut tokens: Vec<Vec<u8>> = (0u16..=255).map(|i| vec![i as u8]).collect();
-    tokens.extend(extra.iter().map(|t| t.to_vec()));
-    tokens.sort();
+/// Sorted, read-padded dictionary of `tokens`, without duplicates.
+pub(crate) fn dictionary<S: AsRef<[u8]>>(tokens: &[S]) -> CompactDictionary {
+    let mut tokens: Vec<&[u8]> = tokens.iter().map(AsRef::as_ref).collect();
+    tokens.sort_unstable();
     tokens.dedup();
+    let mut raw = make_raw(&tokens);
+    pad_raw(&mut raw.data, &raw.offsets);
+    CompactDictionary::from_raw(raw.data, raw.offsets)
+}
 
-    let mut bytes = Vec::new();
-    let mut offsets = vec![0u32];
-    for t in &tokens {
-        bytes.extend_from_slice(t);
-        offsets.push(bytes.len() as u32);
-    }
-    CompactDictionary::from_raw(bytes, offsets)
+/// Sorted, read-padded, complete dictionary: every single byte plus `extra`.
+pub(crate) fn complete_dictionary(extra: &[&[u8]]) -> CompactDictionary {
+    let bytes: Vec<u8> = (0..=255).collect();
+    let tokens: Vec<&[u8]> = bytes.chunks(1).chain(extra.iter().copied()).collect();
+    dictionary(&tokens)
 }
 
 /// The matcher the trainer uses, holding the tokens of `dict`, and the bytes
@@ -67,6 +69,21 @@ pub(crate) fn make_raw<S: AsRef<[u8]>>(strings: &[S]) -> Raw {
         offsets.push(data.len() as u32);
     }
     Raw { data, offsets }
+}
+
+/// Compresses `rows` with the default configuration.
+pub(crate) fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
+    let raw = make_raw(rows);
+    compress(&raw.data, &raw.offsets, DEFAULT_CONFIG).unwrap()
+}
+
+/// Whether `pattern` occurs in `haystack`, compared window by window: the byte-level
+/// oracle of the search tests.
+pub(crate) fn byte_contains(haystack: &[u8], pattern: &[u8]) -> bool {
+    pattern.is_empty()
+        || haystack
+            .windows(pattern.len())
+            .any(|window| window == pattern)
 }
 
 /// URL-shaped repetitive corpus — easy BPE merge targets.

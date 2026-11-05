@@ -36,6 +36,7 @@ use_debug = { level = "deny" }
 
 [dependencies]
 hashbrown = "0.17.0"
+memchr = "2.4.0"
 rand = "0.10.3"
 
 [dev-dependencies]

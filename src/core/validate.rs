@@ -38,6 +38,7 @@
 /// violations decode safely but make search/tokenize give wrong answers.
 /// `validate_safety` checks only the former; `validate` checks both.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum InvalidColumn {
     // ── Safety / addressability ──────────────────────────────────────────────
     /// The dictionary has no token, so it cannot be used by the search tokenizer.

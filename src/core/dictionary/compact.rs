@@ -448,6 +448,29 @@ impl<'a> CompactDictionaryView<'a> {
         Self { bytes, offsets }
     }
 
+    /// The token bytes without the trailing read-padding, plus the offsets
+    /// attributing them.
+    ///
+    /// Every byte of the returned buffer belongs to exactly one token, which is
+    /// what makes the buffer a valid haystack for a bulk substring search: a match
+    /// at `hit` lies inside token `id` exactly when `offsets[id] <= hit` and
+    /// `hit + len <= offsets[id + 1]`. Substring search uses this to sweep
+    /// the whole dictionary with a single `memmem` search rather than one per
+    /// token. Trimming the read-padding is the one care needed — it is the only
+    /// part of `bytes` belonging to no token.
+    ///
+    /// Inherent and crate-internal on purpose, rather than a method on
+    /// [`DictionaryView`]: the buffer is a fact about *this* layout, so a caller
+    /// that needs it needs this type. The strided
+    /// [`WideDictionaryView`](super::WideDictionaryView) has no counterpart — the
+    /// tail of each of its rows holds the bytes of the *following* tokens, so a
+    /// match found there need not lie in any token at all.
+    #[inline]
+    pub(crate) fn token_payload(&self) -> (&'a [u8], &'a [u32]) {
+        let logical = self.offsets.last().copied().unwrap_or(0) as usize;
+        (&self.bytes[..logical], self.offsets)
+    }
+
     /// Validate raw borrowed `(bytes, offsets)` for safe decoding over the same
     /// slices (no copy) — the checked door across the safety boundary. The
     /// borrowed bytes must already be read-padded (a borrow cannot be extended).
@@ -597,7 +620,7 @@ impl<'a> From<&'a CompactDictionary> for CompactDictionaryView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::{ContainsTable, PrefixQuery, contains, starts_with, tokenize};
+    use crate::search::{ContainsDfa, PrefixQuery, row_contains, starts_with, tokenize};
     use crate::{DECODE_PADDING, decode_into, decoded_len, try_decode_into};
     use std::mem::MaybeUninit;
     use std::sync::Arc;
@@ -772,8 +795,8 @@ mod tests {
         // must still make malformed contents bounded to inspect.
         let prefix = PrefixQuery::new(text, view);
         let _ = starts_with(codes, &prefix);
-        let table = ContainsTable::new(text, view);
-        let _ = contains(codes, &table);
+        let dfa = ContainsDfa::new(text, view).unwrap();
+        let _ = row_contains(codes, &dfa);
 
         let expected: Vec<u8> = codes
             .iter()

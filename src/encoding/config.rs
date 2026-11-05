@@ -107,6 +107,7 @@ impl Default for Config {
 
 /// Error returned by the public training and encoding API.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Error {
     /// A configuration value or input buffer was out of range or malformed.
     InvalidArg,

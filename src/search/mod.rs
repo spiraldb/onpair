@@ -1,48 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Compressed-domain search: equality, prefix, and substring queries answered
-//! directly over the code stream, without decoding rows back to bytes.
+//! Equality, prefix and substring search over compressed codes, without decoding rows.
 //!
-//! These operations require a conformant dictionary — one that is sorted,
-//! complete, and unique. A dictionary produced by the trainer or passed through
-//! `validate` satisfies this precondition. [`crate::DictionaryView`]
-//! only guarantees structurally safe access; it does not establish these semantic
-//! properties:
+//! Prepare queries once and reuse them across rows or scans:
 //!
-//! * **Sorted** — tokens are in bytewise-lexicographic order, so a needle can be
-//!   tokenized ([`tokenize`](tokenize())) and prefix-ranged ([`prefix_range`]) by
-//!   binary search.
-//! * **Complete** — all 256 single-byte tokens are present, so any query string
-//!   is encodable into codes.
-//! * **Unique** — no two tokens are equal, so distinct code sequences denote
-//!   distinct strings; equality then reduces to comparing code slices.
+//! * Equality: [`tokenize`](tokenize()) the needle, then call [`equals`](equals()).
+//! * Prefix: build a [`PrefixQuery`], then call [`starts_with`].
+//! * Substring per row: build a [`ContainsDfa`], then call [`row_contains`]. It
+//!   takes one step per code, is exact for rows of any tokenization, needs no
+//!   frequency index, and accepts patterns of up to 255 bytes.
+//! * Substring across rows: build a [`ContainsScan`], then call [`ContainsScan::scan`]
+//!   to append the indices of the matching rows. It searches the whole code stream
+//!   for a few rare tokens, with SIMD where available, and is usually faster. It
+//!   plans with a reusable [`index::TokenFrequencyIndex`], requires greedily
+//!   tokenized rows, and accepts patterns of up to 65535 bytes.
 //!
-//! # Shape
-//! Each query is **prepared once** (tokenize the needle, or build a transition
-//! table) into immutable data, then applied per row by a **free function over a
-//! `&[`[`Token`](crate::Token)`]`**. The row to scan is
-//! [`ColumnView::row_codes`](crate::ColumnView::row_codes), but the predicates
-//! take any code slice, so a caller can scan a prefiltered subset of rows
-//! rather than the whole column.
+//! Search requires a dictionary with unique tokens in bytewise-lexicographic order
+//! and all 256 single-byte tokens. Training or full dictionary validation establishes
+//! these properties; [`crate::DictionaryView`] alone guarantees only structural safety.
 //!
-//! # Operations
-//! * [`tokenize`](tokenize()) — segment a needle into its canonical code sequence.
-//! * [`equals`](equals()) — rows equal to a needle.
-//! * [`starts_with`] — rows beginning with a needle, via a prepared
-//!   [`PrefixQuery`].
-//! * [`contains`](contains()) — rows containing a pattern, via a precomputed
-//!   token-level KMP [`ContainsTable`].
-//! * [`prefix_range`] — the sorted-dictionary primitive prefix search builds on.
+//! Equality, prefix search and [`ContainsScan`] also require rows greedily tokenized
+//! with the same dictionary, as [`Parser`](crate::Parser) encodes them. Validating
+//! external buffers does not establish greedy tokenization.
 
-mod contains;
 mod equals;
+pub mod index;
 mod lookup;
 mod prefix;
+mod substring;
 mod tokenize;
 
-pub use contains::{ContainsTable, contains};
 pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefix::{PrefixQuery, starts_with};
+pub use substring::{ContainsDfa, ContainsError, ContainsScan, ProbeCover, row_contains};
 pub use tokenize::tokenize;

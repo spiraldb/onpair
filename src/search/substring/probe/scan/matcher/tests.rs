@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+//! Tests every kernel eligible on this CPU against scalar cover membership
+//! (`ProbeCover::contains`), across point counts, ranges, code-width boundaries
+//! and block tails.
+
+use super::{Block, Mask, Matcher, Table};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use super::{Kernels, PER_BATCH};
+use crate::core::types::{Token, TokenRange};
+use crate::search::substring::ProbeCover;
+use crate::search::substring::probe::plan::is_eligible;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use crate::search::substring::probe::scan::dispatch::supports;
+use crate::search::substring::probe::scan::{BLOCK, Isa, MatcherKind};
+
+/// Runs one matcher on a mask full of stale bits, as a scan reuses its mask
+/// across blocks, and checks that a false return means an empty mask.
+fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block, skip_empty: bool) -> Mask {
+    let mut bits = [u64::MAX; BLOCK / 64];
+    // A matcher may return true for an empty mask when it always packs.
+    // SAFETY: callers check `supports` before testing a vector matcher.
+    let any_hit = unsafe { M::new(cover) }.check(codes, &mut bits, skip_empty);
+    assert!(
+        any_hit || bits.iter().all(|&set| set == 0),
+        "a set bit under a cleared empty-block flag"
+    );
+    bits
+}
+
+/// Builds the expected bit mask directly from scalar cover membership.
+fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
+    let mut bits = [0u64; BLOCK / 64];
+    for (at, &code) in codes.iter().enumerate() {
+        if cover.contains(code) {
+            bits[at / 64] |= 1 << (at % 64);
+        }
+    }
+    bits
+}
+
+/// Compares a matcher eligible on `isa` with the independent mask oracle, in both
+/// packing modes.
+fn agrees<M: Matcher>(isa: Isa, kind: MatcherKind, name: &str, cover: &ProbeCover, codes: &Block) {
+    if !is_eligible(isa, kind, cover) {
+        return;
+    }
+    for skip_empty in [false, true] {
+        assert_eq!(
+            mask::<M>(cover, codes, skip_empty),
+            expected(cover, codes),
+            "{isa:?} {name} (skip_empty={skip_empty}) differs from the cover it was built from"
+        );
+    }
+}
+
+/// Creates distinct codes so a selected point has exactly one hit per block.
+fn block() -> Block {
+    let mut codes = [0 as Token; BLOCK];
+    for (at, code) in codes.iter_mut().enumerate() {
+        *code = (at * 37 % 50021) as Token;
+    }
+    codes
+}
+
+/// Checks all kernels and packing variants on every instruction set this CPU
+/// supports.
+fn every_matcher(cover: &ProbeCover, codes: &Block) {
+    agrees::<Table>(Isa::Scalar, MatcherKind::Table, "table", cover, codes);
+    #[cfg(target_arch = "aarch64")]
+    vector_matchers::<super::Neon>(cover, codes);
+    #[cfg(target_arch = "x86_64")]
+    {
+        vector_matchers::<super::Avx2>(cover, codes);
+        vector_matchers::<super::Avx512>(cover, codes);
+    }
+}
+
+/// Checks the vector kernels and packing variants of `K`, if this CPU supports its
+/// instruction set.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn vector_matchers<K: Kernels>(cover: &ProbeCover, codes: &Block) {
+    let isa = K::ISA;
+    if !supports(isa) {
+        return;
+    }
+    agrees::<K::EqOr>(isa, MatcherKind::EqOr, "eq_or", cover, codes);
+    // Use the same point-to-batch mapping as production dispatch.
+    let nibble = MatcherKind::Nibble;
+    match cover.points().len().div_ceil(PER_BATCH) {
+        1 => agrees::<K::Nibble<1>>(isa, nibble, "nibble, 1 batch", cover, codes),
+        2 => agrees::<K::Nibble<2>>(isa, nibble, "nibble, 2 batches", cover, codes),
+        3 => agrees::<K::Nibble<3>>(isa, nibble, "nibble, 3 batches", cover, codes),
+        4 => agrees::<K::Nibble<4>>(isa, nibble, "nibble, 4 batches", cover, codes),
+        _ => {}
+    }
+}
+
+/// Checks the point set alone, then with one and two ranges.
+fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) {
+    every_matcher(&cover, codes);
+    every_matcher(
+        &ProbeCover::new(cover.points().to_vec(), vec![TokenRange::new(lo, hi)]),
+        codes,
+    );
+    let two = [TokenRange::new(lo, hi), TokenRange::new(60000, 60100)];
+    every_matcher(
+        &ProbeCover::new(cover.points().to_vec(), two.to_vec()),
+        codes,
+    );
+}
+
+#[test]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn eq_or_without_points_checks_ranges() {
+    let codes = block();
+    #[cfg(target_arch = "aarch64")]
+    eq_or_checks_ranges_alone::<super::Neon>(&codes);
+    #[cfg(target_arch = "x86_64")]
+    {
+        eq_or_checks_ranges_alone::<super::Avx2>(&codes);
+        eq_or_checks_ranges_alone::<super::Avx512>(&codes);
+    }
+}
+
+/// `K`'s EqOr, given a cover without points, marks exactly the ranges, in both
+/// packing modes, if this CPU supports its instruction set.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn eq_or_checks_ranges_alone<K: Kernels>(codes: &Block) {
+    let isa = K::ISA;
+    if !supports(isa) {
+        return;
+    }
+    for ranges in [
+        vec![],
+        vec![TokenRange::new(0, 100), TokenRange::new(1000, 2000)],
+    ] {
+        let cover = ProbeCover::new(vec![], ranges);
+        let want = expected(&cover, codes);
+        for skip_empty in [false, true] {
+            assert_eq!(mask::<K::EqOr>(&cover, codes, skip_empty), want, "{isa:?}");
+        }
+    }
+}
+
+#[test]
+fn agree_on_points_the_block_holds() {
+    let codes = block();
+    for count in [1, 2, 3, 8, 9, 12, 16, 17, 24, 25, 32, 64] {
+        let points: Vec<Token> = (0..count).map(|k| codes[k * 37]).collect();
+        let cover = ProbeCover::new(points.to_vec(), vec![]);
+        assert_eq!(
+            expected(&cover, &codes)
+                .iter()
+                .map(|word| word.count_ones())
+                .sum::<u32>(),
+            count as u32,
+            "wrong hits at K = {count}"
+        );
+        every_matcher_ranged(cover, 1000, 2000, &codes);
+    }
+}
+
+#[test]
+fn agree_on_points_the_block_does_not_hold() {
+    let mut codes = block();
+    codes.fill(7);
+    let points: Vec<Token> = (0..4).map(|k| 60000 + k).collect();
+    every_matcher(&ProbeCover::new(points.to_vec(), vec![]), &codes);
+}
+
+/// A final-code hit must set the last bit in the block mask.
+#[test]
+fn agree_on_a_hit_at_the_seam() {
+    let mut codes = [7 as Token; BLOCK];
+    codes[BLOCK - 1] = 60000;
+    let cover = ProbeCover::new(vec![60000], vec![]);
+    assert_eq!(
+        expected(&cover, &codes)[BLOCK / 64 - 1],
+        1 << 63,
+        "the definition missed the seam hit"
+    );
+    every_matcher(&cover, &codes);
+}
+
+/// Membership must use the entire u16 code before comparison lanes are narrowed.
+#[test]
+fn agree_on_codes_sharing_a_low_byte() {
+    let mut codes = [0x0102 as Token; BLOCK];
+    codes[70] = 0x0202;
+    let cover = ProbeCover::new(vec![0x0202], vec![]);
+    assert_eq!(
+        expected(&cover, &codes)[1],
+        1 << 6,
+        "the definition missed the planted code"
+    );
+    // No block code lies in this range, even though both endpoints share
+    // the block codes' low byte.
+    every_matcher_ranged(cover, 0x0302, 0x0402, &codes);
+}
+
+/// Tests full-domain, singleton, populated, and absent ranges.
+#[test]
+fn agree_on_ranges_of_wide_codes() {
+    let codes = block();
+    for (lo, hi) in [
+        (0 as Token, Token::MAX),
+        (0, 0),
+        (37, 37),
+        (1000, 2000),
+        (50000, 50020),
+        (50021, Token::MAX),
+    ] {
+        let ranges = [TokenRange::new(lo, hi)];
+        every_matcher(&ProbeCover::new(vec![], ranges.to_vec()), &codes);
+        every_matcher(
+            &ProbeCover::new(vec![0 as Token, 30000, 50020], ranges.to_vec()),
+            &codes,
+        );
+    }
+    let all = expected(
+        &ProbeCover::new(vec![], vec![TokenRange::new(0, Token::MAX)]),
+        &codes,
+    );
+    assert!(
+        all.iter().all(|&word| word == !0),
+        "a code outside the width"
+    );
+    let none = expected(
+        &ProbeCover::new(vec![], vec![TokenRange::new(50021, Token::MAX)]),
+        &codes,
+    );
+    assert!(
+        none.iter().all(|&word| word == 0),
+        "a code at or above 50021"
+    );
+}
+
+/// Values around 0x8000 must compare as unsigned codes, including on AVX2.
+#[test]
+fn agree_on_the_sign_boundary() {
+    let mut codes = [0 as Token; BLOCK];
+    for (at, code) in codes.iter_mut().enumerate() {
+        *code = [0x7ffe, 0x7fff, 0x8000, 0x8001, 0x8002, 7][at % 6];
+    }
+    for points in [
+        vec![0x7fff],
+        vec![0x8000],
+        vec![0x8001],
+        vec![0x7fff, 0x8000, 0x8001],
+    ] {
+        every_matcher(&ProbeCover::new(points, vec![]), &codes);
+    }
+    for (lo, hi) in [
+        (0x7ffe, 0x8001),
+        (0x7fff, 0x7fff),
+        (0x8000, 0x8000),
+        (0, 0x7fff),
+        (0x8000, Token::MAX),
+    ] {
+        let range = TokenRange::new(lo, hi);
+        every_matcher(&ProbeCover::new(vec![], vec![range]), &codes);
+        every_matcher(&ProbeCover::new(vec![7], vec![range]), &codes);
+    }
+    let across = expected(
+        &ProbeCover::new(vec![], vec![TokenRange::new(0x7ffe, 0x8001)]),
+        &codes,
+    );
+    assert_eq!(
+        across[0] & 0x3f,
+        0b001111,
+        "the definition misplaced 0x8000"
+    );
+}
+
+/// Ranges ending at the maximum token ID must include it without wrapping.
+#[test]
+fn agree_at_the_top_of_the_code_space() {
+    let mut codes = [0 as Token; BLOCK];
+    for (at, code) in codes.iter_mut().enumerate() {
+        *code = [65527, 65531, 65532, 65533, 65534, Token::MAX, 7][at % 7];
+    }
+    for points in [vec![65527], vec![Token::MAX], vec![65527, Token::MAX]] {
+        every_matcher(&ProbeCover::new(points, vec![]), &codes);
+    }
+    for (lo, hi) in [
+        (65532, Token::MAX),
+        (Token::MAX, Token::MAX),
+        (65528, 65531),
+    ] {
+        let range = TokenRange::new(lo, hi);
+        every_matcher(&ProbeCover::new(vec![], vec![range]), &codes);
+        every_matcher(&ProbeCover::new(vec![65527], vec![range]), &codes);
+    }
+}
+
+/// Probe endpoints are inclusive; neighboring codes outside them are rejected.
+#[test]
+fn table_rejects_the_codes_around_its_own() {
+    let mut codes = [0 as Token; BLOCK];
+    for (at, code) in codes.iter_mut().enumerate() {
+        *code = [999, 1000, 3000, 3001, 0, Token::MAX][at % 6];
+    }
+    let ranges = [TokenRange::new(2500 as Token, 3000)];
+    every_matcher(
+        &ProbeCover::new(vec![1000 as Token], ranges.to_vec()),
+        &codes,
+    );
+    every_matcher(&ProbeCover::new(vec![1000 as Token, 3000], vec![]), &codes);
+    let cover = ProbeCover::new(vec![1000 as Token, 3000], vec![]);
+    let bits = mask::<Table>(&cover, &codes, false);
+    assert_eq!(bits[0] & 0x3f, 0b000110);
+}
+
+/// The portable table kernel must mark exactly the planted code.
+#[test]
+fn the_table_masks_one_code() {
+    let codes = block();
+    let bits = mask::<Table>(
+        &ProbeCover::new(codes[100..101].to_vec(), vec![]),
+        &codes,
+        false,
+    );
+    assert_eq!(bits[100 / 64] >> (100 % 64) & 1, 1, "missed the code");
+    assert_eq!(
+        bits.iter().map(|word| word.count_ones()).sum::<u32>(),
+        1,
+        "extra hits"
+    );
+}

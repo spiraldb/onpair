@@ -34,6 +34,12 @@
 //! [`ColumnView::decoded_len`] or [`ColumnView::row_decoded_len`] (plus
 //! [`DECODE_PADDING`]).
 //!
+//! # Search
+//! [`search`] answers equality, prefix and substring queries on the codes, without
+//! decoding rows. On a column view, [`ColumnView::rows_equal_to`],
+//! [`ColumnView::rows_starting_with`], [`ColumnView::rows_containing`] and
+//! [`ColumnView::rows_containing_with_scan`] return the rows that match.
+//!
 //! # Examples
 //! ```
 //! use onpair::{Column, DECODE_PADDING, DEFAULT_CONFIG};
@@ -68,11 +74,11 @@ mod core;
 mod decoding;
 mod encoding;
 pub mod search;
-
 #[cfg(test)]
 mod test_corpus;
 
 pub use crate::column::{Column, ColumnView};
+
 pub use crate::core::dictionary::{
     CompactDictionary, CompactDictionaryView, Dictionary, DictionaryStorage, DictionaryView,
     OwnedDictionaryStorage, WideDictionary, WideDictionaryView, code_bits_for_num_tokens,
@@ -89,8 +95,9 @@ pub use crate::encoding::rows::Rows;
 
 /// Compress an Arrow `(bytes, offsets)` value pair end-to-end. Equivalent to
 /// `Parser::train(..)?.parse(..)`, but validates the offsets once instead of in
-/// both the train and parse steps. `offsets` has `n + 1` entries. Its first
-/// entry may be non-zero; bytes outside `offsets[0]..offsets[n]` are ignored.
+/// both the train and parse steps. Rows are encoded greedily, as [`Parser`] does.
+/// `offsets` has `n + 1` entries. Its first entry may be non-zero; bytes outside
+/// `offsets[0]..offsets[n]` are ignored.
 ///
 /// # Errors
 /// [`Error::InvalidArg`] if `offsets` is empty or its last entry exceeds
@@ -102,6 +109,7 @@ pub fn compress<O: Offset>(bytes: &[u8], offsets: &[O], cfg: Config) -> Result<C
 }
 
 /// Compress a [`Rows`] input without first copying it into a contiguous buffer.
+/// Rows are encoded greedily, as [`Parser`] does.
 pub fn compress_rows<R: Rows + ?Sized, O: Offset>(rows: &R, cfg: Config) -> Column<O> {
     Parser::train_rows(rows, cfg).parse_rows(rows)
 }
