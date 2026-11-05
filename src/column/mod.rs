@@ -109,8 +109,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// Decompress the whole column into `out` and return the decompressed bytes, the
     /// front of `out`. Expands the dictionary to its load-free `WideDictionary` form
     /// once — the fast layout for a bulk decode, reached directly per code with no
-    /// offset indirection. The caller owns buffer sizing: the original values' total
-    /// length is enough.
+    /// offset indirection. The original values' total length is enough for `out`.
     ///
     /// For repeated decompressions, retain the materialized wide form and pass its
     /// view to [`decompress_into`](crate::decompress_into), so the wide form is not
@@ -157,16 +156,16 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// random-access analog of [`decompress_into`](Self::decompress_into). Same fixed
     /// 16-byte over-copy per token, but decoded directly over the compact dictionary
     /// with no wide-table build (the wide form would cost `O(num_tokens)` to
-    /// materialize, dwarfing a single short row). The caller owns buffer sizing and
-    /// reuse: the row's original length is enough, and
-    /// [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE) bytes per code of
-    /// [`row_codes`](Self::row_codes) is the fastest. Reuse `out` across rows to avoid
-    /// per-row allocation. Precondition: `k < num_rows()`.
+    /// materialize, dwarfing a single short row). The row's original length is enough
+    /// for `out`, and [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE) bytes per code of
+    /// [`row_codes`](Self::row_codes) is the fastest.
     ///
     /// # Errors
     /// Returns [`OutputTooSmall`] if `out` cannot hold the row's bytes.
     ///
     /// # Panics
+    /// If `k >= num_rows()`, or with [`InvalidColumn::BadRowOffsets`] if the row offsets
+    /// decrease or reach past the code stream, as [`row_codes`](Self::row_codes) does.
     /// With [`InvalidColumn::CodeOutOfRange`] on an out-of-range code.
     #[inline]
     pub fn decompress_row_into<'o>(
@@ -181,6 +180,8 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// Codes are still range-checked.
     ///
     /// # Panics
+    /// If `k >= num_rows()`, or with [`InvalidColumn::BadRowOffsets`] if the row offsets
+    /// decrease or reach past the code stream, as [`row_codes`](Self::row_codes) does.
     /// With [`InvalidColumn::CodeOutOfRange`] on an out-of-range code.
     ///
     /// # Safety
