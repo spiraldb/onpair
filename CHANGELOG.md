@@ -46,9 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **Breaking:** Remove `decoded_len`, `ColumnView::decoded_len`,
-  `ColumnView::row_decoded_len` and `InvalidColumn::DecodedLenOverflow`. Walking
-  every code just to get an output size is impractical. Size buffers from the
-  original values' length, or use `MAX_TOKEN_SIZE` bytes per code.
+  `ColumnView::row_decoded_len` and `InvalidColumn::DecodedLenOverflow`.
 
 ## [0.3.0](https://github.com/spiraldb/onpair/compare/v0.2.1...v0.3.0) - 2026-10-27
 

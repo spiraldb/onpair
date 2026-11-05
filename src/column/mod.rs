@@ -156,9 +156,9 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// random-access analog of [`decompress_into`](Self::decompress_into). Same fixed
     /// 16-byte over-copy per token, but decoded directly over the compact dictionary
     /// with no wide-table build (the wide form would cost `O(num_tokens)` to
-    /// materialize, dwarfing a single short row). The row's original length is enough
-    /// for `out`, and [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE) bytes per code of
-    /// [`row_codes`](Self::row_codes) is the fastest.
+    /// materialize, dwarfing a single short row).
+    /// [`MAX_TOKEN_SIZE`](crate::MAX_TOKEN_SIZE) bytes per code of
+    /// [`row_codes`](Self::row_codes) always fit, and are the fastest.
     ///
     /// # Errors
     /// Returns [`OutputTooSmall`] if `out` cannot hold the row's bytes.

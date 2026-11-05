@@ -28,26 +28,25 @@
 //! [`view`](Column::view) decompresses and searches them.
 //!
 //! ```
-//! use onpair::{Column, DEFAULT_CONFIG};
+//! use onpair::{Column, DEFAULT_CONFIG, MAX_TOKEN_SIZE};
 //!
 //! // Compress an Arrow (bytes, offsets) value pair.
 //! let bytes = b"catdogcat";
 //! let offsets: [u32; 4] = [0, 3, 6, 9];
 //! let col = Column::compress(bytes, &offsets, DEFAULT_CONFIG).unwrap();
 //! let view = col.view();
-//!
-//! // Decompression restores the original values, so their lengths size the buffers.
-//! // OnPair does not store these lengths: keep them with the column.
-//! let column_len = bytes.len();
-//! let row_len = (offsets[2] - offsets[1]) as usize;
+//! // Keep the decompressed length with the column: it sizes the buffer for the whole
+//! // column.
+//! let decompressed_len = bytes.len();
 //!
 //! // Random-access one row, decoded straight from the compact dictionary.
-//! let mut row = Vec::with_capacity(row_len);
+//! // MAX_TOKEN_SIZE bytes per code always fit a row.
+//! let mut row = Vec::with_capacity(view.row_codes(1).len() * MAX_TOKEN_SIZE);
 //! let decompressed = view.decompress_row_into(1, row.spare_capacity_mut()).unwrap();
 //! assert_eq!(decompressed, b"dog");
 //!
 //! // Decompress the whole column.
-//! let mut all = Vec::with_capacity(column_len);
+//! let mut all = Vec::with_capacity(decompressed_len);
 //! let decompressed = view.decompress_into(all.spare_capacity_mut()).unwrap();
 //! assert_eq!(decompressed, b"catdogcat");
 //! ```
@@ -62,8 +61,7 @@
 //! [interchange format](https://github.com/spiraldb/onpair/blob/develop/docs/interchange-format.md)
 //! specifies them.
 //!
-//! OnPair does not store two things an engine may want beside them: each row's
-//! decompressed length, which sizes output buffers, and a
+//! Beside them, an engine may keep a
 //! [`TokenFrequencyIndex`](search::index::TokenFrequencyIndex), which
 //! [`ContainsScan`](search::ContainsScan) plans with.
 //!
@@ -77,15 +75,10 @@
 //! time proportional to the dictionary. The output is `&mut [MaybeUninit<u8>]`, so a
 //! `Vec`'s [`spare_capacity_mut`](Vec::spare_capacity_mut) works without zeroing it.
 //!
-//! | You have | Call | Buffer |
-//! |---|---|---|
-//! | A whole column | [`decompress_into`] | Its decompressed length |
-//! | A row | [`decompress_into`] | [`MAX_TOKEN_SIZE`] bytes per code |
-//! | A row, and a length you trust | [`decompress_into_unchecked`] | That length plus [`DECOMPRESS_PADDING`] |
-//!
-//! The last row is the fastest for short rows, and offers nothing for whole columns. A
-//! length read from storage is not one to trust: if it were corrupt, the unchecked call
-//! would write out of bounds. Use the safe call and compare the length it returns.
+//! Size the buffer from the decompressed length for a whole column, or at
+//! [`MAX_TOKEN_SIZE`] bytes per code for a row. At those sizes [`decompress_into`] is
+//! as fast as [`decompress_into_unchecked`], which skips the buffer check: if the
+//! buffer were too small, it would write out of bounds.
 //!
 //! ```
 //! use onpair::{Column, CompactDictionaryView, DEFAULT_CONFIG, Dictionary};
