@@ -194,14 +194,12 @@ fn load_le_u64(data: &[u8], len: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Mask of the low `len * 8` bits in a `u64`.
+/// Mask of the low `len * 8` bits in a `u64`, for `1 <= len <= 8`. A shift
+/// instead of a branch: the length is not predictable.
 #[inline]
 fn mask_u64(len: usize) -> u64 {
-    if len >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (len * 8)) - 1
-    }
+    debug_assert!((1..=8).contains(&len));
+    u64::MAX >> (64 - 8 * len)
 }
 
 /// One long-token entry within a bucket: the suffix bytes after the shared

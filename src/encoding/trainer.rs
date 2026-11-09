@@ -11,6 +11,7 @@
 
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
+
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
@@ -27,6 +28,7 @@ fn hash_pair(key: u32) -> u64 {
     hash ^ (hash >> 32)
 }
 
+/// Saturating occurrence counts of token pairs, keyed by the two token ids.
 struct PairFrequencies {
     table: HashTable<(u32, u8)>,
 }
@@ -341,9 +343,12 @@ fn discover_tokens<'a>(
         }
     }
 
-    // Pair frequency map. Key packs two Token values into a u32.
-    let pair_capacity = (dict_capacity * 8)
-        .max(1024)
+    // Pair frequency map. Key packs two Token values into a u32. Text gives
+    // about one live pair per 20 scanned bytes. A table sized for that stays
+    // small enough for the cache: a larger one is slower, mostly on Graviton.
+    let scanned = scan_budget(cfg.threshold, total_bytes).unwrap_or(total_bytes);
+    let pair_capacity = (scanned / 20)
+        .clamp(1024, 1 << 20)
         .min((total_bytes / 2).max(1024));
     let mut freq = PairFrequencies::with_capacity(pair_capacity);
 
