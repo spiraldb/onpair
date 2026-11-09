@@ -429,18 +429,31 @@ fn discover_tokens<'a>(
 /// `(bytes, offsets)` with ids reassigned to sorted position. Reads tokens
 /// straight from the raw buffers; the result is unpadded — the caller pads before
 /// sealing.
+///
+/// Each token sorts by its bytes as a big-endian `u128`, zero-padded past its
+/// length, then by its length. A token sorts before every longer token that it
+/// is a prefix of, and the first differing byte orders all others, so this is
+/// bytewise-lexicographic order.
 fn sort_tokens(bytes: &[u8], offsets: &[u32]) -> (Vec<u8>, Vec<u32>) {
     let n = offsets.len() - 1;
     let token = |id: usize| -> &[u8] { &bytes[offsets[id] as usize..offsets[id + 1] as usize] };
 
-    let mut perm: Vec<usize> = (0..n).collect();
-    perm.sort_by(|&a, &b| token(a).cmp(token(b)));
+    let mut keys: Vec<(u128, u8, u32)> = (0..n)
+        .map(|id| {
+            let t = token(id);
+            debug_assert!(t.len() <= MAX_TOKEN_SIZE);
+            let mut buf = [0u8; MAX_TOKEN_SIZE];
+            buf[..t.len()].copy_from_slice(t);
+            (u128::from_be_bytes(buf), t.len() as u8, id as u32)
+        })
+        .collect();
+    keys.sort_unstable();
 
     let mut out_bytes: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut out_offsets: Vec<u32> = Vec::with_capacity(n + 1);
     out_offsets.push(0);
-    for &old in &perm {
-        out_bytes.extend_from_slice(token(old));
+    for &(_, _, old) in &keys {
+        out_bytes.extend_from_slice(token(old as usize));
         out_offsets.push(out_bytes.len() as u32);
     }
     (out_bytes, out_offsets)

@@ -13,8 +13,11 @@
 //!     prefix and is searched for the longest matching suffix. A bucket starts
 //!     as a vector and switches to length-grouped binary search once it grows.
 //!
-//! Matching loads up to 16 bytes once, probes the long-token bucket, then checks
-//! short tokens from longest to shortest.
+//! A table on the first two bytes records which token lengths start with those
+//! bytes. Matching loads up to 16 bytes once, reads that table, probes the
+//! long-token bucket only when a long token can match, then checks only the short
+//! token lengths that the table holds, from longest to shortest. Single bytes
+//! need no probe: their token id is the byte.
 //!
 //! [`LongestPrefixMatcher`] accepts inserts and drives training. Encoding uses
 //! [`DictionaryMatcher`](crate::encoding::dictionary_matcher::DictionaryMatcher),
@@ -30,6 +33,123 @@ const BUCKET_PREFIX_LEN: usize = 8;
 
 const MAX_SUFFIX_LEN: usize = MAX_TOKEN_SIZE - BUCKET_PREFIX_LEN;
 const PROMOTE_THRESHOLD: usize = 48;
+
+/// Number of distinct 2-byte prefixes.
+const PREFIX_SLOTS: usize = 1 << 16;
+
+/// Mask of the token lengths, as bits `len - 1`, that the long map holds.
+const LONG_LENS: u32 = !((1 << BUCKET_PREFIX_LEN) - 1);
+
+/// Mask of the token lengths, as bits `len - 1`, that the 4-byte filter covers.
+const QUAD_LENS: u32 = !0b111;
+
+/// Bits of the 4-byte filter index.
+const QUAD_BITS: u32 = 16;
+
+/// Odd multiplier for the multiplicative hashes.
+const HASH_MUL: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Filter slot of the first four bytes of a window.
+#[inline(always)]
+fn quad_slot(lo64: u64) -> usize {
+    ((lo64 as u32 as u64).wrapping_mul(HASH_MUL) >> (64 - QUAD_BITS)) as usize
+}
+
+/// One slot of [`ShortTable`]. A length of zero marks an empty slot.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(align(16))]
+struct ShortSlot {
+    key: u64,
+    len: u8,
+    token: Token,
+}
+
+/// Open-addressing table of the tokens of `2..=BUCKET_PREFIX_LEN` bytes, keyed by
+/// their bytes as a little-endian `u64` and their length. Linear probing, at most
+/// half full. Tokens are never removed.
+#[derive(Clone, Debug)]
+struct ShortTable {
+    slots: Vec<ShortSlot>,
+    shift: u32,
+    len: usize,
+}
+
+impl ShortTable {
+    fn new() -> Self {
+        Self::with_slots(64)
+    }
+
+    fn with_slots(slots: usize) -> Self {
+        debug_assert!(slots.is_power_of_two());
+        Self {
+            slots: vec![ShortSlot::default(); slots],
+            shift: 64 - slots.trailing_zeros(),
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn home(&self, key: u64, len: usize) -> usize {
+        ((key ^ ((len as u64) << 60)).wrapping_mul(HASH_MUL) >> self.shift) as usize
+    }
+
+    /// Make room for `additional` more tokens without growing.
+    fn reserve(&mut self, additional: usize) {
+        let need = ((self.len + additional) * 2).next_power_of_two();
+        if need > self.slots.len() {
+            self.grow(need);
+        }
+    }
+
+    fn grow(&mut self, slots: usize) {
+        let old = std::mem::replace(self, Self::with_slots(slots));
+        for slot in old.slots.into_iter().filter(|s| s.len != 0) {
+            self.insert(slot.key, slot.len as usize, slot.token);
+        }
+    }
+
+    fn insert(&mut self, key: u64, len: usize, token: Token) {
+        if (self.len + 1) * 2 > self.slots.len() {
+            self.grow(self.slots.len() * 2);
+        }
+
+        let mask = self.slots.len() - 1;
+        let mut i = self.home(key, len);
+        loop {
+            let slot = &mut self.slots[i];
+            if slot.len == 0 {
+                *slot = ShortSlot {
+                    key,
+                    len: len as u8,
+                    token,
+                };
+                self.len += 1;
+                return;
+            }
+            if slot.key == key && slot.len as usize == len {
+                slot.token = token;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, key: u64, len: usize) -> Option<Token> {
+        let mask = self.slots.len() - 1;
+        let mut i = self.home(key, len);
+        loop {
+            let slot = &self.slots[i];
+            if slot.key == key && slot.len as usize == len {
+                return Some(slot.token);
+            }
+            if slot.len == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
 
 #[inline]
 fn load_window(data: &[u8]) -> (u64, u64) {
@@ -177,30 +297,33 @@ impl GroupedBucket {
 /// Maps byte sequences (`1..=MAX_TOKEN_SIZE` bytes) to [`Token`] ids. Always
 /// holds the 256 single-byte tokens after construction, so
 /// [`find_longest_match`](Self::find_longest_match) is total.
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct LongestPrefixMatcher {
-    /// Length `1..=8` tokens keyed by (low-`len`-byte u64, length).
-    short_map: HashMap<(u64, u8), Token>,
+    /// Length `2..=8` tokens keyed by (low-`len`-byte u64, length). The id of a
+    /// single-byte token is its byte, so the table does not hold them.
+    short_map: ShortTable,
     /// Length `9..=16` tokens bucketed by their 8-byte prefix.
     long_map: HashMap<u64, Bucket>,
-    /// Longest short-map token length present (`1..=8`).
-    max_short_len: u8,
+    /// Per 2-byte prefix, as a little-endian `u16`: bit `len - 1` is set when a
+    /// token of length `len >= 2` starts with that prefix.
+    prefix_lens: Box<[u16]>,
+    /// Per [`quad_slot`] of the first four bytes: bit `len - 1` is set when a
+    /// token of length `len >= 4` starts with four bytes of that slot. Slots
+    /// can be shared, so a set bit is only a candidate.
+    quad_lens: Box<[u16]>,
     /// Next id to assign. `u32` so the full 16-bit token space (65 536 entries)
     /// is representable without overflow.
     next_id: u32,
 }
 
 impl LongestPrefixMatcher {
-    /// Pre-inserts the 256 single-byte tokens with ids `0..=255`.
+    /// Holds the 256 single-byte tokens with ids `0..=255`.
     pub(crate) fn new() -> Self {
-        let mut short_map = HashMap::with_capacity(256);
-        for i in 0u16..=255 {
-            short_map.insert((i as u64, 1u8), i);
-        }
         Self {
-            short_map,
+            short_map: ShortTable::new(),
             long_map: HashMap::new(),
-            max_short_len: 1,
+            prefix_lens: vec![0u16; PREFIX_SLOTS].into_boxed_slice(),
+            quad_lens: vec![0u16; 1 << QUAD_BITS].into_boxed_slice(),
             next_id: 256,
         }
     }
@@ -208,7 +331,7 @@ impl LongestPrefixMatcher {
     /// Reserve training-time maps for the configured dictionary budget.
     pub(crate) fn reserve(&mut self, token_capacity: usize) {
         self.short_map
-            .reserve(token_capacity.saturating_sub(self.short_map.len()));
+            .reserve(token_capacity.saturating_sub(256 + self.short_map.len));
         let long_capacity = (token_capacity / 4).max(16);
         self.long_map
             .reserve(long_capacity.saturating_sub(self.long_map.len()));
@@ -216,7 +339,8 @@ impl LongestPrefixMatcher {
 
     /// Insert `data` and assign it the next available token id.
     ///
-    /// Precondition: `1 <= data.len() <= MAX_TOKEN_SIZE` and `size() < 65_536`.
+    /// Precondition: `2 <= data.len() <= MAX_TOKEN_SIZE`, `data` is not in the
+    /// matcher yet, and `size() < 65_536`.
     pub(crate) fn insert(&mut self, data: &[u8]) -> Token {
         let id = self.next_id as Token;
         self.next_id += 1;
@@ -226,12 +350,18 @@ impl LongestPrefixMatcher {
 
     #[inline]
     fn insert_internal(&mut self, data: &[u8], id: Token) {
-        debug_assert!(!data.is_empty() && data.len() <= MAX_TOKEN_SIZE);
+        debug_assert!(data.len() >= 2 && data.len() <= MAX_TOKEN_SIZE);
         let len = data.len();
+        let prefix = u16::from_le_bytes([data[0], data[1]]);
+        self.prefix_lens[prefix as usize] |= 1 << (len - 1);
+        if len >= 4 {
+            let quad = u32::from_le_bytes(data[..4].try_into().unwrap());
+            self.quad_lens[quad_slot(u64::from(quad))] |= 1 << (len - 1);
+        }
+
         if len <= BUCKET_PREFIX_LEN {
             let key = load_le_u64(data, len);
-            self.short_map.insert((key, len as u8), id);
-            self.max_short_len = self.max_short_len.max(len as u8);
+            self.short_map.insert(key, len, id);
             return;
         }
 
@@ -268,9 +398,20 @@ impl LongestPrefixMatcher {
     pub(crate) fn find_longest_match(&self, data: &[u8]) -> (Token, usize) {
         let (lo64, hi64) = load_window(data);
         let win = data.len().min(MAX_TOKEN_SIZE);
+        let single = (data[0] as Token, 1);
 
-        if win > BUCKET_PREFIX_LEN
-            && !self.long_map.is_empty()
+        // Token lengths that start with the first two bytes and fit the window.
+        // A window of one byte keeps no bit, since the table has no bit 0.
+        let prefix = lo64 as u16 as usize;
+        let mut lens = u32::from(self.prefix_lens[prefix]) & ((1u32 << win) - 1);
+        if lens & QUAD_LENS != 0 {
+            lens &= u32::from(self.quad_lens[quad_slot(lo64)]) | !QUAD_LENS;
+        }
+        if lens == 0 {
+            return single;
+        }
+
+        if lens & LONG_LENS != 0
             && let Some(bucket) = self.long_map.get(&lo64)
         {
             let max_slen = win - BUCKET_PREFIX_LEN;
@@ -285,13 +426,15 @@ impl LongestPrefixMatcher {
             }
         }
 
-        let short_max = win.min(self.max_short_len as usize);
-        for len in (1..=short_max).rev() {
-            if let Some(&t) = self.short_map.get(&(lo64 & mask_u64(len), len as u8)) {
+        lens &= !LONG_LENS;
+        while lens != 0 {
+            let len = (u32::BITS - lens.leading_zeros()) as usize;
+            lens &= !(1 << (len - 1));
+            if let Some(t) = self.short_map.get(lo64 & mask_u64(len), len) {
                 return (t, len);
             }
         }
-        unreachable!("LPM precondition: every single-byte token must be present")
+        single
     }
 
     /// Number of tokens currently in the matcher.
