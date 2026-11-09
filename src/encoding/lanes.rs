@@ -42,6 +42,8 @@ const BATCH_BYTES: usize = 256 << 10;
 const TREE_LANES: usize = 4;
 const RANK_LANES: usize = 6;
 const SCALAR: u8 = 0;
+/// [`SCALAR`] with a branch at each row end: faster when rows are long.
+const SCALAR_ROWS: u8 = 6;
 #[cfg(target_arch = "x86_64")]
 const TREE: u8 = 1;
 #[cfg(target_arch = "x86_64")]
@@ -69,11 +71,23 @@ const fn max_lanes(lanes: &[usize]) -> usize {
     max
 }
 
-/// Whether `mode` uses an eight-wide rank search, and so probes the first rows
-/// to choose between the branch-free and the branching row completion.
-#[cfg(target_arch = "x86_64")]
+/// Whether `mode` probes the first rows to choose between the branch-free and
+/// the branching row completion.
 const fn probes_rows(mode: u8) -> bool {
-    mode == RANK || mode == RANK_AVX2
+    #[cfg(target_arch = "x86_64")]
+    if mode == RANK || mode == RANK_AVX2 {
+        return true;
+    }
+    mode == SCALAR
+}
+
+/// Whether `mode` uses the branching row completion.
+const fn completes_rows(mode: u8) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if mode == RANK_ROWS || mode == RANK_AVX2_ROWS {
+        return true;
+    }
+    mode == SCALAR_ROWS
 }
 
 /// Reusable per-lane buffers.
@@ -254,35 +268,16 @@ fn parse_arrow_batched_with<I: Offset, O: Offset, const MODE: u8>(
 ) {
     let n = offsets.len() - 1;
     let mut start = 0;
-    #[cfg(target_arch = "x86_64")]
     let mut parse: BatchParser<I, O> = parse_batch::<I, O, MODE>;
-    #[cfg(target_arch = "x86_64")]
     let mut probe = probes_rows(MODE);
     while start < n {
         // At least one row per batch, then whole rows up to `batch_bytes`.
         let limit = offsets[start].to_usize() + batch_bytes;
         let fit = offsets[start + 1..=n].partition_point(|o| o.to_usize() <= limit);
         let end = start + fit.max(1);
-        #[cfg(target_arch = "x86_64")]
         let end = if probe { end.min(start + 64) } else { end };
-        #[cfg(target_arch = "x86_64")]
-        {
-            let before = codes.len();
-            parse(
-                matcher,
-                bytes,
-                &offsets[start..=end],
-                buffers,
-                codes,
-                row_offsets,
-            );
-            if probe {
-                parse = rank_batch_parser::<I, O, MODE>(codes.len() - before, end - start);
-                probe = false;
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        parse_batch::<I, O, MODE>(
+        let before = codes.len();
+        parse(
             matcher,
             bytes,
             &offsets[start..=end],
@@ -290,6 +285,10 @@ fn parse_arrow_batched_with<I: Offset, O: Offset, const MODE: u8>(
             codes,
             row_offsets,
         );
+        if probe {
+            parse = rank_batch_parser::<I, O, MODE>(codes.len() - before, end - start);
+            probe = false;
+        }
         start = end;
     }
 }
@@ -391,11 +390,9 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
     );
 }
 
-#[cfg(target_arch = "x86_64")]
 type BatchParser<I, O> =
     fn(&DictionaryMatcher, &[u8], &[I], &mut LaneBuffers, &mut Vec<Token>, &mut Vec<O>);
 
-#[cfg(target_arch = "x86_64")]
 fn rank_batch_parser<I: OffsetLike, O: Offset, const MODE: u8>(
     codes: usize,
     rows: usize,
@@ -403,11 +400,26 @@ fn rank_batch_parser<I: OffsetLike, O: Offset, const MODE: u8>(
     // Branches pay off when row completions are infrequent. Use measured codes
     // per row, accounting for the input's actual dictionary token frequencies.
     let rows_mode = codes >= 16 * rows;
-    match (MODE == RANK_AVX2, rows_mode) {
-        (false, true) => parse_batch::<I, O, RANK_ROWS>,
-        (false, false) => parse_batch::<I, O, RANK>,
-        (true, true) => parse_batch::<I, O, RANK_AVX2_ROWS>,
-        (true, false) => parse_batch::<I, O, RANK_AVX2>,
+    #[cfg(target_arch = "x86_64")]
+    if MODE == RANK {
+        return if rows_mode {
+            parse_batch::<I, O, RANK_ROWS>
+        } else {
+            parse_batch::<I, O, RANK>
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if MODE == RANK_AVX2 {
+        return if rows_mode {
+            parse_batch::<I, O, RANK_AVX2_ROWS>
+        } else {
+            parse_batch::<I, O, RANK_AVX2>
+        };
+    }
+    if rows_mode {
+        parse_batch::<I, O, SCALAR_ROWS>
+    } else {
+        parse_batch::<I, O, SCALAR>
     }
 }
 
@@ -424,9 +436,7 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
 
     let n = rows.num_rows();
     let mut i = 0;
-    #[cfg(target_arch = "x86_64")]
     let mut parse: BatchParser<usize, O> = parse_batch::<usize, O, MODE>;
-    #[cfg(target_arch = "x86_64")]
     let mut probe = probes_rows(MODE);
     while i < n {
         bytes.clear();
@@ -435,10 +445,7 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
 
         // Parse up to 64 rows with the branch-free loop to measure how often
         // rows end. The probe contributes directly to the output.
-        #[cfg(target_arch = "x86_64")]
         let limit = if probe { n.min(i + 64) } else { n };
-        #[cfg(not(target_arch = "x86_64"))]
-        let limit = n;
         // At least one row per batch, then rows until `batch_bytes` is reached.
         while i < limit && (offsets.len() == 1 || bytes.len() < batch_bytes) {
             bytes.extend_from_slice(rows.row(i));
@@ -448,18 +455,12 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
 
         // Padding keeps every window load on the fast path.
         bytes.resize(bytes.len() + MAX_TOKEN_SIZE, 0);
-        #[cfg(target_arch = "x86_64")]
-        {
-            let before = codes.len();
-            parse(matcher, &bytes, &offsets, buffers, codes, row_offsets);
-            if probe {
-                parse =
-                    rank_batch_parser::<usize, O, MODE>(codes.len() - before, offsets.len() - 1);
-                probe = false;
-            }
+        let before = codes.len();
+        parse(matcher, &bytes, &offsets, buffers, codes, row_offsets);
+        if probe {
+            parse = rank_batch_parser::<usize, O, MODE>(codes.len() - before, offsets.len() - 1);
+            probe = false;
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        parse_batch::<usize, O, MODE>(matcher, &bytes, &offsets, buffers, codes, row_offsets);
     }
 
     buffers.bytes = bytes;
@@ -541,6 +542,17 @@ fn parse_batch<I: OffsetLike, O: Offset, const MODE: u8>(
                     row_offsets,
                 ),
             },
+        );
+    }
+
+    if MODE == SCALAR_ROWS {
+        return parse_batch_with::<I, O, SCALAR_ROWS, LANES>(
+            #[inline(always)]
+            |at, win| matcher.find_all(bytes, at, win),
+            offsets,
+            buffers,
+            codes,
+            row_offsets,
         );
     }
 
@@ -630,8 +642,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
             count[j] += active as usize;
             at[j] += select_unpredictable(active, len, 0);
 
-            #[cfg(target_arch = "x86_64")]
-            if MODE == RANK_ROWS || MODE == RANK_AVX2_ROWS {
+            if completes_rows(MODE) {
                 if at[j] == row_end[j] && running {
                     buffers.row_ends[j][row[j] - bounds[j]] = count[j];
                     row[j] += 1;
