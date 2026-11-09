@@ -166,15 +166,28 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
             start = end;
         }
         if safe < n {
-            parse_arrow_batched_with::<I, O, RANK>(
-                matcher,
-                bytes,
-                &offsets[safe..],
-                batch_bytes,
-                buffers,
-                codes,
-                row_offsets,
-            );
+            let tail = &offsets[safe..];
+            if matches!(kernel, vector::Kernel::Avx512(_)) {
+                parse_arrow_batched_with::<I, O, RANK>(
+                    matcher,
+                    bytes,
+                    tail,
+                    batch_bytes,
+                    buffers,
+                    codes,
+                    row_offsets,
+                );
+            } else {
+                parse_arrow_batched_with::<I, O, RANK_AVX2>(
+                    matcher,
+                    bytes,
+                    tail,
+                    batch_bytes,
+                    buffers,
+                    codes,
+                    row_offsets,
+                );
+            }
         }
         return;
     }
