@@ -7,10 +7,12 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    _mm512_cmpeq_epu64_mask, _mm512_cmple_epu64_mask, _mm512_cmplt_epu64_mask, _mm512_loadu_si512,
-    _mm512_set1_epi64,
+    _mm512_cmpeq_epu64_mask, _mm512_cmple_epu64_mask, _mm512_cmplt_epu64_mask, _mm512_set1_epi64,
 };
 use std::hint::select_unpredictable;
+
+#[cfg(target_arch = "x86_64")]
+use fearless_simd::{SimdBase, u64x8, x86::Avx512};
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
@@ -221,28 +223,27 @@ impl DictionaryMatcher {
         at: &[usize; K],
         win: &[usize; K],
     ) -> [(Token, usize); K] {
-        // SAFETY: the scalar specialization requires no target features.
-        unsafe { self.find_all_with::<K, false>(bytes, at, win) }
+        self.find_all_with(Rank::Scalar, bytes, at, win)
     }
 
-    /// AVX-512 specialization; the caller must detect AVX-512F and POPCNT first.
+    /// [`Self::find_all`] with the AVX-512 rank. The token proves that the CPU
+    /// supports AVX-512.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,popcnt")]
-    #[inline]
-    pub(crate) unsafe fn find_all_avx512<const K: usize>(
+    #[inline(always)]
+    pub(crate) fn find_all_avx512<const K: usize>(
         &self,
+        avx512: Avx512,
         bytes: &[u8],
         at: &[usize; K],
         win: &[usize; K],
     ) -> [(Token, usize); K] {
-        // SAFETY: this function enables AVX-512F and POPCNT.
-        unsafe { self.find_all_with::<K, true>(bytes, at, win) }
+        self.find_all_with(Rank::Avx512(avx512), bytes, at, win)
     }
 
-    /// The SIMD specialization requires AVX-512F and POPCNT on x86-64.
     #[inline(always)]
-    unsafe fn find_all_with<const K: usize, const SIMD: bool>(
+    fn find_all_with<const K: usize>(
         &self,
+        rank: Rank,
         bytes: &[u8],
         at: &[usize; K],
         win: &[usize; K],
@@ -271,7 +272,7 @@ impl DictionaryMatcher {
         // loads sit next to each other and overlap.
         let largest = size.iter().copied().max().unwrap_or(0);
         let mut steps = usize::BITS - largest.saturating_sub(1).leading_zeros();
-        if SIMD {
+        if !matches!(rank, Rank::Scalar) {
             steps = steps.saturating_sub(3);
         }
         for _ in 0..steps {
@@ -285,22 +286,19 @@ impl DictionaryMatcher {
             }
         }
 
-        if SIMD {
-            #[cfg(target_arch = "x86_64")]
+        #[cfg(target_arch = "x86_64")]
+        if let Rank::Avx512(avx512) = rank {
             for j in 0..K {
                 // Outside the remaining range, samples are greater than the
                 // key: either an earlier comparison excluded them, or their
                 // two-byte prefix is larger. MAX pads are valid blocks too.
-                // SAFETY: base is a candidate block, seven trailing samples
-                // make eight elements readable, its first key is <= key[j],
-                // and the caller guarantees AVX-512F and POPCNT.
-                base[j] += unsafe {
-                    rank8(
-                        self.samples_hi.as_ptr().add(base[j]),
-                        self.samples_lo.as_ptr().add(base[j]),
-                        key[j],
-                    )
-                };
+                // Seven trailing samples make eight samples readable.
+                base[j] += rank8(
+                    avx512,
+                    &self.samples_hi[base[j]..base[j] + BLOCK_KEYS],
+                    &self.samples_lo[base[j]..base[j] + BLOCK_KEYS],
+                    key[j],
+                );
             }
         }
 
@@ -309,22 +307,24 @@ impl DictionaryMatcher {
         // the block that is `<=` the input key. Only MAX padding blocks can
         // follow it with equal keys; they carry the same prefix chain.
         let mut slot = [0usize; K];
-        if SIMD {
-            #[cfg(target_arch = "x86_64")]
-            for j in 0..K {
-                let block = &self.blocks[base[j]];
-                // SAFETY: both columns contain eight keys, the first is <=
-                // key[j], and the caller guarantees AVX-512F and POPCNT.
-                slot[j] = unsafe { rank8(block.hi.as_ptr(), block.lo.as_ptr(), key[j]) };
+        match rank {
+            Rank::Scalar => {
+                let mut half = BLOCK_KEYS / 2;
+                while half > 0 {
+                    for j in 0..K {
+                        let block = &self.blocks[base[j]];
+                        slot[j] = advance_if_le(block.key(slot[j] + half), key[j], slot[j], half);
+                    }
+                    half /= 2;
+                }
             }
-        } else {
-            let mut half = BLOCK_KEYS / 2;
-            while half > 0 {
+
+            #[cfg(target_arch = "x86_64")]
+            Rank::Avx512(avx512) => {
                 for j in 0..K {
                     let block = &self.blocks[base[j]];
-                    slot[j] = advance_if_le(block.key(slot[j] + half), key[j], slot[j], half);
+                    slot[j] = rank8(avx512, &block.hi, &block.lo, key[j]);
                 }
-                half /= 2;
             }
         }
 
@@ -353,20 +353,33 @@ impl DictionaryMatcher {
     }
 }
 
-/// Last of eight sorted keys <= `key`. Both pointers must address eight u64s,
-/// and the first key must be <= `key`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,popcnt")]
-#[inline]
-unsafe fn rank8(hi: *const u64, lo: *const u64, key: u128) -> usize {
-    // SAFETY: the caller guarantees eight readable elements in each column.
-    let (hi, lo) = unsafe { (_mm512_loadu_si512(hi.cast()), _mm512_loadu_si512(lo.cast())) };
-    let key_hi = _mm512_set1_epi64((key >> 64) as i64);
-    let key_lo = _mm512_set1_epi64(key as i64);
-    let le = _mm512_cmplt_epu64_mask(hi, key_hi)
-        | (_mm512_cmpeq_epu64_mask(hi, key_hi) & _mm512_cmple_epu64_mask(lo, key_lo));
-    le.count_ones() as usize - 1
+/// How [`DictionaryMatcher::find_all_with`] finishes its searches.
+#[derive(Clone, Copy)]
+enum Rank {
+    /// Binary search to the end.
+    Scalar,
+
+    /// Rank the last eight samples and the block keys with AVX-512.
+    #[cfg(target_arch = "x86_64")]
+    Avx512(Avx512),
 }
+
+#[cfg(target_arch = "x86_64")]
+fearless_simd::kernel!(
+    /// Last of eight sorted keys <= `key`, from their high and low halves.
+    /// Each slice must hold eight values, and the first key must be <= `key`.
+    #[inline(always)]
+    fn rank8(avx512: Avx512, hi: &[u64], lo: &[u64], key: u128) -> usize {
+        let hi = u64x8::from_slice(avx512, hi).into();
+        let lo = u64x8::from_slice(avx512, lo).into();
+        let key_hi = _mm512_set1_epi64((key >> 64) as i64);
+        let key_lo = _mm512_set1_epi64(key as i64);
+
+        let le = _mm512_cmplt_epu64_mask(hi, key_hi)
+            | (_mm512_cmpeq_epu64_mask(hi, key_hi) & _mm512_cmple_epu64_mask(lo, key_lo));
+        le.count_ones() as usize - 1
+    }
+);
 
 /// `at + step` if `a <= b`, else `at`, without a branch: one step of a binary
 /// search whose outcome is unpredictable.
@@ -491,11 +504,8 @@ mod tests {
             );
         }
         #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("popcnt")
-        {
-            // SAFETY: AVX-512F and POPCNT were detected above.
-            let simd = unsafe { matcher.find_all_avx512(bytes, at, win) };
+        if let Some(avx512) = fearless_simd::Level::new().as_avx512() {
+            let simd = matcher.find_all_avx512(avx512, bytes, at, win);
             assert_eq!(simd, scalar);
         }
     }
@@ -574,19 +584,15 @@ mod tests {
             check_paths(&dict, &matcher, &data, &[0, 0, 0], &[1, 2, MAX_TOKEN_SIZE]);
 
             #[cfg(target_arch = "x86_64")]
-            if std::arch::is_x86_feature_detected!("avx512f")
-                && std::arch::is_x86_feature_detected!("popcnt")
-            {
+            if let Some(avx512) = fearless_simd::Level::new().as_avx512() {
+                // Seven samples follow `last`, and every key is <= u128::MAX.
                 let last = matcher.blocks.len() - BLOCK_KEYS;
-                // SAFETY: seven samples follow `last`, AVX-512F and POPCNT were detected,
-                // and every key is <= u128::MAX.
-                let rank = unsafe {
-                    rank8(
-                        matcher.samples_hi.as_ptr().add(last),
-                        matcher.samples_lo.as_ptr().add(last),
-                        u128::MAX,
-                    )
-                };
+                let rank = rank8(
+                    avx512,
+                    &matcher.samples_hi[last..last + BLOCK_KEYS],
+                    &matcher.samples_lo[last..last + BLOCK_KEYS],
+                    u128::MAX,
+                );
                 assert_eq!(rank, BLOCK_KEYS - 1);
             }
         }

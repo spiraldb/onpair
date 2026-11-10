@@ -14,6 +14,8 @@
 
 use std::hint::select_unpredictable;
 
+use fearless_simd::Level;
+
 use crate::core::offset::Offset;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::encoding::dictionary_matcher::DictionaryMatcher;
@@ -92,40 +94,8 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("popcnt")
-    {
-        return parse_arrow_batched_with::<I, O, true>(
-            matcher,
-            bytes,
-            offsets,
-            batch_bytes,
-            buffers,
-            codes,
-            row_offsets,
-        );
-    }
-    parse_arrow_batched_with::<I, O, false>(
-        matcher,
-        bytes,
-        offsets,
-        batch_bytes,
-        buffers,
-        codes,
-        row_offsets,
-    );
-}
+    let level = Level::new();
 
-fn parse_arrow_batched_with<I: Offset, O: Offset, const SIMD: bool>(
-    matcher: &DictionaryMatcher,
-    bytes: &[u8],
-    offsets: &[I],
-    batch_bytes: usize,
-    buffers: &mut LaneBuffers,
-    codes: &mut Vec<Token>,
-    row_offsets: &mut Vec<O>,
-) {
     let n = offsets.len() - 1;
     let mut start = 0;
     while start < n {
@@ -133,7 +103,8 @@ fn parse_arrow_batched_with<I: Offset, O: Offset, const SIMD: bool>(
         let limit = offsets[start].to_usize() + batch_bytes;
         let fit = offsets[start + 1..=n].partition_point(|o| o.to_usize() <= limit);
         let end = start + fit.max(1);
-        parse_batch::<I, O, SIMD>(
+        parse_batch(
+            level,
             matcher,
             bytes,
             &offsets[start..=end],
@@ -165,30 +136,8 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("popcnt")
-    {
-        return parse_rows_batched_with::<R, O, true>(
-            matcher,
-            rows,
-            batch_bytes,
-            buffers,
-            codes,
-            row_offsets,
-        );
-    }
-    parse_rows_batched_with::<R, O, false>(matcher, rows, batch_bytes, buffers, codes, row_offsets);
-}
+    let level = Level::new();
 
-fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const SIMD: bool>(
-    matcher: &DictionaryMatcher,
-    rows: &R,
-    batch_bytes: usize,
-    buffers: &mut LaneBuffers,
-    codes: &mut Vec<Token>,
-    row_offsets: &mut Vec<O>,
-) {
     let mut bytes = std::mem::take(&mut buffers.bytes);
     let mut offsets = std::mem::take(&mut buffers.offsets);
 
@@ -208,7 +157,15 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const SIMD: bool>(
 
         // Padding keeps every window load on the fast path.
         bytes.resize(bytes.len() + MAX_TOKEN_SIZE, 0);
-        parse_batch::<usize, O, SIMD>(matcher, &bytes, &offsets, buffers, codes, row_offsets);
+        parse_batch(
+            level,
+            matcher,
+            &bytes,
+            &offsets,
+            buffers,
+            codes,
+            row_offsets,
+        );
     }
 
     buffers.bytes = bytes;
@@ -216,7 +173,8 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const SIMD: bool>(
 }
 
 /// Encode one batch of contiguous rows with all lanes.
-fn parse_batch<I: OffsetLike, O: Offset, const SIMD: bool>(
+fn parse_batch<I: OffsetLike, O: Offset>(
+    level: Level,
     matcher: &DictionaryMatcher,
     bytes: &[u8],
     offsets: &[I],
@@ -225,26 +183,30 @@ fn parse_batch<I: OffsetLike, O: Offset, const SIMD: bool>(
     row_offsets: &mut Vec<O>,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if SIMD {
-        // SAFETY: the parse entry point detected AVX-512F and POPCNT before choosing SIMD.
-        return unsafe { parse_batch_avx512(matcher, bytes, offsets, buffers, codes, row_offsets) };
-    }
-    parse_batch_with::<I, O, false, LANES>(matcher, bytes, offsets, buffers, codes, row_offsets);
-}
+    if let Some(avx512) = level.as_avx512() {
+        use fearless_simd::Simd;
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,popcnt")]
-unsafe fn parse_batch_avx512<I: OffsetLike, O: Offset>(
-    matcher: &DictionaryMatcher,
-    bytes: &[u8],
-    offsets: &[I],
-    buffers: &mut LaneBuffers,
-    codes: &mut Vec<Token>,
-    row_offsets: &mut Vec<O>,
-) {
-    parse_batch_with::<I, O, true, SIMD_LANES>(
-        matcher,
-        bytes,
+        return avx512.vectorize(
+            #[inline(always)]
+            || {
+                parse_batch_with::<I, O, SIMD_LANES>(
+                    #[inline(always)]
+                    |at, win| matcher.find_all_avx512(avx512, bytes, at, win),
+                    offsets,
+                    buffers,
+                    codes,
+                    row_offsets,
+                )
+            },
+        );
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = level;
+
+    parse_batch_with::<I, O, LANES>(
+        #[inline(always)]
+        |at, win| matcher.find_all(bytes, at, win),
         offsets,
         buffers,
         codes,
@@ -252,10 +214,11 @@ unsafe fn parse_batch_avx512<I: OffsetLike, O: Offset>(
     );
 }
 
+/// Encode one batch with `K` lanes. `find_all` is
+/// [`DictionaryMatcher::find_all`] or one of its SIMD variants.
 #[inline(always)]
-fn parse_batch_with<I: OffsetLike, O: Offset, const SIMD: bool, const K: usize>(
-    matcher: &DictionaryMatcher,
-    bytes: &[u8],
+fn parse_batch_with<I: OffsetLike, O: Offset, const K: usize>(
+    find_all: impl Fn(&[usize; K], &[usize; K]) -> [(Token, usize); K],
     offsets: &[I],
     buffers: &mut LaneBuffers,
     codes: &mut Vec<Token>,
@@ -308,15 +271,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const SIMD: bool, const K: usize>(
         // An inactive lane still runs one search; its result is discarded.
         let win: [usize; K] =
             std::array::from_fn(|j| (row_end[j] - at[j]).clamp(1, MAX_TOKEN_SIZE));
-        #[cfg(target_arch = "x86_64")]
-        let found = if SIMD {
-            // SAFETY: called from parse_batch_avx512 with AVX-512F and POPCNT enabled.
-            unsafe { matcher.find_all_avx512(bytes, &at, &win) }
-        } else {
-            matcher.find_all(bytes, &at, &win)
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        let found = matcher.find_all(bytes, &at, &win);
+        let found = find_all(&at, &win);
 
         let mut busy = false;
         for j in 0..K {
