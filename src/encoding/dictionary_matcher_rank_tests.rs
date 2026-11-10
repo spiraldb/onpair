@@ -24,14 +24,9 @@ fn check<const K: usize>(
         assert_eq!(scalar[j], expected);
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("popcnt")
-        {
-            // SAFETY: the required target features were detected.
-            assert_eq!(unsafe { matcher.find_all_avx512(bytes, at, win) }, scalar);
-            assert_eq!(unsafe { matcher.find_all_rank(bytes, at, win) }, scalar);
-        }
+    if let Some(avx512) = fearless_simd::Level::new().as_avx512() {
+        assert_eq!(matcher.find_all_avx512(avx512, bytes, at, win), scalar);
+        assert_eq!(matcher.find_all_rank(avx512, bytes, at, win), scalar);
     }
 }
 
