@@ -46,13 +46,33 @@ const TREE: u8 = 1;
 const RANK: u8 = 2;
 #[cfg(target_arch = "x86_64")]
 const RANK_ROWS: u8 = 3;
-const MAX_LANES: usize = if TREE_LANES > RANK_LANES && TREE_LANES > LANES {
-    TREE_LANES
-} else if RANK_LANES > LANES {
-    RANK_LANES
-} else {
-    LANES
-};
+#[cfg(target_arch = "x86_64")]
+const RANK_AVX2: u8 = 4;
+#[cfg(target_arch = "x86_64")]
+const RANK_AVX2_ROWS: u8 = 5;
+
+/// Lanes for the AVX2 rank search.
+const RANK_AVX2_LANES: usize = 6;
+const MAX_LANES: usize = max_lanes(&[LANES, TREE_LANES, RANK_LANES, RANK_AVX2_LANES]);
+
+const fn max_lanes(lanes: &[usize]) -> usize {
+    let mut max = 0;
+    let mut i = 0;
+    while i < lanes.len() {
+        if lanes[i] > max {
+            max = lanes[i];
+        }
+        i += 1;
+    }
+    max
+}
+
+/// Whether `mode` uses an eight-wide rank search, and so probes the first rows
+/// to choose between the branch-free and the branching row completion.
+#[cfg(target_arch = "x86_64")]
+const fn probes_rows(mode: u8) -> bool {
+    mode == RANK || mode == RANK_AVX2
+}
 
 /// Reusable per-lane buffers.
 #[derive(Default)]
@@ -140,6 +160,19 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if Level::new().as_avx2().is_some() {
+        return parse_arrow_batched_with::<I, O, RANK_AVX2>(
+            matcher,
+            bytes,
+            offsets,
+            batch_bytes,
+            buffers,
+            codes,
+            row_offsets,
+        );
+    }
+
     parse_arrow_batched_with::<I, O, SCALAR>(
         matcher,
         bytes,
@@ -165,7 +198,7 @@ fn parse_arrow_batched_with<I: Offset, O: Offset, const MODE: u8>(
     #[cfg(target_arch = "x86_64")]
     let mut parse: BatchParser<I, O> = parse_batch::<I, O, MODE>;
     #[cfg(target_arch = "x86_64")]
-    let mut probe = MODE == RANK;
+    let mut probe = probes_rows(MODE);
     while start < n {
         // At least one row per batch, then whole rows up to `batch_bytes`.
         let limit = offsets[start].to_usize() + batch_bytes;
@@ -185,7 +218,7 @@ fn parse_arrow_batched_with<I: Offset, O: Offset, const MODE: u8>(
                 row_offsets,
             );
             if probe {
-                parse = rank_batch_parser::<I, O>(codes.len() - before, end - start);
+                parse = rank_batch_parser::<I, O, MODE>(codes.len() - before, end - start);
                 probe = false;
             }
         }
@@ -241,6 +274,18 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if Level::new().as_avx2().is_some() {
+        return parse_rows_batched_with::<R, O, RANK_AVX2>(
+            matcher,
+            rows,
+            batch_bytes,
+            buffers,
+            codes,
+            row_offsets,
+        );
+    }
+
     parse_rows_batched_with::<R, O, SCALAR>(
         matcher,
         rows,
@@ -256,13 +301,18 @@ type BatchParser<I, O> =
     fn(&DictionaryMatcher, &[u8], &[I], &mut LaneBuffers, &mut Vec<Token>, &mut Vec<O>);
 
 #[cfg(target_arch = "x86_64")]
-fn rank_batch_parser<I: OffsetLike, O: Offset>(codes: usize, rows: usize) -> BatchParser<I, O> {
+fn rank_batch_parser<I: OffsetLike, O: Offset, const MODE: u8>(
+    codes: usize,
+    rows: usize,
+) -> BatchParser<I, O> {
     // Branches pay off when row completions are infrequent. Use measured codes
     // per row, accounting for the input's actual dictionary token frequencies.
-    if codes >= 16 * rows {
-        parse_batch::<I, O, RANK_ROWS>
-    } else {
-        parse_batch::<I, O, RANK>
+    let rows_mode = codes >= 16 * rows;
+    match (MODE == RANK_AVX2, rows_mode) {
+        (false, true) => parse_batch::<I, O, RANK_ROWS>,
+        (false, false) => parse_batch::<I, O, RANK>,
+        (true, true) => parse_batch::<I, O, RANK_AVX2_ROWS>,
+        (true, false) => parse_batch::<I, O, RANK_AVX2>,
     }
 }
 
@@ -282,7 +332,7 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
     #[cfg(target_arch = "x86_64")]
     let mut parse: BatchParser<usize, O> = parse_batch::<usize, O, MODE>;
     #[cfg(target_arch = "x86_64")]
-    let mut probe = MODE == RANK;
+    let mut probe = probes_rows(MODE);
     while i < n {
         bytes.clear();
         offsets.clear();
@@ -308,7 +358,8 @@ fn parse_rows_batched_with<R: Rows + ?Sized, O: Offset, const MODE: u8>(
             let before = codes.len();
             parse(matcher, &bytes, &offsets, buffers, codes, row_offsets);
             if probe {
-                parse = rank_batch_parser::<usize, O>(codes.len() - before, offsets.len() - 1);
+                parse =
+                    rank_batch_parser::<usize, O, MODE>(codes.len() - before, offsets.len() - 1);
                 probe = false;
             }
         }
@@ -330,7 +381,7 @@ fn parse_batch<I: OffsetLike, O: Offset, const MODE: u8>(
     row_offsets: &mut Vec<O>,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if MODE != SCALAR
+    if (MODE == TREE || MODE == RANK || MODE == RANK_ROWS)
         && let Some(avx512) = Level::new().as_avx512()
     {
         use fearless_simd::Simd;
@@ -368,6 +419,36 @@ fn parse_batch<I: OffsetLike, O: Offset, const MODE: u8>(
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if (MODE == RANK_AVX2 || MODE == RANK_AVX2_ROWS)
+        && let Some(avx2) = Level::new().as_avx2()
+    {
+        use fearless_simd::Simd;
+
+        return avx2.vectorize(
+            #[inline(always)]
+            || match MODE {
+                RANK_AVX2 => parse_batch_with::<I, O, RANK_AVX2, RANK_AVX2_LANES>(
+                    #[inline(always)]
+                    |at, win| matcher.find_all_rank_avx2(avx2, bytes, at, win),
+                    offsets,
+                    buffers,
+                    codes,
+                    row_offsets,
+                ),
+
+                _ => parse_batch_with::<I, O, RANK_AVX2_ROWS, RANK_AVX2_LANES>(
+                    #[inline(always)]
+                    |at, win| matcher.find_all_rank_avx2(avx2, bytes, at, win),
+                    offsets,
+                    buffers,
+                    codes,
+                    row_offsets,
+                ),
+            },
+        );
+    }
+
     parse_batch_with::<I, O, SCALAR, LANES>(
         #[inline(always)]
         |at, win| matcher.find_all(bytes, at, win),
@@ -379,7 +460,7 @@ fn parse_batch<I: OffsetLike, O: Offset, const MODE: u8>(
 }
 
 /// Encode one batch with `K` lanes. `find_all` is
-/// [`DictionaryMatcher::find_all`] or one of its AVX-512 variants.
+/// [`DictionaryMatcher::find_all`] or one of its SIMD variants.
 #[inline(always)]
 fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
     find_all: impl Fn(&[usize; K], &[usize; K]) -> [(Token, usize); K],
@@ -455,7 +536,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
             at[j] += select_unpredictable(active, len, 0);
 
             #[cfg(target_arch = "x86_64")]
-            if MODE == RANK_ROWS {
+            if MODE == RANK_ROWS || MODE == RANK_AVX2_ROWS {
                 if at[j] == row_end[j] && running {
                     buffers.row_ends[j][row[j] - bounds[j]] = count[j];
                     row[j] += 1;
@@ -701,6 +782,12 @@ mod tests {
         if Level::new().as_avx512().is_some() {
             check_reused_buffers::<RANK>(&matcher, &rows, &expected, &mut buffers);
             check_reused_buffers::<RANK_ROWS>(&matcher, &rows, &expected, &mut buffers);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if Level::new().as_avx2().is_some() {
+            check_reused_buffers::<RANK_AVX2>(&matcher, &rows, &expected, &mut buffers);
+            check_reused_buffers::<RANK_AVX2_ROWS>(&matcher, &rows, &expected, &mut buffers);
         }
     }
 
