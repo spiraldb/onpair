@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Frozen longest-prefix matcher for encoding. [`DictionaryMatcher`] is built
-//! from the final, sorted dictionary and matches several inputs at once without
-//! data-dependent branches.
+//! from the final, sorted dictionary and overlaps several independent searches.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
@@ -21,16 +20,15 @@ use crate::core::types::{MAX_TOKEN_SIZE, Token};
 const PREFIX_SLOTS: usize = 1 << 16;
 
 /// Frozen longest-prefix matcher over a sorted, complete dictionary. Token ids
-/// are dictionary indices. It matches several inputs at once without
-/// data-dependent branches, so independent inputs overlap in the CPU.
+/// are dictionary indices. Independent inputs overlap their searches in the CPU.
 ///
 /// Each token is held as a 16-byte big-endian key, zero-padded past its length.
 /// Lexicographic token order is then also key order. For input `w`, let `q` be
 /// the last token with `key(q) <= key(w)`. Every token that is a prefix of `w`
 /// sorts between that token and `w`, so it is also a prefix of `q`. Thus the
 /// longest match is `q` or the longest prefix of `q` that is not longer than
-/// the common prefix of `q` and `w`. Each token stores its prefix tokens in one
-/// record, so that last step is a mask and one load. The single-byte token
+/// the common prefix of `q` and `w`. Each token stores its prefix lengths and a shared path of proper prefix
+/// tokens, so the last step is a mask, a rank, and a path lookup. The single-byte token
 /// of `w[0]` sorts at or before `q`, so `q` always exists and shares the first
 /// byte of `w`.
 ///
@@ -41,23 +39,36 @@ const PREFIX_SLOTS: usize = 1 << 16;
 /// block of `q`. AVX-512F finishes the sample search and searches that block
 /// with eight-wide rank counts; the scalar path uses binary search throughout.
 /// A search reads one block that may miss the cache.
-/// All inputs of one call search with the same number of steps, so the loop has
-/// no branch that depends on the data; see [`advance_if_le`].
+/// An alternative eight-way tree over the same block separators avoids the
+/// remaining binary steps in large ranges. The two-byte table acts as a trie
+/// root; equal block ranges share a tree. Tree descent may finish lanes at
+/// different depths, so the parser selects it only when sampled heights agree.
+/// The scalar path retains the original branch-free binary comparisons; see
+/// [`advance_if_le`].
 #[derive(Debug, Clone)]
 pub(crate) struct DictionaryMatcher {
     /// Token keys in dictionary order, then `u128::MAX` up to a whole block.
     blocks: Vec<KeyBlock>,
+    /// Roots of eight-way predecessor trees, shared by equal block ranges.
+    #[cfg(target_arch = "x86_64")]
+    roots: Vec<u32>,
+    #[cfg(target_arch = "x86_64")]
+    tree: Vec<KeyBlock>,
+    /// Child base, valid separator mask, and whether children are leaf blocks.
+    #[cfg(target_arch = "x86_64")]
+    tree_meta: Vec<u64>,
     /// First key of each block, in columns, including seven trailing pad blocks.
     samples_hi: Vec<u64>,
     samples_lo: Vec<u64>,
     /// Per 2-byte prefix `p`: the block of the last token before the tokens
     /// whose keys start with `p` (block 0 if there is none). The block of the
     /// last token with prefix `p` is then `first_blocks[p + 1]`.
-    first_blocks: Vec<u16>,
-    /// Prefix tokens of each token, in dictionary order, then of each pad.
+    first_blocks: Box<[u16; PREFIX_SLOTS + 1]>,
+    /// Prefix metadata of each token, in dictionary order, then of each pad.
     chains: Vec<PrefixChain>,
-    /// Token of each single byte: the first prefix token of every chain.
-    singles: [Token; 256],
+    /// Proper prefix paths, shared by tokens with the same parent.
+    prefix_ids: Vec<Token>,
+    single_byte_only: bool,
 }
 
 /// Keys per 128-byte block.
@@ -78,29 +89,47 @@ impl KeyBlock {
     }
 }
 
-/// The prefix tokens of one token `t` by length bound, in one 32-byte record,
-/// so that the match needs one load after the search.
+/// A token's prefix lengths and its shared path of proper prefix tokens.
+/// Siblings share the path indexed by `base`; `id` holds the token itself.
 #[derive(Copy, Clone, Debug, Default)]
-#[repr(align(32))]
+#[repr(C)]
 struct PrefixChain {
-    /// Bit `k` is set when the first `k + 1` bytes of `t` are a token.
+    base: u32,
     lens: u16,
-    /// Entry `k` is the longest token that is a prefix of `t` and not longer
-    /// than `k + 2` bytes. A bound of one byte gives the single-byte token.
-    ids: [Token; MAX_TOKEN_SIZE - 1],
+    id: Token,
 }
-
+struct PrefixPool {
+    bases: Vec<u32>,
+    ids: Vec<Token>,
+}
 impl PrefixChain {
-    /// Record of `chain`: prefix tokens of one token, shortest first, starting
-    /// with a single byte.
-    fn new(dict: CompactDictionaryView<'_>, chain: &[Token]) -> Self {
-        let mut record = Self::default();
-        for &prefix in chain {
-            let len = dict.token_len(prefix);
-            record.lens |= 1 << (len - 1);
-            record.ids[len.max(2) - 2..].fill(prefix);
+    fn new(dict: CompactDictionaryView<'_>, chain: &[Token], pool: &mut PrefixPool) -> Self {
+        let parent = chain[chain.len().saturating_sub(2)];
+        let base = &mut pool.bases[parent as usize];
+        if *base == u32::MAX {
+            // A dictionary has at most 2^16 tokens, each with at most 16
+            // ancestors, so the path offset fits in u32.
+            *base = pool.ids.len() as u32;
+            let count = chain.len().saturating_sub(1).max(1);
+            pool.ids.extend_from_slice(&chain[..count]);
+            // The full-fit rank reads this spare entry before selecting `id`.
+            // Singles also share their one-entry path with their children.
+            pool.ids.push(0);
         }
-        record
+        let lens = chain
+            .iter()
+            .fold(0u16, |mask, &id| mask | (1 << (dict.token_len(id) - 1)));
+        Self {
+            base: *base,
+            lens,
+            id: *chain.last().unwrap(),
+        }
+    }
+    #[inline(always)]
+    fn code(&self, pool: &[Token], fits: u32) -> Token {
+        let rank = fits.count_ones() as usize - 1;
+        let proper = pool[self.base as usize + rank];
+        select_unpredictable(fits == self.lens as u32, self.id, proper)
     }
 }
 
@@ -111,9 +140,12 @@ impl DictionaryMatcher {
     /// single-byte token.
     pub(crate) fn from_dictionary(dict: CompactDictionaryView<'_>) -> Self {
         let n = dict.num_tokens();
+        let mut prefix_pool = PrefixPool {
+            bases: vec![u32::MAX; n],
+            ids: Vec::new(),
+        };
         let mut keys = Vec::with_capacity(n + 1);
         let mut chains = Vec::with_capacity(n);
-        let mut singles = [0 as Token; 256];
 
         // Prefix tokens of the current token, shortest first. A token that is a
         // prefix of a later token stays on the stack while every token between
@@ -142,11 +174,7 @@ impl DictionaryMatcher {
             chain.push(id);
             debug_assert_eq!(dict.token_len(chain[0]), 1, "dictionary is incomplete");
 
-            if token.len() == 1 {
-                singles[token[0] as usize] = id;
-            }
-
-            chains.push(PrefixChain::new(dict, &chain));
+            chains.push(PrefixChain::new(dict, &chain, &mut prefix_pool));
         }
 
         // `starts[p]` is the first token whose 2-byte prefix is `p` or larger.
@@ -159,7 +187,7 @@ impl DictionaryMatcher {
         }
 
         // At most 2^16 tokens, so at most 2^13 blocks: a block fits a `u16`.
-        let first_blocks = starts
+        let first_blocks: Vec<u16> = starts
             .iter()
             .map(|&start| ((start.max(1) - 1) / BLOCK_KEYS) as u16)
             .collect();
@@ -172,14 +200,14 @@ impl DictionaryMatcher {
         // search can stop on a pad. Its prefix tokens are the runs of `0xFF`.
         // The last token starts with `0xFF`, so the stack holds all of them.
         chain.retain(|&id| dict.token(id).iter().all(|&b| b == 0xFF));
-        chains.resize(keys.len(), PrefixChain::new(dict, &chain));
+        chains.resize(keys.len(), PrefixChain::new(dict, &chain, &mut prefix_pool));
 
         // An eight-wide sample load can include seven entries after the last
         // candidate. For key == u128::MAX those entries compare <= too: there
         // is no larger sentinel. Back them with real pad blocks and the same
         // 0xFF prefix chain, so any rank still selects a valid predecessor.
         keys.resize(keys.len() + (BLOCK_KEYS - 1) * BLOCK_KEYS, u128::MAX);
-        chains.resize(keys.len(), PrefixChain::new(dict, &chain));
+        chains.resize(keys.len(), PrefixChain::new(dict, &chain, &mut prefix_pool));
 
         let blocks: Vec<KeyBlock> = keys
             .chunks_exact(BLOCK_KEYS)
@@ -191,14 +219,79 @@ impl DictionaryMatcher {
         let samples_hi = blocks.iter().map(|block| block.hi[0]).collect();
         let samples_lo = blocks.iter().map(|block| block.lo[0]).collect();
 
+        #[cfg(target_arch = "x86_64")]
+        let (roots, tree, tree_meta) = {
+            // The first separator of every candidate range is <= its query. Each
+            // node partitions contiguous blocks into up to eight contiguous groups.
+            let mut roots = Vec::with_capacity(PREFIX_SLOTS);
+            let mut tree = Vec::new();
+            let mut tree_meta = Vec::new();
+            let mut cache = std::collections::HashMap::new();
+            for p in 0..PREFIX_SLOTS {
+                let first = first_blocks[p] as usize;
+                let last = first_blocks[p + 1] as usize;
+                let link = if first == last {
+                    0x8000_0000 | first as u32
+                } else {
+                    *cache.entry((first, last)).or_insert_with(|| {
+                        let id = tree.len();
+                        tree.push(KeyBlock {
+                            hi: [u64::MAX; 8],
+                            lo: [u64::MAX; 8],
+                        });
+                        tree_meta.push(0);
+                        build_node(
+                            id,
+                            first,
+                            last - first + 1,
+                            &blocks,
+                            &mut tree,
+                            &mut tree_meta,
+                        );
+                        id as u32
+                    })
+                };
+                roots.push(link);
+            }
+            (roots, tree, tree_meta)
+        };
+
         Self {
+            #[cfg(target_arch = "x86_64")]
+            roots,
+            #[cfg(target_arch = "x86_64")]
+            tree,
+            #[cfg(target_arch = "x86_64")]
+            tree_meta,
             blocks,
             samples_hi,
             samples_lo,
-            first_blocks,
+            first_blocks: first_blocks.into_boxed_slice().try_into().unwrap(),
             chains,
-            singles,
+            prefix_ids: prefix_pool.ids,
+            single_byte_only: n == 256,
         }
+    }
+
+    /// Estimate whether tree searches will have a predictable common height.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn prefers_tree(&self, bytes: &[u8]) -> bool {
+        // A mixed tree height makes per-lane completion branches unpredictable.
+        // Require one height in at least seven eighths of the sampled windows.
+        let mut depths = [0usize; 6];
+        for j in 0..64 {
+            let at = bytes.len().saturating_sub(1) * j / 64;
+            let prefix = (window_key(bytes, at) >> 112) as usize;
+            let n = self.first_blocks[prefix + 1] as usize + 1 - self.first_blocks[prefix] as usize;
+            let depth = (usize::BITS - n.saturating_sub(1).leading_zeros()).div_ceil(3) as usize;
+            depths[depth] += 1;
+        }
+        depths.into_iter().max().unwrap_or(0) >= 56
+    }
+
+    /// A complete dictionary with exactly 256 tokens assigns each byte its value.
+    pub(crate) fn is_single_byte_only(&self) -> bool {
+        self.single_byte_only
     }
 
     /// Longest token whose bytes are a prefix of `data`, with that prefix's
@@ -223,11 +316,11 @@ impl DictionaryMatcher {
         at: &[usize; K],
         win: &[usize; K],
     ) -> [(Token, usize); K] {
-        self.find_all_with(Rank::Scalar, bytes, at, win)
+        self.find_all_with(Search::Scalar, bytes, at, win)
     }
 
-    /// [`Self::find_all`] with the AVX-512 rank. The token proves that the CPU
-    /// supports AVX-512.
+    /// [`Self::find_all`] with the AVX-512 prefix trees. The token proves that
+    /// the CPU supports AVX-512.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     pub(crate) fn find_all_avx512<const K: usize>(
@@ -237,13 +330,27 @@ impl DictionaryMatcher {
         at: &[usize; K],
         win: &[usize; K],
     ) -> [(Token, usize); K] {
-        self.find_all_with(Rank::Avx512(avx512), bytes, at, win)
+        self.find_all_with(Search::Tree(avx512), bytes, at, win)
+    }
+
+    /// [`Self::find_all`] with the flat AVX-512 sample rank. The token proves
+    /// that the CPU supports AVX-512.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(crate) fn find_all_rank<const K: usize>(
+        &self,
+        avx512: Avx512,
+        bytes: &[u8],
+        at: &[usize; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        self.find_all_with(Search::Rank(avx512), bytes, at, win)
     }
 
     #[inline(always)]
     fn find_all_with<const K: usize>(
         &self,
-        rank: Rank,
+        search: Search,
         bytes: &[u8],
         at: &[usize; K],
         win: &[usize; K],
@@ -251,7 +358,16 @@ impl DictionaryMatcher {
         // The key holds all 16 bytes at `at`, also past the window. Every token
         // that is a prefix of the window is a prefix of the whole key, so it is
         // also a prefix of `q`; the length bound below drops the longer ones.
-        let key: [u128; K] = std::array::from_fn(|j| window_key(bytes, at[j]));
+        // Keep the fills in the SIMD caller: outlined array closures lose its
+        // POPCNT feature context when several parser loops use this matcher.
+        let mut key = [0u128; K];
+        for j in 0..K {
+            key[j] = window_key(bytes, at[j]);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Search::Tree(avx512) = search {
+            return self.find_tree(avx512, &key, win);
+        }
 
         // Candidate blocks: from the block of the last token before the
         // input's 2-byte prefix to the block of the last token with that
@@ -270,9 +386,11 @@ impl DictionaryMatcher {
         // Find the last candidate block whose first key is `<=` the input key.
         // The searches advance one step at a time across all inputs, so their
         // loads sit next to each other and overlap.
-        let largest = size.iter().copied().max().unwrap_or(0);
-        let mut steps = usize::BITS - largest.saturating_sub(1).leading_zeros();
-        if !matches!(rank, Rank::Scalar) {
+        // Only the highest set bit of the largest span matters. OR combines
+        // those bits without a chain of dependent maximum selections.
+        let span = size.iter().fold(0, |bits, &n| bits | (n - 1));
+        let mut steps = usize::BITS - span.leading_zeros();
+        if !matches!(search, Search::Scalar) {
             steps = steps.saturating_sub(3);
         }
         for _ in 0..steps {
@@ -287,7 +405,7 @@ impl DictionaryMatcher {
         }
 
         #[cfg(target_arch = "x86_64")]
-        if let Rank::Avx512(avx512) = rank {
+        if let Search::Rank(avx512) | Search::Tree(avx512) = search {
             for j in 0..K {
                 // Outside the remaining range, samples are greater than the
                 // key: either an earlier comparison excluded them, or their
@@ -307,8 +425,8 @@ impl DictionaryMatcher {
         // the block that is `<=` the input key. Only MAX padding blocks can
         // follow it with equal keys; they carry the same prefix chain.
         let mut slot = [0usize; K];
-        match rank {
-            Rank::Scalar => {
+        match search {
+            Search::Scalar => {
                 let mut half = BLOCK_KEYS / 2;
                 while half > 0 {
                     for j in 0..K {
@@ -320,7 +438,7 @@ impl DictionaryMatcher {
             }
 
             #[cfg(target_arch = "x86_64")]
-            Rank::Avx512(avx512) => {
+            Search::Rank(avx512) | Search::Tree(avx512) => {
                 for j in 0..K {
                     let block = &self.blocks[base[j]];
                     slot[j] = rank8(avx512, &block.hi, &block.lo, key[j]);
@@ -329,7 +447,9 @@ impl DictionaryMatcher {
         }
 
         let mut q = [0usize; K];
-        let len: [usize; K] = std::array::from_fn(|j| {
+        let mut fits_out = [0u32; K];
+        let mut len = [0usize; K];
+        for j in 0..K {
             q[j] = base[j] * BLOCK_KEYS + slot[j];
             let found = self.blocks[base[j]].key(slot[j]);
 
@@ -338,30 +458,87 @@ impl DictionaryMatcher {
 
             // `max_len >= 1` and bit 0 is always set, so `fits` is never zero.
             let fits = u32::from(self.chains[q[j]].lens) & ((1u32 << max_len) - 1);
-            (u32::BITS - fits.leading_zeros()) as usize
-        });
+            fits_out[j] = fits;
+            len[j] = (u32::BITS - fits.leading_zeros()) as usize;
+        }
 
         // The prefix token of length `len`; a length of one byte is the
         // single-byte token of the first input byte. The token loads come after
         // all lengths: the next positions then do not wait behind them, which
         // is measurably faster on Intel and costs little elsewhere.
+        let mut found = [(0, 0); K];
+        for j in 0..K {
+            found[j] = (
+                self.chains[q[j]].code(&self.prefix_ids, fits_out[j]),
+                len[j],
+            );
+        }
+        found
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn find_tree<const K: usize>(
+        &self,
+        avx512: Avx512,
+        key: &[u128; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        let mut refs: [u32; K] = std::array::from_fn(|j| self.roots[(key[j] >> 112) as usize]);
+        loop {
+            let mut busy = false;
+            for j in 0..K {
+                if refs[j] & 0x8000_0000 == 0 {
+                    let idx = refs[j] as usize;
+                    let node = &self.tree[idx];
+                    let meta = self.tree_meta[idx];
+                    // A node has eight entries in each column; bit zero is
+                    // valid and its key is <= this query.
+                    let slot = rank8_masked(avx512, &node.hi, &node.lo, key[j], (meta >> 32) as u8);
+                    refs[j] = (meta as u32 + slot as u32) | (((meta >> 40) as u32 & 1) << 31);
+                    busy |= refs[j] & 0x8000_0000 == 0;
+                }
+            }
+            if !busy {
+                break;
+            }
+        }
+        let base: [usize; K] = std::array::from_fn(|j| (refs[j] & 0x7fff_ffff) as usize);
+        let slot: [usize; K] = std::array::from_fn(|j| {
+            // A leaf has eight entries and starts <= this query.
+            let b = &self.blocks[base[j]];
+            rank8(avx512, &b.hi, &b.lo, key[j])
+        });
+        let q: [usize; K] = std::array::from_fn(|j| base[j] * 8 + slot[j]);
+        let mut fits_out = [0u32; K];
+        let len: [usize; K] = std::array::from_fn(|j| {
+            let found = self.blocks[base[j]].key(slot[j]);
+            let common = ((found ^ key[j]).leading_zeros() / 8) as usize;
+            let fits = self.chains[q[j]].lens as u32 & ((1u32 << common.min(win[j])) - 1);
+            fits_out[j] = fits;
+            (u32::BITS - fits.leading_zeros()) as usize
+        });
         std::array::from_fn(|j| {
-            let longer = self.chains[q[j]].ids[len[j].max(2) - 2];
-            let single = self.singles[(key[j] >> 120) as usize];
-            (select_unpredictable(len[j] == 1, single, longer), len[j])
+            (
+                self.chains[q[j]].code(&self.prefix_ids, fits_out[j]),
+                len[j],
+            )
         })
     }
 }
 
-/// How [`DictionaryMatcher::find_all_with`] finishes its searches.
+/// How [`DictionaryMatcher::find_all_with`] searches.
 #[derive(Clone, Copy)]
-enum Rank {
+enum Search {
     /// Binary search to the end.
     Scalar,
 
     /// Rank the last eight samples and the block keys with AVX-512.
     #[cfg(target_arch = "x86_64")]
-    Avx512(Avx512),
+    Rank(Avx512),
+
+    /// Walk the eight-way prefix trees with AVX-512.
+    #[cfg(target_arch = "x86_64")]
+    Tree(Avx512),
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -458,6 +635,71 @@ fn window_key(bytes: &[u8], at: usize) -> u128 {
         u128::from_be_bytes(buf)
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+fn build_node(
+    id: usize,
+    first: usize,
+    count: usize,
+    blocks: &[KeyBlock],
+    tree: &mut Vec<KeyBlock>,
+    meta: &mut Vec<u64>,
+) {
+    let mut stride = 1;
+    while stride * 8 < count {
+        stride *= 8;
+    }
+    let children = count.div_ceil(stride);
+    let child_base = if stride == 1 {
+        first
+    } else {
+        let base = tree.len();
+        tree.resize(
+            base + children,
+            KeyBlock {
+                hi: [u64::MAX; 8],
+                lo: [u64::MAX; 8],
+            },
+        );
+        meta.resize(base + children, 0);
+        base
+    };
+    for j in 0..children {
+        let b = first + j * stride;
+        tree[id].hi[j] = blocks[b].hi[0];
+        tree[id].lo[j] = blocks[b].lo[0];
+        if stride > 1 {
+            build_node(
+                child_base + j,
+                b,
+                stride.min(count - j * stride),
+                blocks,
+                tree,
+                meta,
+            );
+        }
+    }
+    // Low 32 bits index contiguous children, bits 32..39 mark separators,
+    // and bit 40 distinguishes leaf blocks from internal nodes.
+    meta[id] = child_base as u64
+        | ((((1u32 << children) - 1) as u64) << 32)
+        | (u64::from(stride == 1) << 40);
+}
+#[cfg(target_arch = "x86_64")]
+fearless_simd::kernel!(
+    /// [`rank8`] over the entries whose bit is set in `valid`.
+    #[inline(always)]
+    fn rank8_masked(avx512: Avx512, hi: &[u64], lo: &[u64], key: u128, valid: u8) -> usize {
+        let hi = u64x8::from_slice(avx512, hi).into();
+        let lo = u64x8::from_slice(avx512, lo).into();
+        let kh = _mm512_set1_epi64((key >> 64) as i64);
+        let kl = _mm512_set1_epi64(key as i64);
+
+        let le = _mm512_cmplt_epu64_mask(hi, kh)
+            | (_mm512_cmpeq_epu64_mask(hi, kh) & _mm512_cmple_epu64_mask(lo, kl));
+        (le & valid).count_ones() as usize - 1
+    }
+);
 
 #[cfg(test)]
 mod tests {
@@ -807,3 +1049,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dictionary_matcher_rank_tests.rs"]
+mod rank_tests;
