@@ -347,9 +347,7 @@ fn discover_tokens<'a>(
     // about one live pair per 20 scanned bytes. A table sized for that stays
     // small enough for the cache: a larger one is slower, mostly on Graviton.
     let scanned = scan_budget(cfg.threshold, total_bytes).unwrap_or(total_bytes);
-    let pair_capacity = (scanned / 20)
-        .clamp(1024, 1 << 20)
-        .min((total_bytes / 2).max(1024));
+    let pair_capacity = (scanned / 20).clamp(1024, 1 << 20);
     let mut freq = PairFrequencies::with_capacity(pair_capacity);
 
     let mut full_dictionary = false;
