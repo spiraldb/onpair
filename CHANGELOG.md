@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.3.0...HEAD)
+## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.4.0...HEAD)
+
+## [0.4.0](https://github.com/spiraldb/onpair/compare/v0.3.0...v0.4.0) - 2026-11-11
 
 ### Added
 
@@ -42,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[non_exhaustive]`, like the new `ContainsError` and
   `InvalidFrequencyIndex`, so later releases can add variants without a
   breaking change. Exhaustive matches on them need a wildcard arm.
+- Speed up parsing by sharing one prefix record among tokens with the same
+  proper prefix, and by widening input bytes directly to codes when every token
+  is one byte.
+- Speed up parsing on x86-64 CPUs with AVX-512 by ranking eight dictionary keys
+  at a time, with an eight-way prefix tree for long prefix ranges.
 
 ### Removed
 
