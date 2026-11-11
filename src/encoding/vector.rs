@@ -128,7 +128,9 @@ struct Lanes {
 ///
 /// # Safety
 /// The caller guarantees a valid Arrow pair, and that at least
-/// `MAX_TOKEN_SIZE - 1` bytes of `bytes` follow the end of the last row.
+/// `MAX_TOKEN_SIZE` bytes of `bytes` follow the end of the last row. A lane
+/// that has no rows left stays at the end of its last row, and the AVX2 lanes
+/// read a window there too.
 pub(crate) unsafe fn parse_batch<I: OffsetLike, O: Offset>(
     kernel: Kernel,
     matcher: &DictionaryMatcher,
@@ -141,7 +143,7 @@ pub(crate) unsafe fn parse_batch<I: OffsetLike, O: Offset>(
     let n = offsets.len() - 1;
     let first = offsets[0].to_usize();
     let total = offsets[n].to_usize() - first;
-    debug_assert!(offsets[n].to_usize() + MAX_TOKEN_SIZE - 1 <= bytes.len());
+    debug_assert!(offsets[n].to_usize() + MAX_TOKEN_SIZE <= bytes.len());
 
     // Lane `j` parses rows `bounds[j]..bounds[j + 1]`, split by byte count.
     let mut bounds = [0usize; LANES + 1];

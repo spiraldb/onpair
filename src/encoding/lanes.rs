@@ -141,17 +141,18 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
 ) {
     #[cfg(target_arch = "x86_64")]
     if let Some(kernel) = vector::Kernel::detect() {
-        // The vector lanes read 16 bytes at each position, so they take the
-        // rows that end at least 15 bytes before the end of `bytes`.
+        // The vector lanes read 16 bytes at each position. A lane that has no
+        // rows left stays at the end of its last row and the AVX2 lanes read
+        // there too, so the vector lanes take the rows that end at least 16
+        // bytes before the end of `bytes`.
         let n = offsets.len() - 1;
-        let safe =
-            offsets[1..].partition_point(|o| o.to_usize() + MAX_TOKEN_SIZE - 1 <= bytes.len());
+        let safe = offsets[1..].partition_point(|o| o.to_usize() + MAX_TOKEN_SIZE <= bytes.len());
         let mut start = 0;
         while start < safe {
             let limit = offsets[start].to_usize() + batch_bytes;
             let fit = offsets[start + 1..=safe].partition_point(|o| o.to_usize() <= limit);
             let end = start + fit.max(1);
-            // SAFETY: the rows end at least 15 bytes before the end of `bytes`.
+            // SAFETY: the rows end at least 16 bytes before the end of `bytes`.
             unsafe {
                 vector::parse_batch(
                     kernel,
