@@ -884,6 +884,8 @@ mod tests {
         let expected = reference(&matcher, &rows);
         let mut buffers = LaneBuffers::default();
         check_reused_buffers::<SCALAR>(&matcher, &rows, &expected, &mut buffers);
+        check_reused_buffers::<SCALAR_ROWS>(&matcher, &rows, &expected, &mut buffers);
+
         #[cfg(target_arch = "x86_64")]
         if Level::new().as_avx512().is_some() {
             check_reused_buffers::<RANK>(&matcher, &rows, &expected, &mut buffers);
