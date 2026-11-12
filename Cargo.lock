@@ -938,7 +938,7 @@ dependencies = [
  "parquet",
  "rand",
  "rstest",
- "tpchgen",
+ "tpchgen 4.0.0",
  "tpchgen-arrow",
 ]
 
@@ -1356,13 +1356,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e26c6d047694183517044ea72d2e0337b05b43d40809f0958f603a7e5a286855"
 
 [[package]]
+name = "tpchgen"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc60dc766636c350180e7df4f430673b6ebd95ad4bc2ce298315e6f9eac73bcc"
+
+[[package]]
 name = "tpchgen-arrow"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c64c19d707b783f219883549268da8ea98f91e7aaec3b626563044a21c2b37aa"
 dependencies = [
  "arrow",
- "tpchgen",
+ "tpchgen 3.0.0",
 ]
 
 [[package]]
