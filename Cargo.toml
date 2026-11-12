@@ -41,7 +41,7 @@ memchr = "2.4.0"
 rand = "0.10.3"
 
 [dev-dependencies]
-divan = { package = "codspeed-divan-compat", version = "5.0.0" }
+divan = { package = "codspeed-divan-compat", version = "6.0.0" }
 hegeltest = "0.52.0"
 rstest = "0.28.0"
 arrow-array = "59.1"
