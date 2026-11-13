@@ -28,9 +28,8 @@ use std::sync::OnceLock;
 
 use std::mem::MaybeUninit;
 
-use arrow_array::RecordBatch;
+use arrow_array::RecordBatchReader;
 use arrow_array::cast::AsArray;
-use arrow_schema::Schema;
 use divan::Bencher;
 use onpair::Column;
 use onpair::Config;
@@ -48,7 +47,6 @@ use tpchgen_arrow::CustomerArrow;
 use tpchgen_arrow::LineItemArrow;
 use tpchgen_arrow::OrderArrow;
 use tpchgen_arrow::PartArrow;
-use tpchgen_arrow::RecordBatchIterator;
 use tpchgen_arrow::SupplierArrow;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -127,57 +125,47 @@ fn corpus_for(col: &'static str) -> &'static Corpus {
 }
 
 /// Dispatch column → table generator. Stops once concatenated bytes reach
-/// `max_bytes`. Each `<Table>Arrow` iterator yields `RecordBatch`es and
-/// exposes a `schema()` accessor via `RecordBatchIterator`.
+/// `max_bytes`. Each `<Table>Arrow` iterator is a `RecordBatchReader`.
 fn generate_column(col: &str, sf: f64, max: usize) -> (Vec<u8>, Vec<u64>) {
     match col {
         // LineItem
         "l_returnflag" | "l_linestatus" | "l_shipinstruct" | "l_shipmode" | "l_comment" => {
             let it =
                 LineItemArrow::new(LineItemGenerator::new(sf, 1, 1)).with_batch_size(BATCH_SIZE);
-            let schema = it.schema().clone();
-            collect_string_view(it, &schema, col, max)
+            collect_string_view(it, col, max)
         }
         // Order
         "o_orderstatus" | "o_orderpriority" | "o_clerk" | "o_comment" => {
             let it = OrderArrow::new(OrderGenerator::new(sf, 1, 1)).with_batch_size(BATCH_SIZE);
-            let schema = it.schema().clone();
-            collect_string_view(it, &schema, col, max)
+            collect_string_view(it, col, max)
         }
         // Customer
         "c_name" | "c_address" | "c_phone" | "c_mktsegment" | "c_comment" => {
             let it =
                 CustomerArrow::new(CustomerGenerator::new(sf, 1, 1)).with_batch_size(BATCH_SIZE);
-            let schema = it.schema().clone();
-            collect_string_view(it, &schema, col, max)
+            collect_string_view(it, col, max)
         }
         // Part
         "p_name" | "p_mfgr" | "p_brand" | "p_type" | "p_container" | "p_comment" => {
             let it = PartArrow::new(PartGenerator::new(sf, 1, 1)).with_batch_size(BATCH_SIZE);
-            let schema = it.schema().clone();
-            collect_string_view(it, &schema, col, max)
+            collect_string_view(it, col, max)
         }
         // Supplier
         "s_name" | "s_address" | "s_phone" | "s_comment" => {
             let it =
                 SupplierArrow::new(SupplierGenerator::new(sf, 1, 1)).with_batch_size(BATCH_SIZE);
-            let schema = it.schema().clone();
-            collect_string_view(it, &schema, col, max)
+            collect_string_view(it, col, max)
         }
         other => panic!("unknown TPC-H string column: {other}"),
     }
 }
 
-fn collect_string_view<I>(
-    batches: I,
-    schema: &Schema,
-    col: &str,
-    max_bytes: usize,
-) -> (Vec<u8>, Vec<u64>)
+fn collect_string_view<R>(batches: R, col: &str, max_bytes: usize) -> (Vec<u8>, Vec<u64>)
 where
-    I: Iterator<Item = RecordBatch>,
+    R: RecordBatchReader,
 {
-    let idx = schema
+    let idx = batches
+        .schema()
         .fields()
         .iter()
         .position(|f| f.name() == col)
@@ -186,6 +174,7 @@ where
     let mut bytes = Vec::with_capacity(max_bytes.min(1 << 28));
     let mut offsets: Vec<u64> = vec![0];
     'outer: for batch in batches {
+        let batch = batch.expect("TPC-H batch generation failed");
         let arr = batch.column(idx).as_string_view();
         for v in arr.iter() {
             let s = v.unwrap_or("").as_bytes();

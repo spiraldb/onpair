@@ -48,7 +48,7 @@ arrow-array = "59.1"
 arrow-schema = "59.1"
 parquet = "59.1"
 tpchgen = "4.0.0"
-tpchgen-arrow = "3.0.0"
+tpchgen-arrow = { version = "4.0.0", default-features = false, features = ["arrow_59"] }
 
 [[bench]]
 name = "tpch"
