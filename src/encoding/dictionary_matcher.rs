@@ -65,6 +65,9 @@ pub(crate) struct DictionaryMatcher {
     /// First key of each block, in columns, including seven trailing pad blocks.
     samples_hi: Vec<u64>,
     samples_lo: Vec<u64>,
+    /// The same samples as whole keys, so a scalar search step reads one
+    /// cache line.
+    samples: Vec<u128>,
     /// Per 2-byte prefix `p`: the block of the last token before the tokens
     /// whose keys start with `p` (block 0 if there is none). The block of the
     /// last token with prefix `p` is then `first_blocks[p + 1]`.
@@ -267,6 +270,7 @@ impl DictionaryMatcher {
             .collect();
         let samples_hi = blocks.iter().map(|block| block.hi[0]).collect();
         let samples_lo = blocks.iter().map(|block| block.lo[0]).collect();
+        let samples = blocks.iter().map(|block| block.key(0)).collect();
 
         #[cfg(target_arch = "x86_64")]
         let (roots, tree, tree_meta) = {
@@ -315,6 +319,7 @@ impl DictionaryMatcher {
             blocks,
             samples_hi,
             samples_lo,
+            samples,
             first_blocks: first_blocks.into_boxed_slice().try_into().unwrap(),
             chains,
             prefix_ids: {
@@ -483,8 +488,11 @@ impl DictionaryMatcher {
             for j in 0..K {
                 let half = size[j] / 2;
                 let mid = base[j] + half;
-                let sample =
-                    (u128::from(self.samples_hi[mid]) << 64) | u128::from(self.samples_lo[mid]);
+                let sample = if !matches!(search, Search::Scalar) {
+                    (u128::from(self.samples_hi[mid]) << 64) | u128::from(self.samples_lo[mid])
+                } else {
+                    self.samples[mid]
+                };
                 base[j] = advance_if_le(sample, key[j], base[j], half);
                 size[j] -= half;
             }
@@ -518,6 +526,21 @@ impl DictionaryMatcher {
                         key[j],
                     );
                 }
+            }
+        }
+
+        // The prefix chains of the block share one cache line. Start its load
+        // now, so that it overlaps the search in the block.
+        #[cfg(target_arch = "aarch64")]
+        for j in 0..K {
+            let line = self.chains[base[j] * BLOCK_KEYS..].as_ptr();
+            // SAFETY: a prefetch only hints the cache; the address is in bounds.
+            unsafe {
+                std::arch::asm!(
+                    "prfm pldl1keep, [{line}]",
+                    line = in(reg) line,
+                    options(nostack, preserves_flags, readonly),
+                );
             }
         }
 
