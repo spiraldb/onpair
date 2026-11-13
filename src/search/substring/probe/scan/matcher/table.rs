@@ -31,10 +31,10 @@ impl Matcher for Table {
     /// Always packs: a lookup per code leaves nothing to skip.
     fn check(&self, codes: &Block, bits: &mut Mask, _skip_empty: bool) -> bool {
         let mut any = 0;
-        for (word, codes) in bits.iter_mut().zip(codes.chunks_exact(64)) {
+        for (word, codes) in bits.iter_mut().zip(codes.as_chunks::<64>().0) {
             // Eight independent shift-OR chains per word.
             let mut packed = 0u64;
-            for (group, codes) in codes.chunks_exact(8).enumerate() {
+            for (group, codes) in codes.as_chunks::<8>().0.iter().enumerate() {
                 let mut byte = 0u64;
                 for (bit, &code) in codes.iter().enumerate() {
                     byte |= u64::from(self.admits[usize::from(code)]) << bit;

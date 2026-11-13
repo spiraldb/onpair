@@ -134,7 +134,7 @@ mod tests {
     //! hit density and row length, including empty rows, long gaps, and rows that
     //! span blocks. These tests accept every hit to isolate row resolution.
 
-    use super::{Mask, Resolver, find_row};
+    use super::{Resolver, find_row};
     use crate::core::dictionary::Dictionary;
     use crate::core::offset::Offset;
     use crate::core::types::Token;
@@ -161,8 +161,8 @@ mod tests {
         };
         let mut out = Vec::new();
         let mut resolver = Resolver::new(input);
-        for (block, bits) in mask.chunks_exact(BLOCK / 64).enumerate() {
-            let bits: &Mask = bits.try_into().unwrap();
+        let (blocks, _) = mask.as_chunks::<{ BLOCK / 64 }>();
+        for (block, bits) in blocks.iter().enumerate() {
             if bits.iter().any(|&set| set != 0) {
                 resolver.rows(bits, block * BLOCK, &mut out);
             }

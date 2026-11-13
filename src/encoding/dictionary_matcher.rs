@@ -210,7 +210,9 @@ impl DictionaryMatcher {
         chains.resize(keys.len(), PrefixChain::new(dict, &chain, &mut prefix_pool));
 
         let blocks: Vec<KeyBlock> = keys
-            .chunks_exact(BLOCK_KEYS)
+            .as_chunks::<BLOCK_KEYS>()
+            .0
+            .iter()
             .map(|chunk| KeyBlock {
                 hi: std::array::from_fn(|i| (chunk[i] >> 64) as u64),
                 lo: std::array::from_fn(|i| chunk[i] as u64),
