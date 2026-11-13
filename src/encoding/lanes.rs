@@ -21,6 +21,8 @@ use crate::core::offset::Offset;
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::encoding::dictionary_matcher::DictionaryMatcher;
 use crate::encoding::rows::Rows;
+#[cfg(target_arch = "x86_64")]
+use crate::encoding::vector;
 
 /// Number of lanes that advance together. Measured best: 4 on x86-64 (Sapphire
 /// Rapids, Zen 4, Zen 5), 6 on Apple Silicon, 5 on Graviton4 (6 is within 3%).
@@ -86,6 +88,9 @@ pub(crate) struct LaneBuffers {
     bytes: Vec<u8>,
     /// Row offsets into `bytes`.
     offsets: Vec<usize>,
+    /// Buffers of the vector parser.
+    #[cfg(target_arch = "x86_64")]
+    vector: crate::encoding::vector::VectorBuffers,
 }
 
 /// Encode the rows of an Arrow pair: row `i` is
@@ -134,6 +139,60 @@ fn parse_arrow_batched<I: Offset, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(kernel) = vector::Kernel::detect() {
+        // The vector lanes read 16 bytes at each position. A lane that has no
+        // rows left stays at the end of its last row and the AVX2 lanes read
+        // there too, so the vector lanes take the rows that end at least 16
+        // bytes before the end of `bytes`.
+        let n = offsets.len() - 1;
+        let safe = offsets[1..].partition_point(|o| o.to_usize() + MAX_TOKEN_SIZE <= bytes.len());
+        let mut start = 0;
+        while start < safe {
+            let limit = offsets[start].to_usize() + batch_bytes;
+            let fit = offsets[start + 1..=safe].partition_point(|o| o.to_usize() <= limit);
+            let end = start + fit.max(1);
+            // SAFETY: the rows end at least 16 bytes before the end of `bytes`.
+            unsafe {
+                vector::parse_batch(
+                    kernel,
+                    matcher,
+                    bytes,
+                    &offsets[start..=end],
+                    &mut buffers.vector,
+                    codes,
+                    row_offsets,
+                );
+            }
+            start = end;
+        }
+        if safe < n {
+            let tail = &offsets[safe..];
+            if matches!(kernel, vector::Kernel::Avx512(_)) {
+                parse_arrow_batched_with::<I, O, RANK>(
+                    matcher,
+                    bytes,
+                    tail,
+                    batch_bytes,
+                    buffers,
+                    codes,
+                    row_offsets,
+                );
+            } else {
+                parse_arrow_batched_with::<I, O, RANK_AVX2>(
+                    matcher,
+                    bytes,
+                    tail,
+                    batch_bytes,
+                    buffers,
+                    codes,
+                    row_offsets,
+                );
+            }
+        }
+        return;
+    }
+
     #[cfg(target_arch = "x86_64")]
     if Level::new().as_avx512().is_some() {
         let first = offsets[0].to_usize();
@@ -262,6 +321,42 @@ fn parse_rows_batched<R: Rows + ?Sized, O: Offset>(
     codes: &mut Vec<Token>,
     row_offsets: &mut Vec<O>,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(kernel) = vector::Kernel::detect() {
+        let mut bytes = std::mem::take(&mut buffers.bytes);
+        let mut offsets = std::mem::take(&mut buffers.offsets);
+        let n = rows.num_rows();
+        let mut i = 0;
+        while i < n {
+            bytes.clear();
+            offsets.clear();
+            offsets.push(0);
+            while i < n && (offsets.len() == 1 || bytes.len() < batch_bytes) {
+                bytes.extend_from_slice(rows.row(i));
+                offsets.push(bytes.len());
+                i += 1;
+            }
+
+            // The vector lanes read 16 bytes at each position.
+            bytes.resize(bytes.len() + MAX_TOKEN_SIZE, 0);
+            // SAFETY: padding follows the rows.
+            unsafe {
+                vector::parse_batch(
+                    kernel,
+                    matcher,
+                    &bytes,
+                    &offsets,
+                    &mut buffers.vector,
+                    codes,
+                    row_offsets,
+                );
+            }
+        }
+        buffers.bytes = bytes;
+        buffers.offsets = offsets;
+        return;
+    }
+
     #[cfg(target_arch = "x86_64")]
     if Level::new().as_avx512().is_some() {
         return parse_rows_batched_with::<R, O, RANK>(
@@ -585,7 +680,7 @@ fn parse_batch_with<I: OffsetLike, O: Offset, const MODE: u8, const K: usize>(
 
 /// Row offsets of a batch: the caller's Arrow offsets, or `usize` offsets
 /// into a batch copy.
-trait OffsetLike: Copy {
+pub(crate) trait OffsetLike: Copy {
     fn to_usize(self) -> usize;
 }
 

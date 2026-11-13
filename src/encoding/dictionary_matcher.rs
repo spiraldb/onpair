@@ -74,6 +74,33 @@ pub(crate) struct DictionaryMatcher {
     /// Proper prefix paths, shared by tokens with the same parent.
     prefix_ids: Vec<Token>,
     single_byte_only: bool,
+    /// Token keys in dictionary order, in columns, for the vector parser.
+    #[cfg(target_arch = "x86_64")]
+    keys_hi: Vec<u64>,
+    #[cfg(target_arch = "x86_64")]
+    keys_lo: Vec<u64>,
+    /// Per 2-byte prefix `p`: the last token before the tokens whose keys
+    /// start with `p` (token 0 if there is none). Entry `p + 1` is then the
+    /// last token with prefix `p` or smaller. Three zero pads follow, so a
+    /// 64-bit load at any prefix stays in bounds.
+    #[cfg(target_arch = "x86_64")]
+    token_bounds: Vec<u16>,
+}
+
+/// Raw views of the matcher for the vector parser.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct FlatMatcher {
+    /// High 64 bits of each token key, in dictionary order.
+    pub(crate) keys_hi: *const i64,
+    /// Low 64 bits of each token key, in dictionary order.
+    pub(crate) keys_lo: *const i64,
+    /// See [`DictionaryMatcher::token_bounds`].
+    pub(crate) token_bounds: *const i64,
+    /// Prefix chain of each token: base in bits 0..32, prefix lengths in bits
+    /// 32..48, and the token id in bits 48..64.
+    pub(crate) chains: *const i64,
+    /// Proper prefix paths. A 32-bit load at any path entry stays in bounds.
+    pub(crate) prefix_ids: *const i32,
 }
 
 /// Keys per 128-byte block.
@@ -103,6 +130,9 @@ struct PrefixChain {
     lens: u16,
     id: Token,
 }
+
+// The vector parser loads a chain as one little-endian 64-bit word.
+const _: () = assert!(std::mem::size_of::<PrefixChain>() == 8);
 struct PrefixPool {
     bases: Vec<u32>,
     ids: Vec<Token>,
@@ -197,6 +227,18 @@ impl DictionaryMatcher {
             .map(|&start| ((start.max(1) - 1) / BLOCK_KEYS) as u16)
             .collect();
 
+        #[cfg(target_arch = "x86_64")]
+        let (keys_hi, keys_lo, token_bounds) = {
+            let hi = keys[..n].iter().map(|&key| (key >> 64) as u64).collect();
+            let lo = keys[..n].iter().map(|&key| key as u64).collect();
+            let bounds = starts
+                .iter()
+                .map(|&start| (start.max(1) - 1) as u16)
+                .chain([0; 3])
+                .collect();
+            (hi, lo, bounds)
+        };
+
         // At least one `u128::MAX` pads the last block, so a search past the
         // last token stops there.
         keys.resize((n / BLOCK_KEYS + 1) * BLOCK_KEYS, u128::MAX);
@@ -275,8 +317,31 @@ impl DictionaryMatcher {
             samples_lo,
             first_blocks: first_blocks.into_boxed_slice().try_into().unwrap(),
             chains,
-            prefix_ids: prefix_pool.ids,
+            prefix_ids: {
+                // A spare entry keeps a 32-bit load at the last entry in bounds.
+                let mut ids = prefix_pool.ids;
+                ids.push(0);
+                ids
+            },
             single_byte_only: n == 256,
+            #[cfg(target_arch = "x86_64")]
+            keys_hi,
+            #[cfg(target_arch = "x86_64")]
+            keys_lo,
+            #[cfg(target_arch = "x86_64")]
+            token_bounds,
+        }
+    }
+
+    /// Raw views for the vector parser. They stay valid while `self` lives.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn flat(&self) -> FlatMatcher {
+        FlatMatcher {
+            keys_hi: self.keys_hi.as_ptr().cast(),
+            keys_lo: self.keys_lo.as_ptr().cast(),
+            token_bounds: self.token_bounds.as_ptr().cast(),
+            chains: self.chains.as_ptr().cast(),
+            prefix_ids: self.prefix_ids.as_ptr().cast(),
         }
     }
 
