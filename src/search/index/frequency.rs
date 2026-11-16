@@ -10,16 +10,21 @@ use crate::core::types::{Token, TokenRange};
 /// Most tokens an index can count: one per [`Token`] value.
 const MAX_TOKENS: usize = Token::MAX as usize + 1;
 
-/// How often each token occurs in a code stream, as prefix sums: entry `i` counts
-/// the codes below token `i`, and the last entry counts them all.
+/// Consecutive codes a sample reads at each of its positions.
+const SAMPLE_BLOCK_LEN: usize = 64;
+
+/// How often each token occurs in the codes counted from a stream, as prefix sums:
+/// entry `i` counts the codes below token `i`, and the last entry counts them all.
 ///
 /// [`ContainsScan`](crate::search::ContainsScan) plans with it, preferring covers of
 /// rare tokens. The index records counts, not the dictionary or stream they came
 /// from, and a scan checks only that it counts as many tokens as the dictionary
 /// has. Counts that do not match the stream make scans slower, never wrong.
 ///
-/// Build an index with [`build`](Self::build), store its prefix sums, and borrow
-/// them back with [`TokenFrequencyIndexView::new`]:
+/// [`build`](Self::build) counts every code. Its prefix sums can be stored next to
+/// the stream and borrowed back with [`TokenFrequencyIndexView::new`]. Where none
+/// are stored, [`sample`](Self::sample) counts part of the stream, and
+/// [`total_frequency`](TokenFrequencyIndexView::total_frequency) tells how much:
 ///
 /// ```
 /// use onpair::TokenRange;
@@ -27,6 +32,11 @@ const MAX_TOKENS: usize = Token::MAX as usize + 1;
 ///
 /// let index = TokenFrequencyIndex::build(&[2, 0, 2, 3, 2, 0], 5)?;
 /// assert_eq!(index.as_view().frequency(2), 3);
+///
+/// // Counts at least 1000 of 100000 codes.
+/// let codes: Vec<u16> = (0..100_000u32).map(|i| (i % 4) as u16).collect();
+/// let sample = TokenFrequencyIndex::sample(&codes, 4, 1000)?;
+/// assert!(sample.as_view().total_frequency() >= 1000);
 ///
 /// let stored: Vec<u32> = index.into_cumulative();
 /// let view = TokenFrequencyIndexView::new(&stored)?;
@@ -48,22 +58,72 @@ impl TokenFrequencyIndex {
     /// `u32::MAX` codes, and [`InvalidFrequencyIndex::CodeOutOfRange`] if a code is
     /// not below `num_tokens`.
     pub fn build(codes: &[Token], num_tokens: usize) -> Result<Self, InvalidFrequencyIndex> {
+        Self::sample(codes, num_tokens, codes.len())
+    }
+
+    /// Counts at least `sample_len` of `codes`, spread evenly over them, or all of
+    /// them, as [`build`](Self::build) does, once `sample_len` reaches `codes.len()`.
+    ///
+    /// [`total_frequency`](TokenFrequencyIndexView::total_frequency) is the number
+    /// `n` of codes counted, so a token's count times `codes.len()`, divided by
+    /// `n`, estimates the token's count in the whole stream. A token making up a
+    /// share `p` of the stream is counted about `n·p` times. Were the codes counted
+    /// drawn at random, the estimate's standard error would be at most `1/√(n·p)`
+    /// of the count: frequent tokens are estimated well by a small sample, rare
+    /// ones need a far larger one, and halving the error takes four times the
+    /// codes.
+    ///
+    /// Codes are counted in runs of neighbours, which are cheaper to read than
+    /// scattered codes, so more of them can be counted in the same time. Where
+    /// neighbouring rows repeat each other, though, a run tells less than as many
+    /// random codes would, and the error is larger.
+    ///
+    /// # Errors
+    /// Returns [`InvalidFrequencyIndex::TooManyTokens`] if `num_tokens` exceeds
+    /// 2^16, [`InvalidFrequencyIndex::FrequencyOverflow`] if more than `u32::MAX`
+    /// codes would be counted, and [`InvalidFrequencyIndex::CodeOutOfRange`] if a
+    /// counted code is not below `num_tokens`.
+    pub fn sample(
+        codes: &[Token],
+        num_tokens: usize,
+        sample_len: usize,
+    ) -> Result<Self, InvalidFrequencyIndex> {
         if num_tokens > MAX_TOKENS {
             return Err(InvalidFrequencyIndex::TooManyTokens);
         }
-        if u32::try_from(codes.len()).is_err() {
+        let read: usize = sample_blocks(codes, sample_len).map(<[Token]>::len).sum();
+        if u32::try_from(read).is_err() {
             return Err(InvalidFrequencyIndex::FrequencyOverflow);
         }
+        let index = Self::sample_any(codes, num_tokens, sample_len);
+        // Codes not below `num_tokens` were skipped, so they are missing from the
+        // total.
+        if index.as_view().total_frequency() as usize != read {
+            return Err(InvalidFrequencyIndex::CodeOutOfRange);
+        }
+        Ok(index)
+    }
+
+    /// As [`sample`](Self::sample), without failing: codes not below `num_tokens`
+    /// are not counted. `num_tokens` must be at most 2^16, and at most `u32::MAX`
+    /// codes must be read.
+    pub(crate) fn sample_any(codes: &[Token], num_tokens: usize, sample_len: usize) -> Self {
+        // Token `t` is counted at `t + 1`, so that summing in place leaves the
+        // prefix sums.
         let mut cumulative = vec![0u32; num_tokens + 1];
-        for &code in codes {
-            *cumulative
-                .get_mut(usize::from(code) + 1)
-                .ok_or(InvalidFrequencyIndex::CodeOutOfRange)? += 1;
+        for block in sample_blocks(codes, sample_len) {
+            for &code in block {
+                if let Some(count) = cumulative.get_mut(usize::from(code) + 1) {
+                    *count += 1;
+                }
+            }
         }
-        for token in 0..num_tokens {
-            cumulative[token + 1] += cumulative[token];
+        let mut sum = 0;
+        for count in &mut cumulative[1..] {
+            sum += *count;
+            *count = sum;
         }
-        Ok(Self { cumulative })
+        Self { cumulative }
     }
 
     /// Adopts stored prefix sums without copying them.
@@ -192,6 +252,19 @@ impl fmt::Display for InvalidFrequencyIndex {
 
 impl std::error::Error for InvalidFrequencyIndex {}
 
+/// At least `sample_len` codes of `codes` in evenly spaced blocks, or all of them in
+/// one block when the blocks would touch.
+fn sample_blocks(codes: &[Token], sample_len: usize) -> impl Iterator<Item = &[Token]> {
+    let blocks = sample_len.div_ceil(SAMPLE_BLOCK_LEN).max(1);
+    let stride = codes.len() / blocks;
+    let (blocks, stride, len) = if stride > SAMPLE_BLOCK_LEN {
+        (blocks, stride, SAMPLE_BLOCK_LEN)
+    } else {
+        (1, 0, codes.len())
+    };
+    (0..blocks).map(move |block| &codes[block * stride..][..len])
+}
+
 /// Checks that `cumulative` is a prefix sum over at most [`MAX_TOKENS`] tokens.
 fn check_cumulative(cumulative: &[u32]) -> Result<(), InvalidFrequencyIndex> {
     let Some(&first) = cumulative.first() else {
@@ -237,6 +310,54 @@ mod tests {
             Err(InvalidFrequencyIndex::TooManyTokens)
         );
         assert!(TokenFrequencyIndex::build(&[Token::MAX], MAX_TOKENS).is_ok());
+    }
+
+    #[test]
+    fn sample_counts_part_of_the_stream() {
+        // Each block a sample reads from a period-4 stream holds its tokens equally
+        // often, so they are counted equally often.
+        let periodic: Vec<Token> = (0..100_000).map(|i| (i % 4) as Token).collect();
+        let sample = TokenFrequencyIndex::sample(&periodic, 4, 1000).unwrap();
+        let sample = sample.as_view();
+        for token in 0..4 {
+            assert_eq!(sample.frequency(token) * 4, sample.total_frequency());
+        }
+
+        for len in [0, 1, 63, 64, 65, 1000, 4097, 100_003] {
+            let codes: Vec<Token> = (0..len).map(|i| ((i * 7 + i / 13) % 5) as Token).collect();
+            let exact = TokenFrequencyIndex::build(&codes, 5).unwrap();
+            for sample_len in [0, 1, 64, 100, 1000, len, len + 1] {
+                let sample = TokenFrequencyIndex::sample(&codes, 5, sample_len).unwrap();
+                let counted = sample.as_view().total_frequency() as usize;
+                assert!(
+                    sample_len.min(len) <= counted && counted <= len,
+                    "{len} codes, sample of {sample_len}: counted {counted}"
+                );
+                if sample_len >= len {
+                    assert_eq!(sample, exact, "{len} codes, sample of {sample_len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sample_rejects_bad_input_and_planning_skips_it() {
+        assert_eq!(
+            TokenFrequencyIndex::sample(&[], MAX_TOKENS + 1, 0),
+            Err(InvalidFrequencyIndex::TooManyTokens)
+        );
+        assert_eq!(
+            TokenFrequencyIndex::sample(&[7; 10_000], 5, 100),
+            Err(InvalidFrequencyIndex::CodeOutOfRange)
+        );
+        let mut codes = vec![1; 10_000];
+        codes[10] = 7;
+        codes[9_000] = Token::MAX;
+        let planning = TokenFrequencyIndex::sample_any(&codes, 5, codes.len());
+        assert_eq!(planning.as_view().frequency(1), 9_998);
+        assert_eq!(planning.as_view().total_frequency(), 9_998);
+        let planning = TokenFrequencyIndex::sample_any(&[7; 10_000], 5, 100);
+        assert_eq!(planning.as_view().total_frequency(), 0);
     }
 
     #[test]

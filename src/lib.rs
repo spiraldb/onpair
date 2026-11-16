@@ -63,7 +63,9 @@
 //!
 //! Beside them, an engine may keep a
 //! [`TokenFrequencyIndex`](search::index::TokenFrequencyIndex), which
-//! [`ContainsScan`](search::ContainsScan) plans with.
+//! [`ContainsScan`](search::ContainsScan) plans with. Without one,
+//! [`ContainsScan::new_sampled`](search::ContainsScan::new_sampled) plans with
+//! the token counts of a sample of the codes.
 //!
 //! **Reading it back.** Buffers from storage can be corrupt.
 //! [`CompactDictionaryView::validate_safety`] checks what memory safety needs, and

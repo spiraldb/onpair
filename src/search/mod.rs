@@ -13,8 +13,9 @@
 //! * Substring across rows: build a [`ContainsScan`], then call [`ContainsScan::scan`]
 //!   to append the indices of the matching rows. It searches the whole code stream
 //!   for a few rare tokens, with SIMD where available, and is usually faster. It
-//!   plans with a reusable [`index::TokenFrequencyIndex`], requires greedily
-//!   tokenized rows, and accepts patterns of up to 65535 bytes.
+//!   plans with a reusable [`index::TokenFrequencyIndex`], or with the token counts
+//!   of a sample of the codes, requires greedily tokenized rows, and accepts
+//!   patterns of up to 65535 bytes.
 //!
 //! Search requires a dictionary with unique tokens in bytewise-lexicographic order
 //! and all 256 single-byte tokens. Training or full dictionary validation establishes
