@@ -254,8 +254,10 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// not establish greedy tokenization for externally supplied codes, and on
     /// other rows the result is unspecified.
     ///
-    /// `frequencies` counts the tokens of this view's code stream, as built by
+    /// `frequencies` counts the tokens of this view's code stream, or of a sample of
+    /// it, as built by
     /// [`TokenFrequencyIndex::build`](crate::search::index::TokenFrequencyIndex::build)
+    /// or [`TokenFrequencyIndex::sample`](crate::search::index::TokenFrequencyIndex::sample),
     /// or borrowed from storage with [`TokenFrequencyIndexView::new`]. Preparation
     /// checks only that it counts as many tokens as the dictionary has; inexact
     /// counts affect planning, not the rows returned.

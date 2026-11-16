@@ -79,7 +79,7 @@ use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::core::validate::{InvalidColumn, panic_malformed};
-use crate::search::index::TokenFrequencyIndexView;
+use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexView};
 use crate::search::substring::ContainsError;
 
 /// Finds the rows of a code stream that contain a pattern, without decoding them.
@@ -218,6 +218,32 @@ impl<'d> ContainsScan<'d> {
                 hit_density: fraction(plan.hits, frequencies.total_frequency()),
             })),
         })
+    }
+
+    /// Prepares a scan for `pattern`, as [`new`](Self::new) does, with the token
+    /// counts of a sample of `codes`, typically the codes it will scan, for streams
+    /// without a stored [`TokenFrequencyIndex`]. Codes outside `dict` are not
+    /// counted.
+    ///
+    /// The sample grows with the square root of the stream. That suffices because
+    /// planning mostly needs to avoid frequent tokens, and being frequent, they show
+    /// up in a small sample. Ranking rare tokens, to find the best cover, would take
+    /// a far larger one, since halving a count's error takes four times the codes,
+    /// but whichever rare tokens are chosen add few hits.
+    ///
+    /// # Errors
+    /// As [`new`](Self::new), except [`ContainsError::FrequencyIndexMismatch`].
+    ///
+    /// # Precondition
+    /// As [`new`](Self::new).
+    pub fn new_sampled(
+        pattern: &[u8],
+        dict: CompactDictionaryView<'d>,
+        codes: &[Token],
+    ) -> Result<Self, ContainsError> {
+        let sample_len = (4 * codes.len().isqrt()).min(codes.len());
+        let frequencies = TokenFrequencyIndex::sample_any(codes, dict.num_tokens(), sample_len);
+        Self::new(pattern, dict, frequencies.as_view())
     }
 
     /// Appends to `out` the index of every row that contains the pattern, in

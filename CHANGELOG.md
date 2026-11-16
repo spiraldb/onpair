@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.4.0...HEAD)
 
+### Added
+
+- Add `TokenFrequencyIndex::sample`, which counts the tokens of a sample of the
+  codes, spread evenly over them.
+- Add `ContainsScan::new_sampled`, which plans a scan with the token counts of a
+  sample of the codes, for streams without a stored frequency index.
+
 ### Fixed
 
 - Require `fearless_simd` 1.0.0 instead of 1.2.0. onpair uses nothing added
