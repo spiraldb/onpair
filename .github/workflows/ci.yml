@@ -6,6 +6,10 @@ on:
   pull_request: {}
   workflow_dispatch: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   actions: read
   contents: read
@@ -48,13 +52,23 @@ jobs:
       - name: Rust Check
         run: cargo +${{ steps.msrv.outputs.version }} check --lib --all-features
 
-  bench-codspeed:
-    name: Benchmark with Codspeed
+  bench-codspeed-shard:
+    name: Benchmark with Codspeed (${{ matrix.shard.name }})
+    # Simulation runs single-threaded under Valgrind, so the suite is split
+    # across jobs; CodSpeed merges the uploads of one workflow run.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: train_and_compress
+            filter: "tpch\\.rs::train_and_compress"
+          - name: parse, decompress, clickbench
+            filter: "tpch\\.rs::(parse|decompress_all)|clickbench\\.rs::"
     runs-on:
       - runs-on=${{ github.run_id }}
       - family=c7i.8xlarge
       - image=ubuntu24-full-x64
-      - tag=bench-codspeed
+      - tag=bench-codspeed-${{ strategy.job-index }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
@@ -76,8 +90,21 @@ jobs:
           CODSPEED_PROCESS_ISOLATION: "false"
         uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         with:
-          run: cargo codspeed run
+          run: cargo codspeed run '${{ matrix.shard.filter }}'
           mode: simulation
+
+  bench-codspeed:
+    name: Benchmark with Codspeed
+    needs: bench-codspeed-shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shards
+        run: |
+          [ "${{ needs.bench-codspeed-shard.result }}" = "success" ] || {
+            echo "Benchmark shards result: ${{ needs.bench-codspeed-shard.result }}"
+            exit 1
+          }
 
   bench-codspeed-walltime:
     name: Benchmark with Codspeed (Walltime)
