@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.4.0...HEAD)
 
+### Fixed
+
+- Require `fearless_simd` 1.0.0 instead of 1.2.0. onpair uses nothing added
+  since 1.0.0, and crates that allow 1.0.0 failed to resolve onpair when
+  checking their minimal dependency versions.
+
 ## [0.4.0](https://github.com/spiraldb/onpair/compare/v0.3.0...v0.4.0) - 2026-11-11
 
 ### Added
