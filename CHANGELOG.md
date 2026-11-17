@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.4.0...HEAD)
+## [Unreleased](https://github.com/spiraldb/onpair/compare/v0.4.1...HEAD)
+
+## [0.4.1](https://github.com/spiraldb/onpair/compare/v0.4.0...v0.4.1) - 2026-11-16
+
+### Added
+
+- Add `TokenFrequencyIndex::sample`, which counts the tokens of a sample of the
+  codes, spread evenly over them.
+- Add `ContainsScan::new_sampled`, which plans a scan with the token counts of a
+  sample of the codes, for streams without a stored frequency index.
+
+### Changed
+
+- Raise the minimum supported Rust version from 1.91 to 1.95.
+
+### Fixed
+
+- Require `fearless_simd` 1.0.0 instead of 1.2.0. onpair uses nothing added
+  since 1.0.0, and crates that allow 1.0.0 failed to resolve onpair when
+  checking their minimal dependency versions.
 
 ## [0.4.0](https://github.com/spiraldb/onpair/compare/v0.3.0...v0.4.0) - 2026-11-11
 

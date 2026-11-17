@@ -101,6 +101,10 @@ fn check(view: ColumnView<'_, u32>, rows: &[&[u8]], patterns: &[&[u8]]) {
             expected,
             "column scan: {pattern:?}"
         );
+        let sampled = ContainsScan::new_sampled(pattern, view.dict, view.codes).unwrap();
+        let mut rows = Vec::new();
+        sampled.scan(view.codes, view.row_offsets, &mut rows);
+        assert_eq!(rows, expected, "sampled scan: {pattern:?}");
         if pattern.len() <= ContainsDfa::MAX_PATTERN_LEN {
             assert_eq!(
                 view.rows_containing(pattern).unwrap(),
@@ -164,12 +168,17 @@ fn pattern_limits_are_independent() {
         })
     );
     let oversized = vec![b'a'; ContainsScan::MAX_PATTERN_LEN + 1];
+    let too_long = ContainsError::PatternTooLong {
+        length: oversized.len(),
+        max: ContainsScan::MAX_PATTERN_LEN,
+    };
     assert_eq!(
         view.rows_containing_with_scan(&oversized, frequencies.as_view()),
-        Err(ContainsError::PatternTooLong {
-            length: oversized.len(),
-            max: ContainsScan::MAX_PATTERN_LEN,
-        })
+        Err(too_long)
+    );
+    assert_eq!(
+        ContainsScan::new_sampled(&oversized, view.dict, view.codes).unwrap_err(),
+        too_long
     );
 }
 
@@ -257,6 +266,11 @@ fn codes_outside_the_dictionary_never_match() {
             scan.scan(&codes, &[0, codes.len() as u32], &mut rows);
             assert_eq!(rows == [0], contains, "scan: {codes:?}");
             assert_eq!(row_contains(&codes, &dfa), contains, "DFA: {codes:?}");
+            // Sampling skips such codes rather than failing.
+            let sampled = ContainsScan::new_sampled(b"alpha", view.dict, &codes).unwrap();
+            let mut rows = Vec::new();
+            sampled.scan(&codes, &[0, codes.len() as u32], &mut rows);
+            assert_eq!(rows == [0], contains, "sampled scan: {codes:?}");
         }
     }
 }
@@ -307,6 +321,8 @@ fn empty_pattern_matches_every_row() {
         let frequencies = TokenFrequencyIndex::build(view.codes, view.dict.num_tokens()).unwrap();
         let scan = ContainsScan::new(b"", view.dict, frequencies.as_view()).unwrap();
         assert!(scan.probe_cover().is_none());
+        let sampled = ContainsScan::new_sampled(b"", view.dict, view.codes).unwrap();
+        assert!(sampled.probe_cover().is_none());
         let unrelated = TokenFrequencyIndex::build(&[], 1).unwrap();
         assert_eq!(
             view.rows_containing_with_scan(b"", unrelated.as_view()),
