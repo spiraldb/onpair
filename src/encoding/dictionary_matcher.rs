@@ -6,12 +6,17 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
+    _mm256_andnot_si256, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_cmpgt_epi64,
+    _mm256_movemask_pd, _mm256_or_si256, _mm256_set1_epi64x, _mm256_xor_si256,
     _mm512_cmpeq_epu64_mask, _mm512_cmple_epu64_mask, _mm512_cmplt_epu64_mask, _mm512_set1_epi64,
 };
 use std::hint::select_unpredictable;
 
 #[cfg(target_arch = "x86_64")]
-use fearless_simd::{SimdBase, u64x8, x86::Avx512};
+use fearless_simd::{
+    SimdBase, u64x4, u64x8,
+    x86::{Avx2, Avx512},
+};
 
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token};
@@ -349,6 +354,20 @@ impl DictionaryMatcher {
         self.find_all_with(Search::Rank(avx512), bytes, at, win)
     }
 
+    /// [`Self::find_all`] with the flat AVX2 sample rank. The token proves
+    /// that the CPU supports AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(crate) fn find_all_rank_avx2<const K: usize>(
+        &self,
+        avx2: Avx2,
+        bytes: &[u8],
+        at: &[usize; K],
+        win: &[usize; K],
+    ) -> [(Token, usize); K] {
+        self.find_all_with(Search::RankAvx2(avx2), bytes, at, win)
+    }
+
     #[inline(always)]
     fn find_all_with<const K: usize>(
         &self,
@@ -406,19 +425,34 @@ impl DictionaryMatcher {
             }
         }
 
+        // Outside the remaining range, samples are greater than the key:
+        // either an earlier comparison excluded them, or their two-byte prefix
+        // is larger. MAX pads are valid blocks too. Seven trailing samples make
+        // eight samples readable.
         #[cfg(target_arch = "x86_64")]
-        if let Search::Rank(avx512) | Search::Tree(avx512) = search {
-            for j in 0..K {
-                // Outside the remaining range, samples are greater than the
-                // key: either an earlier comparison excluded them, or their
-                // two-byte prefix is larger. MAX pads are valid blocks too.
-                // Seven trailing samples make eight samples readable.
-                base[j] += rank8(
-                    avx512,
-                    &self.samples_hi[base[j]..base[j] + BLOCK_KEYS],
-                    &self.samples_lo[base[j]..base[j] + BLOCK_KEYS],
-                    key[j],
-                );
+        match search {
+            Search::Scalar => {}
+
+            Search::Rank(avx512) | Search::Tree(avx512) => {
+                for j in 0..K {
+                    base[j] += rank8(
+                        avx512,
+                        &self.samples_hi[base[j]..base[j] + BLOCK_KEYS],
+                        &self.samples_lo[base[j]..base[j] + BLOCK_KEYS],
+                        key[j],
+                    );
+                }
+            }
+
+            Search::RankAvx2(avx2) => {
+                for j in 0..K {
+                    base[j] += rank8_avx2(
+                        avx2,
+                        &self.samples_hi[base[j]..base[j] + BLOCK_KEYS],
+                        &self.samples_lo[base[j]..base[j] + BLOCK_KEYS],
+                        key[j],
+                    );
+                }
             }
         }
 
@@ -444,6 +478,14 @@ impl DictionaryMatcher {
                 for j in 0..K {
                     let block = &self.blocks[base[j]];
                     slot[j] = rank8(avx512, &block.hi, &block.lo, key[j]);
+                }
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            Search::RankAvx2(avx2) => {
+                for j in 0..K {
+                    let block = &self.blocks[base[j]];
+                    slot[j] = rank8_avx2(avx2, &block.hi, &block.lo, key[j]);
                 }
             }
         }
@@ -541,6 +583,10 @@ enum Search {
     /// Walk the eight-way prefix trees with AVX-512.
     #[cfg(target_arch = "x86_64")]
     Tree(Avx512),
+
+    /// Rank the last eight samples and the block keys with AVX2.
+    #[cfg(target_arch = "x86_64")]
+    RankAvx2(Avx2),
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -557,6 +603,37 @@ fearless_simd::kernel!(
         let le = _mm512_cmplt_epu64_mask(hi, key_hi)
             | (_mm512_cmpeq_epu64_mask(hi, key_hi) & _mm512_cmple_epu64_mask(lo, key_lo));
         le.count_ones() as usize - 1
+    }
+);
+
+#[cfg(target_arch = "x86_64")]
+fearless_simd::kernel!(
+    /// [`rank8`] with AVX2. AVX2 compares 64-bit lanes only as signed numbers,
+    /// so both sides flip their sign bit first to compare as unsigned.
+    #[inline(always)]
+    fn rank8_avx2(avx2: Avx2, hi: &[u64], lo: &[u64], key: u128) -> usize {
+        let hi0 = u64x4::from_slice(avx2, &hi[..4]).into();
+        let hi1 = u64x4::from_slice(avx2, &hi[4..8]).into();
+        let lo0 = u64x4::from_slice(avx2, &lo[..4]).into();
+        let lo1 = u64x4::from_slice(avx2, &lo[4..8]).into();
+
+        let sign = _mm256_set1_epi64x(i64::MIN);
+        let key_hi = _mm256_set1_epi64x((key >> 64) as i64);
+        let key_hi_signed = _mm256_set1_epi64x(((key >> 64) as i64) ^ i64::MIN);
+        let key_lo_signed = _mm256_set1_epi64x((key as i64) ^ i64::MIN);
+
+        // A key is <= the query when its high half is smaller, or equal with a
+        // low half that is not greater.
+        let le = |hi, lo| {
+            let hi_lt = _mm256_cmpgt_epi64(key_hi_signed, _mm256_xor_si256(hi, sign));
+            let hi_eq = _mm256_cmpeq_epi64(hi, key_hi);
+            let lo_gt = _mm256_cmpgt_epi64(_mm256_xor_si256(lo, sign), key_lo_signed);
+            _mm256_or_si256(hi_lt, _mm256_andnot_si256(lo_gt, hi_eq))
+        };
+
+        let low = _mm256_movemask_pd(_mm256_castsi256_pd(le(hi0, lo0))) as u32;
+        let high = _mm256_movemask_pd(_mm256_castsi256_pd(le(hi1, lo1))) as u32;
+        (low | (high << 4)).count_ones() as usize - 1
     }
 );
 
@@ -750,6 +827,12 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         if let Some(avx512) = fearless_simd::Level::new().as_avx512() {
             let simd = matcher.find_all_avx512(avx512, bytes, at, win);
+            assert_eq!(simd, scalar);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if let Some(avx2) = fearless_simd::Level::new().as_avx2() {
+            let simd = matcher.find_all_rank_avx2(avx2, bytes, at, win);
             assert_eq!(simd, scalar);
         }
     }
