@@ -14,3 +14,5 @@ pub(crate) mod lpm;
 pub(crate) mod parser;
 pub(crate) mod rows;
 pub(crate) mod trainer;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod vector;
