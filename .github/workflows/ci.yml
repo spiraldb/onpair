@@ -85,7 +85,7 @@ jobs:
 
       - name: Run benchmarks - Simulation
         env:
-          # Run all benchmarks in one process, as before divan 6.
+          # Run all benchmarks in one process, as before CodSpeed 6.
           CODSPEED_PROCESS_ISOLATION: "false"
         uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         with:
