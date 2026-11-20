@@ -74,8 +74,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
 
       - name: Install Codspeed
-        shell: bash
-        run: cargo install --force cargo-codspeed --locked
+        uses: ./.github/actions/setup-codspeed
 
       - name: Build benchmarks
         env:
@@ -118,8 +117,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
 
       - name: Install Codspeed
-        shell: bash
-        run: cargo install --force cargo-codspeed --locked
+        uses: ./.github/actions/setup-codspeed
 
       - name: Build benchmarks
         env:
